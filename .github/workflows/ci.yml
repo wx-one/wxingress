@@ -128,12 +128,14 @@ jobs:
         with:
           image: ${{ steps.pin.outputs.image || steps.pinfile.outputs.image }}
 
-      # what nginx and the module's static libcurl need to build
+      # what nginx and the module's static libcurl need to build, and the
+      # headers meta lowers the module against (curl/curl.h for meta_fetch)
       - name: Build dependencies
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-            build-essential curl ca-certificates make libpcre2-dev zlib1g-dev libssl-dev >/dev/null
+            build-essential curl ca-certificates make libpcre2-dev zlib1g-dev libssl-dev \
+            libcurl4-openssl-dev >/dev/null
 
       - name: Build
         run: |
