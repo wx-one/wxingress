@@ -4,10 +4,14 @@
 #            module and its test, helm lint - which uploads the binary and
 #            the module as artifacts of this run
 #   image    ghcr.io/wx-one/wxingress:<version> and :latest, built from
-#            build/Dockerfile.wxingress with that binary and module
+#            build/Dockerfile.wxingress with that binary and module; the
+#            release tarball (binary, module, licences) with its SHA-256,
+#            and CycloneDX 1.6 SBOMs of the release and of the image
+#            (ci/sbom.sh), written from what the build knows
 #   chart    charts/wxingress with appVersion <version>, pushed to
 #            oci://ghcr.io/wx-one/charts/wxingress
-#   release  a GitHub release for the tag with the chart attached
+#   release  a GitHub release for the tag with all of that attached and the
+#            image named by its digest
 #
 # The image and the chart are pushed to GHCR with GITHUB_TOKEN; no secrets
 # are needed.
@@ -20,6 +24,9 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # a dry run: everything is built, the SBOMs written and uploaded as
+  # artifacts of the run, nothing is pushed and no release is made
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -43,11 +50,19 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
 
       - name: Version
-        id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          [[ "$GITHUB_REF" == refs/tags/v* ]] || version=0.0.0-${GITHUB_SHA::12}
+          echo "VERSION=$version" >>"$GITHUB_ENV"
+          echo "RELEASE=wxingress-$version-linux-amd64" >>"$GITHUB_ENV"
 
       # build/Dockerfile.wxingress expects both in the build context:
       #   nginx-ingress                                  the controller binary
@@ -67,27 +82,44 @@ jobs:
           chmod +x nginx-ingress
           ./nginx-ingress -version
           test -f dataplane/build/ngx_http_wxingress_module.so
+          cat dataplane/build/META-IMAGE
 
-      - uses: docker/setup-buildx-action@v3
+      - name: The release tarball and its SBOM
+        run: |
+          mkdir -p out "stage/$RELEASE"
+          cp nginx-ingress dataplane/build/ngx_http_wxingress_module.so LICENSE NOTICE "stage/$RELEASE/"
+          cp -r LICENSES "stage/$RELEASE/"
+          tar -czf "out/$RELEASE.tar.gz" -C stage "$RELEASE"
+          (cd out && sha256sum "$RELEASE.tar.gz" > "$RELEASE.sha256")
+          ci/sbom.sh release "$VERSION" nginx-ingress dataplane/build/ngx_http_wxingress_module.so \
+            > "out/$RELEASE.cdx.json"
 
-      - uses: docker/login-action@v3
+      - name: Build the image
+        run: |
+          docker build -q -f build/Dockerfile.wxingress \
+            --build-arg IC_VERSION="$VERSION" \
+            --build-arg NGINX_OSS_VERSION="$NGINX_OSS_VERSION" \
+            -t wxingress:ci .
+          docker run --rm --entrypoint /nginx-ingress wxingress:ci -version
+
+      - name: The image's SBOM
+        run: ci/sbom.sh image "out/$RELEASE.cdx.json" "$IMAGE:$VERSION" wxingress:ci > "out/$RELEASE.image.cdx.json"
+
+      - name: Push the image
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          for tag in "$VERSION" latest; do
+            docker tag wxingress:ci "$IMAGE:$tag"
+            docker push -q "$IMAGE:$tag"
+          done
+          docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$VERSION" > "out/$RELEASE.image-digest"
+          cat "out/$RELEASE.image-digest"
+
+      - uses: actions/upload-artifact@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: build/Dockerfile.wxingress
-          platforms: linux/amd64
-          build-args: |
-            IC_VERSION=${{ github.ref_name }}
-            NGINX_OSS_VERSION=${{ env.NGINX_OSS_VERSION }}
-          tags: |
-            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
-            ${{ env.IMAGE }}:latest
-          push: true
+          name: release
+          path: out/*
 
   chart:
     name: Helm chart
@@ -97,7 +129,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: azure/setup-helm@v4
         with:
@@ -112,6 +144,7 @@ jobs:
           ls -l chart
 
       - name: Push
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -127,6 +160,7 @@ jobs:
 
   release:
     name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [image, chart]
     runs-on: ubuntu-24.04
     permissions:
@@ -134,19 +168,33 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          name: release
+          path: out
+
+      - uses: actions/download-artifact@v4
+        with:
           name: chart-release
-          path: chart
+          path: out
 
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ github.ref_name }}
         run: |
-          gh release create "$GITHUB_REF_NAME" chart/*.tgz \
+          image=$(cat out/*.image-digest)
+          {
+            echo "## Image"
+            echo "\`$image\` (also \`:${GITHUB_REF_NAME#v}\` and \`:latest\`), on Debian 13 with NGINX from nginx.org's packages. Everything installed in it: \`.image.cdx.json\` (CycloneDX 1.6)."
+            echo
+            echo "## Helm chart"
+            echo "\`helm install wxingress oci://ghcr.io/wx-one/charts/wxingress\`, also attached as \`.tgz\`."
+            echo
+            echo "## Binaries"
+            echo "\`wxingress-*-linux-amd64.tar.gz\`: the controller \`nginx-ingress\` and the data plane module \`ngx_http_wxingress_module.so\` (for exactly the NGINX of the image), with the licences. SHA-256 in the \`.sha256\` file, SBOM (CycloneDX 1.6) in \`.cdx.json\`."
+          } > notes.md
+          rm out/*.image-digest
+          gh release create "$GITHUB_REF_NAME" out/* \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --title "$GITHUB_REF_NAME" \
-            --generate-notes \
-            --notes "Image: \`ghcr.io/wx-one/wxingress:${VERSION#v}\`
-
-          Helm chart: \`helm install wxingress oci://ghcr.io/wx-one/charts/wxingress\`"
+            --notes-file notes.md \
+            --generate-notes

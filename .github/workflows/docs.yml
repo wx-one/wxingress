@@ -37,7 +37,7 @@ jobs:
     name: Build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           # the git-revision-date plugins, should mkdocs.yml use one, need history
           fetch-depth: 0

@@ -133,6 +133,9 @@ command-line flags and Helm values, and how to build and develop wxingress.
 |---|---|---|---|
 | 5.7.1-wx5 | 5.7.1 | 1.31.9 | v1.6.3 (NGF 2.8.1) |
 
+Every release comes with CycloneDX SBOMs of the binaries and of the image and names the image by its
+digest; see [Releases and SBOMs](https://wx-one.github.io/wxingress/getting-started/installation/#releases-and-sboms).
+
 The chart requires Kubernetes 1.25 or newer. wxingress is tested on Kubernetes 1.31 and 1.32, on RKE2 and kind.
 
 ## Contributing

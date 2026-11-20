@@ -85,6 +85,10 @@ RUN mkdir -p /var/lib/nginx /etc/nginx/secrets /etc/nginx/stream-conf.d \
 	&& ln -sf /dev/stdout /var/log/nginx/access.log \
 	&& ln -sf /dev/stderr /var/log/nginx/error.log
 
+# the licences of wxingress and of the Apache-2.0 code it is built on
+COPY LICENSE NOTICE /usr/share/doc/wxingress/
+COPY LICENSES/ /usr/share/doc/wxingress/LICENSES/
+
 # the stage local: the binary from outside
 COPY --chown=101:0 nginx-ingress /nginx-ingress
 RUN setcap 'cap_net_bind_service=+ep' /nginx-ingress && setcap -v 'cap_net_bind_service=+ep' /nginx-ingress
@@ -97,5 +101,11 @@ ENTRYPOINT ["/nginx-ingress"]
 USER 101
 
 LABEL org.opencontainers.image.title="wxingress" \
+	org.opencontainers.image.description="The drop-in successor of ingress-nginx, built on NGINX Ingress Controller, with the Gateway API" \
 	org.opencontainers.image.version="${IC_VERSION}" \
-	org.opencontainers.image.source="https://github.com/wx-one/wxingress"
+	org.opencontainers.image.source="https://github.com/wx-one/wxingress" \
+	org.opencontainers.image.url="https://wx-one.github.io/wxingress/" \
+	org.opencontainers.image.documentation="https://wx-one.github.io/wxingress/" \
+	org.opencontainers.image.vendor="WizardTales GmbH" \
+	org.opencontainers.image.licenses="EUPL-1.2 AND Apache-2.0" \
+	org.opencontainers.image.base.name="docker.io/library/debian:trixie-slim"

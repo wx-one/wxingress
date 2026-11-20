@@ -121,6 +121,29 @@ Helm does not upgrade CRDs. Apply the CRDs of the new version before you upgrade
 kubectl apply --server-side -f https://raw.githubusercontent.com/wx-one/wxingress/<tag>/deploy/crds.yaml
 ```
 
+## Releases and SBOMs
+
+Every release on [GitHub](https://github.com/wx-one/wxingress/releases) carries:
+
+| File | What it is |
+|---|---|
+| `wxingress-<version>-linux-amd64.tar.gz` | the controller binary and the data plane module, with the licences |
+| `wxingress-<version>-linux-amd64.sha256` | its SHA-256 |
+| `wxingress-<version>-linux-amd64.cdx.json` | the SBOM of the release (CycloneDX 1.6): the Go modules of the controller, the libcurl and meta runtime in the data plane module, and the NGINX it is built for |
+| `wxingress-<version>-linux-amd64.image.cdx.json` | the SBOM of the image: the release and every Debian and nginx.org package installed, and the base image by digest |
+| `wxingress-<chart version>.tgz` | the Helm chart |
+
+The release notes name the image by its digest. To deploy exactly that image:
+
+```sh
+helm upgrade --install wxingress oci://ghcr.io/wx-one/charts/wxingress -n wxingress \
+  --set controller.image.digest=sha256:<digest from the release notes>
+```
+
+The SBOMs are written from what the build knows, not by scanning: the controller's modules come from
+its build info, the data plane's libraries from the pinned sources it is built from, and the image's
+packages from its package database.
+
 ## Uninstalling
 
 ```sh

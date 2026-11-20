@@ -4,12 +4,17 @@
 #                    make test, with helm for the chart snapshot tests
 #   go-build         the controller binary nginx-ingress (CGO_ENABLED=0)
 #   dataplane-build  the data plane module and an nginx beside it, built with
-#                    dataplane/build.sh inside the meta compiler image
+#                    dataplane/build.sh and the meta compiler
 #   dataplane-test   dataplane/tests/upstream-api.sh against that nginx
 #   helm             helm lint and helm package for charts/wxingress
 #
 # Nothing is pushed or deployed here. release.yml calls this workflow for a
 # tag and builds the image from the binary and module it uploads.
+#
+# meta is not open source. The metalanguage repository publishes it, binary
+# and headers, as the image wxone/meta, and this only uses it: copied out to
+# /opt/meta - see .github/actions/meta. Which one, by tag and digest, is in
+# ci/meta-image: the meta commit this is built and tested with, not latest.
 
 name: CI
 
@@ -41,11 +46,9 @@ concurrency:
 env:
   # the version the chart snapshot tests were recorded with
   HELM_VERSION: v4.3.0
-  # The meta compiler image (tags are short commits of the meta compiler).
-  # Pinned on purpose: the data plane is checked against a known compiler.
-  # Override with the repository variable META_IMAGE or the workflow_dispatch
-  # input to try another one.
-  META_IMAGE: ${{ inputs.meta_image || vars.META_IMAGE || 'docker.io/wxone/meta:0a3067f' }}
+  # The meta compiler is pinned by tag and digest in ci/meta-image: the data
+  # plane is built and tested with a known compiler, not latest. The
+  # repository variable META_IMAGE or the workflow_dispatch input try another.
   # must match NGINX_VERSION in dataplane/build.sh
   NGINX_OSS_VERSION: 1.31.9
 
@@ -54,7 +57,7 @@ jobs:
     name: Go tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-go@v5
         with:
@@ -84,7 +87,7 @@ jobs:
     name: Controller binary
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -108,28 +111,35 @@ jobs:
 
   dataplane-build:
     name: Data plane build
+    # meta lowers against the headers of the compiler its image was built
+    # with: ubuntu:24.04, so the runner is ubuntu-24.04 and uses its gcc
     runs-on: ubuntu-24.04
-    container:
-      image: ${{ inputs.meta_image || vars.META_IMAGE || 'docker.io/wxone/meta:0a3067f' }}
-    env:
-      # the image sets META to its directory, build.sh wants the binary
-      META_ROOT: /opt/meta
-      META: /opt/meta/meta
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      # what nginx and the module's static libcurl need to build and the meta
-      # image does not bring along
+      # meta by tag and digest, in one place: ci/meta-image
+      - id: pin
+        run: echo "image=${{ inputs.meta_image || vars.META_IMAGE }}" >>"$GITHUB_OUTPUT"
+      - id: pinfile
+        if: steps.pin.outputs.image == ''
+        run: echo "image=$(cat ci/meta-image)" >>"$GITHUB_OUTPUT"
+
+      - uses: ./.github/actions/meta
+        with:
+          image: ${{ steps.pin.outputs.image || steps.pinfile.outputs.image }}
+
+      # what nginx and the module's static libcurl need to build
       - name: Build dependencies
         run: |
-          apt-get update -qq
-          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-            curl ca-certificates make libpcre2-dev zlib1g-dev libssl-dev >/dev/null
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            build-essential curl ca-certificates make libpcre2-dev zlib1g-dev libssl-dev >/dev/null
 
       - name: Build
         run: |
           "$META" --version
           ./dataplane/build.sh
+          echo "${META_IMAGE%@*}@$META_DIGEST" > dataplane/build/META-IMAGE
 
       - uses: actions/upload-artifact@v4
         if: always()
@@ -138,6 +148,7 @@ jobs:
           path: |
             dataplane/build/ngx_http_wxingress_module.so
             dataplane/build/nginx/sbin/nginx
+            dataplane/build/META-IMAGE
             dataplane/build/*.log
           if-no-files-found: ignore
           retention-days: 7
@@ -151,7 +162,7 @@ jobs:
     container:
       image: golang:1.27.3-trixie
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/download-artifact@v4
         with:
@@ -170,7 +181,7 @@ jobs:
     name: Helm chart
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: azure/setup-helm@v4
         with:
