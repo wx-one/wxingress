@@ -110,7 +110,7 @@ RUN --mount=type=bind,from=nginx-files,src=patch-os.sh,target=/usr/local/bin/pat
 USER 101
 
 ############################################### NGINX OSS - Alpine #############################################
-FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS alpine
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS alpine
 ARG OSS_PACKAGE_REPO
 ARG NGINX_OSS_VERSION
 ARG AGENT_V3_VERSION
@@ -259,7 +259,7 @@ RUN --mount=type=secret,id=nginx-repo.crt,dst=/etc/ssl/nginx/nginx-repo.crt,mode
 # Base:    alpine:3.24
 # Adds:    nginx-plus, nginx-plus-module-njs/otel/fips-check, nginx-agent v3, tracking.info
 # Used as: BUILD_OS=alpine-plus
-FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS alpine-plus
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS alpine-plus
 ARG NGINX_PLUS_VERSION
 ARG PLUS_PACKAGE_REPO
 ARG AGENT_V3_VERSION
@@ -304,7 +304,7 @@ RUN --mount=type=bind,from=alpine-fips-3.24,target=/tmp/fips/ \
 # Base:     alpine:3.24 (fresh — does not extend alpine-plus, keeps agent layer separate)
 # Installs: nginx-plus, app-protect (NAP WAF v4), attack-signatures, FIPS provider
 # Extended: alpine-plus-nap-fips (Agent v2)  •  alpine-plus-nap-fips-agent (Agent v3)
-FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS alpine-plus-nap-fips-base
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS alpine-plus-nap-fips-base
 ARG NGINX_PLUS_VERSION
 ARG NAP_WAF_VERSION
 ARG NAP_WAF_IPI_VERSION
@@ -380,7 +380,7 @@ RUN --mount=type=secret,id=nginx-repo.crt,dst=/etc/apk/cert.pem,mode=0644 \
 # Base:     alpine:3.24 (fresh — does not extend alpine-plus, keeps agent layer separate)
 # Installs: nginx-plus, app-protect-module-plus (NAP WAF v5), FIPS provider
 # Extended: alpine-plus-nap-v5-fips (Agent v2)  •  alpine-plus-nap-v5-fips-agent (Agent v3)
-FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a AS alpine-plus-nap-v5-fips-base
+FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf AS alpine-plus-nap-v5-fips-base
 ARG NGINX_PLUS_VERSION
 ARG PLUS_PACKAGE_REPO
 ARG NAP_WAF_VERSION
