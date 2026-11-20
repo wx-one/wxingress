@@ -1,0 +1,18 @@
+{{- /* ingress-nginx's tcp and udp services, read by -tcp-services-configmap and -udp-services-configmap */}}
+{{- range $proto := list "tcp" "udp" }}
+{{- $services := index $.Values.controller (printf "%sServices" $proto) }}
+{{- if $services }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nginx-ingress.fullname" $ }}-{{ $proto }}-services
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "nginx-ingress.labels" $ | nindent 4 }}
+data:
+{{- range $port, $target := $services }}
+  {{ $port | quote }}: {{ $target | quote }}
+{{- end }}
+{{- end }}
+{{- end }}

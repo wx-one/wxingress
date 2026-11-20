@@ -1,0 +1,503 @@
+# variables that should not be overridden by the user
+VER = $(shell grep IC_VERSION .github/data/version.txt | cut -d '=' -f 2)
+GIT_TAG = $(shell git describe --exact-match --tags || echo untagged)
+BINARY_NAME = nginx-ingress
+VERSION = $(VER)-SNAPSHOT
+
+# variables that can be overridden by the user
+OSS_REPO					  ?= "packages.nginx.org" ## The package repo to install nginx oss from
+PLUS_REPO					  ?= "pkgs.nginx.com" ## The package repo to install nginx-plus from
+WAF_REPO					  ?= "pkgs.nginx.com" ## The package repo to install nginx app protect waf from
+DOS_REPO					  ?= "pkgs.nginx.com" ## The package repo to install nginx app protect dos from
+
+# renovate: datasource=docker depName=nginx/nginx
+NGINX_OSS_VERSION             ?= 1.31.9
+NGINX_PLUS_VERSION            ?= R37.2
+
+NAP_WAF_VERSION               ?= 37.2+5.777
+NAP_WAF_COMMON_VERSION        ?= 11.869
+NAP_WAF_PLUGIN_VERSION        ?= 6.32
+NAP_WAF_IPI_VERSION           ?= 1.71
+
+AGENT_V2_VERSION              ?= 2
+AGENT_V3_VERSION              ?= 3
+
+# variables that can be overridden by the user, but are required for plus/staging builds
+NGX_CRT 					  ?= nginx-repo.crt
+NGX_KEY 					  ?= nginx-repo.key
+
+DOCKER_AUTH = --secret id=$(NGX_CRT),src=$(NGX_CRT) --secret id=$(NGX_KEY),src=$(NGX_KEY)
+OSS_REPO ?=
+
+ifeq ($(OSS_REPO),pkgs-test.nginx.com)
+override OSS_ARGS += $(DOCKER_AUTH)
+endif
+
+PLUS_ARGS ?=  $(DOCKER_AUTH) --build-arg NGINX_PLUS_VERSION=$(NGINX_PLUS_VERSION) --build-arg PLUS_PACKAGE_REPO=$(PLUS_REPO)
+
+# Variables that can be overridden
+UBI10_PACKAGES_IMAGE ?= ghcr.io/nginx/dependencies/nginx-ubi:ubi10@sha256:8fb7d622f38e0d0f4dba7bfc6228fee7241adf7e1c981f16c532cfbd47eccfc9
+
+# renovate: datasource=github-releases depName=dominikh/go-tools
+STATICCHECK_VERSION ?= 452d5bb86b45416c35891262f6a11dbd6a970117
+
+# renovate: datasource=github-tags depName=golang/vuln
+GOVULNCHECK_VERSION ?= v1.9.0
+
+GO_DOCKER_IMAGE_NAME    ?= golang
+# renovate: datasource=docker depName=golang versioning=docker
+GO_DOCKER_IMAGE_VERSION ?= 1.27.3-trixie
+GO_DOCKER_IMAGE         ?= $(GO_DOCKER_IMAGE_NAME):$(GO_DOCKER_IMAGE_VERSION)
+
+REGISTRY                      ?= ## The registry where the image is located.
+PREFIX                        ?= nginx/nginx-ingress ## The name of the image. For example, nginx/nginx-ingress
+TAG                           ?= $(VERSION:v%=%) ## The tag of the image. For example, 2.0.0
+TARGET                        ?= local ## The target of the build. Possible values: local, container, download, goreleaser, and debug
+override DOCKER_BUILD_OPTIONS += --build-arg IC_VERSION=$(VERSION) --build-arg PLUS_PACKAGE_REPO=$(PLUS_REPO) --build-arg OSS_PACKAGE_REPO=$(OSS_REPO) ## The options for the docker build command. For example, --pull
+ARCH                          ?= amd64 ## The architecture of the image or binary. For example: amd64, arm64, ppc64le, s390x. Not all architectures are supported for all targets
+PLATFORM                      ?= linux/amd64 ## The platform(s) for dependency image builds. For example: linux/amd64 or linux/amd64,linux/arm64
+GOOS                          ?= linux ## The OS of the binary. For example linux, darwin
+# renovate: datasource=github-releases depName=golangci/golangci-lint
+GOLANGCI_LINT_VERSION         ?= v2.15.0 ## The version of golangci-lint to use
+# renovate: datasource=go depName=golang.org/x/tools
+GOIMPORTS_VERSION             ?= v0.52.0 ## The version of goimports to use
+# renovate: datasource=go depName=mvdan.cc/gofumpt
+GOFUMPT_VERSION               ?= v0.12.0 ## The version of gofumpt to use
+
+# Additional flags added here can be accessed in main.go.
+# e.g. `main.version` maps to `var version` in main.go
+GO_LINKER_FLAGS_VARS = -X main.version=${VERSION}
+GO_LINKER_FLAGS_OPTIONS = -s -w
+GO_LINKER_FLAGS = $(GO_LINKER_FLAGS_OPTIONS) $(GO_LINKER_FLAGS_VARS)
+DEBUG_GO_LINKER_FLAGS = $(GO_LINKER_FLAGS_VARS)
+DEBUG_GO_GC_FLAGS = all=-N -l
+
+ifeq (${REGISTRY},)
+BUILD_IMAGE             := $(strip $(PREFIX)):$(strip $(TAG))
+else
+BUILD_IMAGE             := $(strip $(REGISTRY))/$(strip $(PREFIX)):$(strip $(TAG))
+endif
+
+# final docker build command
+DOCKER_CMD = docker build --platform linux/$(strip $(ARCH)) $(strip $(DOCKER_BUILD_OPTIONS)) --target $(strip $(TARGET)) -f build/Dockerfile -t $(BUILD_IMAGE) .
+
+export DOCKER_BUILDKIT = 1
+
+# Note: only tracks committed/staged files. Run `git add` on new .go files for incremental rebuild.
+GO_SRCS := $(shell git ls-files '*.go' go.mod go.sum .github/data/version.txt | grep -v '_test\.go$$')
+
+.DEFAULT_GOAL:=help
+
+.PHONY: help
+help: Makefile ## Display this help
+	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "; printf "Usage:\n\n    make \033[36m<target>\033[0m [VARIABLE=value...]\n\nTargets:\n\n"}; {printf "    \033[36m%-30s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^(override )?[a-zA-Z0-9_-]+ \??\+?= .*? ## .*$$' $< | sort | awk 'BEGIN {FS = " \\??\\+?= .*? ## "; printf "\nVariables:\n\n"}; {gsub(/override /, "", $$1); printf "    \033[36m%-30s\033[0m %s\n", $$1, $$2}'
+
+.PHONY: all
+all: test lint verify-codegen update-crds debian-image
+
+.PHONY: lint
+lint: ## Run linter
+	@git fetch
+	docker run --pull always --rm -v $(shell pwd):/kubernetes-ingress -w /kubernetes-ingress -v $(shell go env GOCACHE):/cache/go -e GOCACHE=/cache/go -e GOLANGCI_LINT_CACHE=/cache/go -v $(shell go env GOPATH)/pkg:/go/pkg golangci/golangci-lint:$(GOLANGCI_LINT_VERSION) git diff -p origin/main > /tmp/diff.patch && golangci-lint --color always run -v --new-from-patch=/tmp/diff.patch
+
+.PHONY: lint-python
+lint-python: ## Run linter for python tests
+	@isort -V || (code=$$?; printf "\033[0;31mError\033[0m: there was a problem with isort, use 'brew install isort' to install it\n"; exit $$code)
+	@black --version || (code=$$?; printf "\033[0;31mError\033[0m: there was a problem with black, use 'brew install black' to install it\n"; exit $$code)
+	@isort .
+	@black .
+
+.PHONY: format
+format: ## Run goimports & gofmt
+	go install golang.org/x/tools/cmd/goimports@$(GOIMPORTS_VERSION)
+	go install mvdan.cc/gofumpt@$(GOFUMPT_VERSION)
+	goimports -l -w .
+	gofumpt -l -w .
+
+.PHONY: staticcheck
+staticcheck: ## Run staticcheck linter
+	@staticcheck -version >/dev/null 2>&1 || go install honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION};
+	staticcheck ./...
+
+.PHONY: govulncheck
+govulncheck: ## Run govulncheck linter
+	@govulncheck -version >/dev/null 2>&1 || go install golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION};
+	govulncheck ./...
+
+.PHONY: test
+test: ## Run GoLang tests
+	go test -tags=aws,helmunit,s3 -shuffle=on ./...
+
+.PHONY: test-update-snaps
+test-update-snaps:
+	UPDATE_SNAPS=always go test -tags=aws,helmunit,s3 -shuffle=on ./...
+
+cover: ## Generate coverage report
+	go test -tags=aws,helmunit,s3 -shuffle=on -race -coverprofile=coverage.txt -covermode=atomic ./...
+
+cover-html: test ## Generate and show coverage report in HTML format
+	go tool cover -html coverage.txt
+
+.PHONY: verify-codegen
+verify-codegen: ## Verify code generation
+	./hack/verify-codegen.sh
+
+.PHONY: update-codegen
+update-codegen: ## Generate code
+	./hack/update-codegen.sh
+
+.PHONY: update-crds
+update-crds: ## Update CRDs
+	go run sigs.k8s.io/controller-tools/cmd/controller-gen crd paths=./pkg/apis/... output:crd:artifacts:config=config/crd/bases
+	@kustomize version || (code=$$?; printf "\033[0;31mError\033[0m: there was a problem with kustomize, use 'brew install kustomize' to install it\n"; exit $$code)
+	kustomize build config/crd >deploy/crds.yaml
+	kustomize build config/crd/app-protect-dos --load-restrictor='LoadRestrictionsNone' >deploy/crds-nap-dos.yaml
+	kustomize build config/crd/app-protect-waf --load-restrictor='LoadRestrictionsNone' >deploy/crds-nap-waf.yaml
+	$(MAKE) update-crd-docs
+
+.PHONY: build-local
+build-local: $(BINARY_NAME)-$(ARCH) ## Build Ingress Controller binary (local, incremental)
+
+$(BINARY_NAME)-$(ARCH): $(GO_SRCS)
+	@go version || (code=$$?; printf "\033[0;31mError\033[0m: unable to build locally, try using the parameter TARGET=container or TARGET=download\n"; exit $$code)
+	CGO_ENABLED=0 GOOS=$(strip $(GOOS)) GOARCH=$(strip $(ARCH)) go build -trimpath -ldflags "$(GO_LINKER_FLAGS)" -o $(BINARY_NAME)-$(ARCH) github.com/wx-one/wxingress/cmd/nginx-ingress
+	@cp $(BINARY_NAME)-$(ARCH) $(BINARY_NAME)
+
+.PHONY: build
+build: ## Build Ingress Controller binary
+ifeq ($(strip $(TARGET)),local)
+	@$(MAKE) $(BINARY_NAME)-$(ARCH)
+else ifeq ($(strip $(TARGET)),download)
+	@docker -v || (code=$$?; printf "\033[0;31mError\033[0m: there was a problem with Docker\n"; exit $$code)
+	@$(MAKE) download-binary-docker
+else ifeq ($(strip $(TARGET)),debug)
+# Debug builds run unconditionally (no incremental file target) since they are infrequent.
+	@go version || (code=$$?; printf "\033[0;31mError\033[0m: unable to build locally, try using the parameter TARGET=container or TARGET=download\n"; exit $$code)
+	CGO_ENABLED=0 GOOS=$(strip $(GOOS)) GOARCH=$(strip $(ARCH)) go build -ldflags "$(DEBUG_GO_LINKER_FLAGS)" -gcflags "$(DEBUG_GO_GC_FLAGS)" -o $(BINARY_NAME)-$(ARCH) github.com/wx-one/wxingress/cmd/nginx-ingress
+	@cp $(BINARY_NAME)-$(ARCH) $(BINARY_NAME)
+else ifeq ($(strip $(TARGET)),container)
+# Binary is built inside Docker as part of the image build; nothing to do here.
+else ifeq ($(strip $(TARGET)),goreleaser)
+# Binary is built using GoReleaser; nothing to do here.
+else
+	$(error Unknown TARGET "$(TARGET)". Valid values: local, container, download, goreleaser, debug)
+endif
+
+.PHONY: download-binary-docker
+download-binary-docker: ## Download Docker image from which to extract Ingress Controller binary, TARGET=download is required
+ifeq ($(strip $(TARGET)),download)
+DOWNLOAD_TAG := $(shell ./hack/docker.sh $(GIT_TAG))
+ifeq ($(DOWNLOAD_TAG),fail)
+$(error unable to build with TARGET=download, this function is only available when building from a git tag or from the latest commit matching the edge image)
+endif
+override DOCKER_BUILD_OPTIONS += --build-arg DOWNLOAD_TAG=$(DOWNLOAD_TAG)
+endif
+
+.PHONY: build-goreleaser
+build-goreleaser: ## Build Ingress Controller binary using GoReleaser
+	@goreleaser -v || (code=$$?; printf "\033[0;31mError\033[0m: there was a problem with GoReleaser. Follow the docs to install it https://goreleaser.com/install\n"; exit $$code)
+	GOOS=$(strip $(GOOS)) GOPATH=$(shell go env GOPATH) GOARCH=$(strip $(ARCH)) goreleaser build --clean --snapshot --id kubernetes-ingress --single-target
+
+###### NIC + NGINX OSS Images (built from scratch) ######
+
+.PHONY: alpine-image
+alpine-image: build ## Build OSS Alpine-based image
+	$(DOCKER_CMD) \
+		$(OSS_ARGS) \
+		--build-arg BUILD_OS=alpine \
+		--build-arg OSS_PACKAGE_REPO=$(OSS_REPO) \
+		--build-arg NGINX_OSS_VERSION=$(NGINX_OSS_VERSION) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+
+.PHONY: debian-image
+debian-image: build ## Build OSS Debian-based image
+	$(DOCKER_CMD) \
+		$(OSS_ARGS) --build-arg BUILD_OS=debian \
+		--build-arg OSS_PACKAGE_REPO=$(OSS_REPO) \
+		--build-arg NGINX_OSS_VERSION=$(NGINX_OSS_VERSION) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+
+.PHONY: debian-image-wxingress
+debian-image-wxingress: build ## Build OSS Debian-based image with the wxingress data plane (-dynamic-upstreams)
+	./dataplane/build.sh module
+	$(DOCKER_CMD) \
+		$(OSS_ARGS) --build-arg BUILD_OS=debian-wxingress \
+		--build-arg OSS_PACKAGE_REPO=$(OSS_REPO) \
+		--build-arg NGINX_OSS_VERSION=$(NGINX_OSS_VERSION) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+.PHONY: ubi-image
+ubi-image: build ## Create OSS UBI-based image
+	$(DOCKER_CMD) \
+		$(OSS_ARGS) --build-arg BUILD_OS=ubi \
+		--build-arg UBI10_PACKAGES_IMAGE=$(UBI10_PACKAGES_IMAGE) \
+		--build-arg OSS_PACKAGE_REPO=$(OSS_REPO) \
+		--build-arg NGINX_OSS_VERSION=$(NGINX_OSS_VERSION) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+
+###### NIC + NGINX PLUS Images ######
+.PHONY: alpine-image-plus
+alpine-image-plus: build ## Create Docker image for Ingress Controller (Alpine with NGINX Plus)
+	$(DOCKER_CMD) \
+		$(PLUS_ARGS) \
+		--build-arg BUILD_OS=alpine-plus \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+.PHONY: alpine-image-plus-fips
+alpine-image-plus-fips: build ## Create Docker image for Ingress Controller (Alpine with NGINX Plus and FIPS)
+	$(DOCKER_CMD) $(PLUS_ARGS) --build-arg BUILD_OS=alpine-plus-fips --build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+.PHONY: alpine-image-nap-plus-fips
+alpine-image-nap-plus-fips: build ## Create Docker image for Ingress Controller (Alpine with NGINX Plus, NGINX App Protect WAF and FIPS)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=alpine-plus-nap-fips \
+		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg NAP_WAF_IPI_VERSION=$(NAP_WAF_IPI_VERSION) \
+		--build-arg AGENT_V2_VERSION=$(AGENT_V2_VERSION)
+
+.PHONY: alpine-image-nap-plus-fips-agent
+alpine-image-nap-plus-fips-agent: build ## Create Docker image for Ingress Controller (Alpine with NGINX Plus, NGINX App Protect WAF, FIPS and Agent v3)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=alpine-plus-nap-fips-agent \
+		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg NAP_WAF_IPI_VERSION=$(NAP_WAF_IPI_VERSION) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+.PHONY: alpine-image-nap-v5-plus-fips
+alpine-image-nap-v5-plus-fips: build ## Create Docker image for Ingress Controller (Alpine with NGINX Plus, NGINX App Protect WAFv5 and FIPS)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=alpine-plus-nap-v5-fips \
+		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg AGENT_V2_VERSION=$(AGENT_V2_VERSION)
+
+.PHONY: alpine-image-nap-v5-plus-fips-agent
+alpine-image-nap-v5-plus-fips-agent: build ## Create Docker image for Ingress Controller (Alpine with NGINX Plus, NGINX App Protect WAFv5, FIPS and Agent v3)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=alpine-plus-nap-v5-fips-agent \
+		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+.PHONY: debian-image-plus
+debian-image-plus: build ## Create Docker image for Ingress Controller (Debian with NGINX Plus)
+	$(DOCKER_CMD) $(PLUS_ARGS) --build-arg BUILD_OS=debian-plus --build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+.PHONY: debian-image-nap-plus
+debian-image-nap-plus: build ## Create Docker image for Ingress Controller (Debian with NGINX Plus and NGINX App Protect WAF)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=debian-plus-nap \
+		--build-arg NAP_MODULES=waf \
+		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg NAP_WAF_PLUGIN_VERSION=$(NAP_WAF_PLUGIN_VERSION) \
+		--build-arg NAP_WAF_COMMON_VERSION=$(NAP_WAF_COMMON_VERSION) \
+		--build-arg NAP_WAF_IPI_VERSION=$(NAP_WAF_IPI_VERSION) \
+		--build-arg AGENT_V2_VERSION=$(AGENT_V2_VERSION)
+
+.PHONY: debian-image-nap-plus-agent
+debian-image-nap-plus-agent: build ## Create Docker image for Ingress Controller (Debian with NGINX Plus, NGINX App Protect WAF and Agent v3)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=debian-plus-nap-agent \
+		--build-arg NAP_MODULES=waf \
+		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg NAP_WAF_PLUGIN_VERSION=$(NAP_WAF_PLUGIN_VERSION) \
+		--build-arg NAP_WAF_COMMON_VERSION=$(NAP_WAF_COMMON_VERSION) \
+		--build-arg NAP_WAF_IPI_VERSION=$(NAP_WAF_IPI_VERSION) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+.PHONY: debian-image-nap-v5-plus
+debian-image-nap-v5-plus: build ## Create Docker image for Ingress Controller (Debian with NGINX Plus and NGINX App Protect WAFv5)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=debian-plus-nap-v5 \
+		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg NAP_WAF_PLUGIN_VERSION=$(NAP_WAF_PLUGIN_VERSION) \
+		--build-arg AGENT_V2_VERSION=$(AGENT_V2_VERSION)
+
+.PHONY: debian-image-nap-v5-plus-agent
+debian-image-nap-v5-plus-agent: build ## Create Docker image for Ingress Controller (Debian with NGINX Plus, NGINX App Protect WAFv5 and Agent v3)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=debian-plus-nap-v5-agent \
+		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg NAP_WAF_PLUGIN_VERSION=$(NAP_WAF_PLUGIN_VERSION) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+.PHONY: debian-image-dos-plus
+debian-image-dos-plus: build ## Create Docker image for Ingress Controller (Debian with NGINX Plus and NGINX App Protect DoS)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=debian-plus-nap \
+		--build-arg NAP_MODULES=dos \
+		--build-arg DOS_PACKAGE_REPO=$(DOS_REPO) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+.PHONY: debian-image-nap-dos-plus
+debian-image-nap-dos-plus: build ## Create Docker image for Ingress Controller (Debian with NGINX Plus, NGINX App Protect WAF and DoS)
+	$(DOCKER_CMD) $(PLUS_ARGS) --build-arg BUILD_OS=debian-plus-nap \
+		--build-arg NAP_MODULES=waf,dos \
+  		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg DOS_PACKAGE_REPO=$(DOS_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg NAP_WAF_PLUGIN_VERSION=$(NAP_WAF_PLUGIN_VERSION) \
+		--build-arg NAP_WAF_COMMON_VERSION=$(NAP_WAF_COMMON_VERSION) \
+		--build-arg NAP_WAF_IPI_VERSION=$(NAP_WAF_IPI_VERSION) \
+		--build-arg AGENT_V2_VERSION=$(AGENT_V2_VERSION)
+
+.PHONY: debian-image-nap-dos-plus-agent
+debian-image-nap-dos-plus-agent: build ## Create Docker image for Ingress Controller (Debian with NGINX Plus, NGINX App Protect WAF, DoS and Agent v3)
+	$(DOCKER_CMD) $(PLUS_ARGS) --build-arg BUILD_OS=debian-plus-nap-agent \
+		--build-arg NAP_MODULES=waf,dos \
+  		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg DOS_PACKAGE_REPO=$(DOS_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg NAP_WAF_PLUGIN_VERSION=$(NAP_WAF_PLUGIN_VERSION) \
+		--build-arg NAP_WAF_COMMON_VERSION=$(NAP_WAF_COMMON_VERSION) \
+		--build-arg NAP_WAF_IPI_VERSION=$(NAP_WAF_IPI_VERSION) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+.PHONY: ubi-image-plus
+ubi-image-plus: build ## Create Docker image for Ingress Controller (UBI with NGINX Plus)
+	$(DOCKER_CMD) $(PLUS_ARGS) --build-arg BUILD_OS=ubi-10-plus --build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION) --build-arg UBI10_PACKAGES_IMAGE=$(UBI10_PACKAGES_IMAGE)
+
+.PHONY: ubi-image-nap-plus
+ubi-image-nap-plus: build ## Create Docker image for Ingress Controller (UBI with NGINX Plus and NGINX App Protect WAF)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=ubi-10-plus-nap \
+		--build-arg NAP_MODULES=waf \
+		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg NAP_WAF_IPI_VERSION=$(NAP_WAF_IPI_VERSION) \
+		--build-arg AGENT_V2_VERSION=$(AGENT_V2_VERSION) \
+		--build-arg UBI10_PACKAGES_IMAGE=$(UBI10_PACKAGES_IMAGE)
+
+.PHONY: ubi-image-nap-plus-agent
+ubi-image-nap-plus-agent: build ## Create Docker image for Ingress Controller (UBI with NGINX Plus, NGINX App Protect WAF and Agent v3)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=ubi-10-plus-nap-agent \
+		--build-arg NAP_MODULES=waf \
+		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg NAP_WAF_IPI_VERSION=$(NAP_WAF_IPI_VERSION) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION) \
+		--build-arg UBI10_PACKAGES_IMAGE=$(UBI10_PACKAGES_IMAGE)
+
+.PHONY: ubi-image-nap-v5-plus
+ubi-image-nap-v5-plus: build ## Create Docker image for Ingress Controller (UBI with NGINX Plus and NGINX App Protect WAFv5)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=ubi-10-plus-nap-v5 \
+		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg AGENT_V2_VERSION=$(AGENT_V2_VERSION) \
+		--build-arg UBI10_PACKAGES_IMAGE=$(UBI10_PACKAGES_IMAGE)
+
+.PHONY: ubi-image-nap-v5-plus-agent
+ubi-image-nap-v5-plus-agent: build ## Create Docker image for Ingress Controller (UBI with NGINX Plus, NGINX App Protect WAFv5 and Agent v3)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=ubi-10-plus-nap-v5-agent \
+		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION) \
+		--build-arg UBI10_PACKAGES_IMAGE=$(UBI10_PACKAGES_IMAGE)
+
+.PHONY: ubi-image-dos-plus
+ubi-image-dos-plus: build ## Create Docker image for Ingress Controller (UBI with NGINX Plus and NGINX App Protect DoS)
+	$(DOCKER_CMD) $(PLUS_ARGS) --build-arg BUILD_OS=ubi-10-plus-nap \
+		--build-arg NAP_MODULES=dos \
+		--build-arg DOS_PACKAGE_REPO=$(DOS_REPO) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION)
+
+.PHONY: ubi-image-nap-dos-plus
+ubi-image-nap-dos-plus: build ## Create Docker image for Ingress Controller (UBI with NGINX Plus, NGINX App Protect WAF and DoS)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=ubi-10-plus-nap \
+		--build-arg NAP_MODULES=waf,dos \
+  		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg DOS_PACKAGE_REPO=$(DOS_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg NAP_WAF_IPI_VERSION=$(NAP_WAF_IPI_VERSION) \
+		--build-arg AGENT_V2_VERSION=$(AGENT_V2_VERSION) \
+		--build-arg UBI10_PACKAGES_IMAGE=$(UBI10_PACKAGES_IMAGE)
+
+.PHONY: ubi-image-nap-dos-plus-agent
+ubi-image-nap-dos-plus-agent: build ## Create Docker image for Ingress Controller (UBI with NGINX Plus, NGINX App Protect WAF, DoS and Agent v3)
+	$(DOCKER_CMD) $(PLUS_ARGS) \
+		--build-arg BUILD_OS=ubi-10-plus-nap-agent \
+		--build-arg NAP_MODULES=waf,dos \
+  		--build-arg WAF_PACKAGE_REPO=$(WAF_REPO) \
+		--build-arg DOS_PACKAGE_REPO=$(DOS_REPO) \
+		--build-arg NAP_WAF_VERSION=$(NAP_WAF_VERSION) \
+		--build-arg NAP_WAF_IPI_VERSION=$(NAP_WAF_IPI_VERSION) \
+		--build-arg AGENT_V3_VERSION=$(AGENT_V3_VERSION) \
+		--build-arg UBI10_PACKAGES_IMAGE=$(UBI10_PACKAGES_IMAGE)
+
+.PHONY: ubi10-dependency-image-local
+ubi10-dependency-image-local: ## Build UBI10 dependency image locally (no push). Requires rhel_license. Set PLATFORM=linux/arm64 for arm64 (default: linux/amd64).
+	docker buildx build --platform $(PLATFORM) \
+		--file build/dependencies/Dockerfile.ubi10 \
+		--tag $(BUILD_IMAGE) \
+		--secret id=nginx-repo.crt,src=nginx-repo.crt --secret id=nginx-repo.key,src=nginx-repo.key \
+		--secret id=rhel_license,src=rhel_license --target final --load .
+
+.PHONY: all-images ## Create all the Docker images for Ingress Controller
+all-images:
+	docker builder prune -af; \
+	images="alpine-image alpine-image-nap-plus-fips alpine-image-nap-plus-fips-agent alpine-image-nap-v5-plus-fips alpine-image-nap-v5-plus-fips-agent alpine-image-plus alpine-image-plus-fips debian-image debian-image-dos-plus debian-image-nap-dos-plus debian-image-nap-dos-plus-agent debian-image-nap-plus debian-image-nap-plus-agent debian-image-nap-v5-plus debian-image-nap-v5-plus-agent debian-image-plus ubi-image ubi-image-dos-plus ubi-image-nap-dos-plus ubi-image-nap-dos-plus-agent ubi-image-nap-plus ubi-image-nap-plus-agent ubi-image-nap-v5-plus ubi-image-nap-v5-plus-agent ubi-image-plus"; \
+	for img in $$images; do \
+		TAG="$(strip $(TAG))-$$img" make $$img; \
+	done
+
+.PHONY: patch-os
+patch-os: ## Patch supplied image
+	$(DOCKER_CMD) --build-arg IMAGE_NAME=$(IMAGE)
+
+.PHONY: push
+push: ## Docker push to PREFIX and TAG
+	docker push $(strip $(PREFIX)):$(strip $(TAG))
+
+.PHONY: clean
+clean:  ## Remove nginx-ingress binaries and dist
+	-rm -f $(BINARY_NAME) $(foreach a,amd64 arm64 ppc64le s390x,$(BINARY_NAME)-$(a))
+	-rm -rf dist
+
+.PHONY: deps
+deps: ## Add missing and remove unused modules, verify deps and download them to local cache
+	@go mod tidy && go mod verify && go mod download
+
+.PHONY: clean-cache
+clean-cache: ## Clean go cache
+	@go clean -modcache
+
+.PHONY: rebuild-test-img ## Rebuild the python e2e test image
+rebuild-test-img:
+	cd tests && \
+	make build
+
+.PHONY: update-crd-docs
+update-crd-docs: ## Update CRD markdown documentation from YAML definitions
+	@echo "Generating CRD documentation..."
+	@go run hack/generate-crd-docs.go -crd-dir config/crd/bases -output-dir docs/crd
+	@echo "CRD documentation updated successfully!"
+
+.PHONY: secrets
+secrets: ## Create just in time TLS certificates etc needed for tests and examples
+ifeq (, $(shell command -v go))
+	@docker run --rm -v .:/workspace/kubernetes-ingress -w /workspace/kubernetes-ingress ${GO_DOCKER_IMAGE} make secrets
+else
+	@make -C hack/secrets-gen ignore
+endif
+
+.PHONY: secrets-clean
+secrets-clean: ## Clean just in time TLS certificates etc. needed for tests and examples
+ifeq (, $(shell command -v go))
+	@docker run --rm -v .:/workspace/kubernetes-ingress -w /workspace/kubernetes-ingress ${GO_DOCKER_IMAGE} make secrets-clean
+else
+	@make -C hack/secrets-gen clean
+endif

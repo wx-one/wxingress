@@ -1,0 +1,47 @@
+# Copied by hack/sync-ngf.sh - do not edit anything below this directory.
+repository: https://github.com/nginx/nginx-gateway-fabric.git
+tag: v2.8.1
+commit: ed383f6aaa256a3e0b75c89f6d6e9f75fbe5faa3
+gateway-api: v1.6.3
+tree-sha256: 6fb8d0e5bfbe5afe190def01ef3abab278be35b6e287699fe249bac63393afe5
+patches:
+  - 0001-s3-client-behind-build-tag.patch
+packages:
+  - apis/v1alpha1
+  - apis/v1alpha2
+  - apis/waf/v1
+  - internal/controller/config
+  - internal/controller/ngfsort
+  - internal/controller/nginx/config/http
+  - internal/controller/nginx/config/policies
+  - internal/controller/nginx/config/policies/policiesfakes
+  - internal/controller/nginx/config/policies/upstreamsettings
+  - internal/controller/nginx/config/shared
+  - internal/controller/nginx/config/validation
+  - internal/controller/state/conditions
+  - internal/controller/state/dataplane
+  - internal/controller/state/graph
+  - internal/controller/state/graph/shared/configmaps
+  - internal/controller/state/graph/shared/secrets
+  - internal/controller/state/mirror
+  - internal/controller/state/resolver
+  - internal/controller/state/resolver/resolverfakes
+  - internal/controller/state/validation
+  - internal/controller/state/validation/validationfakes
+  - internal/controller/status
+  - internal/controller/status/statusfakes
+  - internal/framework/controller
+  - internal/framework/controller/controllerfakes
+  - internal/framework/controller/index
+  - internal/framework/controller/predicate
+  - internal/framework/events
+  - internal/framework/events/eventsfakes
+  - internal/framework/helpers
+  - internal/framework/kinds
+  - internal/framework/kubernetes
+  - internal/framework/kubernetes/kubernetesfakes
+  - internal/framework/types
+  - internal/framework/waf
+  - internal/framework/waf/fetch
+  - internal/framework/waf/fetch/fetchfakes
+  - internal/framework/waf/fetch/s3

@@ -1,0 +1,5062 @@
+package status
+
+import (
+	"errors"
+	"fmt"
+	"testing"
+
+	"github.com/go-logr/logr"
+	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	inference "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+	v1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPI "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/conditions"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+	ngftypes "github.com/wx-one/wxingress/internal/third_party/ngf/framework/types"
+)
+
+func createK8sClientFor(resourceType ngftypes.ObjectType) client.Client {
+	scheme := runtime.NewScheme()
+
+	// for simplicity, we add all used schemes here
+	utilruntime.Must(v1.Install(scheme))
+	utilruntime.Must(ngfAPI.AddToScheme(scheme))
+	utilruntime.Must(inference.Install(scheme))
+
+	k8sClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(
+			resourceType,
+		).
+		Build()
+
+	return k8sClient
+}
+
+func TestHandledStatusResourcesFromGraph(t *testing.T) {
+	t.Parallel()
+
+	httpRouteNsName := types.NamespacedName{Namespace: "test", Name: "http-route"}
+	grpcRouteNsName := types.NamespacedName{Namespace: "test", Name: "grpc-route"}
+	tcpRouteNsName := types.NamespacedName{Namespace: "test", Name: "tcp-route"}
+	btPolicyNsName := types.NamespacedName{Namespace: "test", Name: "backend-tls"}
+	ngfPolicyKey := graph.PolicyKey{
+		NsName: types.NamespacedName{Namespace: "test", Name: "client-settings"},
+		GVK:    schema.GroupVersionKind{Group: ngfAPI.GroupName, Kind: kinds.ClientSettingsPolicy, Version: "v1alpha1"},
+	}
+	snippetsFilterNsName := types.NamespacedName{Namespace: "test", Name: "snippets-filter"}
+	authFilterNsName := types.NamespacedName{Namespace: "test", Name: "auth-filter"}
+	externalLoadBalancerNsName := types.NamespacedName{Namespace: "test", Name: "elb"}
+	listenerSetNsName := types.NamespacedName{Namespace: "test", Name: "listener-set"}
+
+	tests := []struct {
+		previous        HandledStatusResources
+		gr              *graph.Graph
+		expectedHandled HandledStatusResources
+		expectedDropped HandledStatusResources
+		name            string
+	}{
+		{
+			name:            "empty previous and nil graph",
+			previous:        EmptyHandledStatusResources(),
+			gr:              nil,
+			expectedHandled: EmptyHandledStatusResources(),
+			expectedDropped: EmptyHandledStatusResources(),
+		},
+		{
+			name: "nil graph drops all previously handled resources",
+			previous: HandledStatusResources{
+				HTTPRoutes:            map[types.NamespacedName]struct{}{httpRouteNsName: {}},
+				GRPCRoutes:            map[types.NamespacedName]struct{}{grpcRouteNsName: {}},
+				TLSRoutes:             map[types.NamespacedName]struct{}{},
+				TCPRoutes:             map[types.NamespacedName]struct{}{tcpRouteNsName: {}},
+				UDPRoutes:             map[types.NamespacedName]struct{}{},
+				BackendTLSPolicies:    map[types.NamespacedName]struct{}{btPolicyNsName: {}},
+				NGFPolicies:           map[graph.PolicyKey]policies.Policy{ngfPolicyKey: &ngfAPI.ClientSettingsPolicy{}},
+				SnippetsFilters:       map[types.NamespacedName]struct{}{snippetsFilterNsName: {}},
+				AuthenticationFilters: map[types.NamespacedName]struct{}{authFilterNsName: {}},
+				ExternalLoadBalancers: map[types.NamespacedName]struct{}{externalLoadBalancerNsName: {}},
+				ListenerSets:          map[types.NamespacedName]struct{}{listenerSetNsName: {}},
+			},
+			gr:              nil,
+			expectedHandled: EmptyHandledStatusResources(),
+			expectedDropped: HandledStatusResources{
+				HTTPRoutes:            map[types.NamespacedName]struct{}{httpRouteNsName: {}},
+				GRPCRoutes:            map[types.NamespacedName]struct{}{grpcRouteNsName: {}},
+				TLSRoutes:             map[types.NamespacedName]struct{}{},
+				TCPRoutes:             map[types.NamespacedName]struct{}{tcpRouteNsName: {}},
+				UDPRoutes:             map[types.NamespacedName]struct{}{},
+				BackendTLSPolicies:    map[types.NamespacedName]struct{}{btPolicyNsName: {}},
+				NGFPolicies:           map[graph.PolicyKey]policies.Policy{ngfPolicyKey: &ngfAPI.ClientSettingsPolicy{}},
+				SnippetsFilters:       map[types.NamespacedName]struct{}{snippetsFilterNsName: {}},
+				AuthenticationFilters: map[types.NamespacedName]struct{}{authFilterNsName: {}},
+				ExternalLoadBalancers: map[types.NamespacedName]struct{}{externalLoadBalancerNsName: {}},
+				ListenerSets:          map[types.NamespacedName]struct{}{listenerSetNsName: {}},
+			},
+		},
+		{
+			name: "mixed graph keeps existing resources and drops removed ones",
+			previous: HandledStatusResources{
+				HTTPRoutes:            map[types.NamespacedName]struct{}{httpRouteNsName: {}},
+				GRPCRoutes:            map[types.NamespacedName]struct{}{grpcRouteNsName: {}},
+				TLSRoutes:             map[types.NamespacedName]struct{}{},
+				TCPRoutes:             map[types.NamespacedName]struct{}{tcpRouteNsName: {}},
+				UDPRoutes:             map[types.NamespacedName]struct{}{},
+				BackendTLSPolicies:    map[types.NamespacedName]struct{}{btPolicyNsName: {}},
+				NGFPolicies:           map[graph.PolicyKey]policies.Policy{ngfPolicyKey: &ngfAPI.ClientSettingsPolicy{}},
+				SnippetsFilters:       map[types.NamespacedName]struct{}{snippetsFilterNsName: {}},
+				AuthenticationFilters: map[types.NamespacedName]struct{}{authFilterNsName: {}},
+				ExternalLoadBalancers: map[types.NamespacedName]struct{}{externalLoadBalancerNsName: {}},
+				ListenerSets:          map[types.NamespacedName]struct{}{listenerSetNsName: {}},
+			},
+			gr: &graph.Graph{
+				Routes: map[graph.RouteKey]*graph.L7Route{
+					{NamespacedName: httpRouteNsName, RouteType: graph.RouteTypeHTTP}: {},
+				},
+				L4Routes: map[graph.L4RouteKey]*graph.L4Route{},
+				BackendTLSPolicies: map[types.NamespacedName]*graph.BackendTLSPolicy{
+					btPolicyNsName: {IsReferenced: true},
+				},
+				NGFPolicies: map[graph.PolicyKey]*graph.Policy{
+					ngfPolicyKey: {Source: &ngfAPI.ClientSettingsPolicy{}, Ancestors: []graph.PolicyAncestor{{}}},
+				},
+				SnippetsFilters: map[types.NamespacedName]*graph.SnippetsFilter{
+					snippetsFilterNsName: {Source: &ngfAPI.SnippetsFilter{}},
+				},
+				AuthenticationFilters: map[types.NamespacedName]*graph.AuthenticationFilter{},
+				ExternalLoadBalancers: map[types.NamespacedName]*graph.ExternalLoadBalancer{
+					externalLoadBalancerNsName: {Source: &ngfAPI.ExternalLoadBalancer{}},
+				},
+				ListenerSets: map[types.NamespacedName]*graph.ListenerSet{},
+			},
+			expectedHandled: HandledStatusResources{
+				HTTPRoutes:            map[types.NamespacedName]struct{}{httpRouteNsName: {}},
+				GRPCRoutes:            map[types.NamespacedName]struct{}{},
+				TLSRoutes:             map[types.NamespacedName]struct{}{},
+				TCPRoutes:             map[types.NamespacedName]struct{}{},
+				UDPRoutes:             map[types.NamespacedName]struct{}{},
+				BackendTLSPolicies:    map[types.NamespacedName]struct{}{btPolicyNsName: {}},
+				NGFPolicies:           map[graph.PolicyKey]policies.Policy{ngfPolicyKey: &ngfAPI.ClientSettingsPolicy{}},
+				SnippetsFilters:       map[types.NamespacedName]struct{}{snippetsFilterNsName: {}},
+				AuthenticationFilters: map[types.NamespacedName]struct{}{},
+				ExternalLoadBalancers: map[types.NamespacedName]struct{}{externalLoadBalancerNsName: {}},
+				ListenerSets:          map[types.NamespacedName]struct{}{},
+			},
+			expectedDropped: HandledStatusResources{
+				HTTPRoutes:            map[types.NamespacedName]struct{}{},
+				GRPCRoutes:            map[types.NamespacedName]struct{}{grpcRouteNsName: {}},
+				TLSRoutes:             map[types.NamespacedName]struct{}{},
+				TCPRoutes:             map[types.NamespacedName]struct{}{tcpRouteNsName: {}},
+				UDPRoutes:             map[types.NamespacedName]struct{}{},
+				BackendTLSPolicies:    map[types.NamespacedName]struct{}{},
+				NGFPolicies:           map[graph.PolicyKey]policies.Policy{},
+				SnippetsFilters:       map[types.NamespacedName]struct{}{},
+				AuthenticationFilters: map[types.NamespacedName]struct{}{authFilterNsName: {}},
+				ExternalLoadBalancers: map[types.NamespacedName]struct{}{},
+				ListenerSets:          map[types.NamespacedName]struct{}{listenerSetNsName: {}},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			handled, dropped := HandledStatusResourcesFromGraph(test.previous, test.gr)
+
+			g.Expect(handled).To(Equal(test.expectedHandled))
+			g.Expect(dropped).To(Equal(test.expectedDropped))
+		})
+	}
+}
+
+const gatewayCtlrName = "controller"
+
+var (
+	gwNsName       = types.NamespacedName{Namespace: "test", Name: "gateway"}
+	lsNsName       = types.NamespacedName{Namespace: "test", Name: "ls-1"}
+	transitionTime = helpers.PrepareTimeForFakeClient(metav1.Now())
+
+	invalidRouteCondition = conditions.Condition{
+		Type:   "TestInvalidRoute",
+		Status: metav1.ConditionTrue,
+	}
+	invalidAttachmentCondition = conditions.Condition{
+		Type:   "TestInvalidAttachment",
+		Status: metav1.ConditionTrue,
+	}
+
+	commonRouteSpecValid = v1.CommonRouteSpec{
+		ParentRefs: []v1.ParentReference{
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("listener-80-1"),
+			},
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("listener-80-2"),
+			},
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("listener-80-3"),
+			},
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("listener-443-1"),
+			},
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("listener-443-2"),
+			},
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("listener-443-3"),
+			},
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("listener-8080-1"),
+			},
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("listener-8080-2"),
+			},
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("ls-listener-80-1"),
+			},
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("ls-listener-80-2"),
+			},
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("ls-listener-80-3"),
+			},
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("ls-listener-80-4"),
+			},
+		},
+	}
+
+	commonRouteSpecInvalid = v1.CommonRouteSpec{
+		ParentRefs: []v1.ParentReference{
+			{
+				SectionName: helpers.GetPointer[v1.SectionName]("listener-80-1"),
+			},
+		},
+	}
+
+	parentRefsValid = []graph.ParentRef{
+		{
+			Idx:         0,
+			SectionName: commonRouteSpecValid.ParentRefs[0].SectionName,
+			Attachment: &graph.ParentRefAttachmentStatus{
+				Attached: true,
+			},
+			Kind:           kinds.Gateway,
+			NamespacedName: gwNsName,
+			GatewayNsName:  gwNsName,
+		},
+		{
+			Idx:         1,
+			SectionName: commonRouteSpecValid.ParentRefs[1].SectionName,
+			Attachment: &graph.ParentRefAttachmentStatus{
+				Attached:         false,
+				FailedConditions: []conditions.Condition{invalidAttachmentCondition},
+			},
+			Kind:           kinds.Gateway,
+			NamespacedName: gwNsName,
+			GatewayNsName:  gwNsName,
+		},
+		{
+			Idx:         2,
+			SectionName: commonRouteSpecValid.ParentRefs[2].SectionName,
+			Attachment: &graph.ParentRefAttachmentStatus{
+				Attached:         true,
+				FailedConditions: []conditions.Condition{invalidAttachmentCondition},
+			},
+			Kind:           kinds.Gateway,
+			NamespacedName: gwNsName,
+			GatewayNsName:  gwNsName,
+		},
+		{
+			Idx:         3,
+			SectionName: commonRouteSpecValid.ParentRefs[3].SectionName,
+			Attachment: &graph.ParentRefAttachmentStatus{
+				Attached:         false,
+				FailedConditions: []conditions.Condition{invalidAttachmentCondition},
+			},
+			Kind:           kinds.Gateway,
+			NamespacedName: gwNsName,
+			GatewayNsName:  gwNsName,
+		},
+		{
+			Idx:         3,
+			SectionName: commonRouteSpecValid.ParentRefs[4].SectionName,
+			Attachment: &graph.ParentRefAttachmentStatus{
+				Attached: true,
+			},
+			Kind:           kinds.Gateway,
+			NamespacedName: gwNsName,
+			GatewayNsName:  gwNsName,
+		},
+		{
+			Idx:         3,
+			SectionName: commonRouteSpecValid.ParentRefs[5].SectionName,
+			Attachment: &graph.ParentRefAttachmentStatus{
+				Attached:         true, // this wouldn't usually happen, but it's a conditional check
+				FailedConditions: []conditions.Condition{invalidAttachmentCondition},
+			},
+			Kind:           kinds.Gateway,
+			NamespacedName: gwNsName,
+			GatewayNsName:  gwNsName,
+		},
+		{
+			Idx:         4,
+			SectionName: commonRouteSpecValid.ParentRefs[6].SectionName,
+			Attachment: &graph.ParentRefAttachmentStatus{
+				Attached:         false,
+				FailedConditions: []conditions.Condition{invalidAttachmentCondition},
+			},
+			Kind:           kinds.Gateway,
+			NamespacedName: gwNsName,
+			GatewayNsName:  gwNsName,
+		},
+		{
+			Idx:         4,
+			SectionName: commonRouteSpecValid.ParentRefs[7].SectionName,
+			Attachment: &graph.ParentRefAttachmentStatus{
+				Attached:         false,
+				FailedConditions: []conditions.Condition{invalidAttachmentCondition},
+			},
+			Kind:           kinds.Gateway,
+			NamespacedName: gwNsName,
+			GatewayNsName:  gwNsName,
+		},
+		{
+			Idx:         5,
+			SectionName: commonRouteSpecValid.ParentRefs[8].SectionName,
+			Attachment: &graph.ParentRefAttachmentStatus{
+				Attached:         true,
+				FailedConditions: []conditions.Condition{},
+			},
+			Kind:           kinds.ListenerSet,
+			NamespacedName: lsNsName,
+			GatewayNsName:  gwNsName,
+		},
+		{
+			Idx:         6,
+			SectionName: commonRouteSpecValid.ParentRefs[9].SectionName,
+			Attachment: &graph.ParentRefAttachmentStatus{
+				Attached:         true,
+				FailedConditions: []conditions.Condition{},
+			},
+			Kind:           kinds.ListenerSet,
+			NamespacedName: lsNsName,
+			GatewayNsName:  gwNsName,
+		},
+		{
+			Idx:         6,
+			SectionName: commonRouteSpecValid.ParentRefs[10].SectionName,
+			Attachment: &graph.ParentRefAttachmentStatus{
+				Attached:         false,
+				FailedConditions: []conditions.Condition{invalidAttachmentCondition},
+			},
+			Kind:           kinds.ListenerSet,
+			NamespacedName: lsNsName,
+			GatewayNsName:  gwNsName,
+		},
+		{
+			Idx:         7,
+			SectionName: commonRouteSpecValid.ParentRefs[11].SectionName,
+			Attachment: &graph.ParentRefAttachmentStatus{
+				Attached:         false,
+				FailedConditions: []conditions.Condition{invalidAttachmentCondition},
+			},
+			Kind:           kinds.ListenerSet,
+			NamespacedName: lsNsName,
+			GatewayNsName:  gwNsName,
+		},
+	}
+
+	parentRefsInvalid = []graph.ParentRef{
+		{
+			Idx:            0,
+			Attachment:     nil,
+			SectionName:    commonRouteSpecInvalid.ParentRefs[0].SectionName,
+			Kind:           kinds.Gateway,
+			NamespacedName: gwNsName,
+			GatewayNsName:  gwNsName,
+		},
+	}
+
+	routeStatusValid = v1.RouteStatus{
+		Parents: []v1.RouteParentStatus{
+			{
+				ParentRef: v1.ParentReference{
+					Namespace:   helpers.GetPointer(v1.Namespace(gwNsName.Namespace)),
+					Name:        v1.ObjectName(gwNsName.Name),
+					SectionName: helpers.GetPointer[v1.SectionName]("listener-80-1"),
+					Kind:        helpers.GetPointer(v1.Kind(kinds.Gateway)),
+				},
+				ControllerName: gatewayCtlrName,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(v1.RouteConditionAccepted),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonAccepted),
+						Message:            "The Route is accepted",
+					},
+					{
+						Type:               string(v1.RouteConditionResolvedRefs),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonResolvedRefs),
+						Message:            "All references are resolved",
+					},
+				},
+			},
+			{
+				ParentRef: v1.ParentReference{
+					Namespace:   helpers.GetPointer(v1.Namespace(gwNsName.Namespace)),
+					Name:        v1.ObjectName(gwNsName.Name),
+					SectionName: helpers.GetPointer[v1.SectionName]("listener-80-2"),
+					Kind:        helpers.GetPointer(v1.Kind(kinds.Gateway)),
+				},
+				ControllerName: gatewayCtlrName,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(v1.RouteConditionAccepted),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonAccepted),
+						Message:            "The Route is accepted",
+					},
+					{
+						Type:               string(v1.RouteConditionResolvedRefs),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonResolvedRefs),
+						Message:            "All references are resolved",
+					},
+					{
+						Type:               invalidAttachmentCondition.Type,
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+					},
+				},
+			},
+			{
+				ParentRef: v1.ParentReference{
+					Namespace:   helpers.GetPointer(v1.Namespace(gwNsName.Namespace)),
+					Name:        v1.ObjectName(gwNsName.Name),
+					SectionName: helpers.GetPointer[v1.SectionName]("listener-80-3"),
+					Kind:        helpers.GetPointer(v1.Kind(kinds.Gateway)),
+				},
+				ControllerName: gatewayCtlrName,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(v1.RouteConditionAccepted),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonAccepted),
+						Message:            "The Route is accepted",
+					},
+					{
+						Type:               string(v1.RouteConditionResolvedRefs),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonResolvedRefs),
+						Message:            "All references are resolved",
+					},
+					{
+						Type:               invalidAttachmentCondition.Type,
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+					},
+				},
+			},
+			{
+				ParentRef: v1.ParentReference{
+					Namespace: helpers.GetPointer(v1.Namespace(gwNsName.Namespace)),
+					Name:      v1.ObjectName(gwNsName.Name),
+					Kind:      helpers.GetPointer(v1.Kind(kinds.Gateway)),
+				},
+				ControllerName: gatewayCtlrName,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(v1.RouteConditionAccepted),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonAccepted),
+						Message:            "The Route is accepted",
+					},
+					{
+						Type:               string(v1.RouteConditionResolvedRefs),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonResolvedRefs),
+						Message:            "All references are resolved",
+					},
+				},
+			},
+			{
+				ParentRef: v1.ParentReference{
+					Namespace: helpers.GetPointer(v1.Namespace(gwNsName.Namespace)),
+					Name:      v1.ObjectName(gwNsName.Name),
+					Kind:      helpers.GetPointer(v1.Kind(kinds.Gateway)),
+				},
+				ControllerName: gatewayCtlrName,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(v1.RouteConditionAccepted),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonAccepted),
+						Message:            "The Route is accepted",
+					},
+					{
+						Type:               string(v1.RouteConditionResolvedRefs),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonResolvedRefs),
+						Message:            "All references are resolved",
+					},
+					{
+						Type:               invalidAttachmentCondition.Type,
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+					},
+				},
+			},
+			{
+				ParentRef: v1.ParentReference{
+					Namespace:   helpers.GetPointer(v1.Namespace(lsNsName.Namespace)),
+					Name:        v1.ObjectName(lsNsName.Name),
+					SectionName: helpers.GetPointer[v1.SectionName]("ls-listener-80-1"),
+					Kind:        helpers.GetPointer(v1.Kind(kinds.ListenerSet)),
+				},
+				ControllerName: gatewayCtlrName,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(v1.RouteConditionAccepted),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonAccepted),
+						Message:            "The Route is accepted",
+					},
+					{
+						Type:               string(v1.RouteConditionResolvedRefs),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonResolvedRefs),
+						Message:            "All references are resolved",
+					},
+				},
+			},
+			{
+				ParentRef: v1.ParentReference{
+					Namespace: helpers.GetPointer(v1.Namespace(lsNsName.Namespace)),
+					Name:      v1.ObjectName(lsNsName.Name),
+					Kind:      helpers.GetPointer(v1.Kind(kinds.ListenerSet)),
+				},
+				ControllerName: gatewayCtlrName,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(v1.RouteConditionAccepted),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonAccepted),
+						Message:            "The Route is accepted",
+					},
+					{
+						Type:               string(v1.RouteConditionResolvedRefs),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonResolvedRefs),
+						Message:            "All references are resolved",
+					},
+				},
+			},
+			{
+				ParentRef: v1.ParentReference{
+					Namespace:   helpers.GetPointer(v1.Namespace(lsNsName.Namespace)),
+					Name:        v1.ObjectName(lsNsName.Name),
+					Kind:        helpers.GetPointer(v1.Kind(kinds.ListenerSet)),
+					SectionName: helpers.GetPointer[v1.SectionName]("ls-listener-80-4"),
+				},
+				ControllerName: gatewayCtlrName,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(v1.RouteConditionAccepted),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonAccepted),
+						Message:            "The Route is accepted",
+					},
+					{
+						Type:               string(v1.RouteConditionResolvedRefs),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonResolvedRefs),
+						Message:            "All references are resolved",
+					},
+					{
+						Type:               invalidAttachmentCondition.Type,
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+					},
+				},
+			},
+		},
+	}
+
+	routeStatusInvalid = v1.RouteStatus{
+		Parents: []v1.RouteParentStatus{
+			{
+				ParentRef: v1.ParentReference{
+					Namespace:   helpers.GetPointer(v1.Namespace(gwNsName.Namespace)),
+					Name:        v1.ObjectName(gwNsName.Name),
+					SectionName: helpers.GetPointer[v1.SectionName]("listener-80-1"),
+					Kind:        helpers.GetPointer(v1.Kind(kinds.Gateway)),
+				},
+				ControllerName: gatewayCtlrName,
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(v1.RouteConditionAccepted),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonAccepted),
+						Message:            "The Route is accepted",
+					},
+					{
+						Type:               string(v1.RouteConditionResolvedRefs),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(v1.RouteReasonResolvedRefs),
+						Message:            "All references are resolved",
+					},
+					{
+						Type:               invalidRouteCondition.Type,
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+					},
+				},
+			},
+		},
+	}
+)
+
+func TestBuildHTTPRouteStatuses(t *testing.T) {
+	t.Parallel()
+	hrValid := &v1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "hr-valid",
+			Generation: 3,
+		},
+		Spec: v1.HTTPRouteSpec{
+			CommonRouteSpec: commonRouteSpecValid,
+		},
+	}
+
+	hrInvalid := &v1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "hr-invalid",
+			Generation: 3,
+		},
+		Spec: v1.HTTPRouteSpec{
+			CommonRouteSpec: commonRouteSpecInvalid,
+		},
+	}
+	routes := map[graph.RouteKey]*graph.L7Route{
+		graph.CreateRouteKey(hrValid): {
+			Valid:      true,
+			Source:     hrValid,
+			ParentRefs: parentRefsValid,
+			RouteType:  graph.RouteTypeHTTP,
+		},
+		graph.CreateRouteKey(hrInvalid): {
+			Valid:      false,
+			Conditions: []conditions.Condition{invalidRouteCondition},
+			Source:     hrInvalid,
+			ParentRefs: parentRefsInvalid,
+			RouteType:  graph.RouteTypeHTTP,
+		},
+	}
+
+	expectedStatuses := map[types.NamespacedName]v1.HTTPRouteStatus{
+		{Namespace: "test", Name: "hr-valid"}: {
+			RouteStatus: routeStatusValid,
+		},
+		{Namespace: "test", Name: "hr-invalid"}: {
+			RouteStatus: routeStatusInvalid,
+		},
+	}
+
+	g := NewWithT(t)
+
+	k8sClient := createK8sClientFor(&v1.HTTPRoute{})
+
+	for _, r := range routes {
+		err := k8sClient.Create(t.Context(), r.Source)
+		g.Expect(err).ToNot(HaveOccurred())
+	}
+
+	updater := NewUpdater(k8sClient)
+
+	reqs := PrepareActiveRouteRequests(
+		map[graph.L4RouteKey]*graph.L4Route{},
+		routes,
+		transitionTime,
+		gatewayCtlrName,
+	)
+
+	updater.Update(t.Context(), logr.Discard(), reqs...)
+
+	g.Expect(reqs).To(HaveLen(len(expectedStatuses)))
+
+	for nsname, expected := range expectedStatuses {
+		var hr v1.HTTPRoute
+
+		err := k8sClient.Get(t.Context(), nsname, &hr)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(expected.RouteStatus.Parents).To(ConsistOf(hr.Status.Parents))
+	}
+}
+
+func TestPrepareRouteStatusIncludesEndpointPickerTLSWarning(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	condition := conditions.NewRouteEndpointPickerTLSVerificationSkipped()
+	status := prepareRouteStatus(
+		gatewayCtlrName,
+		parentRefsValid,
+		[]conditions.Condition{condition},
+		transitionTime,
+		3,
+	)
+
+	expected := metav1.Condition{
+		Type:               condition.Type,
+		Status:             condition.Status,
+		ObservedGeneration: 3,
+		LastTransitionTime: transitionTime,
+		Reason:             condition.Reason,
+		Message:            condition.Message,
+	}
+
+	g.Expect(status.Parents).ToNot(BeEmpty())
+	for _, parent := range status.Parents {
+		g.Expect(parent.Conditions).To(ContainElement(expected))
+	}
+}
+
+func TestBuildGRPCRouteStatuses(t *testing.T) {
+	t.Parallel()
+	grValid := &v1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "gr-valid",
+			Generation: 3,
+		},
+		Spec: v1.GRPCRouteSpec{
+			CommonRouteSpec: commonRouteSpecValid,
+		},
+	}
+	grInvalid := &v1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "gr-invalid",
+			Generation: 3,
+		},
+		Spec: v1.GRPCRouteSpec{
+			CommonRouteSpec: commonRouteSpecInvalid,
+		},
+	}
+	routes := map[graph.RouteKey]*graph.L7Route{
+		graph.CreateRouteKey(grValid): {
+			Valid:      true,
+			Source:     grValid,
+			ParentRefs: parentRefsValid,
+			RouteType:  graph.RouteTypeGRPC,
+		},
+		graph.CreateRouteKey(grInvalid): {
+			Valid:      false,
+			Conditions: []conditions.Condition{invalidRouteCondition},
+			Source:     grInvalid,
+			ParentRefs: parentRefsInvalid,
+			RouteType:  graph.RouteTypeGRPC,
+		},
+	}
+
+	expectedStatuses := map[types.NamespacedName]v1.GRPCRouteStatus{
+		{Namespace: "test", Name: "gr-valid"}: {
+			RouteStatus: routeStatusValid,
+		},
+		{Namespace: "test", Name: "gr-invalid"}: {
+			RouteStatus: routeStatusInvalid,
+		},
+	}
+
+	g := NewWithT(t)
+
+	k8sClient := createK8sClientFor(&v1.GRPCRoute{})
+
+	for _, r := range routes {
+		err := k8sClient.Create(t.Context(), r.Source)
+		g.Expect(err).ToNot(HaveOccurred())
+	}
+
+	updater := NewUpdater(k8sClient)
+
+	reqs := PrepareActiveRouteRequests(
+		map[graph.L4RouteKey]*graph.L4Route{},
+		routes,
+		transitionTime,
+		gatewayCtlrName,
+	)
+
+	updater.Update(t.Context(), logr.Discard(), reqs...)
+
+	g.Expect(reqs).To(HaveLen(len(expectedStatuses)))
+
+	for nsname, expected := range expectedStatuses {
+		var hr v1.GRPCRoute
+
+		err := k8sClient.Get(t.Context(), nsname, &hr)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(expected.RouteStatus.Parents).To(ConsistOf(hr.Status.Parents))
+	}
+}
+
+func TestBuildTLSRouteStatuses(t *testing.T) {
+	t.Parallel()
+	trValid := &v1.TLSRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "tr-valid",
+			Generation: 3,
+		},
+		Spec: v1.TLSRouteSpec{
+			CommonRouteSpec: commonRouteSpecValid,
+		},
+	}
+	trInvalid := &v1.TLSRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "tr-invalid",
+			Generation: 3,
+		},
+		Spec: v1.TLSRouteSpec{
+			CommonRouteSpec: commonRouteSpecInvalid,
+		},
+	}
+	routes := map[graph.L4RouteKey]*graph.L4Route{
+		graph.CreateRouteKeyL4(trValid): {
+			Valid:      true,
+			Source:     trValid,
+			ParentRefs: parentRefsValid,
+		},
+		graph.CreateRouteKeyL4(trInvalid): {
+			Valid:      false,
+			Conditions: []conditions.Condition{invalidRouteCondition},
+			Source:     trInvalid,
+			ParentRefs: parentRefsInvalid,
+		},
+	}
+
+	expectedStatuses := map[types.NamespacedName]v1.TLSRouteStatus{
+		{Namespace: "test", Name: "tr-valid"}: {
+			RouteStatus: routeStatusValid,
+		},
+		{Namespace: "test", Name: "tr-invalid"}: {
+			RouteStatus: routeStatusInvalid,
+		},
+	}
+
+	g := NewWithT(t)
+
+	k8sClient := createK8sClientFor(&v1.TLSRoute{})
+
+	for _, r := range routes {
+		err := k8sClient.Create(t.Context(), r.Source)
+		g.Expect(err).ToNot(HaveOccurred())
+	}
+
+	updater := NewUpdater(k8sClient)
+
+	reqs := PrepareActiveRouteRequests(
+		routes,
+		map[graph.RouteKey]*graph.L7Route{},
+		transitionTime,
+		gatewayCtlrName,
+	)
+
+	updater.Update(t.Context(), logr.Discard(), reqs...)
+
+	g.Expect(reqs).To(HaveLen(len(expectedStatuses)))
+
+	for nsname, expected := range expectedStatuses {
+		var hr v1.TLSRoute
+
+		err := k8sClient.Get(t.Context(), nsname, &hr)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(expected.RouteStatus.Parents).To(ConsistOf(hr.Status.Parents))
+	}
+}
+
+func TestBuildGatewayClassStatuses(t *testing.T) {
+	t.Parallel()
+	transitionTime := helpers.PrepareTimeForFakeClient(metav1.Now())
+
+	tests := []struct {
+		gc             *graph.GatewayClass
+		ignoredClasses map[types.NamespacedName]*v1.GatewayClass
+		expected       map[types.NamespacedName]v1.GatewayClassStatus
+		name           string
+	}{
+		{
+			name:     "nil gatewayclass and no ignored gatewayclasses",
+			expected: map[types.NamespacedName]v1.GatewayClassStatus{},
+		},
+		{
+			name: "nil gatewayclass and ignored gatewayclasses",
+			ignoredClasses: map[types.NamespacedName]*v1.GatewayClass{
+				{Name: "ignored-1"}: {
+					ObjectMeta: metav1.ObjectMeta{
+						Name:       "ignored-1",
+						Generation: 1,
+					},
+				},
+				{Name: "ignored-2"}: {
+					ObjectMeta: metav1.ObjectMeta{
+						Name:       "ignored-2",
+						Generation: 2,
+					},
+				},
+			},
+			expected: map[types.NamespacedName]v1.GatewayClassStatus{
+				{Name: "ignored-1"}: {
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayClassConditionStatusAccepted),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 1,
+							LastTransitionTime: transitionTime,
+							Reason:             string(conditions.GatewayClassReasonGatewayClassConflict),
+							Message:            conditions.GatewayClassMessageGatewayClassConflict,
+						},
+					},
+					SupportedFeatures: supportedFeatures(),
+				},
+				{Name: "ignored-2"}: {
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayClassConditionStatusAccepted),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(conditions.GatewayClassReasonGatewayClassConflict),
+							Message:            conditions.GatewayClassMessageGatewayClassConflict,
+						},
+					},
+					SupportedFeatures: supportedFeatures(),
+				},
+			},
+		},
+		{
+			name: "valid gatewayclass",
+			gc: &graph.GatewayClass{
+				Source: &v1.GatewayClass{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:       "valid-gc",
+						Generation: 1,
+					},
+				},
+			},
+			expected: map[types.NamespacedName]v1.GatewayClassStatus{
+				{Name: "valid-gc"}: {
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayClassConditionStatusAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 1,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayClassReasonAccepted),
+							Message:            "The GatewayClass is accepted",
+						},
+						{
+							Type:               string(v1.GatewayClassReasonSupportedVersion),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 1,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayClassReasonSupportedVersion),
+							Message:            "The Gateway API CRD versions are supported",
+						},
+					},
+					SupportedFeatures: supportedFeatures(),
+				},
+			},
+		},
+		{
+			name: "gatewayclass with BestEffort=true should not report SupportedFeatures",
+			gc: &graph.GatewayClass{
+				Source: &v1.GatewayClass{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:       "best-effort-gc",
+						Generation: 1,
+					},
+				},
+				BestEffort: true,
+				Conditions: conditions.NewGatewayClassSupportedVersionBestEffort("v1.4.0"),
+			},
+			expected: map[types.NamespacedName]v1.GatewayClassStatus{
+				{Name: "best-effort-gc"}: {
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayClassConditionStatusAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 1,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayClassReasonAccepted),
+							Message:            "The GatewayClass is accepted",
+						},
+						{
+							Type:               string(v1.GatewayClassConditionStatusSupportedVersion),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 1,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayClassReasonUnsupportedVersion),
+							Message:            "The Gateway API CRD versions are not recommended. Recommended version is v1.4.0",
+						},
+					},
+					SupportedFeatures: nil, // Empty when BestEffort=true
+				},
+			},
+		},
+		{
+			name: "gatewayclass with BestEffort=false and conditions should report SupportedFeatures",
+			gc: &graph.GatewayClass{
+				Source: &v1.GatewayClass{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:       "normal-gc-with-conditions",
+						Generation: 1,
+					},
+				},
+				BestEffort: false,
+				Conditions: conditions.NewGatewayClassSupportedVersionBestEffort("v1.4.0"),
+			},
+			expected: map[types.NamespacedName]v1.GatewayClassStatus{
+				{Name: "normal-gc-with-conditions"}: {
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayClassConditionStatusAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 1,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayClassReasonAccepted),
+							Message:            "The GatewayClass is accepted",
+						},
+						{
+							Type:               string(v1.GatewayClassConditionStatusSupportedVersion),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 1,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayClassReasonUnsupportedVersion),
+							Message:            "The Gateway API CRD versions are not recommended. Recommended version is v1.4.0",
+						},
+					},
+					SupportedFeatures: supportedFeatures(),
+				},
+			},
+		},
+		{
+			name: "ignored gatewayclass when active GC has BestEffort=true should not report SupportedFeatures",
+			gc: &graph.GatewayClass{
+				Source: &v1.GatewayClass{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:       "best-effort-gc",
+						Generation: 1,
+					},
+				},
+				BestEffort: true,
+				Conditions: conditions.NewGatewayClassSupportedVersionBestEffort("v1.4.0"),
+			},
+			ignoredClasses: map[types.NamespacedName]*v1.GatewayClass{
+				{Name: "ignored-best-effort"}: {
+					ObjectMeta: metav1.ObjectMeta{
+						Name:       "ignored-best-effort",
+						Generation: 1,
+					},
+				},
+			},
+			expected: map[types.NamespacedName]v1.GatewayClassStatus{
+				{Name: "best-effort-gc"}: {
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayClassConditionStatusAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 1,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayClassReasonAccepted),
+							Message:            "The GatewayClass is accepted",
+						},
+						{
+							Type:               string(v1.GatewayClassConditionStatusSupportedVersion),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 1,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayClassReasonUnsupportedVersion),
+							Message:            "The Gateway API CRD versions are not recommended. Recommended version is v1.4.0",
+						},
+					},
+					SupportedFeatures: nil, // Empty when BestEffort=true
+				},
+				{Name: "ignored-best-effort"}: {
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayClassConditionStatusAccepted),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 1,
+							LastTransitionTime: transitionTime,
+							Reason:             string(conditions.GatewayClassReasonGatewayClassConflict),
+							Message:            conditions.GatewayClassMessageGatewayClassConflict,
+						},
+					},
+					SupportedFeatures: nil, // Empty when active GC has BestEffort=true
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			k8sClient := createK8sClientFor(&v1.GatewayClass{})
+
+			var expectedTotalReqs int
+
+			if test.gc != nil {
+				err := k8sClient.Create(t.Context(), test.gc.Source)
+				g.Expect(err).ToNot(HaveOccurred())
+				expectedTotalReqs++
+			}
+
+			for _, gc := range test.ignoredClasses {
+				err := k8sClient.Create(t.Context(), gc)
+				g.Expect(err).ToNot(HaveOccurred())
+				expectedTotalReqs++
+			}
+
+			updater := NewUpdater(k8sClient)
+
+			reqs := PrepareGatewayClassRequests(test.gc, test.ignoredClasses, transitionTime)
+
+			g.Expect(reqs).To(HaveLen(expectedTotalReqs))
+
+			updater.Update(t.Context(), logr.Discard(), reqs...)
+
+			for nsname, expected := range test.expected {
+				var gc v1.GatewayClass
+
+				err := k8sClient.Get(t.Context(), nsname, &gc)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(helpers.Diff(expected, gc.Status)).To(BeEmpty())
+			}
+		})
+	}
+}
+
+func TestBuildGatewayStatuses(t *testing.T) {
+	t.Parallel()
+	createGateway := func() *v1.Gateway {
+		return &v1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace:  "test",
+				Name:       "gateway",
+				Generation: 2,
+			},
+		}
+	}
+	createGatewayWithAddresses := func(addresses []v1.GatewaySpecAddress) *v1.Gateway {
+		g := createGateway()
+		g.Spec.Addresses = addresses
+		return g
+	}
+
+	transitionTime := helpers.PrepareTimeForFakeClient(metav1.Now())
+
+	validListenerConditions := []metav1.Condition{
+		{
+			Type:               string(v1.ListenerConditionProgrammed),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: 2,
+			LastTransitionTime: transitionTime,
+			Reason:             string(v1.ListenerReasonProgrammed),
+			Message:            "The Listener is programmed",
+		},
+		{
+			Type:               string(v1.ListenerConditionAccepted),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: 2,
+			LastTransitionTime: transitionTime,
+			Reason:             string(v1.ListenerReasonAccepted),
+			Message:            "The Listener is accepted",
+		},
+		{
+			Type:               string(v1.ListenerConditionResolvedRefs),
+			Status:             metav1.ConditionTrue,
+			ObservedGeneration: 2,
+			LastTransitionTime: transitionTime,
+			Reason:             string(v1.ListenerReasonResolvedRefs),
+			Message:            "All references are resolved",
+		},
+		{
+			Type:               string(v1.ListenerConditionConflicted),
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: 2,
+			LastTransitionTime: transitionTime,
+			Reason:             string(v1.ListenerReasonNoConflicts),
+			Message:            "No conflicts",
+		},
+	}
+
+	addr := []v1.GatewayStatusAddress{
+		{
+			Type:  helpers.GetPointer(v1.IPAddressType),
+			Value: "1.2.3.4",
+		},
+	}
+
+	routeKey := graph.RouteKey{NamespacedName: types.NamespacedName{Namespace: "test", Name: "hr-1"}}
+
+	tests := []struct {
+		nginxReloadRes graph.NginxReloadResult
+		gateway        *graph.Gateway
+		expected       map[types.NamespacedName]v1.GatewayStatus
+		name           string
+	}{
+		{
+			name:     "nil gateway and no ignored gateways",
+			expected: map[types.NamespacedName]v1.GatewayStatus{},
+		},
+		{
+			name: "valid gateway; no listeners",
+			gateway: &graph.Gateway{
+				Source:    createGateway(),
+				Listeners: []*graph.Listener{}, // Empty listeners array
+				Valid:     true,
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonAccepted),
+							Message:            "The Gateway is accepted",
+						},
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonProgrammed),
+							Message:            "The Gateway is programmed",
+						},
+					},
+					Listeners:            nil,
+					AttachedListenerSets: helpers.GetPointer(int32(0)),
+				},
+			},
+		},
+		{
+			name: "valid gateway; all valid listeners",
+			gateway: &graph.Gateway{
+				Source: createGateway(),
+				Listeners: []*graph.Listener{
+					{
+						Name:   "listener-valid-1",
+						Valid:  true,
+						Routes: map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+					},
+					{
+						Name:   "listener-valid-2",
+						Valid:  true,
+						Routes: map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+					},
+				},
+				Valid: true,
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonAccepted),
+							Message:            "The Gateway is accepted",
+						},
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonProgrammed),
+							Message:            "The Gateway is programmed",
+						},
+					},
+					Listeners: []v1.ListenerStatus{
+						{
+							Name:           "listener-valid-1",
+							AttachedRoutes: 1,
+							Conditions:     validListenerConditions,
+						},
+						{
+							Name:           "listener-valid-2",
+							AttachedRoutes: 1,
+							Conditions:     validListenerConditions,
+						},
+					},
+					AttachedListenerSets: helpers.GetPointer(int32(0)),
+				},
+			},
+		},
+		{
+			name: "valid gateway; all valid listeners with some from ListenerSets",
+			gateway: &graph.Gateway{
+				Source: createGateway(),
+				Listeners: []*graph.Listener{
+					{
+						Name:   "listener-valid-1",
+						Valid:  true,
+						Routes: map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+					},
+					{
+						Name:   "listener-valid-2",
+						Valid:  true,
+						Routes: map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+					},
+					{
+						Name:            "listenerSet-listener-valid-1",
+						Valid:           true,
+						Routes:          map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+						ListenerSetName: types.NamespacedName{Namespace: "test", Name: "ls-1"},
+					},
+					{
+						Name:            "listenerSet-listener-valid-2",
+						Valid:           true,
+						Routes:          map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+						ListenerSetName: types.NamespacedName{Namespace: "test", Name: "ls-2"},
+					},
+				},
+				Valid: true,
+				AttachedListenerSets: map[types.NamespacedName]*graph.ListenerSet{
+					{Namespace: "test", Name: "ls-1"}: {},
+					{Namespace: "test", Name: "ls-2"}: {},
+				},
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonAccepted),
+							Message:            "The Gateway is accepted",
+						},
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonProgrammed),
+							Message:            "The Gateway is programmed",
+						},
+					},
+					Listeners: []v1.ListenerStatus{
+						{
+							Name:           "listener-valid-1",
+							AttachedRoutes: 1,
+							Conditions:     validListenerConditions,
+						},
+						{
+							Name:           "listener-valid-2",
+							AttachedRoutes: 1,
+							Conditions:     validListenerConditions,
+						},
+					},
+					AttachedListenerSets: helpers.GetPointer(int32(2)),
+				},
+			},
+		},
+		{
+			name: "valid gateway; some valid listeners",
+			gateway: &graph.Gateway{
+				Source: createGateway(),
+				Listeners: []*graph.Listener{
+					{
+						Name:   "listener-valid",
+						Valid:  true,
+						Routes: map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+					},
+					{
+						Name:       "listener-invalid",
+						Valid:      false,
+						Conditions: conditions.NewListenerUnsupportedValue("Unsupported value"),
+					},
+				},
+				Valid: true,
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonProgrammed),
+							Message:            "The Gateway is programmed",
+						},
+						{
+							// is it a bug?
+							Type:               string(v1.GatewayReasonAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonListenersNotValid),
+							Message:            "The Gateway has at least one valid listener",
+						},
+					},
+					Listeners: []v1.ListenerStatus{
+						{
+							Name:           "listener-valid",
+							AttachedRoutes: 1,
+							Conditions:     validListenerConditions,
+						},
+						{
+							Name:           "listener-invalid",
+							AttachedRoutes: 0,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.ListenerConditionAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(conditions.ListenerReasonUnsupportedValue),
+									Message:            "Unsupported value",
+								},
+								{
+									Type:               string(v1.ListenerConditionProgrammed),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonInvalid),
+									Message:            "Unsupported value",
+								},
+							},
+						},
+					},
+					AttachedListenerSets: helpers.GetPointer(int32(0)),
+				},
+			},
+		},
+		{
+			name: "valid gateway; no valid listeners",
+			gateway: &graph.Gateway{
+				Source: createGateway(),
+				Listeners: []*graph.Listener{
+					{
+						Name:       "listener-invalid-1",
+						Valid:      false,
+						Conditions: conditions.NewListenerUnsupportedProtocol("Unsupported protocol"),
+					},
+					{
+						Name:       "listener-invalid-2",
+						Valid:      false,
+						Conditions: conditions.NewListenerUnsupportedValue("Unsupported value"),
+					},
+				},
+				Valid: true,
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayReasonAccepted),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonListenersNotValid),
+							Message:            "The Gateway has no valid listeners",
+						},
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonInvalid),
+							Message:            "The Gateway has no valid listeners",
+						},
+					},
+					Listeners: []v1.ListenerStatus{
+						{
+							Name:           "listener-invalid-1",
+							AttachedRoutes: 0,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.ListenerConditionAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonUnsupportedProtocol),
+									Message:            "Unsupported protocol",
+								},
+								{
+									Type:               string(v1.ListenerConditionProgrammed),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonInvalid),
+									Message:            "Unsupported protocol",
+								},
+							},
+						},
+						{
+							Name:           "listener-invalid-2",
+							AttachedRoutes: 0,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.ListenerConditionAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(conditions.ListenerReasonUnsupportedValue),
+									Message:            "Unsupported value",
+								},
+								{
+									Type:               string(v1.ListenerConditionProgrammed),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonInvalid),
+									Message:            "Unsupported value",
+								},
+							},
+						},
+					},
+					AttachedListenerSets: helpers.GetPointer(int32(0)),
+				},
+			},
+		},
+		{
+			name: "invalid gateway",
+			gateway: &graph.Gateway{
+				Source:     createGateway(),
+				Valid:      false,
+				Conditions: conditions.NewGatewayInvalid("No GatewayClass"),
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionAccepted),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonInvalid),
+							Message:            "No GatewayClass",
+						},
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonInvalid),
+							Message:            "No GatewayClass",
+						},
+					},
+					AttachedListenerSets: nil, // invalid gateway skips reporting a few fields
+				},
+			},
+		},
+		{
+			name: "error reloading nginx; gateway/listener not programmed",
+			gateway: &graph.Gateway{
+				Source:     createGateway(),
+				Valid:      true,
+				Conditions: conditions.NewDefaultGatewayConditions(),
+				Listeners: []*graph.Listener{
+					{
+						Name:   "listener-valid",
+						Valid:  true,
+						Routes: map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+					},
+				},
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonAccepted),
+							Message:            "The Gateway is accepted",
+						},
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonInvalid),
+							Message:            fmt.Sprintf("%s: test error", conditions.GatewayMessageFailedNginxReload),
+						},
+					},
+					Listeners: []v1.ListenerStatus{
+						{
+							Name:           "listener-valid",
+							AttachedRoutes: 1,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.ListenerConditionAccepted),
+									Status:             metav1.ConditionTrue,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonAccepted),
+									Message:            "The Listener is accepted",
+								},
+								{
+									Type:               string(v1.ListenerConditionResolvedRefs),
+									Status:             metav1.ConditionTrue,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonResolvedRefs),
+									Message:            "All references are resolved",
+								},
+								{
+									Type:               string(v1.ListenerConditionConflicted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonNoConflicts),
+									Message:            "No conflicts",
+								},
+								{
+									Type:               string(v1.ListenerConditionProgrammed),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonInvalid),
+									Message:            fmt.Sprintf("%s: test error", conditions.ListenerMessageFailedNginxReload),
+								},
+							},
+						},
+					},
+					AttachedListenerSets: helpers.GetPointer(int32(0)),
+				},
+			},
+			nginxReloadRes: graph.NginxReloadResult{Error: errors.New("test error")},
+		},
+		{
+			name: "valid gateway with valid parametersRef; all valid listeners",
+			gateway: &graph.Gateway{
+				Source: createGateway(),
+				Listeners: []*graph.Listener{
+					{
+						Name:   "listener-valid-1",
+						Valid:  true,
+						Routes: map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+					},
+				},
+				Valid: true,
+				Conditions: []conditions.Condition{
+					conditions.NewGatewayResolvedRefs(),
+				},
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonAccepted),
+							Message:            "The Gateway is accepted",
+						},
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonProgrammed),
+							Message:            "The Gateway is programmed",
+						},
+						{
+							Type:               string(conditions.GatewayResolvedRefs),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(conditions.GatewayReasonResolvedRefs),
+							Message:            "The referenced resources are resolved",
+						},
+					},
+					Listeners: []v1.ListenerStatus{
+						{
+							Name:           "listener-valid-1",
+							AttachedRoutes: 1,
+							Conditions:     validListenerConditions,
+						},
+					},
+					AttachedListenerSets: helpers.GetPointer(int32(0)),
+				},
+			},
+		},
+		{
+			name: "valid gateway with invalid parametersRef; all valid listeners",
+			gateway: &graph.Gateway{
+				Source: createGateway(),
+				Listeners: []*graph.Listener{
+					{
+						Name:   "listener-valid-1",
+						Valid:  true,
+						Routes: map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+					},
+				},
+				Valid: true,
+				Conditions: []conditions.Condition{
+					conditions.NewGatewayInvalidParameters("The ParametersRef not found"),
+					conditions.NewGatewayRefInvalid("The ParametersRef not found"),
+				},
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonProgrammed),
+							Message:            "The Gateway is programmed",
+						},
+						{
+							Type:               string(v1.GatewayConditionAccepted),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonInvalidParameters),
+							Message: "The Gateway is not accepted due to an invalid ParametersRef: " +
+								"The ParametersRef not found",
+						},
+						{
+							Type:               string(conditions.GatewayResolvedRefs),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(conditions.GatewayClassReasonParamsRefInvalid),
+							Message:            "The ParametersRef not found",
+						},
+					},
+					Listeners: []v1.ListenerStatus{
+						{
+							Name:           "listener-valid-1",
+							AttachedRoutes: 1,
+							Conditions:     validListenerConditions,
+						},
+					},
+					AttachedListenerSets: helpers.GetPointer(int32(0)),
+				},
+			},
+		},
+		{
+			name: "valid gateway; valid listeners; gateway addresses value unspecified",
+			gateway: &graph.Gateway{
+				Source: createGatewayWithAddresses([]v1.GatewaySpecAddress{
+					{
+						Type:  helpers.GetPointer(v1.IPAddressType),
+						Value: "",
+					},
+				}),
+				Listeners: []*graph.Listener{
+					{
+						Name:   "listener-valid-1",
+						Valid:  true,
+						Routes: map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+					},
+				},
+				Valid: true,
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonAccepted),
+							Message:            "The Gateway is accepted",
+						},
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonAddressNotAssigned),
+							Message: "Dynamically assigned addresses for the Gateway addresses " +
+								"field are not supported, value must be specified",
+						},
+					},
+					Listeners: []v1.ListenerStatus{
+						{
+							Name:           "listener-valid-1",
+							AttachedRoutes: 1,
+							Conditions:     validListenerConditions,
+						},
+					},
+					AttachedListenerSets: helpers.GetPointer(int32(0)),
+				},
+			},
+		},
+		{
+			name: "valid gateway; valid listeners; gateway addresses value unusable",
+			gateway: &graph.Gateway{
+				Source: createGatewayWithAddresses([]v1.GatewaySpecAddress{
+					{
+						Type:  helpers.GetPointer(v1.IPAddressType),
+						Value: "<invalid-ip>",
+					},
+				}),
+				Listeners: []*graph.Listener{
+					{
+						Name:   "listener-valid-1",
+						Valid:  true,
+						Routes: map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+					},
+				},
+				Valid: true,
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonAccepted),
+							Message:            "The Gateway is accepted",
+						},
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonAddressNotUsable),
+							Message:            "Invalid IP address",
+						},
+					},
+					Listeners: []v1.ListenerStatus{
+						{
+							Name:           "listener-valid-1",
+							AttachedRoutes: 1,
+							Conditions:     validListenerConditions,
+						},
+					},
+					AttachedListenerSets: helpers.GetPointer(int32(0)),
+				},
+			},
+		},
+		{
+			name: "valid gateway; valid listeners; one unresolved frontend tls ca cert ref",
+			gateway: &graph.Gateway{
+				Source: createGateway(),
+				Listeners: []*graph.Listener{
+					{
+						Name:  "listener-valid-1",
+						Valid: true,
+						Conditions: []conditions.Condition{
+							conditions.NewListenerUnresolvedCertificateRef(
+								`certificate ref "test/my-ca-cert" could not be resolved`,
+								string(v1.ListenerReasonInvalidCACertificateRef),
+							),
+						},
+						Routes: map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+					},
+				},
+				Valid:      true,
+				Conditions: []conditions.Condition{},
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonAccepted),
+							Message:            "The Gateway is accepted",
+						},
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonProgrammed),
+							Message:            "The Gateway is programmed",
+						},
+					},
+					Listeners: []v1.ListenerStatus{
+						{
+							Name:           "listener-valid-1",
+							AttachedRoutes: 1,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.ListenerConditionResolvedRefs),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonInvalidCACertificateRef),
+									Message:            `certificate ref "test/my-ca-cert" could not be resolved`,
+								},
+								{
+									Type:               string(v1.ListenerConditionProgrammed),
+									Status:             metav1.ConditionTrue,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonProgrammed),
+									Message:            "The Listener is programmed",
+								},
+								{
+									Type:               string(v1.ListenerConditionAccepted),
+									Status:             metav1.ConditionTrue,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonAccepted),
+									Message:            "The Listener is accepted",
+								},
+								{
+									Type:               string(v1.ListenerConditionConflicted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonNoConflicts),
+									Message:            "No conflicts",
+								},
+							},
+						},
+					},
+					AttachedListenerSets: helpers.GetPointer(int32(0)),
+				},
+			},
+		},
+		{
+			name: "valid gateway; invalid listener with all invalid frontend tls ca cert refs",
+			gateway: &graph.Gateway{
+				Source: createGateway(),
+				Listeners: []*graph.Listener{
+					{
+						Name:  "listener-invalid-ca-certs",
+						Valid: false,
+						Conditions: conditions.NewListenerInvalidNoValidCACertificate(
+							"all CA certificate refs are invalid",
+						),
+					},
+				},
+				Valid:      true,
+				Conditions: []conditions.Condition{},
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionAccepted),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonListenersNotValid),
+							Message:            "The Gateway has no valid listeners",
+						},
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonInvalid),
+							Message:            "The Gateway has no valid listeners",
+						},
+					},
+					Listeners: []v1.ListenerStatus{
+						{
+							Name:           "listener-invalid-ca-certs",
+							AttachedRoutes: 0,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.ListenerConditionAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonNoValidCACertificate),
+									Message:            "all CA certificate refs are invalid",
+								},
+								{
+									Type:               string(v1.ListenerConditionProgrammed),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.ListenerReasonInvalid),
+									Message:            "all CA certificate refs are invalid",
+								},
+							},
+						},
+					},
+					AttachedListenerSets: helpers.GetPointer(int32(0)),
+				},
+			},
+		},
+		{
+			name: "valid gateway; valid listener; frontend tls validation mode set to AllowInsecureFallback",
+			gateway: &graph.Gateway{
+				Source: createGateway(),
+				Listeners: []*graph.Listener{
+					{
+						Name:   "listener-valid-1",
+						Valid:  true,
+						Routes: map[graph.RouteKey]*graph.L7Route{routeKey: {}},
+					},
+				},
+				Valid: true,
+				Conditions: []conditions.Condition{
+					conditions.NewGatewayInsecureFrontendValidationMode(
+						"Validation Mode: AllowInsecureFallback is set for at least one listener",
+					),
+				},
+			},
+			expected: map[types.NamespacedName]v1.GatewayStatus{
+				{Namespace: "test", Name: "gateway"}: {
+					Addresses: addr,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.GatewayConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonAccepted),
+							Message:            "The Gateway is accepted",
+						},
+						{
+							Type:               string(v1.GatewayConditionProgrammed),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonProgrammed),
+							Message:            "The Gateway is programmed",
+						},
+						{
+							Type:               string(v1.GatewayConditionInsecureFrontendValidationMode),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 2,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.GatewayReasonConfigurationChanged),
+							Message:            "Validation Mode: AllowInsecureFallback is set for at least one listener",
+						},
+					},
+					Listeners: []v1.ListenerStatus{
+						{
+							Name:           "listener-valid-1",
+							AttachedRoutes: 1,
+							Conditions:     validListenerConditions,
+						},
+					},
+					AttachedListenerSets: helpers.GetPointer(int32(0)),
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			k8sClient := createK8sClientFor(&v1.Gateway{})
+
+			var expectedTotalReqs int
+
+			if test.gateway != nil {
+				test.gateway.Source.ResourceVersion = ""
+				err := k8sClient.Create(t.Context(), test.gateway.Source)
+				g.Expect(err).ToNot(HaveOccurred())
+				expectedTotalReqs++
+			}
+
+			updater := NewUpdater(k8sClient)
+
+			reqs := PrepareGatewayRequests(
+				test.gateway,
+				transitionTime,
+				addr,
+				test.nginxReloadRes,
+			)
+
+			g.Expect(reqs).To(HaveLen(expectedTotalReqs))
+
+			updater.Update(t.Context(), logr.Discard(), reqs...)
+
+			for nsname, expected := range test.expected {
+				var gw v1.Gateway
+
+				err := k8sClient.Get(t.Context(), nsname, &gw)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(helpers.Diff(expected, gw.Status)).To(BeEmpty())
+			}
+		})
+	}
+}
+
+func TestBuildBackendTLSPolicyStatuses(t *testing.T) {
+	t.Parallel()
+	const gatewayCtlrName = "controller"
+
+	transitionTime := helpers.PrepareTimeForFakeClient(metav1.Now())
+
+	type policyCfg struct {
+		Name         string
+		Conditions   []conditions.Condition
+		Gateways     []types.NamespacedName
+		Valid        bool
+		Ignored      bool
+		IsReferenced bool
+	}
+
+	getBackendTLSPolicy := func(policyCfg policyCfg) *graph.BackendTLSPolicy {
+		return &graph.BackendTLSPolicy{
+			Source: &v1.BackendTLSPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:  "test",
+					Name:       policyCfg.Name,
+					Generation: 1,
+				},
+			},
+			Valid:        policyCfg.Valid,
+			Ignored:      policyCfg.Ignored,
+			IsReferenced: policyCfg.IsReferenced,
+			Conditions:   policyCfg.Conditions,
+			Gateways:     policyCfg.Gateways,
+		}
+	}
+
+	attachedConds := []conditions.Condition{conditions.NewPolicyAccepted()}
+	invalidConds := []conditions.Condition{conditions.NewPolicyInvalid("The BackendTLSPolicy is invalid")}
+
+	validPolicyCfg := policyCfg{
+		Name:         "valid-bt",
+		Valid:        true,
+		IsReferenced: true,
+		Conditions:   attachedConds,
+		Gateways: []types.NamespacedName{
+			{Namespace: "test", Name: "gateway"},
+			{Namespace: "test", Name: "gateway-2"},
+		},
+	}
+
+	invalidPolicyCfg := policyCfg{
+		Name:         "invalid-bt",
+		IsReferenced: true,
+		Conditions:   invalidConds,
+		Gateways: []types.NamespacedName{
+			{Namespace: "test", Name: "gateway"},
+		},
+	}
+
+	ignoredPolicyCfg := policyCfg{
+		Name:         "ignored-bt",
+		Ignored:      true,
+		IsReferenced: true,
+	}
+
+	notReferencedPolicyCfg := policyCfg{
+		Name:  "not-referenced",
+		Valid: true,
+	}
+
+	tests := []struct {
+		backendTLSPolicies map[types.NamespacedName]*graph.BackendTLSPolicy
+		expected           map[types.NamespacedName]v1.PolicyStatus
+		name               string
+		expectedReqs       int
+	}{
+		{
+			name:         "nil backendTLSPolicies",
+			expectedReqs: 0,
+			expected:     map[types.NamespacedName]v1.PolicyStatus{},
+		},
+		{
+			name: "valid BackendTLSPolicy",
+			backendTLSPolicies: map[types.NamespacedName]*graph.BackendTLSPolicy{
+				{Namespace: "test", Name: "valid-bt"}: getBackendTLSPolicy(validPolicyCfg),
+			},
+			expectedReqs: 1,
+			expected: map[types.NamespacedName]v1.PolicyStatus{
+				{Name: "valid-bt", Namespace: "test"}: {
+					Ancestors: []v1.PolicyAncestorStatus{
+						{
+							AncestorRef: v1.ParentReference{
+								Namespace: helpers.GetPointer[v1.Namespace]("test"),
+								Name:      "gateway",
+								Group:     helpers.GetPointer[v1.Group](v1.GroupName),
+								Kind:      helpers.GetPointer[v1.Kind](kinds.Gateway),
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.PolicyConditionAccepted),
+									Status:             metav1.ConditionTrue,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.PolicyReasonAccepted),
+									Message:            "The Policy is accepted",
+								},
+							},
+						},
+						{
+							AncestorRef: v1.ParentReference{
+								Namespace: helpers.GetPointer[v1.Namespace]("test"),
+								Name:      "gateway-2",
+								Group:     helpers.GetPointer[v1.Group](v1.GroupName),
+								Kind:      helpers.GetPointer[v1.Kind](kinds.Gateway),
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.PolicyConditionAccepted),
+									Status:             metav1.ConditionTrue,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.PolicyReasonAccepted),
+									Message:            "The Policy is accepted",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "invalid BackendTLSPolicy",
+			backendTLSPolicies: map[types.NamespacedName]*graph.BackendTLSPolicy{
+				{Namespace: "test", Name: "invalid-bt"}: getBackendTLSPolicy(invalidPolicyCfg),
+			},
+			expectedReqs: 1,
+			expected: map[types.NamespacedName]v1.PolicyStatus{
+				{Name: "invalid-bt", Namespace: "test"}: {
+					Ancestors: []v1.PolicyAncestorStatus{
+						{
+							AncestorRef: v1.ParentReference{
+								Namespace: helpers.GetPointer[v1.Namespace]("test"),
+								Name:      "gateway",
+								Group:     helpers.GetPointer[v1.Group](v1.GroupName),
+								Kind:      helpers.GetPointer[v1.Kind](kinds.Gateway),
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.PolicyConditionAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.PolicyReasonInvalid),
+									Message:            "The BackendTLSPolicy is invalid",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "ignored or not referenced backendTLSPolicies",
+			backendTLSPolicies: map[types.NamespacedName]*graph.BackendTLSPolicy{
+				{Namespace: "test", Name: "ignored-bt"}:     getBackendTLSPolicy(ignoredPolicyCfg),
+				{Namespace: "test", Name: "not-referenced"}: getBackendTLSPolicy(notReferencedPolicyCfg),
+			},
+			expectedReqs: 0,
+			expected: map[types.NamespacedName]v1.PolicyStatus{
+				{Name: "ignored-bt", Namespace: "test"}:     {},
+				{Name: "not-referenced", Namespace: "test"}: {},
+			},
+		},
+		{
+			name: "mix valid and ignored backendTLSPolicies",
+			backendTLSPolicies: map[types.NamespacedName]*graph.BackendTLSPolicy{
+				{Namespace: "test", Name: "ignored-bt"}: getBackendTLSPolicy(ignoredPolicyCfg),
+				{Namespace: "test", Name: "valid-bt"}:   getBackendTLSPolicy(validPolicyCfg),
+			},
+			expectedReqs: 1,
+			expected: map[types.NamespacedName]v1.PolicyStatus{
+				{Name: "ignored-bt", Namespace: "test"}: {},
+				{Name: "valid-bt", Namespace: "test"}: {
+					Ancestors: []v1.PolicyAncestorStatus{
+						{
+							AncestorRef: v1.ParentReference{
+								Namespace: helpers.GetPointer[v1.Namespace]("test"),
+								Name:      "gateway",
+								Group:     helpers.GetPointer[v1.Group](v1.GroupName),
+								Kind:      helpers.GetPointer[v1.Kind](kinds.Gateway),
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.PolicyConditionAccepted),
+									Status:             metav1.ConditionTrue,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.PolicyReasonAccepted),
+									Message:            "The Policy is accepted",
+								},
+							},
+						},
+						{
+							AncestorRef: v1.ParentReference{
+								Namespace: helpers.GetPointer[v1.Namespace]("test"),
+								Name:      "gateway-2",
+								Group:     helpers.GetPointer[v1.Group](v1.GroupName),
+								Kind:      helpers.GetPointer[v1.Kind](kinds.Gateway),
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.PolicyConditionAccepted),
+									Status:             metav1.ConditionTrue,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.PolicyReasonAccepted),
+									Message:            "The Policy is accepted",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			k8sClient := createK8sClientFor(&v1.BackendTLSPolicy{})
+
+			for _, pol := range test.backendTLSPolicies {
+				err := k8sClient.Create(t.Context(), pol.Source)
+				g.Expect(err).ToNot(HaveOccurred())
+			}
+
+			updater := NewUpdater(k8sClient)
+
+			reqs := PrepareActiveBackendTLSPolicyRequests(
+				test.backendTLSPolicies,
+				transitionTime,
+				gatewayCtlrName,
+			)
+
+			g.Expect(reqs).To(HaveLen(test.expectedReqs))
+
+			updater.Update(t.Context(), logr.Discard(), reqs...)
+
+			for nsname, expected := range test.expected {
+				var pol v1.BackendTLSPolicy
+
+				err := k8sClient.Get(t.Context(), nsname, &pol)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(helpers.Diff(expected, pol.Status)).To(BeEmpty())
+			}
+		})
+	}
+}
+
+func TestPrepareBackendTLSPolicyRequestsClearsStatusesForUnhandledPolicies(t *testing.T) {
+	t.Parallel()
+
+	g := NewWithT(t)
+	nsname := types.NamespacedName{Namespace: "test", Name: "orphaned-bt"}
+	policy := &v1.BackendTLSPolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: nsname.Namespace, Name: nsname.Name, Generation: 1},
+	}
+
+	k8sClient := createK8sClientFor(&v1.BackendTLSPolicy{})
+	g.Expect(k8sClient.Create(t.Context(), policy)).To(Succeed())
+
+	updater := NewUpdater(k8sClient)
+	updater.Update(t.Context(), logr.Discard(), UpdateRequest{
+		NsName:       nsname,
+		ResourceType: &v1.BackendTLSPolicy{},
+		Setter: newBackendTLSPolicyStatusSetter(v1.PolicyStatus{Ancestors: []v1.PolicyAncestorStatus{{
+			ControllerName: v1.GatewayController(gatewayCtlrName),
+			AncestorRef: v1.ParentReference{
+				Namespace: helpers.GetPointer(v1.Namespace("test")),
+				Name:      "gateway",
+				Group:     helpers.GetPointer[v1.Group](v1.GroupName),
+				Kind:      helpers.GetPointer[v1.Kind](kinds.Gateway),
+			},
+			Conditions: []metav1.Condition{{Type: "Accepted", Message: "stale"}},
+		}}}, gatewayCtlrName),
+	})
+
+	reqs := PrepareDroppedRequests(
+		HandledStatusResources{BackendTLSPolicies: map[types.NamespacedName]struct{}{nsname: {}}},
+		gatewayCtlrName,
+	)
+
+	g.Expect(reqs).To(HaveLen(1))
+	updater.Update(t.Context(), logr.Discard(), reqs...)
+
+	var updated v1.BackendTLSPolicy
+	g.Expect(k8sClient.Get(t.Context(), nsname, &updated)).To(Succeed())
+	g.Expect(updated.Status.Ancestors).To(BeEmpty())
+}
+
+func TestBuildNginxGatewayStatus(t *testing.T) {
+	t.Parallel()
+	transitionTime := helpers.PrepareTimeForFakeClient(metav1.Now())
+
+	tests := []struct {
+		cpUpdateResult ControlPlaneUpdateResult
+		nginxGateway   *ngfAPI.NginxGateway
+		expected       *ngfAPI.NginxGatewayStatus
+		name           string
+	}{
+		{
+			name: "nil NginxGateway",
+		},
+		{
+			name: "NginxGateway with no update error",
+			nginxGateway: &ngfAPI.NginxGateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "nginx-gateway",
+					Namespace:  "test",
+					Generation: 3,
+				},
+			},
+			cpUpdateResult: ControlPlaneUpdateResult{},
+			expected: &ngfAPI.NginxGatewayStatus{
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(ngfAPI.NginxGatewayConditionValid),
+						Status:             metav1.ConditionTrue,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(ngfAPI.NginxGatewayReasonValid),
+						Message:            "The NginxGateway is valid",
+					},
+				},
+			},
+		},
+		{
+			name: "NginxGateway with update error",
+			nginxGateway: &ngfAPI.NginxGateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "nginx-gateway",
+					Namespace:  "test",
+					Generation: 3,
+				},
+			},
+			cpUpdateResult: ControlPlaneUpdateResult{
+				Error: errors.New("test error"),
+			},
+			expected: &ngfAPI.NginxGatewayStatus{
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(ngfAPI.NginxGatewayConditionValid),
+						Status:             metav1.ConditionFalse,
+						ObservedGeneration: 3,
+						LastTransitionTime: transitionTime,
+						Reason:             string(ngfAPI.NginxGatewayReasonInvalid),
+						Message:            "Failed to update control plane configuration: test error",
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			k8sClient := createK8sClientFor(&ngfAPI.NginxGateway{})
+
+			if test.nginxGateway != nil {
+				err := k8sClient.Create(t.Context(), test.nginxGateway)
+				g.Expect(err).ToNot(HaveOccurred())
+			}
+
+			updater := NewUpdater(k8sClient)
+
+			req := PrepareNginxGatewayStatus(test.nginxGateway, transitionTime, test.cpUpdateResult)
+
+			if test.nginxGateway == nil {
+				g.Expect(req).To(BeNil())
+			} else {
+				g.Expect(req).ToNot(BeNil())
+				updater.Update(t.Context(), logr.Discard(), *req)
+
+				var ngw ngfAPI.NginxGateway
+
+				err := k8sClient.Get(t.Context(), types.NamespacedName{Namespace: "test", Name: "nginx-gateway"}, &ngw)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(helpers.Diff(*test.expected, ngw.Status)).To(BeEmpty())
+			}
+		})
+	}
+}
+
+func TestBuildNGFPolicyStatuses(t *testing.T) {
+	t.Parallel()
+	const gatewayCtlrName = "controller"
+
+	transitionTime := helpers.PrepareTimeForFakeClient(metav1.Now())
+
+	// programmedCond and notProgrammedCond are the GEP-713 "Programmed" conditions expected for the NGF
+	// settings policies (ClientSettingsPolicy is used as the representative type below).
+	programmedCond := metav1.Condition{
+		Type:               string(conditions.PolicyConditionProgrammed),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: 2,
+		LastTransitionTime: transitionTime,
+		Reason:             string(conditions.PolicyReasonProgrammed),
+		Message:            "Policy is programmed in the data plane",
+	}
+	notProgrammedCond := metav1.Condition{
+		Type:               string(conditions.PolicyConditionProgrammed),
+		Status:             metav1.ConditionFalse,
+		ObservedGeneration: 2,
+		LastTransitionTime: transitionTime,
+		Reason:             string(conditions.PolicyReasonReconciling),
+		Message:            "Policy is not programmed in the data plane",
+	}
+
+	type policyCfg struct {
+		Ancestors  []graph.PolicyAncestor
+		Name       string
+		Conditions []conditions.Condition
+		Valid      bool
+	}
+
+	// We have to use a real policy here because the test makes the status update using the k8sClient.
+	// One policy type should suffice here, unless a new policy introduces branching.
+	getPolicy := func(cfg policyCfg) *graph.Policy {
+		return &graph.Policy{
+			Source: &ngfAPI.ClientSettingsPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       cfg.Name,
+					Namespace:  "test",
+					Generation: 2,
+				},
+			},
+			Conditions: cfg.Conditions,
+			Ancestors:  cfg.Ancestors,
+			Valid:      cfg.Valid,
+		}
+	}
+
+	invalidConds := []conditions.Condition{conditions.NewPolicyInvalid("Invalid")}
+	targetRefNotFoundConds := []conditions.Condition{conditions.NewPolicyTargetNotFound("The Target not found")}
+
+	validPolicyKey := graph.PolicyKey{
+		NsName: types.NamespacedName{Namespace: "test", Name: "valid-pol"},
+		GVK:    schema.GroupVersionKind{Group: ngfAPI.GroupName, Kind: kinds.ClientSettingsPolicy},
+	}
+	validPolicyCfg := policyCfg{
+		Name:  validPolicyKey.NsName.Name,
+		Valid: true,
+		Ancestors: []graph.PolicyAncestor{
+			{
+				Ancestor: v1.ParentReference{
+					Name: "ancestor1",
+				},
+			},
+			{
+				Ancestor: v1.ParentReference{
+					Name: "ancestor2",
+				},
+			},
+		},
+	}
+
+	invalidPolicyKey := graph.PolicyKey{
+		NsName: types.NamespacedName{Namespace: "test", Name: "invalid-pol"},
+		GVK:    schema.GroupVersionKind{Group: ngfAPI.GroupName, Kind: kinds.ClientSettingsPolicy},
+	}
+	invalidPolicyCfg := policyCfg{
+		Name:       invalidPolicyKey.NsName.Name,
+		Conditions: invalidConds,
+		Ancestors: []graph.PolicyAncestor{
+			{
+				Ancestor: v1.ParentReference{
+					Name: "ancestor1",
+				},
+			},
+			{
+				Ancestor: v1.ParentReference{
+					Name: "ancestor2",
+				},
+			},
+		},
+	}
+
+	targetRefNotFoundPolicyKey := graph.PolicyKey{
+		NsName: types.NamespacedName{Namespace: "test", Name: "target-not-found-pol"},
+		GVK:    schema.GroupVersionKind{Group: ngfAPI.GroupName, Kind: kinds.ClientSettingsPolicy},
+	}
+	// Valid is true here while the ancestor carries an Accepted=False (TargetNotFound) condition: the policy
+	// is structurally valid but failed to attach. This exercises ancestorAccepted() returning false rather
+	// than the pol.Valid short-circuit, so the "Programmed=False" result is driven by the ancestor check.
+	targetRefNotFoundPolicyCfg := policyCfg{
+		Name:  targetRefNotFoundPolicyKey.NsName.Name,
+		Valid: true,
+		Ancestors: []graph.PolicyAncestor{
+			{
+				Ancestor: v1.ParentReference{
+					Name: "ancestor1",
+				},
+				Conditions: targetRefNotFoundConds,
+			},
+		},
+	}
+
+	multiInvalidCondsPolicyKey := graph.PolicyKey{
+		NsName: types.NamespacedName{Namespace: "test", Name: "multi-invalid-conds-pol"},
+		GVK:    schema.GroupVersionKind{Group: ngfAPI.GroupName, Kind: kinds.ClientSettingsPolicy},
+	}
+	multiInvalidCondsPolicyCfg := policyCfg{
+		Name:       multiInvalidCondsPolicyKey.NsName.Name,
+		Conditions: invalidConds,
+		Ancestors: []graph.PolicyAncestor{
+			{
+				Ancestor: v1.ParentReference{
+					Name: "ancestor1",
+				},
+				Conditions: targetRefNotFoundConds,
+			},
+		},
+	}
+
+	nilAncestorPolicyKey := graph.PolicyKey{
+		NsName: types.NamespacedName{Namespace: "test", Name: "nil-ancestor-pol"},
+		GVK:    schema.GroupVersionKind{Group: ngfAPI.GroupName, Kind: kinds.ClientSettingsPolicy},
+	}
+	nilAncestorPolicyCfg := policyCfg{
+		Name:      nilAncestorPolicyKey.NsName.Name,
+		Ancestors: nil,
+	}
+
+	tests := []struct {
+		policies map[graph.PolicyKey]*graph.Policy
+		expected map[types.NamespacedName]v1.PolicyStatus
+		name     string
+	}{
+		{
+			name:     "nil policies",
+			expected: map[types.NamespacedName]v1.PolicyStatus{},
+		},
+		{
+			name: "mix valid and invalid policies",
+			policies: map[graph.PolicyKey]*graph.Policy{
+				invalidPolicyKey:           getPolicy(invalidPolicyCfg),
+				targetRefNotFoundPolicyKey: getPolicy(targetRefNotFoundPolicyCfg),
+				validPolicyKey:             getPolicy(validPolicyCfg),
+			},
+			expected: map[types.NamespacedName]v1.PolicyStatus{
+				invalidPolicyKey.NsName: {
+					Ancestors: []v1.PolicyAncestorStatus{
+						{
+							AncestorRef: v1.ParentReference{
+								Name: "ancestor1",
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								notProgrammedCond,
+								{
+									Type:               string(v1.PolicyConditionAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.PolicyReasonInvalid),
+									Message:            "Invalid",
+								},
+							},
+						},
+						{
+							AncestorRef: v1.ParentReference{
+								Name: "ancestor2",
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								notProgrammedCond,
+								{
+									Type:               string(v1.PolicyConditionAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.PolicyReasonInvalid),
+									Message:            "Invalid",
+								},
+							},
+						},
+					},
+				},
+				targetRefNotFoundPolicyKey.NsName: {
+					Ancestors: []v1.PolicyAncestorStatus{
+						{
+							AncestorRef: v1.ParentReference{
+								Name: "ancestor1",
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								notProgrammedCond,
+								{
+									Type:               string(v1.PolicyConditionAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.PolicyReasonTargetNotFound),
+									Message:            "The Target not found",
+								},
+							},
+						},
+					},
+				},
+				validPolicyKey.NsName: {
+					Ancestors: []v1.PolicyAncestorStatus{
+						{
+							AncestorRef: v1.ParentReference{
+								Name: "ancestor1",
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.PolicyConditionAccepted),
+									Status:             metav1.ConditionTrue,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.PolicyReasonAccepted),
+									Message:            "The Policy is accepted",
+								},
+								programmedCond,
+							},
+						},
+						{
+							AncestorRef: v1.ParentReference{
+								Name: "ancestor2",
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(v1.PolicyConditionAccepted),
+									Status:             metav1.ConditionTrue,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.PolicyReasonAccepted),
+									Message:            "The Policy is accepted",
+								},
+								programmedCond,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "policy with policy conditions and ancestor conditions; policy conditions win",
+			policies: map[graph.PolicyKey]*graph.Policy{
+				multiInvalidCondsPolicyKey: getPolicy(multiInvalidCondsPolicyCfg),
+			},
+			expected: map[types.NamespacedName]v1.PolicyStatus{
+				multiInvalidCondsPolicyKey.NsName: {
+					Ancestors: []v1.PolicyAncestorStatus{
+						{
+							AncestorRef: v1.ParentReference{
+								Name: "ancestor1",
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								notProgrammedCond,
+								{
+									Type:               string(v1.PolicyConditionAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 2,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.PolicyReasonInvalid),
+									Message:            "Invalid",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "Policy with nil ancestor",
+			policies: map[graph.PolicyKey]*graph.Policy{
+				nilAncestorPolicyKey: getPolicy(nilAncestorPolicyCfg),
+			},
+			expected: map[types.NamespacedName]v1.PolicyStatus{},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			k8sClient := createK8sClientFor(&ngfAPI.ClientSettingsPolicy{})
+
+			for _, pol := range test.policies {
+				err := k8sClient.Create(t.Context(), pol.Source)
+				g.Expect(err).ToNot(HaveOccurred())
+			}
+
+			updater := NewUpdater(k8sClient)
+
+			reqs := PrepareActiveNGFPolicyRequests(
+				test.policies,
+				transitionTime,
+				gatewayCtlrName,
+			)
+
+			g.Expect(reqs).To(HaveLen(len(test.expected)))
+
+			updater.Update(t.Context(), logr.Discard(), reqs...)
+
+			for nsname, expected := range test.expected {
+				var pol ngfAPI.ClientSettingsPolicy
+
+				err := k8sClient.Get(t.Context(), nsname, &pol)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(helpers.Diff(expected, pol.Status)).To(BeEmpty())
+			}
+		})
+	}
+}
+
+func TestBuildNGFPolicyStatusesProgrammedCondition(t *testing.T) {
+	t.Parallel()
+
+	const gatewayCtlrName = "controller"
+
+	transitionTime := helpers.PrepareTimeForFakeClient(metav1.Now())
+
+	// The GEP-713 "Programmed" condition is added based on the policy Kind, so each of the NGF policy
+	// kinds that report it is exercised. ClientSettingsPolicy is used as the representative Source type for
+	// the fake client (status assembly only branches on the PolicyKey Kind, not the concrete Source type).
+	policyKinds := []string{
+		kinds.ClientSettingsPolicy,
+		kinds.UpstreamSettingsPolicy,
+		kinds.ObservabilityPolicy,
+		kinds.ProxySettingsPolicy,
+		kinds.RateLimitPolicy,
+		kinds.SnippetsPolicy,
+		kinds.PayloadProcessor,
+	}
+
+	programmedCond := metav1.Condition{
+		Type:               string(conditions.PolicyConditionProgrammed),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: 1,
+		LastTransitionTime: transitionTime,
+		Reason:             string(conditions.PolicyReasonProgrammed),
+		Message:            "Policy is programmed in the data plane",
+	}
+	notProgrammedCond := programmedCond
+	notProgrammedCond.Status = metav1.ConditionFalse
+	notProgrammedCond.Reason = string(conditions.PolicyReasonReconciling)
+	notProgrammedCond.Message = "Policy is not programmed in the data plane"
+
+	overriddenCond := programmedCond
+	overriddenCond.Status = metav1.ConditionFalse
+	overriddenCond.Reason = string(conditions.PolicyReasonOverridden)
+	overriddenCond.Message = "Policy is overridden by a conflicting policy of greater precedence"
+
+	for _, kind := range policyKinds {
+		t.Run(kind, func(t *testing.T) {
+			t.Parallel()
+
+			tests := []struct {
+				expected    metav1.Condition
+				name        string
+				policyConds []conditions.Condition
+				valid       bool
+			}{
+				{name: "valid policy is programmed", valid: true, expected: programmedCond},
+				{name: "invalid policy is not programmed", valid: false, expected: notProgrammedCond},
+				{
+					name:  "conflicted policy is overridden",
+					valid: false,
+					policyConds: []conditions.Condition{
+						conditions.NewPolicyConflicted("Conflicts with another " + kind),
+					},
+					expected: overriddenCond,
+				},
+			}
+
+			for _, test := range tests {
+				t.Run(test.name, func(t *testing.T) {
+					t.Parallel()
+					g := NewWithT(t)
+
+					nsname := types.NamespacedName{Namespace: "test", Name: "pol"}
+					graphPolicies := map[graph.PolicyKey]*graph.Policy{
+						{
+							NsName: nsname,
+							GVK:    schema.GroupVersionKind{Group: ngfAPI.GroupName, Kind: kind},
+						}: {
+							Source: &ngfAPI.ClientSettingsPolicy{
+								ObjectMeta: metav1.ObjectMeta{Name: nsname.Name, Namespace: nsname.Namespace, Generation: 1},
+							},
+							Valid:      test.valid,
+							Conditions: test.policyConds,
+							Ancestors: []graph.PolicyAncestor{
+								{Ancestor: v1.ParentReference{Name: "ancestor1"}},
+							},
+						},
+					}
+
+					k8sClient := createK8sClientFor(&ngfAPI.ClientSettingsPolicy{})
+					for _, pol := range graphPolicies {
+						g.Expect(k8sClient.Create(t.Context(), pol.Source)).To(Succeed())
+					}
+
+					reqs := PrepareActiveNGFPolicyRequests(
+						graphPolicies,
+						transitionTime,
+						gatewayCtlrName,
+					)
+					g.Expect(reqs).To(HaveLen(1))
+
+					NewUpdater(k8sClient).Update(t.Context(), logr.Discard(), reqs...)
+
+					var pol ngfAPI.ClientSettingsPolicy
+					g.Expect(k8sClient.Get(t.Context(), nsname, &pol)).To(Succeed())
+					g.Expect(pol.Status.Ancestors).To(HaveLen(1))
+					g.Expect(pol.Status.Ancestors[0].Conditions).To(ContainElement(test.expected))
+				})
+			}
+		})
+	}
+}
+
+func TestBuildWAFPolicyStatuses(t *testing.T) {
+	t.Parallel()
+	const gatewayCtlrName = "controller"
+
+	transitionTime := helpers.PrepareTimeForFakeClient(metav1.Now())
+
+	type policyCfg struct {
+		Ancestors  []graph.PolicyAncestor
+		Name       string
+		Conditions []conditions.Condition
+	}
+
+	getWAFPolicy := func(cfg policyCfg) *graph.Policy {
+		return &graph.Policy{
+			Source: &ngfAPI.WAFPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       cfg.Name,
+					Namespace:  "test",
+					Generation: 1,
+				},
+			},
+			Conditions: cfg.Conditions,
+			Ancestors:  cfg.Ancestors,
+		}
+	}
+
+	wgbPolicyKey := func(name string) graph.PolicyKey {
+		return graph.PolicyKey{
+			NsName: types.NamespacedName{Namespace: "test", Name: name},
+			GVK:    schema.GroupVersionKind{Group: ngfAPI.GroupName, Kind: kinds.WAFPolicy},
+		}
+	}
+
+	acceptedCond := metav1.Condition{
+		Type:               string(v1.PolicyConditionAccepted),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: 1,
+		LastTransitionTime: transitionTime,
+		Reason:             string(v1.PolicyReasonAccepted),
+		Message:            "The Policy is accepted",
+	}
+	resolvedRefsCond := metav1.Condition{
+		Type:               string(conditions.WAFResolvedRefsConditionType),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: 1,
+		LastTransitionTime: transitionTime,
+		Reason:             string(conditions.PolicyReasonResolvedRefs),
+		Message:            "All references are resolved",
+	}
+	programmedCond := metav1.Condition{
+		Type:               string(conditions.WAFProgrammedConditionType),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: 1,
+		LastTransitionTime: transitionTime,
+		Reason:             string(conditions.PolicyReasonProgrammed),
+		Message:            "Policy is programmed in the data plane",
+	}
+
+	tests := []struct {
+		policies map[graph.PolicyKey]*graph.Policy
+		expected map[types.NamespacedName]v1.PolicyStatus
+		name     string
+	}{
+		{
+			name: "valid WAF policy gets all three default conditions",
+			policies: map[graph.PolicyKey]*graph.Policy{
+				wgbPolicyKey("valid-waf"): getWAFPolicy(policyCfg{
+					Name: "valid-waf",
+					Ancestors: []graph.PolicyAncestor{
+						{
+							Ancestor: v1.ParentReference{
+								Name: "ancestor1",
+							},
+						},
+					},
+				}),
+			},
+			expected: map[types.NamespacedName]v1.PolicyStatus{
+				{Namespace: "test", Name: "valid-waf"}: {
+					Ancestors: []v1.PolicyAncestorStatus{
+						{
+							AncestorRef: v1.ParentReference{
+								Name: "ancestor1",
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								acceptedCond,
+								resolvedRefsCond,
+								programmedCond,
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "WAF policy with Programmed error overrides default",
+			policies: map[graph.PolicyKey]*graph.Policy{
+				wgbPolicyKey("fetch-err-waf"): getWAFPolicy(policyCfg{
+					Name: "fetch-err-waf",
+					Conditions: []conditions.Condition{
+						conditions.NewPolicyNotProgrammedBundleFetchError("connection refused"),
+					},
+					Ancestors: []graph.PolicyAncestor{
+						{
+							Ancestor: v1.ParentReference{
+								Name: "ancestor1",
+							},
+						},
+					},
+				}),
+			},
+			expected: map[types.NamespacedName]v1.PolicyStatus{
+				{Namespace: "test", Name: "fetch-err-waf"}: {
+					Ancestors: []v1.PolicyAncestorStatus{
+						{
+							AncestorRef: v1.ParentReference{
+								Name: "ancestor1",
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								acceptedCond,
+								resolvedRefsCond,
+								{
+									Type:               string(conditions.WAFProgrammedConditionType),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(conditions.PolicyReasonFetchError),
+									Message:            "Failed to fetch bundle: connection refused",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "WAF policy with integrity error",
+			policies: map[graph.PolicyKey]*graph.Policy{
+				wgbPolicyKey("integrity-err-waf"): getWAFPolicy(policyCfg{
+					Name: "integrity-err-waf",
+					Conditions: []conditions.Condition{
+						conditions.NewPolicyNotProgrammedIntegrityError("checksum mismatch"),
+					},
+					Ancestors: []graph.PolicyAncestor{
+						{
+							Ancestor: v1.ParentReference{
+								Name: "ancestor1",
+							},
+						},
+					},
+				}),
+			},
+			expected: map[types.NamespacedName]v1.PolicyStatus{
+				{Namespace: "test", Name: "integrity-err-waf"}: {
+					Ancestors: []v1.PolicyAncestorStatus{
+						{
+							AncestorRef: v1.ParentReference{
+								Name: "ancestor1",
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								acceptedCond,
+								resolvedRefsCond,
+								{
+									Type:               string(conditions.WAFProgrammedConditionType),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(conditions.PolicyReasonIntegrityError),
+									Message:            "Bundle integrity check failed: checksum mismatch",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "WAF policy with Accepted error overrides default Accepted",
+			policies: map[graph.PolicyKey]*graph.Policy{
+				wgbPolicyKey("invalid-waf"): getWAFPolicy(policyCfg{
+					Name: "invalid-waf",
+					Conditions: []conditions.Condition{
+						conditions.NewPolicyInvalid("spec is invalid"),
+					},
+					Ancestors: []graph.PolicyAncestor{
+						{
+							Ancestor: v1.ParentReference{
+								Name: "ancestor1",
+							},
+						},
+					},
+				}),
+			},
+			expected: map[types.NamespacedName]v1.PolicyStatus{
+				{Namespace: "test", Name: "invalid-waf"}: {
+					Ancestors: []v1.PolicyAncestorStatus{
+						{
+							AncestorRef: v1.ParentReference{
+								Name: "ancestor1",
+							},
+							ControllerName: gatewayCtlrName,
+							Conditions: []metav1.Condition{
+								resolvedRefsCond,
+								programmedCond,
+								{
+									Type:               string(v1.PolicyConditionAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(v1.PolicyReasonInvalid),
+									Message:            "spec is invalid",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			k8sClient := createK8sClientFor(&ngfAPI.WAFPolicy{})
+
+			for _, pol := range test.policies {
+				err := k8sClient.Create(t.Context(), pol.Source)
+				g.Expect(err).ToNot(HaveOccurred())
+			}
+
+			updater := NewUpdater(k8sClient)
+
+			reqs := PrepareActiveNGFPolicyRequests(
+				test.policies,
+				transitionTime,
+				gatewayCtlrName,
+			)
+
+			g.Expect(reqs).To(HaveLen(len(test.expected)))
+
+			updater.Update(t.Context(), logr.Discard(), reqs...)
+
+			for nsname, expected := range test.expected {
+				var pol ngfAPI.WAFPolicy
+
+				err := k8sClient.Get(t.Context(), nsname, &pol)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(helpers.Diff(expected, pol.Status)).To(BeEmpty())
+			}
+		})
+	}
+}
+
+func TestBuildSnippetsFilterStatuses(t *testing.T) {
+	t.Parallel()
+	transitionTime := helpers.PrepareTimeForFakeClient(metav1.Now())
+	const gatewayCtlrName = "controller"
+
+	validSnippetsFilter := &graph.SnippetsFilter{
+		Source: &ngfAPI.SnippetsFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "valid-snippet",
+				Namespace:  "test",
+				Generation: 1,
+			},
+			Spec: ngfAPI.SnippetsFilterSpec{
+				Snippets: []ngfAPI.Snippet{
+					{
+						Context: ngfAPI.NginxContextHTTP,
+						Value:   "proxy_buffer on;",
+					},
+				},
+			},
+		},
+		Valid: true,
+	}
+
+	invalidSnippetsFilter := &graph.SnippetsFilter{
+		Source: &ngfAPI.SnippetsFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "invalid-snippet",
+				Namespace:  "test",
+				Generation: 1,
+			},
+		},
+		Conditions: []conditions.Condition{conditions.NewSnippetsFilterInvalid("Invalid SnippetsFilter")},
+		Valid:      false,
+	}
+
+	tests := []struct {
+		snippetsFilters map[types.NamespacedName]*graph.SnippetsFilter
+		expected        map[types.NamespacedName]ngfAPI.SnippetsFilterStatus
+		name            string
+		expectedReqs    int
+	}{
+		{
+			name:         "nil snippetsFilters",
+			expectedReqs: 0,
+			expected:     map[types.NamespacedName]ngfAPI.SnippetsFilterStatus{},
+		},
+		{
+			name: "valid snippetsFilter",
+			snippetsFilters: map[types.NamespacedName]*graph.SnippetsFilter{
+				{Namespace: "test", Name: "valid-snippet"}: validSnippetsFilter,
+			},
+			expectedReqs: 1,
+			expected: map[types.NamespacedName]ngfAPI.SnippetsFilterStatus{
+				{Namespace: "test", Name: "valid-snippet"}: {
+					Controllers: []ngfAPI.ControllerStatus{
+						{
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(ngfAPI.SnippetsFilterConditionTypeAccepted),
+									Status:             metav1.ConditionTrue,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(ngfAPI.SnippetsFilterConditionReasonAccepted),
+									Message:            "The SnippetsFilter is accepted",
+								},
+							},
+							ControllerName: gatewayCtlrName,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "invalid snippetsFilter",
+			snippetsFilters: map[types.NamespacedName]*graph.SnippetsFilter{
+				{Namespace: "test", Name: "invalid-snippet"}: invalidSnippetsFilter,
+			},
+			expectedReqs: 1,
+			expected: map[types.NamespacedName]ngfAPI.SnippetsFilterStatus{
+				{Namespace: "test", Name: "invalid-snippet"}: {
+					Controllers: []ngfAPI.ControllerStatus{
+						{
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(ngfAPI.SnippetsFilterConditionTypeAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(ngfAPI.SnippetsFilterConditionReasonInvalid),
+									Message:            "Invalid SnippetsFilter",
+								},
+							},
+							ControllerName: gatewayCtlrName,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			k8sClient := createK8sClientFor(&ngfAPI.SnippetsFilter{})
+
+			for _, snippets := range test.snippetsFilters {
+				err := k8sClient.Create(t.Context(), snippets.Source)
+				g.Expect(err).ToNot(HaveOccurred())
+			}
+
+			updater := NewUpdater(k8sClient)
+
+			reqs := PrepareActiveSnippetsFilterRequests(
+				test.snippetsFilters,
+				transitionTime,
+				gatewayCtlrName,
+			)
+
+			g.Expect(reqs).To(HaveLen(test.expectedReqs))
+
+			updater.Update(t.Context(), logr.Discard(), reqs...)
+
+			for nsname, expected := range test.expected {
+				var snippetsFilter ngfAPI.SnippetsFilter
+
+				err := k8sClient.Get(t.Context(), nsname, &snippetsFilter)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(helpers.Diff(expected, snippetsFilter.Status)).To(BeEmpty())
+			}
+		})
+	}
+}
+
+func TestPrepareSnippetsFilterRequestsClearsStatusesForUnhandledFilters(t *testing.T) {
+	t.Parallel()
+
+	g := NewWithT(t)
+	nsname := types.NamespacedName{Namespace: "test", Name: "orphaned-snippet"}
+	filter := &ngfAPI.SnippetsFilter{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  nsname.Namespace,
+			Name:       nsname.Name,
+			Generation: 1,
+		},
+	}
+
+	k8sClient := createK8sClientFor(&ngfAPI.SnippetsFilter{})
+	g.Expect(k8sClient.Create(t.Context(), filter)).To(Succeed())
+
+	updater := NewUpdater(k8sClient)
+	updater.Update(t.Context(), logr.Discard(), UpdateRequest{
+		NsName:       nsname,
+		ResourceType: &ngfAPI.SnippetsFilter{},
+		Setter: newSnippetsFilterStatusSetter(ngfAPI.SnippetsFilterStatus{Controllers: []ngfAPI.ControllerStatus{{
+			ControllerName: gatewayCtlrName,
+			Conditions:     []metav1.Condition{{Type: "Accepted", Message: "stale"}},
+		}}}, gatewayCtlrName),
+	})
+
+	reqs := PrepareDroppedRequests(
+		HandledStatusResources{SnippetsFilters: map[types.NamespacedName]struct{}{nsname: {}}},
+		gatewayCtlrName,
+	)
+
+	g.Expect(reqs).To(HaveLen(1))
+	updater.Update(t.Context(), logr.Discard(), reqs...)
+
+	var updated ngfAPI.SnippetsFilter
+	g.Expect(k8sClient.Get(t.Context(), nsname, &updated)).To(Succeed())
+	g.Expect(updated.Status.Controllers).To(BeEmpty())
+}
+
+func TestPrepareExternalLoadBalancerRequests(t *testing.T) {
+	t.Parallel()
+	transitionTime := helpers.PrepareTimeForFakeClient(metav1.Now())
+
+	elbSource := func(name string) *ngfAPI.ExternalLoadBalancer {
+		return &ngfAPI.ExternalLoadBalancer{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test", Generation: 1},
+		}
+	}
+
+	acceptedELB := &graph.ExternalLoadBalancer{
+		Source:     elbSource("accepted-elb"),
+		Valid:      true,
+		Conditions: []conditions.Condition{conditions.NewExternalLoadBalancerAccepted()},
+	}
+	invalidELB := &graph.ExternalLoadBalancer{
+		Source:     elbSource("invalid-elb"),
+		Valid:      false,
+		Conditions: []conditions.Condition{conditions.NewExternalLoadBalancerInvalid("bad partition")},
+	}
+	conflictedELB := &graph.ExternalLoadBalancer{
+		Source:     elbSource("conflicted-elb"),
+		Valid:      false,
+		Conditions: []conditions.Condition{conditions.NewExternalLoadBalancerConflicted("already fronted")},
+	}
+
+	expectedController := func(status metav1.ConditionStatus, reason, message string) []ngfAPI.ControllerStatus {
+		return []ngfAPI.ControllerStatus{
+			{
+				Conditions: []metav1.Condition{
+					{
+						Type:               string(ngfAPI.ExternalLoadBalancerConditionTypeAccepted),
+						Status:             status,
+						ObservedGeneration: 1,
+						LastTransitionTime: transitionTime,
+						Reason:             reason,
+						Message:            message,
+					},
+				},
+				ControllerName: gatewayCtlrName,
+			},
+		}
+	}
+
+	tests := []struct {
+		externalLoadBalancers map[types.NamespacedName]*graph.ExternalLoadBalancer
+		expected              map[types.NamespacedName]ngfAPI.ExternalLoadBalancerStatus
+		name                  string
+		expectedReqs          int
+	}{
+		{
+			name:         "nil externalLoadBalancers",
+			expectedReqs: 0,
+			expected:     map[types.NamespacedName]ngfAPI.ExternalLoadBalancerStatus{},
+		},
+		{
+			name: "accepted externalLoadBalancer",
+			externalLoadBalancers: map[types.NamespacedName]*graph.ExternalLoadBalancer{
+				{Namespace: "test", Name: "accepted-elb"}: acceptedELB,
+			},
+			expectedReqs: 1,
+			expected: map[types.NamespacedName]ngfAPI.ExternalLoadBalancerStatus{
+				{Namespace: "test", Name: "accepted-elb"}: {
+					Controllers: expectedController(
+						metav1.ConditionTrue,
+						string(ngfAPI.ExternalLoadBalancerConditionReasonAccepted),
+						"The ExternalLoadBalancer is accepted",
+					),
+				},
+			},
+		},
+		{
+			name: "invalid externalLoadBalancer overrides the default Accepted condition",
+			externalLoadBalancers: map[types.NamespacedName]*graph.ExternalLoadBalancer{
+				{Namespace: "test", Name: "invalid-elb"}: invalidELB,
+			},
+			expectedReqs: 1,
+			expected: map[types.NamespacedName]ngfAPI.ExternalLoadBalancerStatus{
+				{Namespace: "test", Name: "invalid-elb"}: {
+					Controllers: expectedController(
+						metav1.ConditionFalse,
+						string(ngfAPI.ExternalLoadBalancerConditionReasonInvalid),
+						"bad partition",
+					),
+				},
+			},
+		},
+		{
+			name: "conflicted externalLoadBalancer overrides the default Accepted condition",
+			externalLoadBalancers: map[types.NamespacedName]*graph.ExternalLoadBalancer{
+				{Namespace: "test", Name: "conflicted-elb"}: conflictedELB,
+			},
+			expectedReqs: 1,
+			expected: map[types.NamespacedName]ngfAPI.ExternalLoadBalancerStatus{
+				{Namespace: "test", Name: "conflicted-elb"}: {
+					Controllers: expectedController(
+						metav1.ConditionFalse,
+						string(ngfAPI.ExternalLoadBalancerConditionReasonConflicted),
+						"already fronted",
+					),
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			k8sClient := createK8sClientFor(&ngfAPI.ExternalLoadBalancer{})
+
+			for _, elb := range test.externalLoadBalancers {
+				g.Expect(k8sClient.Create(t.Context(), elb.Source)).ToNot(HaveOccurred())
+			}
+
+			updater := NewUpdater(k8sClient)
+
+			reqs := PrepareActiveExternalLoadBalancerRequests(
+				test.externalLoadBalancers,
+				transitionTime,
+				gatewayCtlrName,
+			)
+
+			g.Expect(reqs).To(HaveLen(test.expectedReqs))
+
+			updater.Update(t.Context(), logr.Discard(), reqs...)
+
+			for nsname, expected := range test.expected {
+				var elb ngfAPI.ExternalLoadBalancer
+
+				g.Expect(k8sClient.Get(t.Context(), nsname, &elb)).ToNot(HaveOccurred())
+				g.Expect(helpers.Diff(expected, elb.Status)).To(BeEmpty())
+			}
+		})
+	}
+}
+
+func TestPrepareExternalLoadBalancerRequestsClearsStatusesForUnhandledResources(t *testing.T) {
+	t.Parallel()
+
+	g := NewWithT(t)
+	nsname := types.NamespacedName{Namespace: "test", Name: "orphaned-elb"}
+	elb := &ngfAPI.ExternalLoadBalancer{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  nsname.Namespace,
+			Name:       nsname.Name,
+			Generation: 1,
+		},
+	}
+
+	k8sClient := createK8sClientFor(&ngfAPI.ExternalLoadBalancer{})
+	g.Expect(k8sClient.Create(t.Context(), elb)).To(Succeed())
+
+	updater := NewUpdater(k8sClient)
+	updater.Update(t.Context(), logr.Discard(), UpdateRequest{
+		NsName:       nsname,
+		ResourceType: &ngfAPI.ExternalLoadBalancer{},
+		Setter: newExternalLoadBalancerStatusSetter(ngfAPI.ExternalLoadBalancerStatus{Controllers: []ngfAPI.ControllerStatus{{
+			ControllerName: gatewayCtlrName,
+			Conditions:     []metav1.Condition{{Type: "Accepted", Message: "stale"}},
+		}}}, gatewayCtlrName),
+	})
+
+	reqs := PrepareDroppedRequests(
+		HandledStatusResources{ExternalLoadBalancers: map[types.NamespacedName]struct{}{nsname: {}}},
+		gatewayCtlrName,
+	)
+
+	g.Expect(reqs).To(HaveLen(1))
+	updater.Update(t.Context(), logr.Discard(), reqs...)
+
+	var updated ngfAPI.ExternalLoadBalancer
+	g.Expect(k8sClient.Get(t.Context(), nsname, &updated)).To(Succeed())
+	g.Expect(updated.Status.Controllers).To(BeEmpty())
+}
+
+func TestBuildAuthenticationFilterStatuses(t *testing.T) {
+	t.Parallel()
+	transitionTime := helpers.PrepareTimeForFakeClient(metav1.Now())
+
+	validAuthenticationFilter := &graph.AuthenticationFilter{
+		Source: &ngfAPI.AuthenticationFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "valid-auth",
+				Namespace:  "test",
+				Generation: 1,
+			},
+		},
+		Valid: true,
+	}
+
+	invalidAuthenticationFilter := &graph.AuthenticationFilter{
+		Source: &ngfAPI.AuthenticationFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "invalid-auth",
+				Namespace:  "test",
+				Generation: 1,
+			},
+		},
+		Conditions: []conditions.Condition{conditions.NewAuthenticationFilterInvalid("Invalid AuthenticationFilter")},
+		Valid:      false,
+	}
+
+	tests := []struct {
+		authenticationFilters map[types.NamespacedName]*graph.AuthenticationFilter
+		expected              map[types.NamespacedName]ngfAPI.AuthenticationFilterStatus
+		name                  string
+		expectedReqs          int
+	}{
+		{
+			name:         "nil authenticationFilters",
+			expectedReqs: 0,
+			expected:     map[types.NamespacedName]ngfAPI.AuthenticationFilterStatus{},
+		},
+		{
+			name: "valid authenticationFilter",
+			authenticationFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "valid-auth"}: validAuthenticationFilter,
+			},
+			expectedReqs: 1,
+			expected: map[types.NamespacedName]ngfAPI.AuthenticationFilterStatus{
+				{Namespace: "test", Name: "valid-auth"}: {
+					Controllers: []ngfAPI.ControllerStatus{
+						{
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(ngfAPI.AuthenticationFilterConditionTypeAccepted),
+									Status:             metav1.ConditionTrue,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(ngfAPI.AuthenticationFilterConditionReasonAccepted),
+									Message:            "The AuthenticationFilter is accepted",
+								},
+							},
+							ControllerName: gatewayCtlrName,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "invalid authenticationFilter",
+			authenticationFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "invalid-auth"}: invalidAuthenticationFilter,
+			},
+			expectedReqs: 1,
+			expected: map[types.NamespacedName]ngfAPI.AuthenticationFilterStatus{
+				{Namespace: "test", Name: "invalid-auth"}: {
+					Controllers: []ngfAPI.ControllerStatus{
+						{
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(ngfAPI.AuthenticationFilterConditionTypeAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(ngfAPI.AuthenticationFilterConditionReasonInvalid),
+									Message:            "Invalid AuthenticationFilter",
+								},
+							},
+							ControllerName: gatewayCtlrName,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			k8sClient := createK8sClientFor(&ngfAPI.AuthenticationFilter{})
+
+			for _, af := range test.authenticationFilters {
+				err := k8sClient.Create(t.Context(), af.Source)
+				g.Expect(err).ToNot(HaveOccurred())
+			}
+
+			updater := NewUpdater(k8sClient)
+
+			reqs := PrepareActiveAuthenticationFilterRequests(
+				test.authenticationFilters,
+				transitionTime,
+				gatewayCtlrName,
+			)
+
+			g.Expect(reqs).To(HaveLen(test.expectedReqs))
+
+			updater.Update(t.Context(), logr.Discard(), reqs...)
+
+			for nsname, expected := range test.expected {
+				var authFilter ngfAPI.AuthenticationFilter
+
+				err := k8sClient.Get(t.Context(), nsname, &authFilter)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(helpers.Diff(expected, authFilter.Status)).To(BeEmpty())
+			}
+		})
+	}
+}
+
+func TestPrepareAuthenticationFilterRequestsClearsStatusesForUnhandledFilters(t *testing.T) {
+	t.Parallel()
+
+	g := NewWithT(t)
+	nsname := types.NamespacedName{Namespace: "test", Name: "orphaned-auth"}
+	filter := &ngfAPI.AuthenticationFilter{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  nsname.Namespace,
+			Name:       nsname.Name,
+			Generation: 1,
+		},
+	}
+
+	k8sClient := createK8sClientFor(&ngfAPI.AuthenticationFilter{})
+	g.Expect(k8sClient.Create(t.Context(), filter)).To(Succeed())
+
+	updater := NewUpdater(k8sClient)
+	updater.Update(t.Context(), logr.Discard(), UpdateRequest{
+		NsName:       nsname,
+		ResourceType: &ngfAPI.AuthenticationFilter{},
+		Setter: newAuthenticationFilterStatusSetter(ngfAPI.AuthenticationFilterStatus{Controllers: []ngfAPI.ControllerStatus{{
+			ControllerName: gatewayCtlrName,
+			Conditions:     []metav1.Condition{{Type: "Accepted", Message: "stale"}},
+		}}}, gatewayCtlrName),
+	})
+
+	reqs := PrepareDroppedRequests(
+		HandledStatusResources{AuthenticationFilters: map[types.NamespacedName]struct{}{nsname: {}}},
+		gatewayCtlrName,
+	)
+
+	g.Expect(reqs).To(HaveLen(1))
+	updater.Update(t.Context(), logr.Discard(), reqs...)
+
+	var updated ngfAPI.AuthenticationFilter
+	g.Expect(k8sClient.Get(t.Context(), nsname, &updated)).To(Succeed())
+	g.Expect(updated.Status.Controllers).To(BeEmpty())
+}
+
+func TestBuildInferencePoolStatuses(t *testing.T) {
+	t.Parallel()
+	transitionTime := helpers.PrepareTimeForFakeClient(metav1.Now())
+	group := ""
+
+	validAcceptedCondition := metav1.Condition{
+		Type:               string(inference.InferencePoolConditionAccepted),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: 1,
+		LastTransitionTime: transitionTime,
+		Reason:             string(inference.InferencePoolReasonAccepted),
+		Message:            "The InferencePool is accepted by the Gateway.",
+	}
+
+	validResolvedRefsCondition := metav1.Condition{
+		Type:               string(inference.InferencePoolConditionResolvedRefs),
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: 1,
+		LastTransitionTime: transitionTime,
+		Reason:             string(inference.InferencePoolConditionResolvedRefs),
+		Message:            "The InferencePool references a valid ExtensionRef.",
+	}
+
+	referencedGateways := map[types.NamespacedName]*graph.Gateway{
+		{Namespace: "test", Name: "gateway-1"}: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "gateway-1",
+					Namespace: "test",
+				},
+			},
+			Valid: true,
+		},
+		{Namespace: "test", Name: "gateway-2"}: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "gateway-2",
+					Namespace: "test",
+				},
+			},
+			Valid: true,
+		},
+	}
+
+	validInferencePool := &inference.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "valid-inference-pool",
+			Namespace:  "test",
+			Generation: 1,
+		},
+	}
+
+	validInferencePoolWithInvalidExtensionRef := &inference.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "valid-inference-pool",
+			Namespace:  "test",
+			Generation: 1,
+		},
+		Spec: inference.InferencePoolSpec{
+			EndpointPickerRef: &inference.EndpointPickerRef{
+				Name: inference.ObjectName("invalid-extension-ref"),
+			},
+		},
+	}
+
+	validInferencePoolWithStatus := &inference.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "valid-inference-pool-with-status",
+			Namespace:  "test",
+			Generation: 1,
+		},
+		Status: inference.InferencePoolStatus{
+			Parents: []inference.ParentStatus{
+				{
+					Conditions: []metav1.Condition{
+						validAcceptedCondition,
+						validResolvedRefsCondition,
+					},
+					ParentRef: inference.ParentReference{
+						Namespace: inference.Namespace("test"),
+						Name:      "gateway-1",
+						Kind:      kinds.Gateway,
+						Group:     helpers.GetPointer(inference.Group(group)),
+					},
+				},
+			},
+		},
+	}
+
+	// Same Name/Namespace/Kind as an nginx Gateway parent ref, but a different Group.
+	// This should NOT be treated as a match by containsParentReference, so this parent
+	// status must be preserved (not filtered out) even though it's no longer referenced.
+	validInferencePoolWithDifferentGroupStatus := &inference.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "valid-inference-pool-with-different-group-status",
+			Namespace:  "test",
+			Generation: 1,
+		},
+		Status: inference.InferencePoolStatus{
+			Parents: []inference.ParentStatus{
+				{
+					Conditions: []metav1.Condition{
+						validAcceptedCondition,
+						validResolvedRefsCondition,
+					},
+					ParentRef: inference.ParentReference{
+						Namespace: inference.Namespace("test"),
+						Name:      "gateway-1",
+						Kind:      kinds.Gateway,
+						Group:     helpers.GetPointer(inference.Group("different.example.com")),
+					},
+				},
+			},
+		},
+	}
+
+	// Same Name/Namespace/Kind as an nginx Gateway parent ref, and a Group of "core" which
+	// is equivalent to the empty string Group used by nginx's own parent refs. This SHOULD be
+	// treated as a match by containsParentReference, so this parent status must be removed
+	// since the pool is no longer referenced.
+	validInferencePoolWithCoreGroupStatus := &inference.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "valid-inference-pool-with-core-group-status",
+			Namespace:  "test",
+			Generation: 1,
+		},
+		Status: inference.InferencePoolStatus{
+			Parents: []inference.ParentStatus{
+				{
+					Conditions: []metav1.Condition{
+						validAcceptedCondition,
+						validResolvedRefsCondition,
+					},
+					ParentRef: inference.ParentReference{
+						Namespace: inference.Namespace("test"),
+						Name:      "gateway-1",
+						Kind:      kinds.Gateway,
+						Group:     helpers.GetPointer(inference.Group("core")),
+					},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		referencedInferencePool map[types.NamespacedName]*graph.ReferencedInferencePool
+		expectedPoolWithStatus  map[types.NamespacedName]inference.InferencePoolStatus
+		name                    string
+		clusterInferencePools   inference.InferencePoolList
+		expectedReqs            int
+	}{
+		{
+			name:         "no referenced inferencePools",
+			expectedReqs: 0,
+		},
+		{
+			name: "an inference pool has valid status for multiple gateways",
+			referencedInferencePool: map[types.NamespacedName]*graph.ReferencedInferencePool{
+				{Namespace: "test", Name: "valid-inference-pool"}: {
+					Source: validInferencePool,
+					Gateways: []*v1.Gateway{
+						{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "gateway-1",
+								Namespace: "test",
+							},
+						},
+						{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "gateway-2",
+								Namespace: "test",
+							},
+						},
+					},
+				},
+			},
+			clusterInferencePools: inference.InferencePoolList{
+				Items: []inference.InferencePool{
+					*validInferencePool,
+				},
+			},
+			expectedReqs: 1,
+			expectedPoolWithStatus: map[types.NamespacedName]inference.InferencePoolStatus{
+				{Namespace: "test", Name: "valid-inference-pool"}: {
+					Parents: []inference.ParentStatus{
+						{
+							Conditions: []metav1.Condition{
+								validAcceptedCondition,
+								validResolvedRefsCondition,
+							},
+							ParentRef: inference.ParentReference{
+								Namespace: inference.Namespace("test"),
+								Name:      "gateway-1",
+								Kind:      kinds.Gateway,
+								Group:     helpers.GetPointer(inference.Group(group)),
+							},
+						},
+						{
+							Conditions: []metav1.Condition{
+								validAcceptedCondition,
+								validResolvedRefsCondition,
+							},
+							ParentRef: inference.ParentReference{
+								Namespace: inference.Namespace("test"),
+								Name:      "gateway-2",
+								Kind:      kinds.Gateway,
+								Group:     helpers.GetPointer(inference.Group(group)),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "an inference pool has accepted valid status and is referenced by invalid ExtensionRef",
+			referencedInferencePool: map[types.NamespacedName]*graph.ReferencedInferencePool{
+				{Namespace: "test", Name: "valid-inference-pool"}: {
+					Source: validInferencePoolWithInvalidExtensionRef,
+					Gateways: []*v1.Gateway{
+						{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "gateway-1",
+								Namespace: "test",
+							},
+						},
+					},
+					Conditions: []conditions.Condition{
+						conditions.NewInferencePoolInvalidExtensionref("Invalid ExtensionRef: test/invalid-extension-ref"),
+					},
+				},
+			},
+			clusterInferencePools: inference.InferencePoolList{
+				Items: []inference.InferencePool{
+					*validInferencePoolWithInvalidExtensionRef,
+				},
+			},
+			expectedReqs: 1,
+			expectedPoolWithStatus: map[types.NamespacedName]inference.InferencePoolStatus{
+				{Namespace: "test", Name: "valid-inference-pool"}: {
+					Parents: []inference.ParentStatus{
+						{
+							Conditions: []metav1.Condition{
+								validAcceptedCondition,
+								{
+									Type:               string(inference.InferencePoolConditionResolvedRefs),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(inference.InferencePoolReasonInvalidExtensionRef),
+									Message:            "Invalid ExtensionRef: test/invalid-extension-ref",
+								},
+							},
+							ParentRef: inference.ParentReference{
+								Namespace: inference.Namespace("test"),
+								Name:      "gateway-1",
+								Kind:      kinds.Gateway,
+								Group:     helpers.GetPointer(inference.Group(group)),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "an inference pool is referencing an invalid route and is referenced by invalid ExtensionRef",
+			referencedInferencePool: map[types.NamespacedName]*graph.ReferencedInferencePool{
+				{Namespace: "test", Name: "valid-inference-pool"}: {
+					Source: validInferencePool,
+					Gateways: []*v1.Gateway{
+						{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "gateway-1",
+								Namespace: "test",
+							},
+						},
+					},
+					Conditions: []conditions.Condition{
+						conditions.NewInferencePoolInvalidHTTPRouteNotAccepted("Invalid HTTPRoute: test/invalid-route not accepted"),
+						conditions.NewInferencePoolInvalidExtensionref("Invalid ExtensionRef: test/invalid-extension-ref"),
+					},
+				},
+			},
+			clusterInferencePools: inference.InferencePoolList{
+				Items: []inference.InferencePool{
+					*validInferencePool,
+				},
+			},
+			expectedReqs: 1,
+			expectedPoolWithStatus: map[types.NamespacedName]inference.InferencePoolStatus{
+				{Namespace: "test", Name: "valid-inference-pool"}: {
+					Parents: []inference.ParentStatus{
+						{
+							Conditions: []metav1.Condition{
+								{
+									Type:               string(inference.InferencePoolConditionAccepted),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(inference.InferencePoolReasonHTTPRouteNotAccepted),
+									Message:            "Invalid HTTPRoute: test/invalid-route not accepted",
+								},
+								{
+									Type:               string(inference.InferencePoolConditionResolvedRefs),
+									Status:             metav1.ConditionFalse,
+									ObservedGeneration: 1,
+									LastTransitionTime: transitionTime,
+									Reason:             string(inference.InferencePoolReasonInvalidExtensionRef),
+									Message:            "Invalid ExtensionRef: test/invalid-extension-ref",
+								},
+							},
+							ParentRef: inference.ParentReference{
+								Namespace: inference.Namespace("test"),
+								Name:      "gateway-1",
+								Kind:      kinds.Gateway,
+								Group:     helpers.GetPointer(inference.Group(group)),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:                    "inference pool status gets removed if no longer referenced",
+			referencedInferencePool: map[types.NamespacedName]*graph.ReferencedInferencePool{},
+			clusterInferencePools: inference.InferencePoolList{
+				Items: []inference.InferencePool{
+					*validInferencePoolWithStatus,
+				},
+			},
+			expectedReqs: 1,
+			expectedPoolWithStatus: map[types.NamespacedName]inference.InferencePoolStatus{
+				{Namespace: "test", Name: "valid-inference-pool-with-status"}: {
+					Parents: nil,
+				},
+			},
+		},
+		{
+			name:                    "inference pool parent status with different Group is not removed",
+			referencedInferencePool: map[types.NamespacedName]*graph.ReferencedInferencePool{},
+			clusterInferencePools: inference.InferencePoolList{
+				Items: []inference.InferencePool{
+					*validInferencePoolWithDifferentGroupStatus,
+				},
+			},
+			expectedReqs: 0,
+			expectedPoolWithStatus: map[types.NamespacedName]inference.InferencePoolStatus{
+				{Namespace: "test", Name: "valid-inference-pool-with-different-group-status"}: {
+					Parents: []inference.ParentStatus{
+						{
+							Conditions: []metav1.Condition{
+								validAcceptedCondition,
+								validResolvedRefsCondition,
+							},
+							ParentRef: inference.ParentReference{
+								Namespace: inference.Namespace("test"),
+								Name:      "gateway-1",
+								Kind:      kinds.Gateway,
+								Group:     helpers.GetPointer(inference.Group("different.example.com")),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:                    "inference pool parent status with core Group is removed",
+			referencedInferencePool: map[types.NamespacedName]*graph.ReferencedInferencePool{},
+			clusterInferencePools: inference.InferencePoolList{
+				Items: []inference.InferencePool{
+					*validInferencePoolWithCoreGroupStatus,
+				},
+			},
+			expectedReqs: 1,
+			expectedPoolWithStatus: map[types.NamespacedName]inference.InferencePoolStatus{
+				{Namespace: "test", Name: "valid-inference-pool-with-core-group-status"}: {
+					Parents: nil,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			k8sClient := createK8sClientFor(&inference.InferencePool{})
+			for _, ip := range test.clusterInferencePools.Items {
+				err := k8sClient.Create(t.Context(), &ip)
+				g.Expect(err).ToNot(HaveOccurred())
+			}
+
+			updater := NewUpdater(k8sClient)
+			reqs := PrepareInferencePoolRequests(
+				test.referencedInferencePool,
+				&test.clusterInferencePools,
+				referencedGateways,
+				transitionTime,
+			)
+			g.Expect(reqs).To(HaveLen(test.expectedReqs))
+			updater.Update(t.Context(), logr.Discard(), reqs...)
+
+			for nsname, expected := range test.expectedPoolWithStatus {
+				var inferencePool inference.InferencePool
+
+				err := k8sClient.Get(t.Context(), nsname, &inferencePool)
+				g.Expect(err).ToNot(HaveOccurred())
+				g.Expect(helpers.Diff(expected, inferencePool.Status)).To(BeEmpty())
+			}
+		})
+	}
+}
+
+func TestBuildTCPRouteStatuses(t *testing.T) {
+	t.Parallel()
+	tcpValid := &v1.TCPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "tcp-valid",
+			Generation: 3,
+		},
+		Spec: v1.TCPRouteSpec{
+			CommonRouteSpec: commonRouteSpecValid,
+		},
+	}
+	tcpInvalid := &v1.TCPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "tcp-invalid",
+			Generation: 3,
+		},
+		Spec: v1.TCPRouteSpec{
+			CommonRouteSpec: commonRouteSpecInvalid,
+		},
+	}
+	routes := map[graph.L4RouteKey]*graph.L4Route{
+		graph.CreateRouteKeyL4(tcpValid): {
+			Valid:      true,
+			Source:     tcpValid,
+			ParentRefs: parentRefsValid,
+		},
+		graph.CreateRouteKeyL4(tcpInvalid): {
+			Valid:      false,
+			Conditions: []conditions.Condition{invalidRouteCondition},
+			Source:     tcpInvalid,
+			ParentRefs: parentRefsInvalid,
+		},
+	}
+
+	expectedStatuses := map[types.NamespacedName]v1.TCPRouteStatus{
+		{Namespace: "test", Name: "tcp-valid"}: {
+			RouteStatus: routeStatusValid,
+		},
+		{Namespace: "test", Name: "tcp-invalid"}: {
+			RouteStatus: routeStatusInvalid,
+		},
+	}
+
+	g := NewWithT(t)
+
+	k8sClient := createK8sClientFor(&v1.TCPRoute{})
+
+	for _, r := range routes {
+		err := k8sClient.Create(t.Context(), r.Source)
+		g.Expect(err).ToNot(HaveOccurred())
+	}
+
+	updater := NewUpdater(k8sClient)
+
+	reqs := PrepareActiveRouteRequests(
+		routes,
+		map[graph.RouteKey]*graph.L7Route{},
+		transitionTime,
+		gatewayCtlrName,
+	)
+
+	updater.Update(t.Context(), logr.Discard(), reqs...)
+
+	g.Expect(reqs).To(HaveLen(len(expectedStatuses)))
+
+	for nsname, expected := range expectedStatuses {
+		var tcpRoute v1.TCPRoute
+
+		err := k8sClient.Get(t.Context(), nsname, &tcpRoute)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(expected.RouteStatus.Parents).To(ConsistOf(tcpRoute.Status.Parents))
+	}
+}
+
+func TestBuildUDPRouteStatuses(t *testing.T) {
+	t.Parallel()
+	udpValid := &v1.UDPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "udp-valid",
+			Generation: 3,
+		},
+		Spec: v1.UDPRouteSpec{
+			CommonRouteSpec: commonRouteSpecValid,
+		},
+	}
+	udpInvalid := &v1.UDPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "udp-invalid",
+			Generation: 3,
+		},
+		Spec: v1.UDPRouteSpec{
+			CommonRouteSpec: commonRouteSpecInvalid,
+		},
+	}
+	routes := map[graph.L4RouteKey]*graph.L4Route{
+		graph.CreateRouteKeyL4(udpValid): {
+			Valid:      true,
+			Source:     udpValid,
+			ParentRefs: parentRefsValid,
+		},
+		graph.CreateRouteKeyL4(udpInvalid): {
+			Valid:      false,
+			Conditions: []conditions.Condition{invalidRouteCondition},
+			Source:     udpInvalid,
+			ParentRefs: parentRefsInvalid,
+		},
+	}
+
+	expectedStatuses := map[types.NamespacedName]v1.UDPRouteStatus{
+		{Namespace: "test", Name: "udp-valid"}: {
+			RouteStatus: routeStatusValid,
+		},
+		{Namespace: "test", Name: "udp-invalid"}: {
+			RouteStatus: routeStatusInvalid,
+		},
+	}
+
+	g := NewWithT(t)
+
+	k8sClient := createK8sClientFor(&v1.UDPRoute{})
+
+	for _, r := range routes {
+		err := k8sClient.Create(t.Context(), r.Source)
+		g.Expect(err).ToNot(HaveOccurred())
+	}
+
+	updater := NewUpdater(k8sClient)
+
+	reqs := PrepareActiveRouteRequests(
+		routes,
+		map[graph.RouteKey]*graph.L7Route{},
+		transitionTime,
+		gatewayCtlrName,
+	)
+
+	updater.Update(t.Context(), logr.Discard(), reqs...)
+
+	g.Expect(reqs).To(HaveLen(len(expectedStatuses)))
+
+	for nsname, expected := range expectedStatuses {
+		var udpRoute v1.UDPRoute
+
+		err := k8sClient.Get(t.Context(), nsname, &udpRoute)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(expected.RouteStatus.Parents).To(ConsistOf(udpRoute.Status.Parents))
+	}
+}
+
+func TestPrepareRouteRequestsClearsStatusesForUnhandledRoutes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		resourceType ngftypes.ObjectType
+		newObject    func(types.NamespacedName) client.Object
+		seedStatus   func(types.NamespacedName) UpdateRequest
+		dropped      func(types.NamespacedName) HandledStatusResources
+		assertEmpty  func(*WithT, client.Client, types.NamespacedName)
+		name         string
+	}{
+		{
+			name:         "HTTPRoute",
+			resourceType: &v1.HTTPRoute{},
+			newObject: func(nsname types.NamespacedName) client.Object {
+				return &v1.HTTPRoute{ObjectMeta: metav1.ObjectMeta{Namespace: nsname.Namespace, Name: nsname.Name, Generation: 1}}
+			},
+			seedStatus: func(nsname types.NamespacedName) UpdateRequest {
+				return UpdateRequest{
+					NsName:       nsname,
+					ResourceType: &v1.HTTPRoute{},
+					Setter: newHTTPRouteStatusSetter(v1.HTTPRouteStatus{RouteStatus: v1.RouteStatus{Parents: []v1.RouteParentStatus{{
+						ControllerName: v1.GatewayController(gatewayCtlrName),
+						ParentRef:      v1.ParentReference{Name: "gateway", Namespace: helpers.GetPointer(v1.Namespace("test"))},
+						Conditions:     []metav1.Condition{{Type: "Accepted", Message: "stale"}},
+					}}}}, gatewayCtlrName),
+				}
+			},
+			dropped: func(nsname types.NamespacedName) HandledStatusResources {
+				return HandledStatusResources{HTTPRoutes: map[types.NamespacedName]struct{}{nsname: {}}}
+			},
+			assertEmpty: func(g *WithT, k8sClient client.Client, nsname types.NamespacedName) {
+				var updated v1.HTTPRoute
+				g.Expect(k8sClient.Get(t.Context(), nsname, &updated)).To(Succeed())
+				g.Expect(updated.Status.Parents).To(BeEmpty())
+			},
+		},
+		{
+			name:         "GRPCRoute",
+			resourceType: &v1.GRPCRoute{},
+			newObject: func(nsname types.NamespacedName) client.Object {
+				return &v1.GRPCRoute{ObjectMeta: metav1.ObjectMeta{Namespace: nsname.Namespace, Name: nsname.Name, Generation: 1}}
+			},
+			seedStatus: func(nsname types.NamespacedName) UpdateRequest {
+				return UpdateRequest{
+					NsName:       nsname,
+					ResourceType: &v1.GRPCRoute{},
+					Setter: newGRPCRouteStatusSetter(v1.GRPCRouteStatus{RouteStatus: v1.RouteStatus{Parents: []v1.RouteParentStatus{{
+						ControllerName: v1.GatewayController(gatewayCtlrName),
+						ParentRef:      v1.ParentReference{Name: "gateway", Namespace: helpers.GetPointer(v1.Namespace("test"))},
+						Conditions:     []metav1.Condition{{Type: "Accepted", Message: "stale"}},
+					}}}}, gatewayCtlrName),
+				}
+			},
+			dropped: func(nsname types.NamespacedName) HandledStatusResources {
+				return HandledStatusResources{GRPCRoutes: map[types.NamespacedName]struct{}{nsname: {}}}
+			},
+			assertEmpty: func(g *WithT, k8sClient client.Client, nsname types.NamespacedName) {
+				var updated v1.GRPCRoute
+				g.Expect(k8sClient.Get(t.Context(), nsname, &updated)).To(Succeed())
+				g.Expect(updated.Status.Parents).To(BeEmpty())
+			},
+		},
+		{
+			name:         "TLSRoute",
+			resourceType: &v1.TLSRoute{},
+			newObject: func(nsname types.NamespacedName) client.Object {
+				return &v1.TLSRoute{ObjectMeta: metav1.ObjectMeta{Namespace: nsname.Namespace, Name: nsname.Name, Generation: 1}}
+			},
+			seedStatus: func(nsname types.NamespacedName) UpdateRequest {
+				return UpdateRequest{
+					NsName:       nsname,
+					ResourceType: &v1.TLSRoute{},
+					Setter: newTLSRouteStatusSetter(v1.TLSRouteStatus{RouteStatus: v1.RouteStatus{Parents: []v1.RouteParentStatus{{
+						ControllerName: v1.GatewayController(gatewayCtlrName),
+						ParentRef:      v1.ParentReference{Name: "gateway", Namespace: helpers.GetPointer(v1.Namespace("test"))},
+						Conditions:     []metav1.Condition{{Type: "Accepted", Message: "stale"}},
+					}}}}, gatewayCtlrName),
+				}
+			},
+			dropped: func(nsname types.NamespacedName) HandledStatusResources {
+				return HandledStatusResources{TLSRoutes: map[types.NamespacedName]struct{}{nsname: {}}}
+			},
+			assertEmpty: func(g *WithT, k8sClient client.Client, nsname types.NamespacedName) {
+				var updated v1.TLSRoute
+				g.Expect(k8sClient.Get(t.Context(), nsname, &updated)).To(Succeed())
+				g.Expect(updated.Status.Parents).To(BeEmpty())
+			},
+		},
+		{
+			name:         "TCPRoute",
+			resourceType: &v1.TCPRoute{},
+			newObject: func(nsname types.NamespacedName) client.Object {
+				return &v1.TCPRoute{ObjectMeta: metav1.ObjectMeta{Namespace: nsname.Namespace, Name: nsname.Name, Generation: 1}}
+			},
+			seedStatus: func(nsname types.NamespacedName) UpdateRequest {
+				return UpdateRequest{
+					NsName:       nsname,
+					ResourceType: &v1.TCPRoute{},
+					Setter: newTCPRouteStatusSetter(v1.TCPRouteStatus{RouteStatus: v1.RouteStatus{Parents: []v1.RouteParentStatus{{
+						ControllerName: v1.GatewayController(gatewayCtlrName),
+						ParentRef:      v1.ParentReference{Name: "gateway", Namespace: helpers.GetPointer(v1.Namespace("test"))},
+						Conditions:     []metav1.Condition{{Type: "Accepted", Message: "stale"}},
+					}}}}, gatewayCtlrName),
+				}
+			},
+			dropped: func(nsname types.NamespacedName) HandledStatusResources {
+				return HandledStatusResources{TCPRoutes: map[types.NamespacedName]struct{}{nsname: {}}}
+			},
+			assertEmpty: func(g *WithT, k8sClient client.Client, nsname types.NamespacedName) {
+				var updated v1.TCPRoute
+				g.Expect(k8sClient.Get(t.Context(), nsname, &updated)).To(Succeed())
+				g.Expect(updated.Status.Parents).To(BeEmpty())
+			},
+		},
+		{
+			name:         "UDPRoute",
+			resourceType: &v1.UDPRoute{},
+			newObject: func(nsname types.NamespacedName) client.Object {
+				return &v1.UDPRoute{ObjectMeta: metav1.ObjectMeta{Namespace: nsname.Namespace, Name: nsname.Name, Generation: 1}}
+			},
+			seedStatus: func(nsname types.NamespacedName) UpdateRequest {
+				return UpdateRequest{
+					NsName:       nsname,
+					ResourceType: &v1.UDPRoute{},
+					Setter: newUDPRouteStatusSetter(v1.UDPRouteStatus{RouteStatus: v1.RouteStatus{Parents: []v1.RouteParentStatus{{
+						ControllerName: v1.GatewayController(gatewayCtlrName),
+						ParentRef:      v1.ParentReference{Name: "gateway", Namespace: helpers.GetPointer(v1.Namespace("test"))},
+						Conditions:     []metav1.Condition{{Type: "Accepted", Message: "stale"}},
+					}}}}, gatewayCtlrName),
+				}
+			},
+			dropped: func(nsname types.NamespacedName) HandledStatusResources {
+				return HandledStatusResources{UDPRoutes: map[types.NamespacedName]struct{}{nsname: {}}}
+			},
+			assertEmpty: func(g *WithT, k8sClient client.Client, nsname types.NamespacedName) {
+				var updated v1.UDPRoute
+				g.Expect(k8sClient.Get(t.Context(), nsname, &updated)).To(Succeed())
+				g.Expect(updated.Status.Parents).To(BeEmpty())
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			nsname := types.NamespacedName{Namespace: "test", Name: "orphaned-route"}
+
+			k8sClient := createK8sClientFor(test.resourceType)
+			g.Expect(k8sClient.Create(t.Context(), test.newObject(nsname))).To(Succeed())
+
+			updater := NewUpdater(k8sClient)
+			updater.Update(t.Context(), logr.Discard(), test.seedStatus(nsname))
+
+			reqs := PrepareDroppedRequests(test.dropped(nsname), gatewayCtlrName)
+			g.Expect(reqs).To(HaveLen(1))
+			updater.Update(t.Context(), logr.Discard(), reqs...)
+
+			test.assertEmpty(g, k8sClient, nsname)
+		})
+	}
+}
+
+func TestPrepareNGFPolicyRequestsClearsStatusesForUnhandledPolicies(t *testing.T) {
+	t.Parallel()
+
+	g := NewWithT(t)
+	key := graph.PolicyKey{
+		NsName: types.NamespacedName{Namespace: "test", Name: "orphaned-policy"},
+		GVK:    schema.GroupVersionKind{Group: ngfAPI.GroupName, Kind: kinds.ClientSettingsPolicy},
+	}
+	policy := &ngfAPI.ClientSettingsPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  key.NsName.Namespace,
+			Name:       key.NsName.Name,
+			Generation: 1,
+		},
+	}
+
+	k8sClient := createK8sClientFor(&ngfAPI.ClientSettingsPolicy{})
+	g.Expect(k8sClient.Create(t.Context(), policy)).To(Succeed())
+
+	updater := NewUpdater(k8sClient)
+	updater.Update(t.Context(), logr.Discard(), UpdateRequest{
+		NsName:       key.NsName,
+		ResourceType: policy,
+		Setter: newNGFPolicyStatusSetter(v1.PolicyStatus{Ancestors: []v1.PolicyAncestorStatus{{
+			ControllerName: v1.GatewayController(gatewayCtlrName),
+			AncestorRef:    v1.ParentReference{Name: "ancestor"},
+			Conditions:     []metav1.Condition{{Type: "Accepted", Message: "stale"}},
+		}}}, gatewayCtlrName),
+	})
+
+	reqs := PrepareDroppedRequests(
+		HandledStatusResources{NGFPolicies: map[graph.PolicyKey]policies.Policy{key: policy}},
+		gatewayCtlrName,
+	)
+
+	g.Expect(reqs).To(HaveLen(1))
+	updater.Update(t.Context(), logr.Discard(), reqs...)
+
+	var updated ngfAPI.ClientSettingsPolicy
+	g.Expect(k8sClient.Get(t.Context(), key.NsName, &updated)).To(Succeed())
+	g.Expect(updated.Status.Ancestors).To(BeEmpty())
+}
+
+func TestPrepareListenerSetRequestsClearsStatusesForUnhandledListenerSets(t *testing.T) {
+	t.Parallel()
+
+	g := NewWithT(t)
+	nsname := types.NamespacedName{Namespace: "test", Name: "orphaned-listener-set"}
+	listenerSet := &v1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  nsname.Namespace,
+			Name:       nsname.Name,
+			Generation: 1,
+		},
+	}
+
+	k8sClient := createK8sClientFor(&v1.ListenerSet{})
+	g.Expect(k8sClient.Create(t.Context(), listenerSet)).To(Succeed())
+
+	updater := NewUpdater(k8sClient)
+	updater.Update(t.Context(), logr.Discard(), UpdateRequest{
+		NsName:       nsname,
+		ResourceType: &v1.ListenerSet{},
+		Setter: newListenerSetStatusSetter(v1.ListenerSetStatus{
+			Conditions: []metav1.Condition{{Type: string(v1.ListenerSetConditionAccepted), Message: "stale"}},
+			Listeners: []v1.ListenerEntryStatus{{
+				Name:       "listener",
+				Conditions: []metav1.Condition{{Type: string(v1.ListenerConditionAccepted), Message: "stale"}},
+			}},
+		}),
+	})
+
+	reqs := PrepareDroppedRequests(
+		HandledStatusResources{ListenerSets: map[types.NamespacedName]struct{}{nsname: {}}},
+		gatewayCtlrName,
+	)
+
+	g.Expect(reqs).To(HaveLen(1))
+	updater.Update(t.Context(), logr.Discard(), reqs...)
+
+	var updated v1.ListenerSet
+	g.Expect(k8sClient.Get(t.Context(), nsname, &updated)).To(Succeed())
+	g.Expect(updated.Status.Conditions).To(BeEmpty())
+	g.Expect(updated.Status.Listeners).To(BeEmpty())
+}
+
+func TestBuildListenerSetStatuses(t *testing.T) {
+	t.Parallel()
+
+	lsValid := &v1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "ls-valid",
+			Generation: 3,
+		},
+		Spec: v1.ListenerSetSpec{
+			ParentRef: v1.ParentGatewayReference{
+				Name:      "gateway",
+				Namespace: helpers.GetPointer(v1.Namespace("test")),
+			},
+			Listeners: []v1.ListenerEntry{
+				{
+					Name:     "http-listener",
+					Port:     8080,
+					Protocol: v1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	lsInvalid := &v1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "ls-invalid",
+			Generation: 3,
+		},
+		Spec: v1.ListenerSetSpec{
+			ParentRef: v1.ParentGatewayReference{
+				Name:      "gateway",
+				Namespace: helpers.GetPointer(v1.Namespace("test")),
+			},
+			Listeners: []v1.ListenerEntry{
+				{
+					Name:     "invalid-listener",
+					Port:     9090,
+					Protocol: v1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	lsNotAllowed := &v1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "ls-not-allowed",
+			Generation: 3,
+		},
+		Spec: v1.ListenerSetSpec{
+			ParentRef: v1.ParentGatewayReference{
+				Name:      "gateway",
+				Namespace: helpers.GetPointer(v1.Namespace("test")),
+			},
+			Listeners: []v1.ListenerEntry{
+				{
+					Name:     "listener",
+					Port:     8080,
+					Protocol: v1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	lsParentNotAccepted := &v1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:  "test",
+			Name:       "ls-parent-not-accepted",
+			Generation: 3,
+		},
+		Spec: v1.ListenerSetSpec{
+			ParentRef: v1.ParentGatewayReference{
+				Name:      "gateway",
+				Namespace: helpers.GetPointer(v1.Namespace("test")),
+			},
+			Listeners: []v1.ListenerEntry{
+				{
+					Name:     "listener",
+					Port:     8080,
+					Protocol: v1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	listenerSets := map[types.NamespacedName]*graph.ListenerSet{
+		{Namespace: "test", Name: "ls-valid"}: {
+			Valid:  true,
+			Source: lsValid,
+			Listeners: []*graph.Listener{
+				{
+					Name:  "http-listener",
+					Valid: true,
+					Routes: map[graph.RouteKey]*graph.L7Route{
+						{
+							NamespacedName: types.NamespacedName{Namespace: "test", Name: "test-http-route"},
+							RouteType:      graph.RouteTypeHTTP,
+						}: {
+							Source: &v1.HTTPRoute{
+								ObjectMeta: metav1.ObjectMeta{Name: "test-http-route", Namespace: "test"},
+							},
+							Valid: true,
+						},
+					},
+					L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+						{
+							NamespacedName: types.NamespacedName{Namespace: "test", Name: "test-tls-route"},
+							RouteType:      graph.RouteTypeTLS,
+						}: {
+							Source: &v1.TLSRoute{
+								ObjectMeta: metav1.ObjectMeta{Name: "test-tls-route", Namespace: "test"},
+							},
+							Valid: true,
+						},
+					},
+					SupportedKinds: []v1.RouteGroupKind{
+						{Kind: v1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[v1.Group](v1.GroupName)},
+					},
+					Conditions: []conditions.Condition{},
+				},
+			},
+			Conditions: []conditions.Condition{},
+		},
+		{Namespace: "test", Name: "ls-invalid"}: {
+			Valid:  false,
+			Source: lsInvalid,
+			Listeners: []*graph.Listener{
+				{
+					Name:       "invalid-listener",
+					Valid:      false,
+					Routes:     map[graph.RouteKey]*graph.L7Route{},
+					Conditions: conditions.NewListenerUnsupportedValue("Unsupported listener configuration"),
+				},
+			},
+			Conditions: []conditions.Condition{
+				conditions.NewListenerSetListenersNotValid("All listeners are invalid"),
+			},
+		},
+		{Namespace: "test", Name: "ls-not-allowed"}: {
+			Valid:     false,
+			Source:    lsNotAllowed,
+			Listeners: []*graph.Listener{},
+			Conditions: []conditions.Condition{
+				conditions.NewListenerSetNotAllowed("ListenerSet is not allowed by parent Gateway AllowedListeners configuration"),
+			},
+		},
+		{Namespace: "test", Name: "ls-parent-not-accepted"}: {
+			Valid:     false,
+			Source:    lsParentNotAccepted,
+			Listeners: []*graph.Listener{},
+			Conditions: []conditions.Condition{
+				conditions.NewListenerSetParentNotAccepted("Parent Gateway is not accepted"),
+			},
+		},
+		{Namespace: "test", Name: "ls-mixed"}: {
+			Valid: true,
+			Source: &v1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "ls-mixed",
+					Namespace:  "test",
+					Generation: 3,
+				},
+				Spec: v1.ListenerSetSpec{
+					ParentRef: v1.ParentGatewayReference{
+						Name:      v1.ObjectName(gwNsName.Name),
+						Namespace: helpers.GetPointer(v1.Namespace("test")),
+					},
+					Listeners: []v1.ListenerEntry{
+						{
+							Name:     "valid-listener",
+							Port:     8080,
+							Protocol: v1.HTTPProtocolType,
+						},
+						{
+							Name:     "invalid-listener",
+							Port:     9090,
+							Protocol: v1.HTTPProtocolType,
+						},
+					},
+				},
+			},
+			Listeners: []*graph.Listener{
+				{
+					Name:   "valid-listener",
+					Valid:  true,
+					Routes: map[graph.RouteKey]*graph.L7Route{},
+					SupportedKinds: []v1.RouteGroupKind{
+						{Kind: v1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[v1.Group](v1.GroupName)},
+					},
+					Conditions: []conditions.Condition{},
+				},
+				{
+					Name:       "invalid-listener",
+					Valid:      false,
+					Routes:     map[graph.RouteKey]*graph.L7Route{},
+					Conditions: conditions.NewListenerUnsupportedValue("Unsupported listener configuration"),
+				},
+			},
+			Conditions: []conditions.Condition{},
+		},
+	}
+
+	expectedStatuses := map[types.NamespacedName]v1.ListenerSetStatus{
+		{Namespace: "test", Name: "ls-valid"}: {
+			Conditions: []metav1.Condition{
+				{
+					Type:               string(v1.ListenerSetConditionAccepted),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 3,
+					LastTransitionTime: transitionTime,
+					Reason:             string(v1.ListenerSetReasonAccepted),
+					Message:            "The ListenerSet is accepted",
+				},
+				{
+					Type:               string(v1.ListenerSetConditionProgrammed),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 3,
+					LastTransitionTime: transitionTime,
+					Reason:             string(v1.ListenerSetReasonProgrammed),
+					Message:            "The ListenerSet is programmed",
+				},
+			},
+			Listeners: []v1.ListenerEntryStatus{
+				{
+					Name:           "http-listener",
+					AttachedRoutes: 2,
+					SupportedKinds: []v1.RouteGroupKind{
+						{Kind: v1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[v1.Group](v1.GroupName)},
+					},
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.ListenerConditionProgrammed),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 3,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.ListenerReasonProgrammed),
+							Message:            "The Listener is programmed",
+						},
+						{
+							Type:               string(v1.ListenerConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 3,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.ListenerReasonAccepted),
+							Message:            "The Listener is accepted",
+						},
+						{
+							Type:               string(v1.ListenerConditionResolvedRefs),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 3,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.ListenerReasonResolvedRefs),
+							Message:            "All references are resolved",
+						},
+						{
+							Type:               string(v1.ListenerConditionConflicted),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 3,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.ListenerReasonNoConflicts),
+							Message:            "No conflicts",
+						},
+					},
+				},
+			},
+		},
+		{Namespace: "test", Name: "ls-invalid"}: {
+			Conditions: []metav1.Condition{
+				{
+					Type:               string(v1.ListenerSetConditionAccepted),
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: 3,
+					LastTransitionTime: transitionTime,
+					Reason:             string(v1.ListenerSetReasonListenersNotValid),
+					Message:            "All listeners are invalid",
+				},
+				{
+					Type:               string(v1.ListenerSetConditionProgrammed),
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: 3,
+					LastTransitionTime: transitionTime,
+					Reason:             string(v1.ListenerSetReasonListenersNotValid),
+					Message:            "All listeners are invalid",
+				},
+			},
+			Listeners: []v1.ListenerEntryStatus{
+				{
+					Name:           "invalid-listener",
+					AttachedRoutes: 0,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.ListenerConditionAccepted),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 3,
+							LastTransitionTime: transitionTime,
+							Reason:             string(conditions.ListenerReasonUnsupportedValue),
+							Message:            "Unsupported listener configuration",
+						},
+						{
+							Type:               string(v1.ListenerConditionProgrammed),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 3,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.ListenerReasonInvalid),
+							Message:            "Unsupported listener configuration",
+						},
+					},
+				},
+			},
+		},
+		{Namespace: "test", Name: "ls-mixed"}: {
+			Conditions: []metav1.Condition{
+				{
+					Type:               string(v1.ListenerSetConditionAccepted),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 3,
+					LastTransitionTime: transitionTime,
+					Reason:             string(v1.ListenerSetReasonAccepted),
+					Message:            "The ListenerSet is accepted",
+				},
+				{
+					Type:               string(v1.ListenerSetConditionProgrammed),
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 3,
+					LastTransitionTime: transitionTime,
+					Reason:             string(v1.ListenerSetReasonProgrammed),
+					Message:            "The ListenerSet is programmed",
+				},
+			},
+			Listeners: []v1.ListenerEntryStatus{
+				{
+					Name:           "valid-listener",
+					AttachedRoutes: 0,
+					SupportedKinds: []v1.RouteGroupKind{
+						{Kind: v1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[v1.Group](v1.GroupName)},
+					},
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.ListenerConditionProgrammed),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 3,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.ListenerReasonProgrammed),
+							Message:            "The Listener is programmed",
+						},
+						{
+							Type:               string(v1.ListenerConditionAccepted),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 3,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.ListenerReasonAccepted),
+							Message:            "The Listener is accepted",
+						},
+						{
+							Type:               string(v1.ListenerConditionResolvedRefs),
+							Status:             metav1.ConditionTrue,
+							ObservedGeneration: 3,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.ListenerReasonResolvedRefs),
+							Message:            "All references are resolved",
+						},
+						{
+							Type:               string(v1.ListenerConditionConflicted),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 3,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.ListenerReasonNoConflicts),
+							Message:            "No conflicts",
+						},
+					},
+				},
+				{
+					Name:           "invalid-listener",
+					AttachedRoutes: 0,
+					Conditions: []metav1.Condition{
+						{
+							Type:               string(v1.ListenerConditionAccepted),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 3,
+							LastTransitionTime: transitionTime,
+							Reason:             string(conditions.ListenerReasonUnsupportedValue),
+							Message:            "Unsupported listener configuration",
+						},
+						{
+							Type:               string(v1.ListenerConditionProgrammed),
+							Status:             metav1.ConditionFalse,
+							ObservedGeneration: 3,
+							LastTransitionTime: transitionTime,
+							Reason:             string(v1.ListenerReasonInvalid),
+							Message:            "Unsupported listener configuration",
+						},
+					},
+				},
+			},
+		},
+		{Namespace: "test", Name: "ls-not-allowed"}: {
+			Conditions: []metav1.Condition{
+				{
+					Type:               string(v1.ListenerSetConditionAccepted),
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: 3,
+					LastTransitionTime: transitionTime,
+					Reason:             string(v1.ListenerSetReasonNotAllowed),
+					Message:            "ListenerSet is not allowed by parent Gateway AllowedListeners configuration",
+				},
+				{
+					Type:               string(v1.ListenerSetConditionProgrammed),
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: 3,
+					LastTransitionTime: transitionTime,
+					Reason:             string(v1.ListenerSetReasonNotAllowed),
+					Message:            "ListenerSet is not allowed by parent Gateway AllowedListeners configuration",
+				},
+			},
+			Listeners: []v1.ListenerEntryStatus{},
+		},
+		{Namespace: "test", Name: "ls-parent-not-accepted"}: {
+			Conditions: []metav1.Condition{
+				{
+					Type:               string(v1.ListenerSetConditionAccepted),
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: 3,
+					LastTransitionTime: transitionTime,
+					Reason:             string(v1.ListenerSetReasonParentNotAccepted),
+					Message:            "Parent Gateway is not accepted",
+				},
+				{
+					Type:               string(v1.ListenerSetConditionProgrammed),
+					Status:             metav1.ConditionFalse,
+					ObservedGeneration: 3,
+					LastTransitionTime: transitionTime,
+					Reason:             string(conditions.ListenerSetReasonParentNotProgrammed),
+					Message:            "Parent Gateway is not accepted",
+				},
+			},
+			Listeners: []v1.ListenerEntryStatus{},
+		},
+	}
+
+	g := NewWithT(t)
+
+	k8sClient := createK8sClientFor(&v1.ListenerSet{})
+
+	for _, ls := range listenerSets {
+		err := k8sClient.Create(t.Context(), ls.Source)
+		g.Expect(err).ToNot(HaveOccurred())
+	}
+
+	updater := NewUpdater(k8sClient)
+
+	reqs := PrepareListenerSetRequests(
+		listenerSets,
+		transitionTime,
+	)
+
+	updater.Update(t.Context(), logr.Discard(), reqs...)
+
+	g.Expect(reqs).To(HaveLen(len(expectedStatuses)))
+
+	for nsname, expected := range expectedStatuses {
+		var ls v1.ListenerSet
+		err := k8sClient.Get(t.Context(), nsname, &ls)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(ls.Status.Conditions).To(ConsistOf(expected.Conditions))
+		g.Expect(ls.Status.Listeners).To(ConsistOf(expected.Listeners))
+	}
+}

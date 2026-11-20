@@ -1,0 +1,863 @@
+package configs
+
+import (
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/wx-one/wxingress/internal/configs/version1"
+	nl "github.com/wx-one/wxingress/internal/logger"
+	"github.com/wx-one/wxingress/internal/validation"
+)
+
+// PoliciesAnnotation is the annotation where the list of policies to apply to an Ingress is specified.
+const PoliciesAnnotation = "nginx.org/policies"
+
+// PoliciesAnnotationPlus is the plus-only annotation where the list of policies to apply to an Ingress is specified.
+const PoliciesAnnotationPlus = "nginx.com/policies"
+
+// JWTKeyAnnotation is the annotation where the Secret with a JWK is specified.
+const JWTKeyAnnotation = "nginx.com/jwt-key"
+
+// JWTRealmAnnotation is the annotation where the JWT authentication realm is specified.
+const JWTRealmAnnotation = "nginx.com/jwt-realm"
+
+// JWTTokenAnnotation is the annotation where the JWT token location is specified.
+const JWTTokenAnnotation = "nginx.com/jwt-token" // #nosec G101
+
+// JWTLoginURLAnnotation is the annotation where the JWT login URL is specified.
+const JWTLoginURLAnnotation = "nginx.com/jwt-login-url"
+
+// BasicAuthSecretAnnotation is the annotation where the Secret with the HTTP basic user list
+const BasicAuthSecretAnnotation = "nginx.org/basic-auth-secret" // #nosec G101
+
+// PathRegexAnnotation is the annotation where the regex location (path) modifier is specified.
+const PathRegexAnnotation = "nginx.org/path-regex"
+
+// RewriteTargetAnnotation is the annotation where the regex-based rewrite target is specified.
+const RewriteTargetAnnotation = "nginx.org/rewrite-target"
+
+// UpstreamVhostAnnotation is the annotation where the Host header value sent to the upstream is specified.
+const UpstreamVhostAnnotation = "nginx.org/upstream-vhost"
+
+// SSLCiphersAnnotation is the annotation where SSL ciphers are specified.
+const SSLCiphersAnnotation = "nginx.org/ssl-ciphers"
+
+// SSLPreferServerCiphersAnnotation is the annotation where SSL prefer server ciphers is specified.
+const SSLPreferServerCiphersAnnotation = "nginx.org/ssl-prefer-server-ciphers"
+
+// HTTP2Annotation turns HTTP/2 on or off for an Ingress, overriding the http2 ConfigMap key.
+// For unencrypted (h2c) traffic on the default listeners, HTTP/2 must also be enabled in the ConfigMap.
+// When off, HTTP/2 requests for the Ingress hosts get 421 Misdirected Request; HTTP/1.1 is unaffected.
+const HTTP2Annotation = "nginx.org/http2"
+
+// UseClusterIPAnnotation is the annotation where the use-cluster-ip boolean is specified.
+const UseClusterIPAnnotation = "nginx.org/use-cluster-ip"
+
+// SSLRedirectAnnotation is the annotation where the SSL redirect boolean is specified.
+const SSLRedirectAnnotation = "nginx.org/ssl-redirect"
+
+// HTTPRedirectCodeAnnotation is the annotation where the HTTP redirect code is specified.
+const HTTPRedirectCodeAnnotation = "nginx.org/http-redirect-code"
+
+// ProxySetHeadersAnnotation is the annotation where the proxy set headers are specified.
+const ProxySetHeadersAnnotation = "nginx.org/proxy-set-headers"
+
+// AddHeaderAnnotation is the annotation where add_header directives are specified.
+const AddHeaderAnnotation = "nginx.org/add-header"
+
+// ProxyNextUpstreamAnnotation is the annotation where the proxy next upstream settings are specified.
+const ProxyNextUpstreamAnnotation = "nginx.org/proxy-next-upstream"
+
+// ProxyNextUpstreamTimeoutAnnotation is the annotation where the proxy next upstream timeout is specified.
+const ProxyNextUpstreamTimeoutAnnotation = "nginx.org/proxy-next-upstream-timeout"
+
+// ProxyNextUpstreamTriesAnnotation is the annotation where the proxy next upstream tries is specified.
+const ProxyNextUpstreamTriesAnnotation = "nginx.org/proxy-next-upstream-tries"
+
+// RedirectToHTTPSAnnotation is the annotation where the redirect-to-https boolean is specified.
+const RedirectToHTTPSAnnotation = "nginx.org/redirect-to-https"
+
+// AppProtectPolicyAnnotation is where the NGINX App Protect policy is specified
+const AppProtectPolicyAnnotation = "appprotect.f5.com/app-protect-policy"
+
+// AppProtectLogConfAnnotation is where the NGINX AppProtect Log Configuration is specified
+const AppProtectLogConfAnnotation = "appprotect.f5.com/app-protect-security-log"
+
+// AppProtectLogConfDstAnnotation is where the NGINX AppProtect Log Configuration destination is specified
+const AppProtectLogConfDstAnnotation = "appprotect.f5.com/app-protect-security-log-destination"
+
+// AppProtectDosProtectedAnnotation is the namespace/name reference of a DosProtectedResource
+const AppProtectDosProtectedAnnotation = "appprotectdos.f5.com/app-protect-dos-resource"
+
+// StickyCookieServicesAnnotation is the annotation where the sticky cookie configuration is specified.
+const StickyCookieServicesAnnotation = "nginx.org/sticky-cookie-services"
+
+// StickyCookieServicesAnnotationPlus is the annotation where the sticky cookie configuration is specified for NGINX Plus.
+const StickyCookieServicesAnnotationPlus = "nginx.com/sticky-cookie-services"
+
+// AddHeaderInheritAnnotation is the annotation where add_header inheritance behavior is specified.
+const AddHeaderInheritAnnotation = "nginx.org/add-header-inherit"
+
+// ProxyRedirectFromAnnotation is the annotation for the proxy_redirect "from" parameter.
+const ProxyRedirectFromAnnotation = "nginx.org/proxy-redirect-from"
+
+// ProxyRedirectToAnnotation is the annotation for the proxy_redirect "to" parameter.
+const ProxyRedirectToAnnotation = "nginx.org/proxy-redirect-to"
+
+// CustomHTTPErrorsAnnotation is the annotation for enabling custom error handling for a
+// comma-separated list of upstream status codes (and 4xx/5xx range shorthands). When set,
+// NGINX intercepts matching upstream responses (proxy_intercept_errors on) and routes
+// them via error_page to the Ingress's spec.defaultBackend when one is configured.
+const CustomHTTPErrorsAnnotation = "nginx.org/custom-http-errors"
+
+// ProxyHTTPVersionAnnotation is the annotation for specifying the HTTP version to use when proxying requests to upstream servers.
+const ProxyHTTPVersionAnnotation = "nginx.org/proxy-http-version"
+
+var masterDenylist = map[string]bool{
+	"nginx.org/rewrites":                      true,
+	"nginx.org/ssl-services":                  true,
+	"nginx.org/grpc-services":                 true,
+	"nginx.org/websocket-services":            true,
+	StickyCookieServicesAnnotation:            true,
+	StickyCookieServicesAnnotationPlus:        true,
+	"nginx.com/health-checks":                 true,
+	"nginx.com/health-checks-mandatory":       true,
+	"nginx.com/health-checks-mandatory-queue": true,
+	UseClusterIPAnnotation:                    true,
+}
+
+var minionDenylist = map[string]bool{
+	"nginx.org/proxy-hide-headers":                      true,
+	"nginx.org/proxy-pass-headers":                      true,
+	RedirectToHTTPSAnnotation:                           true,
+	"ingress.kubernetes.io/ssl-redirect":                true,
+	SSLRedirectAnnotation:                               true,
+	HTTPRedirectCodeAnnotation:                          true,
+	"nginx.org/hsts":                                    true,
+	"nginx.org/hsts-max-age":                            true,
+	"nginx.org/hsts-include-subdomains":                 true,
+	"nginx.org/server-tokens":                           true,
+	"nginx.org/listen-ports":                            true,
+	"nginx.org/listen-ports-ssl":                        true,
+	"nginx.org/server-snippets":                         true,
+	"nginx.org/ssl-ciphers":                             true,
+	"nginx.org/ssl-prefer-server-ciphers":               true,
+	HTTP2Annotation:                                     true,
+	"nginx.org/app-root":                                true,
+	"appprotect.f5.com/app_protect_enable":              true,
+	"appprotect.f5.com/app_protect_policy":              true,
+	"appprotect.f5.com/app_protect_security_log_enable": true,
+	"appprotect.f5.com/app_protect_security_log":        true,
+	"appprotectdos.f5.com/app-protect-dos-resource":     true,
+}
+
+var minionInheritanceList = map[string]bool{
+	"nginx.org/proxy-connect-timeout":    true,
+	"nginx.org/proxy-read-timeout":       true,
+	"nginx.org/proxy-send-timeout":       true,
+	"nginx.org/client-max-body-size":     true,
+	"nginx.org/proxy-buffering":          true,
+	"nginx.org/proxy-buffers":            true,
+	"nginx.org/proxy-buffer-size":        true,
+	"nginx.org/proxy-busy-buffers-size":  true,
+	"nginx.org/proxy-max-temp-file-size": true,
+	"nginx.org/upstream-zone-size":       true,
+	"nginx.org/location-snippets":        true,
+	"nginx.org/lb-method":                true,
+	"nginx.org/keepalive":                true,
+	"nginx.org/max-fails":                true,
+	"nginx.org/max-conns":                true,
+	"nginx.org/fail-timeout":             true,
+	"nginx.org/limit-req-rate":           true,
+	"nginx.org/limit-req-key":            true,
+	"nginx.org/limit-req-zone-size":      true,
+	"nginx.org/limit-req-delay":          true,
+	"nginx.org/limit-req-no-delay":       true,
+	"nginx.org/limit-req-burst":          true,
+	"nginx.org/limit-req-dry-run":        true,
+	"nginx.org/limit-req-log-level":      true,
+	"nginx.org/limit-req-reject-code":    true,
+	"nginx.org/limit-req-scale":          true,
+	UpstreamVhostAnnotation:              true,
+	ProxyHTTPVersionAnnotation:           true,
+}
+
+var validPathRegex = map[string]bool{
+	"case_sensitive":   true,
+	"case_insensitive": true,
+	"exact":            true,
+}
+
+// List of Ingress Annotation Keys used by the Ingress Controller
+var allowedAnnotationKeys = []string{
+	"nginx.org",
+	"nginx.com",
+	"f5.com",
+	"ingress.kubernetes.io/ssl-redirect",
+}
+
+// nolint: gocyclo
+func parseAnnotations(ingEx *IngressEx, baseCfgParams *ConfigParams, isPlus bool, hasAppProtect bool, hasAppProtectDos bool, enableDirectiveAutoadjust bool) ConfigParams {
+	l := nl.LoggerFromContext(baseCfgParams.Context)
+	cfgParams := *baseCfgParams
+
+	if lbMethod, exists := ingEx.Ingress.Annotations["nginx.org/lb-method"]; exists {
+		if isPlus {
+			if parsedMethod, err := ParseLBMethodForPlus(lbMethod); err != nil {
+				nl.Errorf(l, "Ingress %s/%s: Invalid value for the nginx.org/lb-method: got %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), lbMethod, err)
+			} else {
+				cfgParams.LBMethod = parsedMethod
+			}
+		} else {
+			if parsedMethod, err := ParseLBMethod(lbMethod); err != nil {
+				nl.Errorf(l, "Ingress %s/%s: Invalid value for the nginx.org/lb-method: got %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), lbMethod, err)
+			} else {
+				cfgParams.LBMethod = parsedMethod
+			}
+		}
+	}
+
+	if healthCheckEnabled, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, "nginx.com/health-checks", ingEx.Ingress); exists {
+		if err != nil {
+			nl.Error(l, err)
+		}
+		if isPlus {
+			cfgParams.HealthCheckEnabled = healthCheckEnabled
+		} else {
+			nl.Warn(l, "Annotation 'nginx.com/health-checks' requires NGINX Plus")
+		}
+	}
+
+	if cfgParams.HealthCheckEnabled {
+		if healthCheckMandatory, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, "nginx.com/health-checks-mandatory", ingEx.Ingress); exists {
+			if err != nil {
+				nl.Error(l, err)
+			}
+			cfgParams.HealthCheckMandatory = healthCheckMandatory
+		}
+	}
+
+	if cfgParams.HealthCheckMandatory {
+		if healthCheckQueue, exists, err := GetMapKeyAsInt64(ingEx.Ingress.Annotations, "nginx.com/health-checks-mandatory-queue", ingEx.Ingress); exists {
+			if err != nil {
+				nl.Error(l, err)
+			}
+			cfgParams.HealthCheckMandatoryQueue = healthCheckQueue
+		}
+	}
+
+	if slowStart, exists := ingEx.Ingress.Annotations["nginx.com/slow-start"]; exists {
+		if parsedSlowStart, err := ParseTime(slowStart); err != nil {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value nginx.org/slow-start: got %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), slowStart, err)
+		} else {
+			if isPlus {
+				cfgParams.SlowStart = parsedSlowStart
+			} else {
+				nl.Warn(l, "Annotation 'nginx.com/slow-start' requires NGINX Plus")
+			}
+		}
+	}
+
+	if serverTokens, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, "nginx.org/server-tokens", ingEx.Ingress); exists {
+		if err != nil {
+			if isPlus {
+				cfgParams.ServerTokens = ingEx.Ingress.Annotations["nginx.org/server-tokens"]
+			} else {
+				nl.Error(l, err)
+			}
+		} else {
+			cfgParams.ServerTokens = "off"
+			if serverTokens {
+				cfgParams.ServerTokens = "on"
+			}
+		}
+	}
+
+	if serverSnippets, exists := GetMapKeyAsStringSlice(ingEx.Ingress.Annotations, "nginx.org/server-snippets", ingEx.Ingress, "\n"); exists {
+		cfgParams.ServerSnippets = serverSnippets
+	}
+
+	if locationSnippets, exists := GetMapKeyAsStringSlice(ingEx.Ingress.Annotations, "nginx.org/location-snippets", ingEx.Ingress, "\n"); exists {
+		cfgParams.LocationSnippets = locationSnippets
+	}
+
+	if addHeaderInherit, exists := ingEx.Ingress.Annotations[AddHeaderInheritAnnotation]; exists {
+		if parsedAddHeaderInherit, err := ParseAddHeaderInherit(addHeaderInherit); err != nil {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value %s: got %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), AddHeaderInheritAnnotation, addHeaderInherit, err)
+		} else {
+			cfgParams.AddHeaderInherit = parsedAddHeaderInherit
+		}
+	}
+
+	if proxyConnectTimeout, exists := ingEx.Ingress.Annotations["nginx.org/proxy-connect-timeout"]; exists {
+		if parsedProxyConnectTimeout, err := ParseTime(proxyConnectTimeout); err != nil {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value nginx.org/proxy-connect-timeout: got %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), proxyConnectTimeout, err)
+		} else {
+			cfgParams.ProxyConnectTimeout = parsedProxyConnectTimeout
+		}
+	}
+
+	if proxyReadTimeout, exists := ingEx.Ingress.Annotations["nginx.org/proxy-read-timeout"]; exists {
+		if parsedProxyReadTimeout, err := ParseTime(proxyReadTimeout); err != nil {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value nginx.org/proxy-read-timeout: got %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), proxyReadTimeout, err)
+		} else {
+			cfgParams.ProxyReadTimeout = parsedProxyReadTimeout
+		}
+	}
+
+	if proxySendTimeout, exists := ingEx.Ingress.Annotations["nginx.org/proxy-send-timeout"]; exists {
+		if parsedProxySendTimeout, err := ParseTime(proxySendTimeout); err != nil {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value nginx.org/proxy-send-timeout: got %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), proxySendTimeout, err)
+		} else {
+			cfgParams.ProxySendTimeout = parsedProxySendTimeout
+		}
+	}
+
+	if proxyHideHeaders, exists := ingEx.Ingress.Annotations["nginx.org/proxy-hide-headers"]; exists {
+		if parsedProxyHideHeaders, err := ParseHeaderList(proxyHideHeaders); err != nil {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value nginx.org/proxy-hide-headers: got %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), proxyHideHeaders, err)
+		} else {
+			cfgParams.ProxyHideHeaders = parsedProxyHideHeaders
+		}
+	}
+
+	if proxyPassHeaders, exists := ingEx.Ingress.Annotations["nginx.org/proxy-pass-headers"]; exists {
+		if parsedProxyPassHeaders, err := ParseHeaderList(proxyPassHeaders); err != nil {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value nginx.org/proxy-pass-headers: got %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), proxyPassHeaders, err)
+		} else {
+			cfgParams.ProxyPassHeaders = parsedProxyPassHeaders
+		}
+	}
+
+	if proxySetHeaders, exists := ingEx.Ingress.Annotations[ProxySetHeadersAnnotation]; exists {
+		cfgParams.ProxySetHeaders = version1.ParseProxySetHeaders(proxySetHeaders)
+	}
+
+	if addHeader, exists := ingEx.Ingress.Annotations[AddHeaderAnnotation]; exists {
+		cfgParams.AddHeaders = version1.ParseAddHeaders(addHeader)
+	}
+
+	if proxyNextUpstream, exists := ingEx.Ingress.Annotations[ProxyNextUpstreamAnnotation]; exists {
+		normalizedValue := strings.Join(strings.Fields(proxyNextUpstream), " ")
+		cfgParams.ProxyNextUpstream = normalizedValue
+	}
+
+	if proxyNextUpstreamTimeout, exists := ingEx.Ingress.Annotations[ProxyNextUpstreamTimeoutAnnotation]; exists {
+		if parsedProxyNextUpstreamTimeout, err := ParseTime(proxyNextUpstreamTimeout); err != nil {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value nginx.org/proxy-next-upstream-timeout: got %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), proxyNextUpstreamTimeout, err)
+		} else {
+			cfgParams.ProxyNextUpstreamTimeout = parsedProxyNextUpstreamTimeout
+		}
+	}
+
+	if proxyNextUpstreamTries, exists, err := GetMapKeyAsUint64(ingEx.Ingress.Annotations, ProxyNextUpstreamTriesAnnotation, ingEx.Ingress, false); exists {
+		if err != nil {
+			nl.Error(l, err)
+		}
+		cfgParams.ProxyNextUpstreamTries = &proxyNextUpstreamTries
+	}
+
+	if proxyHTTPVersion, exists := ingEx.Ingress.Annotations[ProxyHTTPVersionAnnotation]; exists {
+		cfgParams.ProxyHTTPVersion = proxyHTTPVersion
+	}
+
+	if clientMaxBodySize, exists := ingEx.Ingress.Annotations["nginx.org/client-max-body-size"]; exists {
+		cfgParams.ClientMaxBodySize = clientMaxBodySize
+	}
+
+	if clientBodyBufferSize, exists := ingEx.Ingress.Annotations["nginx.org/client-body-buffer-size"]; exists {
+		size, err := ParseSize(clientBodyBufferSize)
+		if err != nil {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value nginx.org/client-body-buffer-size: got %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), clientBodyBufferSize, err)
+		}
+		cfgParams.ClientBodyBufferSize = size
+	}
+
+	if redirectToHTTPS, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, RedirectToHTTPSAnnotation, ingEx.Ingress); exists {
+		if err != nil {
+			nl.Error(l, err)
+		} else {
+			cfgParams.RedirectToHTTPS = redirectToHTTPS
+		}
+	}
+
+	if sslRedirect, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, SSLRedirectAnnotation, ingEx.Ingress); exists {
+		if err != nil {
+			nl.Error(l, err)
+		} else {
+			cfgParams.SSLRedirect = sslRedirect
+		}
+	} else if sslRedirect, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, "ingress.kubernetes.io/ssl-redirect", ingEx.Ingress); exists {
+		if err != nil {
+			nl.Error(l, err)
+		} else {
+			cfgParams.SSLRedirect = sslRedirect
+		}
+	}
+
+	if httpRedirectCode, exists := ingEx.Ingress.Annotations[HTTPRedirectCodeAnnotation]; exists {
+		if code, err := ParseHTTPRedirectCode(httpRedirectCode); err != nil {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value for nginx.org/http-redirect-code: %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), httpRedirectCode, err)
+		} else {
+			cfgParams.HTTPRedirectCode = code
+		}
+	}
+
+	if sslCiphers, exists := ingEx.Ingress.Annotations[SSLCiphersAnnotation]; exists {
+		cfgParams.ServerSSLCiphers = sslCiphers
+	}
+
+	if sslPreferServerCiphers, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, SSLPreferServerCiphersAnnotation, ingEx.Ingress); exists {
+		if err != nil {
+			nl.Error(l, err)
+		} else {
+			cfgParams.ServerSSLPreferServerCiphers = sslPreferServerCiphers
+		}
+	}
+
+	if http2, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, HTTP2Annotation, ingEx.Ingress); exists {
+		if err != nil {
+			nl.Error(l, err)
+		} else {
+			cfgParams.HTTP2 = http2
+		}
+	}
+
+	if proxyBuffering, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, "nginx.org/proxy-buffering", ingEx.Ingress); exists {
+		if err != nil {
+			nl.Error(l, err)
+		} else {
+			cfgParams.ProxyBuffering = proxyBuffering
+		}
+	}
+
+	if hsts, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, "nginx.org/hsts", ingEx.Ingress); exists {
+		if err != nil {
+			nl.Error(l, err)
+		} else {
+			parsingErrors := false
+
+			hstsMaxAge, existsMA, err := GetMapKeyAsInt64(ingEx.Ingress.Annotations, "nginx.org/hsts-max-age", ingEx.Ingress)
+			if existsMA && err != nil {
+				nl.Error(l, err)
+				parsingErrors = true
+			}
+			hstsIncludeSubdomains, existsIS, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, "nginx.org/hsts-include-subdomains", ingEx.Ingress)
+			if existsIS && err != nil {
+				nl.Error(l, err)
+				parsingErrors = true
+			}
+			hstsBehindProxy, existsBP, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, "nginx.org/hsts-behind-proxy", ingEx.Ingress)
+			if existsBP && err != nil {
+				nl.Error(l, err)
+				parsingErrors = true
+			}
+
+			if parsingErrors {
+				nl.Errorf(l, "Ingress %s/%s: There are configuration issues with hsts annotations, skipping annotations for all hsts settings", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName())
+			} else {
+				cfgParams.HSTS = hsts
+				if existsMA {
+					cfgParams.HSTSMaxAge = hstsMaxAge
+				}
+				if existsIS {
+					cfgParams.HSTSIncludeSubdomains = hstsIncludeSubdomains
+				}
+				if existsBP {
+					cfgParams.HSTSBehindProxy = hstsBehindProxy
+				}
+			}
+		}
+	}
+
+	// proxyBuffers gets validated in k8s/validation.go in annotationValidations
+	if proxyBuffers, exists := ingEx.Ingress.Annotations["nginx.org/proxy-buffers"]; exists {
+		cfgParams.ProxyBuffers = proxyBuffers
+	}
+
+	// proxyBufferSize gets validated in k8s/validation.go in annotationValidations
+	if proxyBufferSize, exists := ingEx.Ingress.Annotations["nginx.org/proxy-buffer-size"]; exists {
+		cfgParams.ProxyBufferSize = proxyBufferSize
+	}
+
+	// proxyBusyBuffersSize gets validated in k8s/validation.go in annotationValidations
+	if proxyBusyBuffersSize, exists := ingEx.Ingress.Annotations["nginx.org/proxy-busy-buffers-size"]; exists {
+		cfgParams.ProxyBusyBuffersSize = proxyBusyBuffersSize
+	}
+
+	// Only run balance validation if auto-adjust is enabled
+	if enableDirectiveAutoadjust {
+		balancedProxyBuffers, balancedProxyBufferSize, balancedProxyBusyBufferSize, modifications := validation.BalanceProxyValues(cfgParams.ProxyBuffers, cfgParams.ProxyBufferSize, cfgParams.ProxyBusyBuffersSize, enableDirectiveAutoadjust)
+
+		cfgParams.ProxyBuffers = balancedProxyBuffers
+		cfgParams.ProxyBufferSize = balancedProxyBufferSize
+		cfgParams.ProxyBusyBuffersSize = balancedProxyBusyBufferSize
+
+		if len(modifications) > 0 {
+			for _, modification := range modifications {
+				nl.Infof(l, "Changes made to proxy values: %s", modification)
+			}
+		}
+	}
+
+	if upstreamZoneSize, exists := ingEx.Ingress.Annotations["nginx.org/upstream-zone-size"]; exists {
+		cfgParams.UpstreamZoneSize = upstreamZoneSize
+	}
+
+	if proxyMaxTempFileSize, exists := ingEx.Ingress.Annotations["nginx.org/proxy-max-temp-file-size"]; exists {
+		cfgParams.ProxyMaxTempFileSize = proxyMaxTempFileSize
+	}
+
+	if proxyRedirectFrom, exists := ingEx.Ingress.Annotations[ProxyRedirectFromAnnotation]; exists {
+		cfgParams.ProxyRedirectFrom = proxyRedirectFrom
+	}
+	if proxyRedirectTo, exists := ingEx.Ingress.Annotations[ProxyRedirectToAnnotation]; exists {
+		cfgParams.ProxyRedirectTo = proxyRedirectTo
+	}
+
+	if val, exists := ingEx.Ingress.Annotations[CustomHTTPErrorsAnnotation]; exists {
+		codes, err := ParseCustomHTTPErrors(val)
+		if err != nil {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value %s: got %q: %v",
+				ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(),
+				CustomHTTPErrorsAnnotation, val, err)
+		} else {
+			cfgParams.CustomHTTPErrors = codes
+		}
+	}
+
+	if isPlus {
+		if jwtRealm, exists := ingEx.Ingress.Annotations[JWTRealmAnnotation]; exists {
+			cfgParams.JWTRealm = jwtRealm
+		}
+		if jwtKey, exists := ingEx.Ingress.Annotations[JWTKeyAnnotation]; exists {
+			cfgParams.JWTKey = jwtKey
+		}
+		if jwtToken, exists := ingEx.Ingress.Annotations[JWTTokenAnnotation]; exists {
+			cfgParams.JWTToken = jwtToken
+		}
+		if jwtLoginURL, exists := ingEx.Ingress.Annotations[JWTLoginURLAnnotation]; exists {
+			cfgParams.JWTLoginURL = jwtLoginURL
+		}
+	}
+
+	if basicSecret, exists := ingEx.Ingress.Annotations[BasicAuthSecretAnnotation]; exists {
+		cfgParams.BasicAuthSecret = basicSecret
+	}
+	if basicRealm, exists := ingEx.Ingress.Annotations["nginx.org/basic-auth-realm"]; exists {
+		cfgParams.BasicAuthRealm = basicRealm
+	}
+
+	if values, exists := ingEx.Ingress.Annotations["nginx.org/listen-ports"]; exists {
+		ports, err := ParsePortList(values)
+		if err != nil {
+			nl.Errorf(l, "In %v nginx.org/listen-ports contains invalid declaration: %v, ignoring", ingEx.Ingress.Name, err)
+		}
+		if len(ports) > 0 {
+			cfgParams.Ports = ports
+		}
+	}
+
+	if values, exists := ingEx.Ingress.Annotations["nginx.org/listen-ports-ssl"]; exists {
+		sslPorts, err := ParsePortList(values)
+		if err != nil {
+			nl.Errorf(l, "In %v nginx.org/listen-ports-ssl contains invalid declaration: %v, ignoring", ingEx.Ingress.Name, err)
+		}
+		if len(sslPorts) > 0 {
+			cfgParams.SSLPorts = sslPorts
+		}
+	}
+
+	if keepalive, exists, err := GetMapKeyAsInt(ingEx.Ingress.Annotations, "nginx.org/keepalive", ingEx.Ingress); exists {
+		if err != nil {
+			nl.Error(l, err)
+		} else {
+			cfgParams.Keepalive = keepalive
+		}
+	}
+
+	if maxFails, exists, err := GetMapKeyAsInt(ingEx.Ingress.Annotations, "nginx.org/max-fails", ingEx.Ingress); exists {
+		if err != nil {
+			nl.Error(l, err)
+		} else {
+			cfgParams.MaxFails = maxFails
+		}
+	}
+
+	if maxConns, exists, err := GetMapKeyAsInt(ingEx.Ingress.Annotations, "nginx.org/max-conns", ingEx.Ingress); exists {
+		if err != nil {
+			nl.Error(l, err)
+		} else {
+			cfgParams.MaxConns = maxConns
+		}
+	}
+
+	if failTimeout, exists := ingEx.Ingress.Annotations["nginx.org/fail-timeout"]; exists {
+		if parsedFailTimeout, err := ParseTime(failTimeout); err != nil {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value nginx.org/fail-timeout: got %q: %v", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), failTimeout, err)
+		} else {
+			cfgParams.FailTimeout = parsedFailTimeout
+		}
+	}
+
+	if hasAppProtect {
+		if appProtectEnable, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, "appprotect.f5.com/app-protect-enable", ingEx.Ingress); exists {
+			if err != nil {
+				nl.Error(l, err)
+			} else {
+				if appProtectEnable {
+					cfgParams.AppProtectEnable = "on"
+				} else {
+					cfgParams.AppProtectEnable = "off"
+				}
+			}
+		}
+
+		if appProtectLogEnable, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, "appprotect.f5.com/app-protect-security-log-enable", ingEx.Ingress); exists {
+			if err != nil {
+				nl.Error(l, err)
+			} else {
+				if appProtectLogEnable {
+					cfgParams.AppProtectLogEnable = "on"
+				} else {
+					cfgParams.AppProtectLogEnable = "off"
+				}
+			}
+		}
+
+	}
+	if hasAppProtectDos {
+		if appProtectDosResource, exists := ingEx.Ingress.Annotations["appprotectdos.f5.com/app-protect-dos-resource"]; exists {
+			cfgParams.AppProtectDosResource = appProtectDosResource
+		}
+	}
+
+	if pathRegex, exists := ingEx.Ingress.Annotations[PathRegexAnnotation]; exists {
+		_, ok := validPathRegex[pathRegex]
+		if !ok {
+			nl.Errorf(l, "Ingress %s/%s: Invalid value nginx.org/path-regex: got %q. Allowed values: 'case_sensitive', 'case_insensitive', 'exact'", ingEx.Ingress.GetNamespace(), ingEx.Ingress.GetName(), pathRegex)
+		}
+	}
+
+	if appRoot, exists := ingEx.Ingress.Annotations["nginx.org/app-root"]; exists {
+		cfgParams.AppRoot = appRoot
+	}
+
+	if useClusterIP, exists, err := GetMapKeyAsBool(ingEx.Ingress.Annotations, UseClusterIPAnnotation, ingEx.Ingress); exists {
+		if err != nil {
+			nl.Error(l, err)
+		} else {
+			cfgParams.UseClusterIP = useClusterIP
+		}
+	}
+
+	for _, err := range parseRateLimitAnnotations(ingEx.Ingress.Annotations, &cfgParams, ingEx.Ingress) {
+		nl.Error(l, err)
+	}
+
+	return cfgParams
+}
+
+// parseRateLimitAnnotations parses rate-limiting-related annotations and places them into CfgParams. Occurring errors are collected and returned, but do not abort parsing.
+//
+//gocyclo:ignore
+func parseRateLimitAnnotations(annotations map[string]string, cfgParams *ConfigParams, context apiObject) []error {
+	errors := make([]error, 0)
+	if requestRateLimit, exists := annotations["nginx.org/limit-req-rate"]; exists {
+		if rate, err := ParseRequestRate(requestRateLimit); err != nil {
+			errors = append(errors, fmt.Errorf("ingress %s/%s: invalid value for nginx.org/limit-req-rate: got %s: %w", context.GetNamespace(), context.GetName(), requestRateLimit, err))
+		} else {
+			cfgParams.LimitReqRate = rate
+		}
+	}
+	if requestRateKey, exists := annotations["nginx.org/limit-req-key"]; exists {
+		cfgParams.LimitReqKey = requestRateKey
+	}
+	if requestRateZoneSize, exists := annotations["nginx.org/limit-req-zone-size"]; exists {
+		if size, err := ParseSize(requestRateZoneSize); err != nil {
+			errors = append(errors, fmt.Errorf("ingress %s/%s: invalid value for nginx.org/limit-req-zone-size: got %s: %w", context.GetNamespace(), context.GetName(), requestRateZoneSize, err))
+		} else {
+			cfgParams.LimitReqZoneSize = size
+		}
+	}
+	if requestRateDelay, exists, err := GetMapKeyAsInt(annotations, "nginx.org/limit-req-delay", context); exists {
+		if err != nil {
+			errors = append(errors, err)
+		} else {
+			cfgParams.LimitReqDelay = requestRateDelay
+		}
+	}
+	if requestRateNoDelay, exists, err := GetMapKeyAsBool(annotations, "nginx.org/limit-req-no-delay", context); exists {
+		if err != nil {
+			errors = append(errors, err)
+		} else {
+			cfgParams.LimitReqNoDelay = requestRateNoDelay
+		}
+	}
+	if requestRateBurst, exists, err := GetMapKeyAsInt(annotations, "nginx.org/limit-req-burst", context); exists {
+		if err != nil {
+			errors = append(errors, err)
+		} else {
+			cfgParams.LimitReqBurst = requestRateBurst
+		}
+	}
+	if requestRateDryRun, exists, err := GetMapKeyAsBool(annotations, "nginx.org/limit-req-dry-run", context); exists {
+		if err != nil {
+			errors = append(errors, err)
+		} else {
+			cfgParams.LimitReqDryRun = requestRateDryRun
+		}
+	}
+	if requestRateLogLevel, exists := annotations["nginx.org/limit-req-log-level"]; exists {
+		if !slices.Contains([]string{"info", "notice", "warn", "error"}, requestRateLogLevel) {
+			errors = append(errors, fmt.Errorf("ingress %s/%s: invalid value for nginx.org/limit-req-log-level: got %s", context.GetNamespace(), context.GetName(), requestRateLogLevel))
+		} else {
+			cfgParams.LimitReqLogLevel = requestRateLogLevel
+		}
+	}
+	if requestRateRejectCode, exists, err := GetMapKeyAsInt(annotations, "nginx.org/limit-req-reject-code", context); exists {
+		if err != nil {
+			errors = append(errors, err)
+		} else {
+			cfgParams.LimitReqRejectCode = requestRateRejectCode
+		}
+	}
+	if requestRateScale, exists, err := GetMapKeyAsBool(annotations, "nginx.org/limit-req-scale", context); exists {
+		if err != nil {
+			errors = append(errors, err)
+		} else {
+			cfgParams.LimitReqScale = requestRateScale
+		}
+	}
+	return errors
+}
+
+func getWebsocketServices(ingEx *IngressEx) map[string]bool {
+	if value, exists := ingEx.Ingress.Annotations["nginx.org/websocket-services"]; exists {
+		return ParseServiceList(value)
+	}
+	return nil
+}
+
+func getRewrites(ctx context.Context, ingEx *IngressEx) map[string]string {
+	l := nl.LoggerFromContext(ctx)
+	if value, exists := ingEx.Ingress.Annotations["nginx.org/rewrites"]; exists {
+		rewrites, err := ParseRewriteList(value)
+		if err != nil {
+			nl.Error(l, err)
+		}
+		return rewrites
+	}
+	return nil
+}
+
+func getRewriteTarget(ctx context.Context, ingEx *IngressEx) (string, Warnings) {
+	l := nl.LoggerFromContext(ctx)
+	warnings := newWarnings()
+
+	// Check for mutual exclusivity
+	if _, hasRewrites := ingEx.Ingress.Annotations["nginx.org/rewrites"]; hasRewrites {
+		if _, hasRewriteTarget := ingEx.Ingress.Annotations[RewriteTargetAnnotation]; hasRewriteTarget {
+			warningMsg := "nginx.org/rewrites and nginx.org/rewrite-target annotations are mutually exclusive; nginx.org/rewrites will take precedence"
+			nl.Errorf(l, "Ingress %s/%s: %s", ingEx.Ingress.Namespace, ingEx.Ingress.Name, warningMsg)
+			warnings.AddWarning(ingEx.Ingress, warningMsg)
+			return "", warnings
+		}
+	}
+
+	if value, exists := ingEx.Ingress.Annotations[RewriteTargetAnnotation]; exists {
+		return value, warnings
+	}
+	return "", warnings
+}
+
+func getUpstreamVhost(ingEx *IngressEx) (string, Warnings) {
+	warnings := newWarnings()
+
+	if value, exists := ingEx.Ingress.Annotations[UpstreamVhostAnnotation]; exists {
+		return value, warnings
+	}
+	return "", warnings
+}
+
+func getSSLServices(ingEx *IngressEx) map[string]bool {
+	if value, exists := ingEx.Ingress.Annotations["nginx.org/ssl-services"]; exists {
+		return ParseServiceList(value)
+	}
+	return nil
+}
+
+func getGrpcServices(ingEx *IngressEx) map[string]bool {
+	if value, exists := ingEx.Ingress.Annotations["nginx.org/grpc-services"]; exists {
+		return ParseServiceList(value)
+	}
+	return nil
+}
+
+func getSessionPersistenceServices(ctx context.Context, ingEx *IngressEx) map[string]string {
+	l := nl.LoggerFromContext(ctx)
+
+	// Check for both annotations to maintain compatibility with existing users of the nginx.com
+	// annotation. If both annotations are present, the nginx.org annotation takes precedence.
+	valuePlus, plusExists := ingEx.Ingress.Annotations[StickyCookieServicesAnnotationPlus]
+	valueOrg, orgExists := ingEx.Ingress.Annotations[StickyCookieServicesAnnotation]
+	if !plusExists && !orgExists {
+		return nil
+	}
+
+	value := valuePlus
+	if orgExists {
+		value = valueOrg
+	}
+
+	if plusExists && orgExists {
+		nl.Warnf(l, "Ingress %s/%s: both %s and %s annotations are set; using %s",
+			ingEx.Ingress.Namespace, ingEx.Ingress.Name,
+			StickyCookieServicesAnnotation, StickyCookieServicesAnnotationPlus,
+			StickyCookieServicesAnnotation)
+	}
+
+	services, err := ParseStickyServiceList(value)
+	if err != nil {
+		nl.Error(l, err)
+	}
+	return services
+}
+
+func filterMasterAnnotations(annotations map[string]string) []string {
+	var removedAnnotations []string
+
+	for key := range annotations {
+		if _, notAllowed := masterDenylist[key]; notAllowed {
+			removedAnnotations = append(removedAnnotations, key)
+			delete(annotations, key)
+		}
+	}
+
+	return removedAnnotations
+}
+
+func filterMinionAnnotations(annotations map[string]string) []string {
+	var removedAnnotations []string
+
+	for key := range annotations {
+		if _, notAllowed := minionDenylist[key]; notAllowed {
+			removedAnnotations = append(removedAnnotations, key)
+			delete(annotations, key)
+		}
+	}
+
+	return removedAnnotations
+}
+
+func mergeMasterAnnotationsIntoMinion(minionAnnotations map[string]string, masterAnnotations map[string]string) {
+	for key, val := range masterAnnotations {
+		if _, exists := minionAnnotations[key]; !exists {
+			if _, allowed := minionInheritanceList[key]; allowed {
+				minionAnnotations[key] = val
+			}
+		}
+	}
+}

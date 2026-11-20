@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://wx-one.github.io/wxingress/
+    about: Installation, configuration and migration guides.
+  - name: Questions and discussions
+    url: https://github.com/wx-one/wxingress/discussions
+    about: Ask questions and share ideas in GitHub Discussions.
+  - name: Security vulnerabilities
+    url: https://github.com/wx-one/wxingress/blob/main/SECURITY.md
+    about: Please report security issues privately as described in the security policy, not as a public issue.

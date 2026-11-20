@@ -1,0 +1,483 @@
+# The annotations of ingress-nginx's own e2e suite (test/e2e/annotations/*.go
+# of kubernetes/ingress-nginx), one Ingress each with the values its specs
+# use, for dataplane/e2e/ingress-nginx-parity.sh. The Services are made by
+# parity/corpus.py; `parity/backend` says which backend suits an Ingress.
+# Left out: snippets (off by default since 1.9 and refused by ingress-nginx's
+# webhook), modsecurity (fail-closed here: docs/user-guide/ingress-nginx-compatibility.md), auth-tls
+# (needs a client certificate the probes do not send), ssl-passthrough
+# (--enable-ssl-passthrough is off in RKE2), global-rate-limit (memcached).
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rewrite
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: rewrite.annotations.parity.test
+    http:
+      paths:
+      - {path: "/something(/|$)(.*)", pathType: ImplementationSpecific, backend: {service: {name: echo, port: {number: 80}}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: regex
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: regex.annotations.parity.test
+    http:
+      paths:
+      - {path: "/foo/bar/[A-Z0-9]{3}", pathType: ImplementationSpecific, backend: {service: {name: echo, port: {number: 80}}}}
+      - {path: /foo, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: approot
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/app-root: /foo
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: approot.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: permanent
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/permanent-redirect: https://www.parity.test/landing
+    nginx.ingress.kubernetes.io/permanent-redirect-code: "308"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: permanent.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: temporal
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/temporal-redirect: https://www.parity.test/later
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: temporal.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: tls-redirect
+  namespace: inx-annotations
+spec:
+  ingressClassName: nginx
+  tls: [{hosts: [tls.annotations.parity.test], secretName: tls}]
+  rules:
+  - host: tls.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: no-redirect
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  tls: [{hosts: [plain.annotations.parity.test], secretName: tls}]
+  rules:
+  - host: plain.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: force-redirect
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: force.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cors
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.parity.test"
+    nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+    nginx.ingress.kubernetes.io/cors-expose-headers: "X-Total"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: cors.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cors-any
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: corsany.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: basic-auth
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: basic
+    nginx.ingress.kubernetes.io/auth-realm: "parity"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: basic.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: external-auth
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/auth-url: http://authsvc.inx-annotations.svc.cluster.local/auth
+    nginx.ingress.kubernetes.io/auth-signin: https://signin.annotations.parity.test/start
+    nginx.ingress.kubernetes.io/auth-response-headers: X-Auth-Request-User
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: extauth.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: authsvc
+  namespace: inx-annotations
+  annotations:
+    parity/backend: auth
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: authsvc.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: authsvc, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: allowlist
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/whitelist-source-range: 192.0.2.0/24
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: allowlist.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: denylist
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/denylist-source-range: 0.0.0.0/0
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: denylist.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: bodysize
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 8m
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: bodysize.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vhost
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/upstream-vhost: backend.internal
+    nginx.ingress.kubernetes.io/x-forwarded-prefix: /prefix
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: vhost.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: primary
+  namespace: inx-annotations
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: canary.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: canary
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-by-header: X-Canary
+    parity/backend: ws
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: canary.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo-canary, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: affinity
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/affinity: cookie
+    nginx.ingress.kubernetes.io/session-cookie-name: route
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "172800"
+    nginx.ingress.kubernetes.io/session-cookie-samesite: Lax
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: affinity.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hash
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/upstream-hash-by: $arg_RouteToken
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: hash.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: https-backend
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: httpsbackend.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo-tls, port: {number: 443}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grpc
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: GRPC
+spec:
+  ingressClassName: nginx
+  tls: [{hosts: [grpc.annotations.parity.test], secretName: tls}]
+  rules:
+  - host: grpc.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: grpcbin, port: {number: 9000}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: websocket
+  namespace: inx-annotations
+  annotations:
+    parity/backend: ws
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: ws.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: ws, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: alias
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/server-alias: alias2.annotations.parity.test
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: alias.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: www
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/from-to-www-redirect: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: www.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: errors
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/custom-http-errors: "404,503"
+    nginx.ingress.kubernetes.io/default-backend: errors
+    parity/backend: none
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: errors.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: nothing, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: connection
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/connection-proxy-header: keep-alive
+    nginx.ingress.kubernetes.io/proxy-buffering: "on"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: connection.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: no-access-log
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/enable-access-log: "false"
+    nginx.ingress.kubernetes.io/service-upstream: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: nolog.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: satisfy
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: basic
+    nginx.ingress.kubernetes.io/whitelist-source-range: 0.0.0.0/0
+    nginx.ingress.kubernetes.io/satisfy: any
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: satisfy.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+# cert-manager's http01 solver, as it makes them: class nginx and none
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cm-acme-http-solver-parity
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/whitelist-source-range: 0.0.0.0/0,::/0
+  labels:
+    acme.cert-manager.io/http01-solver: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: tls.annotations.parity.test
+    http:
+      paths:
+      - {path: /.well-known/acme-challenge/parity-token-1, pathType: ImplementationSpecific, backend: {service: {name: cm-acme-http-solver-x7k2p, port: {number: 8089}}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cm-acme-http-solver-classless
+  namespace: inx-annotations
+  annotations:
+    nginx.ingress.kubernetes.io/whitelist-source-range: 0.0.0.0/0,::/0
+spec:
+  rules:
+  - host: classless.annotations.parity.test
+    http:
+      paths:
+      - {path: /.well-known/acme-challenge/parity-token-2, pathType: ImplementationSpecific, backend: {service: {name: cm-acme-http-solver-x7k2p, port: {number: 8089}}}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: annotation-class
+  namespace: inx-annotations
+  annotations:
+    kubernetes.io/ingress.class: nginx
+spec:
+  rules:
+  - host: annclass.annotations.parity.test
+    http: {paths: [{path: /, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}]}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: exact
+  namespace: inx-annotations
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: exact.annotations.parity.test
+    http:
+      paths:
+      - {path: /only, pathType: Exact, backend: {service: {name: echo, port: {number: 80}}}}
+      - {path: /prefix/, pathType: Prefix, backend: {service: {name: echo, port: {number: 80}}}}

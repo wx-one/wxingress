@@ -1,0 +1,623 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"regexp"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/wx-one/wxingress/internal/k8s/secrets"
+	nl "github.com/wx-one/wxingress/internal/logger"
+	nic_glog "github.com/wx-one/wxingress/internal/logger/glog"
+	"github.com/wx-one/wxingress/internal/logger/levels"
+	apps_v1 "k8s.io/api/apps/v1"
+	api_v1 "k8s.io/api/core/v1"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	pkgversion "k8s.io/apimachinery/pkg/version"
+	fakediscovery "k8s.io/client-go/discovery/fake"
+	"k8s.io/client-go/kubernetes/fake"
+)
+
+func TestLogFormats(t *testing.T) {
+	testCases := []struct {
+		name   string
+		format string
+		wantre string
+	}{
+		{
+			name:   "glog format message",
+			format: "glog",
+			wantre: `^I\d{8}\s\d+:\d+:\d+.\d{6}\s+\d+\s\w+\.go:\d+\]\s.*\s$`,
+		},
+		{
+			name:   "json format message",
+			format: "json",
+			wantre: `^{"time":"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d+.*","level":"INFO","source":\{"file":"[^"]+\.go","line":\d+\},"msg":".*}`,
+		},
+		{
+			name:   "text format message",
+			format: "text",
+			wantre: `^time=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d+.*level=\w+\ssource=[^:]+\.go:\d+\smsg=\w+`,
+		},
+	}
+	t.Parallel()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			ctx := initLogger(tc.format, levels.LevelInfo, &buf)
+			l := nl.LoggerFromContext(ctx)
+			l.Log(ctx, levels.LevelInfo, "test")
+			got := buf.String()
+			re := regexp.MustCompile(tc.wantre)
+			if !re.MatchString(got) {
+				t.Errorf("\ngot:\n%q\nwant:\n%q", got, tc.wantre)
+			}
+		})
+	}
+}
+
+func TestLogTimeFormats(t *testing.T) {
+	testCases := []struct {
+		name      string
+		logFormat string
+		wantre    string
+	}{
+		// JSON format tests
+		{
+			name:      "json default time format",
+			logFormat: "json",
+			wantre:    `^{"time":"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d+.*","level":"INFO","source":\{"file":"[^"]+\.go","line":\d+\},"msg":".*}`,
+		},
+		{
+			name:      "json unix time format",
+			logFormat: "json-unix",
+			wantre:    `^{"time":\d{10},"level":"INFO","source":\{"file":"[^"]+\.go","line":\d+\},"msg":".*}`,
+		},
+		{
+			name:      "json unix-ms time format",
+			logFormat: "json-unix-ms",
+			wantre:    `^{"time":\d{13},"level":"INFO","source":\{"file":"[^"]+\.go","line":\d+\},"msg":".*}`,
+		},
+		// TEXT format tests
+		{
+			name:      "text default time format",
+			logFormat: "text",
+			wantre:    `^time=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}.\d+.*level=\w+\ssource=[^:]+\.go:\d+\smsg=\w+`,
+		},
+		{
+			name:      "text unix time format",
+			logFormat: "text-unix",
+			wantre:    `^time=\d{10}\slevel=\w+\ssource=[^:]+\.go:\d+\smsg=\w+`,
+		},
+		{
+			name:      "text unix-ms time format",
+			logFormat: "text-unix-ms",
+			wantre:    `^time=\d{13}\slevel=\w+\ssource=[^:]+\.go:\d+\smsg=\w+`,
+		},
+	}
+	t.Parallel()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			ctx := initLogger(tc.logFormat, levels.LevelInfo, &buf)
+			l := nl.LoggerFromContext(ctx)
+			l.Log(ctx, levels.LevelInfo, "test")
+			got := buf.String()
+			re := regexp.MustCompile(tc.wantre)
+			if !re.MatchString(got) {
+				t.Errorf("\ngot:\n%q\nwant regex:\n%q", got, tc.wantre)
+			}
+		})
+	}
+}
+
+func TestK8sVersionValidation(t *testing.T) {
+	testCases := []struct {
+		name        string
+		kubeVersion string
+	}{
+		{
+			name:        "Earliest version 1.22.0",
+			kubeVersion: "1.22.0",
+		},
+		{
+			name:        "Minor version 1.22.5",
+			kubeVersion: "1.22.5",
+		},
+		{
+			name:        "Close to current 1.32.0",
+			kubeVersion: "1.32.0",
+		},
+	}
+	t.Parallel()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// setup logger
+			l := slog.New(nic_glog.New(io.Discard, &nic_glog.Options{Level: levels.LevelInfo}))
+			ctx := nl.ContextWithLogger(context.Background(), l)
+
+			// setup kube client with version
+			clientset := fake.NewClientset()
+			fakeDiscovery, _ := clientset.Discovery().(*fakediscovery.FakeDiscovery)
+			fakeDiscovery.FakedServerVersion = &pkgversion.Info{GitVersion: tc.kubeVersion}
+
+			// run test
+			err := validateKubernetesVersionInfo(ctx, clientset)
+			if err != nil {
+				t.Errorf("%v", err)
+			}
+		})
+	}
+}
+
+func TestK8sVersionValidationBad(t *testing.T) {
+	testCases := []struct {
+		name        string
+		kubeVersion string
+	}{
+		{
+			name:        "Before earliest version 1.21.0",
+			kubeVersion: "1.21.0",
+		},
+		{
+			name:        "Empty version",
+			kubeVersion: "",
+		},
+		{
+			name:        "Garbage",
+			kubeVersion: "xyzabc",
+		},
+	}
+	t.Parallel()
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// setup logger
+			l := slog.New(nic_glog.New(io.Discard, &nic_glog.Options{Level: levels.LevelInfo}))
+			ctx := nl.ContextWithLogger(context.Background(), l)
+
+			// setup kube client with version
+			clientset := fake.NewClientset()
+			fakeDiscovery, _ := clientset.Discovery().(*fakediscovery.FakeDiscovery)
+			fakeDiscovery.FakedServerVersion = &pkgversion.Info{GitVersion: tc.kubeVersion}
+
+			// run test
+			err := validateKubernetesVersionInfo(ctx, clientset)
+			if err == nil {
+				t.Error("Wanted an error here")
+			}
+		})
+	}
+}
+
+func TestCreateHeadlessService(t *testing.T) {
+	logger := nl.LoggerFromContext(context.Background())
+	controllerNamespace := "default"
+	configMapName := "test-configmap"
+	configMapNamespace := "default"
+	configMapNamespacedName := fmt.Sprintf("%s/%s", configMapNamespace, configMapName)
+	podName := "test-pod"
+
+	podLabels := map[string]string{
+		"app.kubernetes.io/name":     "nginx-ingress",
+		"app.kubernetes.io/instance": "my-release",
+		"pod-template-hash":          "abc123",
+	}
+
+	svcName := "test-hl-service"
+
+	configMap := &api_v1.ConfigMap{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:      configMapName,
+			Namespace: configMapNamespace,
+			UID:       types.UID("uid-cm"),
+		},
+	}
+
+	expectedOwnerReferences := []meta_v1.OwnerReference{
+		{
+			APIVersion:         "v1",
+			Kind:               "ConfigMap",
+			Name:               configMap.Name,
+			UID:                configMap.UID,
+			Controller:         new(true),
+			BlockOwnerDeletion: new(true),
+		},
+	}
+
+	testCases := []struct {
+		name                string
+		ownerKind           string
+		controllerName      string
+		controllerSelectors map[string]string
+		expectedSelector    map[string]string
+		existingService     *api_v1.Service
+		expectedAction      string
+		expectedOwnerRefs   []meta_v1.OwnerReference
+	}{
+		{
+			name:           "Create service for ReplicaSet controller",
+			ownerKind:      "ReplicaSet",
+			controllerName: "nginx-ingress-123",
+			controllerSelectors: map[string]string{
+				"app.kubernetes.io/name":     "nginx-ingress",
+				"app.kubernetes.io/instance": "my-release",
+				"pod-template-hash":          "abc123",
+			},
+			// For ReplicaSet, pod-template-hash should be excluded
+			expectedSelector: map[string]string{
+				"app.kubernetes.io/name":     "nginx-ingress",
+				"app.kubernetes.io/instance": "my-release",
+			},
+			expectedAction:    "create",
+			expectedOwnerRefs: expectedOwnerReferences,
+		},
+		{
+			name:           "Create service for DaemonSet controller",
+			ownerKind:      "DaemonSet",
+			controllerName: "nginx-ingress-ds",
+			controllerSelectors: map[string]string{
+				"app.kubernetes.io/name":     "nginx-ingress",
+				"app.kubernetes.io/instance": "my-release",
+			},
+			expectedSelector: map[string]string{
+				"app.kubernetes.io/name":     "nginx-ingress",
+				"app.kubernetes.io/instance": "my-release",
+			},
+			expectedAction:    "create",
+			expectedOwnerRefs: expectedOwnerReferences,
+		},
+		{
+			name:           "Create service for StatefulSet controller",
+			ownerKind:      "StatefulSet",
+			controllerName: "nginx-ingress-sts",
+			controllerSelectors: map[string]string{
+				"app.kubernetes.io/name":     "nginx-ingress",
+				"app.kubernetes.io/instance": "my-release",
+			},
+			expectedSelector: map[string]string{
+				"app.kubernetes.io/name":     "nginx-ingress",
+				"app.kubernetes.io/instance": "my-release",
+			},
+			expectedAction:    "create",
+			expectedOwnerRefs: expectedOwnerReferences,
+		},
+		{
+			name:           "Skip update if selectors match",
+			ownerKind:      "ReplicaSet",
+			controllerName: "nginx-ingress-123",
+			controllerSelectors: map[string]string{
+				"app.kubernetes.io/name":     "nginx-ingress",
+				"app.kubernetes.io/instance": "my-release",
+				"pod-template-hash":          "abc123",
+			},
+			expectedSelector: map[string]string{
+				"app.kubernetes.io/name":     "nginx-ingress",
+				"app.kubernetes.io/instance": "my-release",
+			},
+			existingService: &api_v1.Service{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Name:            svcName,
+					Namespace:       controllerNamespace,
+					OwnerReferences: expectedOwnerReferences,
+				},
+				Spec: api_v1.ServiceSpec{
+					Selector: map[string]string{
+						"app.kubernetes.io/name":     "nginx-ingress",
+						"app.kubernetes.io/instance": "my-release",
+					},
+				},
+			},
+			expectedAction:    "none",
+			expectedOwnerRefs: expectedOwnerReferences,
+		},
+		{
+			name:           "Update service if selectors differ",
+			ownerKind:      "ReplicaSet",
+			controllerName: "nginx-ingress-123",
+			controllerSelectors: map[string]string{
+				"app.kubernetes.io/name":     "nginx-ingress",
+				"app.kubernetes.io/instance": "my-release",
+				"pod-template-hash":          "abc123",
+			},
+			expectedSelector: map[string]string{
+				"app.kubernetes.io/name":     "nginx-ingress",
+				"app.kubernetes.io/instance": "my-release",
+			},
+			existingService: &api_v1.Service{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Name:            svcName,
+					Namespace:       controllerNamespace,
+					OwnerReferences: expectedOwnerReferences,
+				},
+				Spec: api_v1.ServiceSpec{
+					Selector: map[string]string{"old-label": "true"},
+				},
+			},
+			expectedAction:    "update",
+			expectedOwnerRefs: expectedOwnerReferences,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Create pod with owner reference to the controller
+			pod := &api_v1.Pod{
+				ObjectMeta: meta_v1.ObjectMeta{
+					Name:      podName,
+					Namespace: controllerNamespace,
+					Labels:    podLabels,
+					OwnerReferences: []meta_v1.OwnerReference{
+						{
+							APIVersion: "apps/v1",
+							Kind:       tc.ownerKind,
+							Name:       tc.controllerName,
+							UID:        types.UID("controller-uid-123"),
+							Controller: new(true),
+						},
+					},
+				},
+			}
+
+			// Create the appropriate controller object
+			var controllerObj runtime.Object
+			switch tc.ownerKind {
+			case "ReplicaSet":
+				controllerObj = &apps_v1.ReplicaSet{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      tc.controllerName,
+						Namespace: controllerNamespace,
+					},
+					Spec: apps_v1.ReplicaSetSpec{
+						Selector: &meta_v1.LabelSelector{
+							MatchLabels: tc.controllerSelectors,
+						},
+					},
+				}
+			case "DaemonSet":
+				controllerObj = &apps_v1.DaemonSet{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      tc.controllerName,
+						Namespace: controllerNamespace,
+					},
+					Spec: apps_v1.DaemonSetSpec{
+						Selector: &meta_v1.LabelSelector{
+							MatchLabels: tc.controllerSelectors,
+						},
+					},
+				}
+			case "StatefulSet":
+				controllerObj = &apps_v1.StatefulSet{
+					ObjectMeta: meta_v1.ObjectMeta{
+						Name:      tc.controllerName,
+						Namespace: controllerNamespace,
+					},
+					Spec: apps_v1.StatefulSetSpec{
+						Selector: &meta_v1.LabelSelector{
+							MatchLabels: tc.controllerSelectors,
+						},
+					},
+				}
+			}
+
+			clientObjects := []runtime.Object{pod, configMap, controllerObj}
+			if tc.existingService != nil {
+				clientObjects = append(clientObjects, tc.existingService)
+			}
+			clientset := fake.NewClientset(clientObjects...)
+
+			err := createHeadlessService(logger, clientset, controllerNamespace, svcName, configMapNamespacedName, pod)
+			assert.NoError(t, err)
+
+			service, err := clientset.CoreV1().Services(controllerNamespace).Get(context.Background(), svcName, meta_v1.GetOptions{})
+			assert.NoError(t, err, "Failed to get service after create/update")
+
+			if err == nil {
+				assert.Equal(t, tc.expectedSelector, service.Spec.Selector, "Service selector mismatch")
+				assert.Equal(t, tc.expectedOwnerRefs, service.OwnerReferences, "Service OwnerReferences mismatch")
+			}
+
+			actions := clientset.Actions()
+			var serviceCreated, serviceUpdated bool
+			for _, action := range actions {
+				if action.Matches("create", "services") {
+					serviceCreated = true
+				}
+				if action.Matches("update", "services") {
+					serviceUpdated = true
+				}
+			}
+
+			switch tc.expectedAction {
+			case "create":
+				assert.True(t, serviceCreated, "service to be created")
+				assert.False(t, serviceUpdated, "no service update when creation is expected")
+			case "update":
+				assert.True(t, serviceUpdated, "service to be updated")
+				assert.False(t, serviceCreated, "no service creation when update is expected")
+			case "none":
+				assert.False(t, serviceCreated, "no service creation when no action is expected")
+				assert.False(t, serviceUpdated, "no service update when no action is expected")
+			default:
+				t.Fatalf("Invalid expectedAction: %s", tc.expectedAction)
+			}
+		})
+	}
+}
+
+func TestGetAndValidateSecret(t *testing.T) {
+	t.Parallel()
+
+	jwkSecret := &api_v1.Secret{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "jwk-secret", Namespace: "default"},
+		Type:       api_v1.SecretTypeOpaque,
+		Data:       map[string][]byte{"jwk": []byte("{}")},
+	}
+
+	tests := []struct {
+		name         string
+		secretNsName string
+		role         secrets.SecretRole
+		wantErr      string
+	}{
+		{
+			name:         "valid for the role whose required key it carries",
+			secretNsName: "default/jwk-secret",
+			role:         secrets.RoleJWK,
+		},
+		{
+			name:         "invalid for a role whose required keys it lacks",
+			secretNsName: "default/jwk-secret",
+			role:         secrets.RoleTLS,
+			wantErr:      `default/jwk-secret is invalid: secret is missing required key "tls.crt"`,
+		},
+		{
+			name:         "secret absent from the cluster",
+			secretNsName: "default/nope",
+			role:         secrets.RoleJWK,
+			wantErr:      "could not find default/nope",
+		},
+		{
+			name:         "unparseable secret reference",
+			secretNsName: "not-a-namespaced-name",
+			role:         secrets.RoleJWK,
+			wantErr:      "could not parse the not-a-namespaced-name argument",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			clientset := fake.NewClientset(jwkSecret)
+
+			secret, err := getAndValidateSecret(clientset, test.secretNsName, test.role)
+
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("getAndValidateSecret() unexpected error: %v", err)
+				}
+				if secret == nil || secret.Name != "jwk-secret" {
+					t.Errorf("getAndValidateSecret() returned %v, want jwk-secret", secret)
+				}
+				return
+			}
+
+			if err == nil {
+				t.Fatalf("getAndValidateSecret() expected an error containing %q, got none", test.wantErr)
+			}
+			if !strings.Contains(err.Error(), test.wantErr) {
+				t.Errorf("getAndValidateSecret() error = %q, want it to contain %q", err.Error(), test.wantErr)
+			}
+		})
+	}
+}
+
+func TestGetControllerZone(t *testing.T) {
+	t.Parallel()
+
+	node := func(name string, labels map[string]string) *api_v1.Node {
+		return &api_v1.Node{ObjectMeta: meta_v1.ObjectMeta{Name: name, Labels: labels}}
+	}
+
+	tests := []struct {
+		name     string
+		nodeName string
+		objects  []runtime.Object
+		want     string
+	}{
+		{
+			name:     "zone label on the controller node",
+			nodeName: "node-1",
+			objects: []runtime.Object{
+				node("node-1", map[string]string{api_v1.LabelTopologyZone: "zone-a"}),
+				node("node-2", map[string]string{api_v1.LabelTopologyZone: "zone-b"}),
+			},
+			want: "zone-a",
+		},
+		{
+			name:     "controller node has no zone label",
+			nodeName: "node-1",
+			objects:  []runtime.Object{node("node-1", nil)},
+			want:     "",
+		},
+		{
+			name:     "controller node not found",
+			nodeName: "node-1",
+			objects:  []runtime.Object{node("node-2", map[string]string{api_v1.LabelTopologyZone: "zone-b"})},
+			want:     "",
+		},
+		{
+			name:     "empty node name",
+			nodeName: "",
+			objects:  []runtime.Object{node("node-1", map[string]string{api_v1.LabelTopologyZone: "zone-a"})},
+			want:     "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			clientset := fake.NewClientset(test.objects...)
+			ctx := nl.ContextWithLogger(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			got := getControllerZone(ctx, clientset, test.nodeName)
+			if got != test.want {
+				t.Errorf("getControllerZone() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestGetControllerTopology(t *testing.T) {
+	t.Parallel()
+
+	pod := &api_v1.Pod{Spec: api_v1.PodSpec{NodeName: "node-1"}}
+	node := &api_v1.Node{ObjectMeta: meta_v1.ObjectMeta{
+		Name:   "node-1",
+		Labels: map[string]string{api_v1.LabelTopologyZone: "zone-a"},
+	}}
+
+	tests := []struct {
+		name         string
+		enabled      bool
+		wantNodeName string
+		wantZone     string
+		wantActions  int
+	}{
+		{
+			name:         "enabled resolves node and zone",
+			enabled:      true,
+			wantNodeName: "node-1",
+			wantZone:     "zone-a",
+			wantActions:  1,
+		},
+		{
+			name:        "disabled does not query the API",
+			enabled:     false,
+			wantActions: 0,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			clientset := fake.NewClientset(node)
+			ctx := nl.ContextWithLogger(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+			gotNodeName, gotZone := getControllerTopology(ctx, clientset, pod, test.enabled)
+			if gotNodeName != test.wantNodeName || gotZone != test.wantZone {
+				t.Errorf("getControllerTopology() = (%q, %q), want (%q, %q)", gotNodeName, gotZone, test.wantNodeName, test.wantZone)
+			}
+			if got := len(clientset.Actions()); got != test.wantActions {
+				t.Errorf("getControllerTopology() made %d API calls, want %d", got, test.wantActions)
+			}
+		})
+	}
+}

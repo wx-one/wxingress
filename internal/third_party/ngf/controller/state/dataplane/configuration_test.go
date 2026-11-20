@@ -1,0 +1,13157 @@
+package dataplane
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-logr/logr"
+	. "github.com/onsi/gomega"
+	apiv1 "k8s.io/api/core/v1"
+	discoveryV1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	v1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPIv1alpha1 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	ngfAPIv1alpha2 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha2"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies/policiesfakes"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/shared"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/conditions"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/configmaps"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/secrets"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/resolver"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/resolver/resolverfakes"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+)
+
+const (
+	invalidMatchesPath = "/not-valid-matches"
+	invalidFiltersPath = "/not-valid-filters"
+	prefix             = v1.PathMatchPathPrefix
+)
+
+var (
+
+	// backends.
+	validBackendRef = getNormalBackendRef()
+
+	fooUpstreamName = "test_foo_80"
+	expValidBackend = Backend{
+		UpstreamName: fooUpstreamName,
+		Weight:       1,
+		Valid:        true,
+	}
+	fooEndpoints = []resolver.Endpoint{
+		{
+			Address: "10.0.0.0",
+			Port:    8080,
+		},
+	}
+
+	fooUpstream = Upstream{
+		Name:         fooUpstreamName,
+		Endpoints:    fooEndpoints,
+		StateFileKey: fooUpstreamName,
+	}
+
+	// routes.
+
+	httpsHR1, expHTTPSHR1Groups, httpsRouteHR1 = createTestResources(
+		"https-hr-1",
+		"foo.example.com",
+		"listener-443-1",
+		pathAndType{path: "/", pathType: prefix},
+	)
+
+	httpsHR2, expHTTPSHR2Groups, httpsRouteHR2 = createTestResources(
+		"https-hr-2",
+		"bar.example.com",
+		"listener-443-1",
+		pathAndType{path: "/", pathType: prefix},
+	)
+
+	// secrets.
+	secret2NsName = types.NamespacedName{Namespace: "test", Name: "secret-2"}
+	secret2       = &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secret2NsName.Name,
+				Namespace: secret2NsName.Namespace,
+			},
+			Data: map[string][]byte{
+				apiv1.TLSCertKey:       []byte("cert-2"),
+				apiv1.TLSPrivateKeyKey: []byte("privateKey-2"),
+			},
+		},
+		CertBundle: secrets.NewCertificateBundle(
+			secret2NsName,
+			"Secret",
+			&secrets.Certificate{
+				TLSCert:       []byte("cert-2"),
+				TLSPrivateKey: []byte("privateKey-2"),
+			},
+		),
+	}
+	secret1NsName = types.NamespacedName{Namespace: "test", Name: "secret-1"}
+	secret1       = &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secret1NsName.Name,
+				Namespace: secret1NsName.Namespace,
+			},
+			Data: map[string][]byte{
+				apiv1.TLSCertKey:       []byte("cert-1"),
+				apiv1.TLSPrivateKeyKey: []byte("privateKey-1"),
+			},
+		},
+		CertBundle: secrets.NewCertificateBundle(
+			secret1NsName,
+			"Secret",
+			&secrets.Certificate{
+				TLSCert:       []byte("cert-1"),
+				TLSPrivateKey: []byte("privateKey-1"),
+			},
+		),
+	}
+
+	defaultConfig = Configuration{
+		Logging:   Logging{ErrorLevel: defaultErrorLogLevel},
+		NginxPlus: NginxPlus{},
+	}
+
+	// listeners.
+	listener80 = v1.Listener{
+		Name:     "listener-80-1",
+		Hostname: nil,
+		Port:     80,
+		Protocol: v1.HTTPProtocolType,
+	}
+
+	hostname                = v1.Hostname("example.com")
+	listener443WithHostname = v1.Listener{
+		Name:     "listener-443-with-hostname",
+		Hostname: &hostname,
+		Port:     443,
+		Protocol: v1.HTTPSProtocolType,
+		TLS: &v1.ListenerTLSConfig{
+			Mode: helpers.GetPointer(v1.TLSModeTerminate),
+			CertificateRefs: []v1.SecretObjectReference{
+				{
+					Kind:      (*v1.Kind)(helpers.GetPointer("Secret")),
+					Namespace: helpers.GetPointer(v1.Namespace(secret2NsName.Namespace)),
+					Name:      v1.ObjectName(secret2NsName.Name),
+				},
+			},
+		},
+	}
+)
+
+type commonTestCase struct {
+	msg     string
+	graph   *graph.Graph
+	expConf Configuration
+}
+
+var defaultBaseHTTPConfig = BaseHTTPConfig{
+	NginxReadinessProbePort: DefaultNginxReadinessProbePort,
+	NginxReadinessProbePath: DefaultNginxReadinessProbePath,
+	HTTP2:                   true,
+	IPFamily:                Dual,
+}
+
+func getNormalBackendRef() graph.BackendRef {
+	return graph.BackendRef{
+		SvcNsName:   types.NamespacedName{Name: "foo", Namespace: "test"},
+		ServicePort: apiv1.ServicePort{Port: 80},
+		Valid:       true,
+		Weight:      1,
+	}
+}
+
+func getExpectedSPConfiguration() Configuration {
+	return Configuration{
+		BaseHTTPConfig: defaultBaseHTTPConfig,
+		HTTPServers: []VirtualServer{
+			{
+				IsDefault: true,
+				Port:      80,
+			},
+		},
+		SSLServers: []VirtualServer{
+			{
+				IsDefault: true,
+				Port:      443,
+			},
+		},
+		Upstreams:     []Upstream{},
+		BackendGroups: []BackendGroup{},
+		SSLKeyPairs: map[SSLKeyPairID]SSLKeyPair{
+			"ssl_keypair_test_secret-1": {
+				Cert: []byte("cert-1"),
+				Key:  []byte("privateKey-1"),
+			},
+		},
+		CertBundles: map[CertBundleID]CertBundle{},
+		Logging: Logging{
+			ErrorLevel: defaultErrorLogLevel,
+		},
+		NginxPlus: NginxPlus{},
+	}
+}
+
+var gatewayNsName = types.NamespacedName{
+	Namespace: "test",
+	Name:      "gateway",
+}
+
+func getNormalGraph() *graph.Graph {
+	return &graph.Graph{
+		GatewayClass: &graph.GatewayClass{
+			Source: &v1.GatewayClass{},
+			Valid:  true,
+		},
+		Gateways: map[types.NamespacedName]*graph.Gateway{
+			gatewayNsName: {
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{},
+			},
+		},
+		Routes:                     map[graph.RouteKey]*graph.L7Route{},
+		ReferencedSecrets:          map[types.NamespacedName]*secrets.Secret{},
+		ReferencedCaCertConfigMaps: map[types.NamespacedName]*configmaps.CaCertConfigMap{},
+		ReferencedServices:         map[types.NamespacedName]*graph.ReferencedService{},
+	}
+}
+
+func getModifiedGraph(mod func(g *graph.Graph) *graph.Graph) *graph.Graph {
+	return mod(getNormalGraph())
+}
+
+func getModifiedExpectedConfiguration(mod func(conf Configuration) Configuration) Configuration {
+	return mod(getExpectedSPConfiguration())
+}
+
+func createFakePolicy(name string, kind string) policies.Policy {
+	fakeKind := &policiesfakes.ObjectKindMock{
+		GroupVersionKindFunc: func() schema.GroupVersionKind {
+			return schema.GroupVersionKind{Kind: kind}
+		},
+	}
+
+	return &policiesfakes.PolicyMock{
+		GetNameFunc: func() string {
+			return name
+		},
+		GetNamespaceFunc: func() string {
+			return "default"
+		},
+		GetObjectKindFunc: func() schema.ObjectKind {
+			return fakeKind
+		},
+	}
+}
+
+func createRoute(name string) *v1.HTTPRoute {
+	return &v1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test",
+			Name:      name,
+		},
+		Spec: v1.HTTPRouteSpec{},
+	}
+}
+
+func createGRPCRoute(name string) *v1.GRPCRoute {
+	return &v1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test",
+			Name:      name,
+		},
+		Spec: v1.GRPCRouteSpec{},
+	}
+}
+
+func createUpstreamWithBackendTLSPolicy(name string) Upstream {
+	return Upstream{
+		Name:         fooUpstreamName,
+		Endpoints:    fooEndpoints,
+		StateFileKey: fooUpstreamName,
+		VerifyTLS: &VerifyTLS{
+			CertBundleID: generateCertBundleID(
+				types.NamespacedName{Namespace: "test", Name: name},
+			),
+			Hostname: "foo.example.com",
+		},
+	}
+}
+
+func addFilters(hr *graph.L7Route, filters []graph.Filter) {
+	for i := range hr.Spec.Rules {
+		hr.Spec.Rules[i].Filters = graph.RouteRuleFilters{
+			Filters: filters,
+			Valid:   *hr.Spec.Rules[i].Matches[0].Path.Value != invalidFiltersPath,
+		}
+	}
+}
+
+func addFilterPerRule(hr *graph.L7Route, filters []graph.Filter) {
+	for i := range hr.Spec.Rules {
+		hr.Spec.Rules[i].Filters = graph.RouteRuleFilters{
+			Filters: []graph.Filter{filters[i]},
+			Valid:   *hr.Spec.Rules[i].Matches[0].Path.Value != invalidFiltersPath,
+		}
+	}
+}
+
+func createBackendRefs(validRule bool) []graph.BackendRef {
+	if !validRule {
+		return nil
+	}
+
+	return []graph.BackendRef{validBackendRef}
+}
+
+func createRules(paths []pathAndType) []graph.RouteRule {
+	rules := make([]graph.RouteRule, len(paths))
+
+	for i := range paths {
+		validMatches := paths[i].path != invalidMatchesPath
+		validFilters := paths[i].path != invalidFiltersPath
+		validRule := validMatches && validFilters
+
+		m := []v1.HTTPRouteMatch{
+			{
+				Path: &v1.HTTPPathMatch{
+					Value: &paths[i].path,
+					Type:  &paths[i].pathType,
+				},
+			},
+		}
+
+		rules[i] = graph.RouteRule{
+			Matches: m,
+			Filters: graph.RouteRuleFilters{
+				Valid: validFilters,
+			},
+			BackendRefs:  createBackendRefs(validRule),
+			ValidMatches: validMatches,
+		}
+	}
+
+	return rules
+}
+
+func createInternalRoute(
+	source client.Object,
+	routeType graph.RouteType,
+	hostnames []string,
+	listenerName string,
+	paths []pathAndType,
+) *graph.L7Route {
+	r := &graph.L7Route{
+		RouteType: routeType,
+		Source:    source,
+		Spec: graph.L7RouteSpec{
+			Rules: createRules(paths),
+		},
+		Valid: true,
+		ParentRefs: []graph.ParentRef{
+			{
+				Kind:           kinds.Gateway,
+				NamespacedName: gatewayNsName,
+				GatewayNsName:  gatewayNsName,
+				Attachment: &graph.ParentRefAttachmentStatus{
+					Listeners: []graph.ListenerAttachmentStatus{{
+						Key:               graph.CreateParentRefListenerKey(gatewayNsName, listenerName),
+						AcceptedHostnames: hostnames,
+						Port:              0,
+					}},
+				},
+			},
+		},
+	}
+	return r
+}
+
+func createExpBackendGroupsForRoute(route *graph.L7Route) []BackendGroup {
+	groups := make([]BackendGroup, 0)
+
+	for idx, r := range route.Spec.Rules {
+		var backends []Backend
+		if r.Filters.Valid && r.ValidMatches {
+			backends = []Backend{expValidBackend}
+		}
+
+		groups = append(groups, BackendGroup{
+			Backends: backends,
+			Source:   client.ObjectKeyFromObject(route.Source),
+			RuleIdx:  idx,
+		})
+	}
+
+	return groups
+}
+
+func createTestResources(name, hostname, listenerName string, paths ...pathAndType) (
+	*v1.HTTPRoute, []BackendGroup, *graph.L7Route,
+) {
+	hr := createRoute(name)
+	route := createInternalRoute(hr, graph.RouteTypeHTTP, []string{hostname}, listenerName, paths)
+	groups := createExpBackendGroupsForRoute(route)
+	return hr, groups, route
+}
+
+// common function to assert the generated configuration.
+func assertBuildConfiguration(g *WithT, result, expected Configuration) {
+	g.Expect(result.BackendGroups).To(ConsistOf(expected.BackendGroups))
+	g.Expect(result.Upstreams).To(ConsistOf(expected.Upstreams))
+	g.Expect(result.HTTPServers).To(ConsistOf(expected.HTTPServers))
+	g.Expect(result.SSLServers).To(ConsistOf(expected.SSLServers))
+	g.Expect(result.TLSServers).To(ConsistOf(expected.TLSServers))
+	g.Expect(result.SSLKeyPairs).To(Equal(expected.SSLKeyPairs))
+	g.Expect(result.CertBundles).To(Equal(expected.CertBundles))
+	g.Expect(result.Telemetry).To(Equal(expected.Telemetry))
+	g.Expect(result.BaseHTTPConfig).To(Equal(expected.BaseHTTPConfig))
+	g.Expect(result.Logging).To(Equal(expected.Logging))
+	g.Expect(result.NginxPlus).To(Equal(expected.NginxPlus))
+	g.Expect(result.SSLListenerHostnames).To(Equal(expected.SSLListenerHostnames))
+}
+
+func TestBuildConfiguration(t *testing.T) {
+	// setPathRuleIdx creates a new BackendGroup with the specified PathRuleIdx
+	// This is needed because pathRuleIdx cannot be determined in createTestResources when
+	// the BackendGroup is created, but can only be determined when the VirtualServer's PathRules are
+	// being defined in the Configuration.
+	setPathRuleIdx := func(bg BackendGroup, pathRuleIdx int) BackendGroup {
+		return BackendGroup{
+			Source:      bg.Source,
+			RuleIdx:     bg.RuleIdx,
+			PathRuleIdx: pathRuleIdx,
+			Backends:    bg.Backends,
+		}
+	}
+
+	t.Parallel()
+
+	fakeResolver := &resolverfakes.ServiceResolverMock{}
+	fakeResolver.ResolveFunc = func(
+		context.Context, logr.Logger, types.NamespacedName, apiv1.ServicePort, []discoveryV1.AddressType) (
+		[]resolver.Endpoint, error,
+	) {
+		return fooEndpoints, nil
+	}
+
+	gwPolicy1 := &graph.Policy{
+		Source: createFakePolicy("attach-gw", "ApplePolicy"),
+		Valid:  true,
+	}
+
+	gwPolicy2 := &graph.Policy{
+		Source: createFakePolicy("attach-gw", "OrangePolicy"),
+		Valid:  true,
+	}
+
+	hrPolicy1 := &graph.Policy{
+		Source: createFakePolicy("attach-hr", "LemonPolicy"),
+		Valid:  true,
+	}
+
+	hrPolicy2 := &graph.Policy{
+		Source: createFakePolicy("attach-hr", "LimePolicy"),
+		Valid:  true,
+	}
+
+	invalidPolicy := &graph.Policy{
+		Source: createFakePolicy("invalid", "LimePolicy"),
+		Valid:  false,
+	}
+
+	hr1, expHR1Groups, routeHR1 := createTestResources(
+		"hr-1",
+		"foo.example.com",
+		"listener-80-1",
+		pathAndType{path: "/", pathType: prefix},
+	)
+
+	_, _, routeHR1Invalid := createTestResources(
+		"hr-1",
+		"foo.example.com",
+		"listener-80-1",
+		pathAndType{path: "/", pathType: prefix},
+	)
+	routeHR1Invalid.Valid = false
+
+	hr2, expHR2Groups, routeHR2 := createTestResources(
+		"hr-2",
+		"bar.example.com",
+		"listener-80-1",
+		pathAndType{path: "/", pathType: prefix},
+	)
+	hr3, expHR3Groups, routeHR3 := createTestResources(
+		"hr-3",
+		"foo.example.com",
+		"listener-80-1",
+		pathAndType{path: "/", pathType: prefix},
+		pathAndType{path: "/third", pathType: prefix},
+	)
+
+	hr4, expHR4Groups, routeHR4 := createTestResources(
+		"hr-4",
+		"foo.example.com",
+		"listener-80-1",
+		pathAndType{path: "/fourth", pathType: prefix},
+		pathAndType{path: "/", pathType: prefix},
+	)
+	hr5, expHR5Groups, routeHR5 := createTestResources(
+		"hr-5",
+		"foo.example.com",
+		"listener-80-1",
+		pathAndType{path: "/", pathType: prefix},
+		pathAndType{path: invalidFiltersPath, pathType: prefix},
+	)
+
+	sf1 := &graph.SnippetsFilter{
+		Source: &ngfAPIv1alpha1.SnippetsFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "sf",
+				Namespace: "test",
+			},
+		},
+		Valid:      true,
+		Referenced: true,
+		Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+			ngfAPIv1alpha1.NginxContextHTTPServerLocation: "location snippet",
+			ngfAPIv1alpha1.NginxContextHTTPServer:         "server snippet",
+			ngfAPIv1alpha1.NginxContextMain:               "main snippet",
+			ngfAPIv1alpha1.NginxContextHTTP:               "http snippet",
+		},
+	}
+
+	sfNotReferenced := &graph.SnippetsFilter{
+		Source: &ngfAPIv1alpha1.SnippetsFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "sf-not-referenced",
+				Namespace: "test",
+			},
+		},
+		Valid:      true,
+		Referenced: false,
+		Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+			ngfAPIv1alpha1.NginxContextMain: "main snippet no ref",
+			ngfAPIv1alpha1.NginxContextHTTP: "http snippet no ref",
+		},
+	}
+
+	// Basic Auth resources
+	authBasicSecretNsName := types.NamespacedName{Namespace: "test", Name: "auth-basic-secret"}
+	authBasicSecret := &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      authBasicSecretNsName.Name,
+				Namespace: authBasicSecretNsName.Namespace,
+			},
+			Type: apiv1.SecretTypeOpaque,
+			Data: map[string][]byte{
+				"auth": []byte("user:$apr1$cred"),
+			},
+		},
+	}
+
+	afBasicAuth := &graph.AuthenticationFilter{
+		Source: &ngfAPIv1alpha1.AuthenticationFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "af",
+				Namespace: "test",
+			},
+			Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+				Type: ngfAPIv1alpha1.AuthTypeBasic,
+				Basic: &ngfAPIv1alpha1.BasicAuth{
+					SecretRef: ngfAPIv1alpha1.LocalObjectReference{
+						Name: authBasicSecretNsName.Name,
+					},
+					Realm: "",
+				},
+			},
+		},
+		Valid:      true,
+		Referenced: true,
+	}
+
+	// JWT Auth resources
+	authJWTSecretNsName := types.NamespacedName{Namespace: "test", Name: "auth-jwt-secret"}
+	authJWTSecret := &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      authJWTSecretNsName.Name,
+				Namespace: authJWTSecretNsName.Namespace,
+			},
+			Type: apiv1.SecretTypeOpaque,
+			Data: map[string][]byte{
+				"auth": []byte("token"),
+			},
+		},
+	}
+
+	afJWTAuth := &graph.AuthenticationFilter{
+		Source: &ngfAPIv1alpha1.AuthenticationFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "af-jwt",
+				Namespace: "test",
+			},
+			Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+				Type: ngfAPIv1alpha1.AuthTypeJWT,
+				JWT: &ngfAPIv1alpha1.JWTAuth{
+					Source: ngfAPIv1alpha1.JWTKeySourceFile,
+					File: &ngfAPIv1alpha1.JWTFileKeySource{
+						SecretRef: ngfAPIv1alpha1.LocalObjectReference{
+							Name: authJWTSecretNsName.Name,
+						},
+					},
+					KeyCache: helpers.GetPointer(ngfAPIv1alpha1.Duration("10s")),
+					Realm:    "",
+				},
+			},
+		},
+		Valid:      true,
+		Referenced: true,
+	}
+
+	redirect := graph.Filter{
+		FilterType: graph.FilterRequestRedirect,
+		RequestRedirect: &v1.HTTPRequestRedirectFilter{
+			Hostname: (*v1.PreciseHostname)(helpers.GetPointer("foo.example.com")),
+		},
+	}
+	extRefFilterSnippetsFilter := graph.Filter{
+		FilterType: graph.FilterExtensionRef,
+		ExtensionRef: &v1.LocalObjectReference{
+			Group: ngfAPIv1alpha1.GroupName,
+			Kind:  kinds.SnippetsFilter,
+			Name:  "sf",
+		},
+		ResolvedExtensionRef: &graph.ExtensionRefFilter{
+			Valid:          true,
+			SnippetsFilter: sf1,
+		},
+	}
+
+	extRefFilterAuthenticationFilterBasic := graph.Filter{
+		FilterType: graph.FilterExtensionRef,
+		ExtensionRef: &v1.LocalObjectReference{
+			Group: ngfAPIv1alpha1.GroupName,
+			Kind:  kinds.AuthenticationFilter,
+			Name:  "af",
+		},
+		ResolvedExtensionRef: &graph.ExtensionRefFilter{
+			Valid:                true,
+			AuthenticationFilter: afBasicAuth,
+		},
+	}
+
+	extRefFilterAuthenticationFilterJWT := graph.Filter{
+		FilterType: graph.FilterExtensionRef,
+		ExtensionRef: &v1.LocalObjectReference{
+			Group: ngfAPIv1alpha1.GroupName,
+			Kind:  kinds.AuthenticationFilter,
+			Name:  "af-jwt",
+		},
+		ResolvedExtensionRef: &graph.ExtensionRefFilter{
+			Valid:                true,
+			AuthenticationFilter: afJWTAuth,
+		},
+	}
+
+	addFilters(routeHR5, []graph.Filter{
+		redirect,
+		extRefFilterSnippetsFilter,
+		extRefFilterAuthenticationFilterBasic,
+	})
+
+	expRedirect := HTTPRequestRedirectFilter{
+		Hostname: helpers.GetPointer("foo.example.com"),
+	}
+
+	expExtRefFiltersSf := SnippetsFilter{
+		LocationSnippet: &Snippet{
+			Name: createSnippetName(
+				ngfAPIv1alpha1.NginxContextHTTPServerLocation,
+				client.ObjectKeyFromObject(extRefFilterSnippetsFilter.ResolvedExtensionRef.SnippetsFilter.Source),
+			),
+			Contents: "location snippet",
+		},
+		ServerSnippet: &Snippet{
+			Name: createSnippetName(
+				ngfAPIv1alpha1.NginxContextHTTPServer,
+				client.ObjectKeyFromObject(extRefFilterSnippetsFilter.ResolvedExtensionRef.SnippetsFilter.Source),
+			),
+			Contents: "server snippet",
+		},
+	}
+
+	expExtRefFiltersAfBasic := &AuthenticationFilter{
+		Basic: &AuthBasic{
+			SecretName:      authBasicSecretNsName.Name,
+			SecretNamespace: authBasicSecretNsName.Namespace,
+			Realm:           "",
+			Data:            authBasicSecret.Source.Data["auth"],
+		},
+	}
+
+	expExtRefFiltersAfJWT := &AuthenticationFilter{
+		JWT: &AuthJWT{
+			SecretName:      authJWTSecretNsName.Name,
+			SecretNamespace: authJWTSecretNsName.Namespace,
+			Realm:           "",
+			Data:            authJWTSecret.Source.Data["auth"],
+			KeyCache:        helpers.GetPointer(ngfAPIv1alpha1.Duration("10s")),
+		},
+	}
+
+	hr6, expHR6Groups, routeHR6 := createTestResources(
+		"hr-6",
+		"foo.example.com",
+		"listener-80-1",
+		pathAndType{path: "/valid", pathType: prefix}, pathAndType{path: invalidMatchesPath, pathType: prefix},
+	)
+
+	hr7, expHR7Groups, routeHR7 := createTestResources(
+		"hr-7",
+		"foo.example.com",
+		"listener-80-1",
+		pathAndType{path: "/valid", pathType: prefix}, pathAndType{path: "/valid", pathType: v1.PathMatchExact},
+	)
+
+	hr8, expHR8Groups, routeHR8 := createTestResources(
+		"hr-8",
+		"foo.example.com", // same as hr3
+		"listener-8080",
+		pathAndType{path: "/", pathType: prefix},
+		pathAndType{path: "/third", pathType: prefix},
+	)
+
+	hr9, expHR9Groups, routeHR9 := createTestResources(
+		"hr-9",
+		"foo.example.com",
+		"listener-80-1",
+		pathAndType{path: "/auth-basic", pathType: prefix},
+		pathAndType{path: "/auth-jwt", pathType: prefix},
+	)
+
+	addFilterPerRule(routeHR9, []graph.Filter{
+		extRefFilterAuthenticationFilterBasic,
+		extRefFilterAuthenticationFilterJWT,
+	})
+
+	_, _, httpsRouteHR1Invalid := createTestResources(
+		"https-hr-1",
+		"foo.example.com",
+		"listener-443-1",
+		pathAndType{path: "/", pathType: prefix},
+	)
+	httpsRouteHR1Invalid.Valid = false
+
+	httpsHR3, expHTTPSHR3Groups, httpsRouteHR3 := createTestResources(
+		"https-hr-3",
+		"foo.example.com",
+		"listener-443-1",
+		pathAndType{path: "/", pathType: prefix}, pathAndType{path: "/third", pathType: prefix},
+	)
+
+	httpsHR4, expHTTPSHR4Groups, httpsRouteHR4 := createTestResources(
+		"https-hr-4",
+		"foo.example.com",
+		"listener-443-1",
+		pathAndType{path: "/fourth", pathType: prefix}, pathAndType{path: "/", pathType: prefix},
+	)
+
+	httpsHR5, expHTTPSHR5Groups, httpsRouteHR5 := createTestResources(
+		"https-hr-5",
+		"example.com",
+		"listener-443-with-hostname",
+		pathAndType{path: "/", pathType: prefix},
+	)
+	// add extra attachment for this route for duplicate listener test
+	key := graph.CreateParentRefListenerKey(gatewayNsName, "listener-443-1")
+	httpsRouteHR5.ParentRefs[0].Attachment.Listeners = append(
+		httpsRouteHR5.ParentRefs[0].Attachment.Listeners,
+		graph.ListenerAttachmentStatus{Key: key, AcceptedHostnames: []string{"example.com"}, Port: 443},
+	)
+
+	httpsHR6, expHTTPSHR6Groups, httpsRouteHR6 := createTestResources(
+		"https-hr-6",
+		"foo.example.com",
+		"listener-443-1",
+		pathAndType{path: "/valid", pathType: prefix}, pathAndType{path: invalidMatchesPath, pathType: prefix},
+	)
+
+	tlsTR1 := graph.L4Route{
+		Spec: graph.L4RouteSpec{
+			Hostnames: []v1.Hostname{"app.example.com", "cafe.example.com"},
+			BackendRef: graph.BackendRef{
+				SvcNsName: types.NamespacedName{
+					Namespace: "default",
+					Name:      "secure-app",
+				},
+				ServicePort: apiv1.ServicePort{
+					Name:     "https",
+					Protocol: "TCP",
+					Port:     8443,
+					TargetPort: intstr.IntOrString{
+						Type:   intstr.Int,
+						IntVal: 8443,
+					},
+				},
+				Valid: true,
+			},
+		},
+		ParentRefs: []graph.ParentRef{
+			{
+				Kind:           kinds.Gateway,
+				NamespacedName: gatewayNsName,
+				GatewayNsName:  gatewayNsName,
+				Attachment: &graph.ParentRefAttachmentStatus{
+					Listeners: []graph.ListenerAttachmentStatus{{
+						Key:               graph.CreateParentRefListenerKey(gatewayNsName, "listener-443-2"),
+						AcceptedHostnames: []string{"app.example.com"},
+						Port:              443,
+					}},
+				},
+			},
+			{
+				Kind:           kinds.Gateway,
+				NamespacedName: gatewayNsName,
+				GatewayNsName:  gatewayNsName,
+				Attachment: &graph.ParentRefAttachmentStatus{
+					Listeners: []graph.ListenerAttachmentStatus{{
+						Key:               graph.CreateParentRefListenerKey(gatewayNsName, "listener-444-3"),
+						AcceptedHostnames: []string{"app.example.com"},
+						Port:              444,
+					}},
+				},
+			},
+		},
+		Valid: true,
+	}
+
+	invalidBackendRefTR2 := graph.L4Route{
+		Spec: graph.L4RouteSpec{
+			Hostnames:  []v1.Hostname{"test.example.com"},
+			BackendRef: graph.BackendRef{},
+		},
+		Valid: true,
+	}
+
+	TR1Key := graph.L4RouteKey{NamespacedName: types.NamespacedName{
+		Namespace: "default",
+		Name:      "secure-app",
+	}}
+
+	TR2Key := graph.L4RouteKey{NamespacedName: types.NamespacedName{
+		Namespace: "default",
+		Name:      "secure-app2",
+	}}
+
+	httpsHR7, expHTTPSHR7Groups, httpsRouteHR7 := createTestResources(
+		"https-hr-7",
+		"foo.example.com", // same as httpsHR3
+		"listener-8443",
+		pathAndType{path: "/", pathType: prefix}, pathAndType{path: "/third", pathType: prefix},
+	)
+	httpsHR8, expHTTPSHR8Groups, httpsRouteHR8 := createTestResources(
+		"https-hr-8",
+		"foo.example.com",
+		"listener-443-1",
+		pathAndType{path: "/", pathType: prefix}, pathAndType{path: "/", pathType: prefix},
+	)
+
+	httpsRouteHR8.Spec.Rules[0].BackendRefs[0].BackendTLSPolicy = &graph.BackendTLSPolicy{
+		Source: &v1.BackendTLSPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "btp",
+				Namespace: "test",
+			},
+			Spec: v1.BackendTLSPolicySpec{
+				TargetRefs: []v1.LocalPolicyTargetReferenceWithSectionName{
+					{
+						LocalPolicyTargetReference: v1.LocalPolicyTargetReference{
+							Group: "",
+							Kind:  "Service",
+							Name:  "foo",
+						},
+					},
+				},
+				Validation: v1.BackendTLSPolicyValidation{
+					Hostname: "foo.example.com",
+					CACertificateRefs: []v1.LocalObjectReference{
+						{
+							Kind:  "ConfigMap",
+							Name:  "configmap-1",
+							Group: "",
+						},
+					},
+				},
+			},
+		},
+		CaCertRef: types.NamespacedName{Namespace: "test", Name: "configmap-1"},
+		Valid:     true,
+		Gateways:  []types.NamespacedName{gatewayNsName},
+	}
+
+	expHTTPSHR8Groups[0].Backends[0].VerifyTLS = &VerifyTLS{
+		CertBundleID: generateCertBundleID(types.NamespacedName{Namespace: "test", Name: "configmap-1"}),
+		Hostname:     "foo.example.com",
+	}
+
+	httpsHR9, expHTTPSHR9Groups, httpsRouteHR9 := createTestResources(
+		"https-hr-9",
+		"foo.example.com",
+		"listener-443-1",
+		pathAndType{path: "/", pathType: prefix}, pathAndType{path: "/", pathType: prefix},
+	)
+
+	gr := createGRPCRoute("gr")
+	routeGR := createInternalRoute(
+		gr,
+		graph.RouteTypeGRPC,
+		[]string{"foo.example.com"},
+		"listener-80-1",
+		[]pathAndType{{path: "/", pathType: prefix}},
+	)
+	expGRGroups := createExpBackendGroupsForRoute(routeGR)
+
+	httpsRouteHR9.Spec.Rules[0].BackendRefs[0].BackendTLSPolicy = &graph.BackendTLSPolicy{
+		Source: &v1.BackendTLSPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "btp2",
+				Namespace: "test",
+			},
+			Spec: v1.BackendTLSPolicySpec{
+				TargetRefs: []v1.LocalPolicyTargetReferenceWithSectionName{
+					{
+						LocalPolicyTargetReference: v1.LocalPolicyTargetReference{
+							Group: "",
+							Kind:  "Service",
+							Name:  "foo",
+						},
+					},
+				},
+				Validation: v1.BackendTLSPolicyValidation{
+					Hostname: "foo.example.com",
+					CACertificateRefs: []v1.LocalObjectReference{
+						{
+							Kind:  "ConfigMap",
+							Name:  "configmap-2",
+							Group: "",
+						},
+					},
+				},
+			},
+		},
+		CaCertRef: types.NamespacedName{Namespace: "test", Name: "configmap-2"},
+		Valid:     true,
+		Gateways:  []types.NamespacedName{gatewayNsName},
+	}
+
+	expHTTPSHR9Groups[0].Backends[0].VerifyTLS = &VerifyTLS{
+		CertBundleID: generateCertBundleID(types.NamespacedName{Namespace: "test", Name: "configmap-2"}),
+		Hostname:     "foo.example.com",
+	}
+
+	hrWithPolicy, expHRWithPolicyGroups, l7RouteWithPolicy := createTestResources(
+		"hr-with-policy",
+		"policy.com",
+		"listener-80-1",
+		pathAndType{
+			path:     "/",
+			pathType: prefix,
+		},
+	)
+
+	hrAdvancedRouteWithPolicyAndHeaderMatch,
+		groupsHRAdvancedWithHeaderMatch,
+		routeHRAdvancedWithHeaderMatch := createTestResources(
+		"hr-advanced-route-with-policy-header-match",
+		"policy.com",
+		"listener-80-1",
+		pathAndType{path: "/rest", pathType: prefix},
+	)
+
+	pathMatch := helpers.GetPointer(v1.HTTPPathMatch{
+		Value: helpers.GetPointer("/rest"),
+		Type:  helpers.GetPointer(v1.PathMatchPathPrefix),
+	})
+
+	routeHRAdvancedWithHeaderMatch.Spec.Rules[0].Matches = []v1.HTTPRouteMatch{
+		{
+			Path: pathMatch,
+			Headers: []v1.HTTPHeaderMatch{
+				{
+					Name:  "Referrer",
+					Type:  helpers.GetPointer(v1.HeaderMatchRegularExpression),
+					Value: "(?i)(mydomain|myotherdomain).+\\.example\\.(cloud|com)",
+				},
+			},
+		},
+		{
+			Path: pathMatch,
+		},
+	}
+	routeHRAdvancedWithHeaderMatch.Spec.Hostnames = []v1.Hostname{"policy.com"}
+
+	l7RouteWithPolicy.Policies = []*graph.Policy{hrPolicy1, invalidPolicy}
+
+	httpsHRWithPolicy, expHTTPSHRWithPolicyGroups, l7HTTPSRouteWithPolicy := createTestResources(
+		"https-hr-with-policy",
+		"policy.com",
+		"listener-443-1",
+		pathAndType{
+			path:     "/",
+			pathType: prefix,
+		},
+	)
+
+	l7HTTPSRouteWithPolicy.Policies = []*graph.Policy{hrPolicy2, invalidPolicy}
+
+	hrWithMirror, expHRWithMirrorGroups, routeHRWithMirror := createTestResources(
+		"hr-with-mirror",
+		"foo.example.com",
+		"listener-80-1",
+		pathAndType{
+			path:     "/mirror",
+			pathType: prefix,
+		},
+	)
+
+	mirrorUpstreamName := "test_mirror-backend_80"
+	mirrorUpstream := Upstream{
+		Name: mirrorUpstreamName,
+		Endpoints: []resolver.Endpoint{
+			{
+				Address: "10.0.0.1",
+				Port:    8080,
+			},
+		},
+	}
+
+	fakeResolver.ResolveFunc = func(
+		_ context.Context,
+		_ logr.Logger,
+		nsName types.NamespacedName,
+		_ apiv1.ServicePort,
+		_ []discoveryV1.AddressType,
+	) ([]resolver.Endpoint, error) {
+		if nsName.Name == "mirror-backend" {
+			return mirrorUpstream.Endpoints, nil
+		}
+		return fooEndpoints, nil
+	}
+
+	addFilters(routeHRWithMirror, []graph.Filter{
+		{
+			FilterType: graph.FilterRequestMirror,
+			RequestMirror: &v1.HTTPRequestMirrorFilter{
+				BackendRef: v1.BackendObjectReference{
+					Group: helpers.GetPointer(v1.Group("core")),
+					Kind:  helpers.GetPointer(v1.Kind("Service")),
+					Name:  v1.ObjectName("mirror-backend"),
+				},
+			},
+		},
+	})
+
+	listener8080 := v1.Listener{
+		Name:     "listener-8080",
+		Hostname: nil,
+		Port:     8080,
+		Protocol: v1.HTTPProtocolType,
+	}
+
+	listener443 := v1.Listener{
+		Name:     "listener-443-1",
+		Hostname: nil,
+		Port:     443,
+		Protocol: v1.HTTPSProtocolType,
+		TLS: &v1.ListenerTLSConfig{
+			Mode: helpers.GetPointer(v1.TLSModeTerminate),
+			CertificateRefs: []v1.SecretObjectReference{
+				{
+					Kind:      (*v1.Kind)(helpers.GetPointer("Secret")),
+					Namespace: helpers.GetPointer(v1.Namespace(secret1NsName.Namespace)),
+					Name:      v1.ObjectName(secret1NsName.Name),
+				},
+			},
+		},
+	}
+
+	listener443_2 := v1.Listener{
+		Name:     "listener-443-2",
+		Hostname: (*v1.Hostname)(helpers.GetPointer("*.example.com")),
+		Port:     443,
+		Protocol: v1.TLSProtocolType,
+	}
+
+	listener444_3 := v1.Listener{
+		Name:     "listener-444-3",
+		Hostname: (*v1.Hostname)(helpers.GetPointer("app.example.com")),
+		Port:     444,
+		Protocol: v1.TLSProtocolType,
+	}
+
+	listener443_4 := v1.Listener{
+		Name:     "listener-443-4",
+		Port:     443,
+		Protocol: v1.TLSProtocolType,
+	}
+
+	listener8443 := v1.Listener{
+		Name:     "listener-8443",
+		Hostname: nil,
+		Port:     8443,
+		Protocol: v1.HTTPSProtocolType,
+		TLS: &v1.ListenerTLSConfig{
+			Mode: helpers.GetPointer(v1.TLSModeTerminate),
+			CertificateRefs: []v1.SecretObjectReference{
+				{
+					Kind:      (*v1.Kind)(helpers.GetPointer("Secret")),
+					Namespace: helpers.GetPointer(v1.Namespace(secret2NsName.Namespace)),
+					Name:      v1.ObjectName(secret2NsName.Name),
+				},
+			},
+		},
+	}
+
+	hostname := v1.Hostname("example.com")
+
+	listener443WithHostname := v1.Listener{
+		Name:     "listener-443-with-hostname",
+		Hostname: &hostname,
+		Port:     443,
+		Protocol: v1.HTTPSProtocolType,
+		TLS: &v1.ListenerTLSConfig{
+			Mode: helpers.GetPointer(v1.TLSModeTerminate),
+			CertificateRefs: []v1.SecretObjectReference{
+				{
+					Kind:      (*v1.Kind)(helpers.GetPointer("Secret")),
+					Namespace: helpers.GetPointer(v1.Namespace(secret2NsName.Namespace)),
+					Name:      v1.ObjectName(secret2NsName.Name),
+				},
+			},
+		},
+	}
+
+	referencedConfigMaps := map[types.NamespacedName]*configmaps.CaCertConfigMap{
+		{Namespace: "test", Name: "configmap-1"}: {
+			Source: &apiv1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "configmap-1",
+					Namespace: "test",
+				},
+				Data: map[string]string{
+					secrets.CAKey: "cert-1",
+				},
+			},
+			CertBundle: secrets.NewCertificateBundle(
+				types.NamespacedName{Namespace: "test", Name: "configmap-1"},
+				"ConfigMap",
+				&secrets.Certificate{
+					CACert: []byte("cert-1"),
+				},
+			),
+		},
+		{Namespace: "test", Name: "configmap-2"}: {
+			Source: &apiv1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "configmap-2",
+					Namespace: "test",
+				},
+				BinaryData: map[string][]byte{
+					secrets.CAKey: []byte("cert-2"),
+				},
+			},
+			CertBundle: secrets.NewCertificateBundle(
+				types.NamespacedName{Namespace: "test", Name: "configmap-2"},
+				"ConfigMap",
+				&secrets.Certificate{
+					CACert: []byte("cert-2"),
+				},
+			),
+		},
+	}
+
+	tests := []commonTestCase{
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes: map[graph.RouteKey]*graph.L7Route{
+						graph.CreateRouteKey(hr1): routeHR1,
+						graph.CreateRouteKey(hr2): routeHR2,
+					},
+				})
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hr1): routeHR1,
+					graph.CreateRouteKey(hr2): routeHR2,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = append(conf.HTTPServers, []VirtualServer{
+					{
+						Hostname: "bar.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHR2Groups[0],
+										Source:       &hr2.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port: 80,
+					},
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHR1Groups[0],
+										Source:       &hr1.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port: 80,
+					},
+				}...)
+				conf.SSLServers = []VirtualServer{}
+				conf.Upstreams = []Upstream{fooUpstream}
+				conf.BackendGroups = []BackendGroup{expHR1Groups[0], expHR2Groups[0]}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+
+				return conf
+			}),
+			msg: "one http listener with two routes for different hostnames",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes: map[graph.RouteKey]*graph.L7Route{
+						graph.CreateRouteKey(gr): routeGR,
+					},
+				})
+				g.Routes[graph.CreateRouteKey(gr)] = routeGR
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = append(
+					conf.HTTPServers, VirtualServer{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								GRPC:     true,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expGRGroups[0],
+										Source:       &gr.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port: 80,
+					},
+				)
+				conf.SSLServers = []VirtualServer{}
+				conf.Upstreams = append(conf.Upstreams, fooUpstream)
+				conf.BackendGroups = []BackendGroup{expGRGroups[0]}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				return conf
+			}),
+			msg: "one http listener with one grpc route",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, []*graph.Listener{
+					{
+						Name:        "listener-443-1",
+						GatewayName: gatewayNsName,
+						Source:      listener443,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(httpsHR1): httpsRouteHR1,
+							graph.CreateRouteKey(httpsHR2): httpsRouteHR2,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret1NsName},
+					},
+					{
+						Name:        "listener-443-with-hostname",
+						GatewayName: gatewayNsName,
+						Source:      listener443WithHostname,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(httpsHR5): httpsRouteHR5,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret2NsName},
+					},
+				}...)
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hr1):      httpsRouteHR1,
+					graph.CreateRouteKey(hr2):      httpsRouteHR2,
+					graph.CreateRouteKey(httpsHR5): httpsRouteHR5,
+				}
+				g.ReferencedSecrets = map[types.NamespacedName]*secrets.Secret{
+					secret1NsName: secret1,
+					secret2NsName: secret2,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = []VirtualServer{}
+				conf.SSLServers = append(conf.SSLServers, []VirtualServer{
+					{
+						Hostname: "bar.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHTTPSHR2Groups[0],
+										Source:       &httpsHR2.ObjectMeta,
+									},
+								},
+							},
+						},
+						SSL:  &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port: 443,
+					},
+					{
+						Hostname: "example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHTTPSHR5Groups[0],
+										Source:       &httpsHR5.ObjectMeta,
+									},
+								},
+							},
+						},
+						SSL:  &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-2"}},
+						Port: 443,
+					},
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHTTPSHR1Groups[0],
+										Source:       &httpsHR1.ObjectMeta,
+									},
+								},
+							},
+						},
+						SSL:  &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port: 443,
+					},
+					{
+						Hostname: wildcardHostname,
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port:     443,
+					},
+				}...)
+				conf.Upstreams = []Upstream{fooUpstream}
+				conf.BackendGroups = []BackendGroup{expHTTPSHR1Groups[0], expHTTPSHR2Groups[0], expHTTPSHR5Groups[0]}
+				conf.SSLServers[0].SSL = &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{
+					"ssl_keypair_test_secret-1": {
+						Cert: []byte("cert-1"),
+						Key:  []byte("privateKey-1"),
+					},
+					"ssl_keypair_test_secret-2": {
+						Cert: []byte("cert-2"),
+						Key:  []byte("privateKey-2"),
+					},
+				}
+				conf.SSLListenerHostnames = map[int32][]string{443: {"", "example.com"}}
+				return conf
+			}),
+			msg: "two https listeners each with routes for different hostnames",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, []*graph.Listener{
+					{
+						Name:        "listener-80-1",
+						GatewayName: gatewayNsName,
+						Source:      listener80,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(hr3): routeHR3,
+							graph.CreateRouteKey(hr4): routeHR4,
+						},
+					},
+					{
+						Name:        "listener-443-1",
+						GatewayName: gatewayNsName,
+						Source:      listener443,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(httpsHR3): httpsRouteHR3,
+							graph.CreateRouteKey(httpsHR4): httpsRouteHR4,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret1NsName},
+					},
+				}...)
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hr3):      routeHR3,
+					graph.CreateRouteKey(hr4):      routeHR4,
+					graph.CreateRouteKey(httpsHR3): httpsRouteHR3,
+					graph.CreateRouteKey(httpsHR4): httpsRouteHR4,
+				}
+				g.ReferencedSecrets = map[types.NamespacedName]*secrets.Secret{
+					secret1NsName: secret1,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = append(conf.HTTPServers, []VirtualServer{
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/fourth",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHR4Groups[0], 0),
+										Source:       &hr4.ObjectMeta,
+									},
+								},
+							},
+							{
+								Path:     "/third",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHR3Groups[1], 1),
+										Source:       &hr3.ObjectMeta,
+									},
+								},
+							},
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHR3Groups[0], 2),
+										Source:       &hr3.ObjectMeta,
+									},
+									{
+										BackendGroup: setPathRuleIdx(expHR4Groups[1], 2),
+										Source:       &hr4.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port: 80,
+					},
+				}...)
+				conf.SSLServers = append(conf.SSLServers, []VirtualServer{
+					{
+						Hostname: "foo.example.com",
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						PathRules: []PathRule{
+							{
+								Path:     "/fourth",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHTTPSHR4Groups[0], 0),
+										Source:       &httpsHR4.ObjectMeta,
+									},
+								},
+							},
+							{
+								Path:     "/third",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHTTPSHR3Groups[1], 1),
+										Source:       &httpsHR3.ObjectMeta,
+									},
+								},
+							},
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHTTPSHR3Groups[0], 2),
+										Source:       &httpsHR3.ObjectMeta,
+									},
+									{
+										BackendGroup: setPathRuleIdx(expHTTPSHR4Groups[1], 2),
+										Source:       &httpsHR4.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port: 443,
+					},
+					{
+						Hostname: wildcardHostname,
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port:     443,
+					},
+				}...)
+				conf.Upstreams = append(conf.Upstreams, fooUpstream)
+				conf.BackendGroups = []BackendGroup{
+					setPathRuleIdx(expHR3Groups[0], 2),
+					setPathRuleIdx(expHR3Groups[1], 1),
+					setPathRuleIdx(expHR4Groups[0], 0),
+					setPathRuleIdx(expHR4Groups[1], 2),
+					setPathRuleIdx(expHTTPSHR3Groups[0], 2),
+					setPathRuleIdx(expHTTPSHR3Groups[1], 1),
+					setPathRuleIdx(expHTTPSHR4Groups[0], 0),
+					setPathRuleIdx(expHTTPSHR4Groups[1], 2),
+				}
+				conf.SSLServers[0].SSL = &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}}
+				conf.SSLListenerHostnames = map[int32][]string{443: {""}}
+				return conf
+			}),
+			msg: "one http and one https listener with two routes with the same hostname with and without collisions",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, []*graph.Listener{
+					{
+						Name:        "listener-80-1",
+						GatewayName: gatewayNsName,
+						Source:      listener80,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(hr3): routeHR3,
+						},
+					},
+					{
+						Name:        "listener-8080",
+						GatewayName: gatewayNsName,
+						Source:      listener8080,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(hr8): routeHR8,
+						},
+					},
+					{
+						Name:        "listener-443-1",
+						GatewayName: gatewayNsName,
+						Source:      listener443,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(httpsHR3): httpsRouteHR3,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret1NsName},
+					},
+					{
+						Name:        "listener-8443",
+						GatewayName: gatewayNsName,
+						Source:      listener8443,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(httpsHR7): httpsRouteHR7,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret2NsName},
+					},
+				}...)
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hr3):      routeHR3,
+					graph.CreateRouteKey(hr8):      routeHR8,
+					graph.CreateRouteKey(httpsHR3): httpsRouteHR3,
+					graph.CreateRouteKey(httpsHR7): httpsRouteHR7,
+				}
+				g.ReferencedSecrets = map[types.NamespacedName]*secrets.Secret{
+					secret1NsName: secret1,
+					secret2NsName: secret2,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = append(conf.HTTPServers, []VirtualServer{
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/third",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHR3Groups[1], 0),
+										Source:       &hr3.ObjectMeta,
+									},
+								},
+							},
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHR3Groups[0], 1),
+										Source:       &hr3.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port: 80,
+					},
+					{
+						IsDefault: true,
+						Port:      8080,
+					},
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/third",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHR8Groups[1], 0),
+										Source:       &hr8.ObjectMeta,
+									},
+								},
+							},
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHR8Groups[0], 1),
+										Source:       &hr8.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port: 8080,
+					},
+				}...)
+				conf.SSLServers = append(conf.SSLServers, []VirtualServer{
+					{
+						Hostname: "foo.example.com",
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						PathRules: []PathRule{
+							{
+								Path:     "/third",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHTTPSHR3Groups[1], 0),
+										Source:       &httpsHR3.ObjectMeta,
+									},
+								},
+							},
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHTTPSHR3Groups[0], 1),
+										Source:       &httpsHR3.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port: 443,
+					},
+					{
+						Hostname: wildcardHostname,
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port:     443,
+					},
+					{
+						IsDefault: true,
+						Port:      8443,
+						SSL:       &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-2"}},
+					},
+					{
+						Hostname: "foo.example.com",
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-2"}},
+						PathRules: []PathRule{
+							{
+								Path:     "/third",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHTTPSHR7Groups[1], 0),
+										Source:       &httpsHR7.ObjectMeta,
+									},
+								},
+							},
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHTTPSHR7Groups[0], 1),
+										Source:       &httpsHR7.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port: 8443,
+					},
+					{
+						Hostname: wildcardHostname,
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-2"}},
+						Port:     8443,
+					},
+				}...)
+				conf.Upstreams = append(conf.Upstreams, fooUpstream)
+				conf.BackendGroups = []BackendGroup{
+					setPathRuleIdx(expHR3Groups[0], 1),
+					setPathRuleIdx(expHR3Groups[1], 0),
+					setPathRuleIdx(expHR8Groups[0], 1),
+					setPathRuleIdx(expHR8Groups[1], 0),
+					setPathRuleIdx(expHTTPSHR3Groups[0], 1),
+					setPathRuleIdx(expHTTPSHR3Groups[1], 0),
+					setPathRuleIdx(expHTTPSHR7Groups[0], 1),
+					setPathRuleIdx(expHTTPSHR7Groups[1], 0),
+				}
+				conf.SSLServers[0].SSL = &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{
+					"ssl_keypair_test_secret-1": {
+						Cert: []byte("cert-1"),
+						Key:  []byte("privateKey-1"),
+					},
+					"ssl_keypair_test_secret-2": {
+						Cert: []byte("cert-2"),
+						Key:  []byte("privateKey-2"),
+					},
+				}
+				conf.SSLListenerHostnames = map[int32][]string{443: {""}, 8443: {""}}
+				return conf
+			}),
+			msg: "multiple http and https listeners; different ports with different secrets",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				g.GatewayClass = nil
+				return g
+			}),
+			expConf: defaultConfig,
+			msg:     "missing gatewayclass",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				delete(g.Gateways, gatewayNsName)
+				return g
+			}),
+			expConf: defaultConfig,
+			msg:     "missing gateway",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes: map[graph.RouteKey]*graph.L7Route{
+						graph.CreateRouteKey(hr5): routeHR5,
+					},
+				})
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hr5): routeHR5,
+				}
+				g.ReferencedSecrets = map[types.NamespacedName]*secrets.Secret{
+					authBasicSecretNsName: authBasicSecret,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = append(conf.HTTPServers, []VirtualServer{
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     invalidFiltersPath,
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										Source:       &hr5.ObjectMeta,
+										BackendGroup: setPathRuleIdx(expHR5Groups[1], 0),
+										Filters: HTTPFilters{
+											InvalidFilter: &InvalidHTTPFilter{},
+										},
+									},
+								},
+							},
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										Source:       &hr5.ObjectMeta,
+										BackendGroup: setPathRuleIdx(expHR5Groups[0], 1),
+										Filters: HTTPFilters{
+											RequestRedirect:      &expRedirect,
+											SnippetsFilters:      []SnippetsFilter{expExtRefFiltersSf},
+											AuthenticationFilter: expExtRefFiltersAfBasic,
+										},
+									},
+								},
+							},
+						},
+						Port: 80,
+					},
+				}...)
+				conf.SSLServers = []VirtualServer{}
+				conf.Upstreams = []Upstream{fooUpstream}
+				conf.BackendGroups = []BackendGroup{setPathRuleIdx(expHR5Groups[0], 1), setPathRuleIdx(expHR5Groups[1], 0)}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				return conf
+			}),
+			msg: "one http listener with one route with filters",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes: map[graph.RouteKey]*graph.L7Route{
+						graph.CreateRouteKey(hr9): routeHR9,
+					},
+				})
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hr9): routeHR9,
+				}
+				g.ReferencedSecrets = map[types.NamespacedName]*secrets.Secret{
+					authBasicSecretNsName: authBasicSecret,
+					authJWTSecretNsName:   authJWTSecret,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = append(conf.HTTPServers, []VirtualServer{
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/auth-basic",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										Source:       &hr9.ObjectMeta,
+										BackendGroup: setPathRuleIdx(expHR9Groups[0], 0),
+										Filters: HTTPFilters{
+											AuthenticationFilter: expExtRefFiltersAfBasic,
+										},
+									},
+								},
+							},
+							{
+								Path:     "/auth-jwt",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										Source:       &hr9.ObjectMeta,
+										BackendGroup: setPathRuleIdx(expHR9Groups[1], 1),
+										Filters: HTTPFilters{
+											AuthenticationFilter: expExtRefFiltersAfJWT,
+										},
+									},
+								},
+							},
+						},
+						Port: 80,
+					},
+				}...)
+				conf.SSLServers = []VirtualServer{}
+				conf.Upstreams = []Upstream{fooUpstream}
+				conf.BackendGroups = []BackendGroup{
+					setPathRuleIdx(expHR9Groups[0], 0),
+					setPathRuleIdx(expHR9Groups[1], 1),
+				}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				return conf
+			}),
+			msg: "one http listener with multiple routes each with their own auth filter",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, []*graph.Listener{
+					{
+						Name:        "listener-80-1",
+						GatewayName: gatewayNsName,
+						Source:      listener80,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(hr6): routeHR6,
+						},
+					},
+					{
+						Name:        "listener-443-1",
+						GatewayName: gatewayNsName,
+						Source:      listener443,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(httpsHR6): httpsRouteHR6,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret1NsName},
+					},
+					{
+						Name:        "listener-443-2",
+						GatewayName: gatewayNsName,
+						Source:      listener443_2,
+						Valid:       true,
+						Routes:      map[graph.RouteKey]*graph.L7Route{},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							TR1Key: &tlsTR1,
+							TR2Key: &invalidBackendRefTR2,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret1NsName},
+					},
+					{
+						Name:        "listener-444-3",
+						GatewayName: gatewayNsName,
+						Source:      listener444_3,
+						Valid:       true,
+						Routes:      map[graph.RouteKey]*graph.L7Route{},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							TR1Key: &tlsTR1,
+							TR2Key: &invalidBackendRefTR2,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret1NsName},
+					},
+					{
+						Name:            "listener-443-4",
+						GatewayName:     gatewayNsName,
+						Source:          listener443_4,
+						Valid:           true,
+						Routes:          map[graph.RouteKey]*graph.L7Route{},
+						L4Routes:        map[graph.L4RouteKey]*graph.L4Route{},
+						ResolvedSecrets: []types.NamespacedName{secret1NsName},
+					},
+				}...)
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hr6):      routeHR6,
+					graph.CreateRouteKey(httpsHR6): httpsRouteHR6,
+				}
+				g.L4Routes = map[graph.L4RouteKey]*graph.L4Route{
+					TR1Key: &tlsTR1,
+					TR2Key: &invalidBackendRefTR2,
+				}
+				g.ReferencedSecrets = map[types.NamespacedName]*secrets.Secret{
+					secret1NsName: secret1,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = append(conf.HTTPServers, []VirtualServer{
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/valid",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHR6Groups[0],
+										Source:       &hr6.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port: 80,
+					},
+				}...)
+				conf.SSLServers = append(conf.SSLServers, []VirtualServer{
+					{
+						Hostname: "foo.example.com",
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						PathRules: []PathRule{
+							{
+								Path:     "/valid",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHTTPSHR6Groups[0],
+										Source:       &httpsHR6.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port: 443,
+					},
+					{
+						Hostname: wildcardHostname,
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port:     443,
+					},
+				}...)
+				conf.Upstreams = []Upstream{fooUpstream}
+				conf.BackendGroups = []BackendGroup{expHR6Groups[0], expHTTPSHR6Groups[0]}
+				conf.StreamUpstreams = []Upstream{
+					{
+						Endpoints: fooEndpoints,
+						Name:      "default_secure-app_8443",
+					},
+				}
+				conf.TLSServers = []Layer4VirtualServer{
+					{
+						Hostname: "app.example.com",
+						Upstreams: []Layer4Upstream{
+							{Name: "default_secure-app_8443", Weight: 0},
+						},
+						Port: 443,
+					},
+					{
+						Hostname:  "*.example.com",
+						Upstreams: []Layer4Upstream{},
+						Port:      443,
+						IsDefault: true,
+					},
+					{
+						Hostname: "app.example.com",
+						Upstreams: []Layer4Upstream{
+							{Name: "default_secure-app_8443", Weight: 0},
+						},
+						Port:      444,
+						IsDefault: false,
+					},
+					{
+						Hostname:  "",
+						Upstreams: []Layer4Upstream{},
+						Port:      443,
+						IsDefault: true,
+					},
+				}
+				conf.SSLServers[0].SSL = &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}}
+				conf.SSLListenerHostnames = map[int32][]string{443: {""}}
+				return conf
+			}),
+			msg: "one http, one https listener, and three tls listeners with routes with valid and invalid rules",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes: map[graph.RouteKey]*graph.L7Route{
+						graph.CreateRouteKey(hr7): routeHR7,
+					},
+				})
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hr7): routeHR7,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = append(conf.HTTPServers, []VirtualServer{
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/valid",
+								PathType: PathTypeExact,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHR7Groups[1],
+										Source:       &hr7.ObjectMeta,
+									},
+								},
+							},
+							{
+								Path:     "/valid",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: setPathRuleIdx(expHR7Groups[0], 1),
+										Source:       &hr7.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port: 80,
+					},
+				}...)
+				conf.SSLServers = []VirtualServer{}
+				conf.Upstreams = []Upstream{fooUpstream}
+				conf.BackendGroups = []BackendGroup{setPathRuleIdx(expHR7Groups[0], 1), expHR7Groups[1]}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				return conf
+			}),
+			msg: "duplicate paths with different types",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, []*graph.Listener{
+					{
+						Name:        "listener-443-with-hostname",
+						GatewayName: gatewayNsName,
+						Source:      listener443WithHostname,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(httpsHR5): httpsRouteHR5,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret2NsName},
+					},
+					{
+						Name:        "listener-443-1",
+						GatewayName: gatewayNsName,
+						Source:      listener443,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(httpsHR5): httpsRouteHR5,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret1NsName},
+					},
+				}...)
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(httpsHR5): httpsRouteHR5,
+				}
+				g.ReferencedSecrets = map[types.NamespacedName]*secrets.Secret{
+					secret1NsName: secret1,
+					secret2NsName: secret2,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.SSLServers = append(conf.SSLServers, []VirtualServer{
+					{
+						Hostname: "example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									// duplicate match rules since two listeners both match this route's hostname
+									{
+										BackendGroup: expHTTPSHR5Groups[0],
+										Source:       &httpsHR5.ObjectMeta,
+									},
+									{
+										BackendGroup: expHTTPSHR5Groups[0],
+										Source:       &httpsHR5.ObjectMeta,
+									},
+								},
+							},
+						},
+						SSL:  &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-2"}},
+						Port: 443,
+					},
+					{
+						Hostname: wildcardHostname,
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port:     443,
+					},
+				}...)
+				conf.HTTPServers = []VirtualServer{}
+				conf.Upstreams = []Upstream{fooUpstream}
+				conf.BackendGroups = []BackendGroup{expHTTPSHR5Groups[0]}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{
+					"ssl_keypair_test_secret-1": {
+						Cert: []byte("cert-1"),
+						Key:  []byte("privateKey-1"),
+					},
+					"ssl_keypair_test_secret-2": {
+						Cert: []byte("cert-2"),
+						Key:  []byte("privateKey-2"),
+					},
+				}
+				conf.SSLServers[0].SSL = &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}}
+				conf.SSLListenerHostnames = map[int32][]string{443: {"example.com", ""}}
+				return conf
+			}),
+			msg: "two https listeners with different hostnames but same route; chooses listener with more specific hostname",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-443-1",
+					GatewayName: gatewayNsName,
+					Source:      listener443,
+					Valid:       true,
+					Routes: map[graph.RouteKey]*graph.L7Route{
+						graph.CreateRouteKey(httpsHR8): httpsRouteHR8,
+					},
+					ResolvedSecrets: []types.NamespacedName{secret1NsName},
+				})
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(httpsHR8): httpsRouteHR8,
+				}
+				g.ReferencedSecrets = map[types.NamespacedName]*secrets.Secret{
+					secret1NsName: secret1,
+				}
+				g.ReferencedCaCertConfigMaps = referencedConfigMaps
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.SSLServers = append(conf.SSLServers, []VirtualServer{
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHTTPSHR8Groups[0],
+										Source:       &httpsHR8.ObjectMeta,
+									},
+									{
+										BackendGroup: expHTTPSHR8Groups[1],
+										Source:       &httpsHR8.ObjectMeta,
+									},
+								},
+							},
+						},
+						SSL:  &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port: 443,
+					},
+					{
+						Hostname: wildcardHostname,
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port:     443,
+					},
+				}...)
+				conf.HTTPServers = []VirtualServer{}
+				conf.Upstreams = []Upstream{createUpstreamWithBackendTLSPolicy("configmap-1")}
+				conf.BackendGroups = []BackendGroup{expHTTPSHR8Groups[0], expHTTPSHR8Groups[1]}
+				conf.CertBundles = map[CertBundleID]CertBundle{
+					"cert_bundle_test_configmap-1": []byte("cert-1"),
+				}
+				conf.SSLServers[0].SSL = &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}}
+				conf.SSLListenerHostnames = map[int32][]string{443: {""}}
+				return conf
+			}),
+			msg: "https listener with httproute with backend that has a backend TLS policy attached",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-443-1",
+					GatewayName: gatewayNsName,
+					Source:      listener443,
+					Valid:       true,
+					Routes: map[graph.RouteKey]*graph.L7Route{
+						graph.CreateRouteKey(httpsHR9): httpsRouteHR9,
+					},
+					ResolvedSecrets: []types.NamespacedName{secret1NsName},
+				})
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(httpsHR9): httpsRouteHR9,
+				}
+				g.ReferencedSecrets = map[types.NamespacedName]*secrets.Secret{
+					secret1NsName: secret1,
+				}
+				g.ReferencedCaCertConfigMaps = referencedConfigMaps
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.SSLServers = append(conf.SSLServers, []VirtualServer{
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHTTPSHR9Groups[0],
+										Source:       &httpsHR9.ObjectMeta,
+									},
+									{
+										BackendGroup: expHTTPSHR9Groups[1],
+										Source:       &httpsHR9.ObjectMeta,
+									},
+								},
+							},
+						},
+						SSL:  &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port: 443,
+					},
+					{
+						Hostname: wildcardHostname,
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port:     443,
+					},
+				}...)
+				conf.HTTPServers = []VirtualServer{}
+				conf.Upstreams = []Upstream{createUpstreamWithBackendTLSPolicy("configmap-2")}
+				conf.BackendGroups = []BackendGroup{expHTTPSHR9Groups[0], expHTTPSHR9Groups[1]}
+				conf.CertBundles = map[CertBundleID]CertBundle{
+					"cert_bundle_test_configmap-2": []byte("cert-2"),
+				}
+				conf.SSLServers[0].SSL = &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}}
+				conf.SSLListenerHostnames = map[int32][]string{443: {""}}
+				return conf
+			}),
+			msg: "https listener with httproute with backend that has a backend TLS policy with binaryData attached",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes: map[graph.RouteKey]*graph.L7Route{
+						graph.CreateRouteKey(hrWithMirror): routeHRWithMirror,
+					},
+				})
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hrWithMirror): routeHRWithMirror,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = append(conf.HTTPServers, []VirtualServer{
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/mirror",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHRWithMirrorGroups[0],
+										Source:       &hrWithMirror.ObjectMeta,
+										Filters: HTTPFilters{
+											RequestMirrors: []*HTTPRequestMirrorFilter{
+												{
+													Name:    helpers.GetPointer("mirror-backend"),
+													Target:  helpers.GetPointer("/_ngf-internal-mirror-mirror-backend-test/hr-with-mirror-0"),
+													Percent: helpers.GetPointer(float64(100)),
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						Port: 80,
+					},
+				}...)
+				conf.SSLServers = []VirtualServer{}
+				conf.Upstreams = []Upstream{fooUpstream}
+				conf.BackendGroups = []BackendGroup{expHRWithMirrorGroups[0]}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				return conf
+			}),
+			msg: "one http listener with one route containing a request mirror filter",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, []*graph.Listener{
+					{
+						Name:        "listener-80-1",
+						GatewayName: gatewayNsName,
+						Source:      listener80,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(hrWithPolicy): l7RouteWithPolicy,
+						},
+					},
+					{
+						Name:        "listener-443-1",
+						GatewayName: gatewayNsName,
+						Source:      listener443,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(httpsHRWithPolicy): l7HTTPSRouteWithPolicy,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret1NsName},
+					},
+				}...)
+				gw.Policies = []*graph.Policy{gwPolicy1, gwPolicy2}
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hrWithPolicy):      l7RouteWithPolicy,
+					graph.CreateRouteKey(httpsHRWithPolicy): l7HTTPSRouteWithPolicy,
+				}
+				g.ReferencedSecrets = map[types.NamespacedName]*secrets.Secret{
+					secret1NsName: secret1,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.BaseHTTPConfig.Policies = []policies.Policy{gwPolicy1.Source, gwPolicy2.Source}
+				conf.SSLServers = []VirtualServer{
+					{
+						IsDefault: true,
+						Port:      443,
+						Policies:  []policies.Policy{gwPolicy1.Source, gwPolicy2.Source},
+						SSL:       &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+					},
+					{
+						Hostname: "policy.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHTTPSHRWithPolicyGroups[0],
+										Source:       &httpsHRWithPolicy.ObjectMeta,
+									},
+								},
+								Policies: []policies.Policy{hrPolicy2.Source},
+							},
+						},
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port:     443,
+						Policies: []policies.Policy{gwPolicy1.Source, gwPolicy2.Source},
+					},
+					{
+						Hostname: wildcardHostname,
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port:     443,
+						Policies: []policies.Policy{gwPolicy1.Source, gwPolicy2.Source},
+					},
+				}
+				conf.HTTPServers = []VirtualServer{
+					{
+						IsDefault: true,
+						Port:      80,
+						Policies:  []policies.Policy{gwPolicy1.Source, gwPolicy2.Source},
+					},
+					{
+						Hostname: "policy.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										Source:       &hrWithPolicy.ObjectMeta,
+										BackendGroup: expHRWithPolicyGroups[0],
+									},
+								},
+								Policies: []policies.Policy{hrPolicy1.Source},
+							},
+						},
+						Port:     80,
+						Policies: []policies.Policy{gwPolicy1.Source, gwPolicy2.Source},
+					},
+				}
+				conf.Upstreams = []Upstream{fooUpstream}
+				conf.BackendGroups = []BackendGroup{expHRWithPolicyGroups[0], expHTTPSHRWithPolicyGroups[0]}
+				conf.SSLListenerHostnames = map[int32][]string{443: {""}}
+				return conf
+			}),
+			msg: "Simple Gateway and HTTPRoute with policies attached",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, []*graph.Listener{
+					{
+						Name:        "listener-80-1",
+						GatewayName: gatewayNsName,
+						Source:      listener80,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(hrAdvancedRouteWithPolicyAndHeaderMatch): routeHRAdvancedWithHeaderMatch,
+						},
+					},
+				}...)
+				gw.Policies = []*graph.Policy{gwPolicy1, gwPolicy2}
+				routeHRAdvancedWithHeaderMatch.Policies = []*graph.Policy{hrPolicy1}
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hrAdvancedRouteWithPolicyAndHeaderMatch): routeHRAdvancedWithHeaderMatch,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.BaseHTTPConfig.Policies = []policies.Policy{gwPolicy1.Source, gwPolicy2.Source}
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				conf.HTTPServers = []VirtualServer{
+					{
+						IsDefault: true,
+						Port:      80,
+						Policies:  []policies.Policy{gwPolicy1.Source, gwPolicy2.Source},
+					},
+					{
+						Hostname: "policy.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/rest",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: groupsHRAdvancedWithHeaderMatch[0],
+										Source:       &hrAdvancedRouteWithPolicyAndHeaderMatch.ObjectMeta,
+										Match: Match{
+											Headers: []HTTPHeaderMatch{
+												{
+													Name:  "Referrer",
+													Value: "(?i)(mydomain|myotherdomain).+\\.example\\.(cloud|com)",
+													Type:  "RegularExpression",
+												},
+											},
+										},
+									},
+									{
+										BackendGroup: groupsHRAdvancedWithHeaderMatch[0],
+										Source:       &hrAdvancedRouteWithPolicyAndHeaderMatch.ObjectMeta,
+									},
+								},
+								Policies: []policies.Policy{hrPolicy1.Source},
+							},
+						},
+						Port:     80,
+						Policies: []policies.Policy{gwPolicy1.Source, gwPolicy2.Source},
+					},
+				}
+				conf.Upstreams = []Upstream{fooUpstream}
+				conf.BackendGroups = []BackendGroup{groupsHRAdvancedWithHeaderMatch[0]}
+				return conf
+			}),
+			msg: "Gateway and HTTPRoute with policies attached with advanced routing",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+
+				// Create a RateLimitPolicy that targets the Gateway directly
+				gatewayRateLimitPolicy := &graph.Policy{
+					Source: &ngfAPIv1alpha1.RateLimitPolicy{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "gateway-rate-limit",
+							Namespace: "test",
+						},
+						Spec: ngfAPIv1alpha1.RateLimitPolicySpec{
+							RateLimit: &ngfAPIv1alpha1.RateLimit{
+								Local: &ngfAPIv1alpha1.LocalRateLimit{
+									Rules: []ngfAPIv1alpha1.RateLimitRule{
+										{
+											Key:      "$binary_remote_addr",
+											Rate:     "20r/m",
+											ZoneSize: helpers.GetPointer(ngfAPIv1alpha1.Size("5m")),
+											Burst:    helpers.GetPointer(int32(10)),
+										},
+									},
+								},
+							},
+							TargetRefs: []v1.LocalPolicyTargetReference{
+								{
+									Group: "gateway.networking.k8s.io",
+									Kind:  kinds.Gateway,
+									Name:  "gateway",
+								},
+							},
+						},
+					},
+					Valid: true,
+					TargetRefs: []graph.PolicyTargetRef{
+						{
+							Group: "gateway.networking.k8s.io",
+							Kind:  kinds.Gateway,
+							Nsname: types.NamespacedName{
+								Namespace: "test",
+								Name:      "gateway",
+							},
+						},
+					},
+				}
+
+				// Create a RateLimitPolicy that targets a route attached to this Gateway
+				routeRateLimitPolicy := &graph.Policy{
+					Source: &ngfAPIv1alpha1.RateLimitPolicy{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "route-rate-limit",
+							Namespace: "test",
+						},
+						Spec: ngfAPIv1alpha1.RateLimitPolicySpec{
+							RateLimit: &ngfAPIv1alpha1.RateLimit{
+								Local: &ngfAPIv1alpha1.LocalRateLimit{
+									Rules: []ngfAPIv1alpha1.RateLimitRule{
+										{
+											Key:      "$binary_remote_addr",
+											Rate:     "10r/m",
+											ZoneSize: helpers.GetPointer(ngfAPIv1alpha1.Size("10m")),
+											Burst:    helpers.GetPointer(int32(5)),
+										},
+									},
+								},
+							},
+							TargetRefs: []v1.LocalPolicyTargetReference{
+								{
+									Group: "gateway.networking.k8s.io",
+									Kind:  "HTTPRoute",
+									Name:  "hr-1",
+								},
+							},
+						},
+					},
+					Valid: true,
+					TargetRefs: []graph.PolicyTargetRef{
+						{
+							Group: "gateway.networking.k8s.io",
+							Kind:  "HTTPRoute",
+							Nsname: types.NamespacedName{
+								Namespace: "test",
+								Name:      "hr-1",
+							},
+						},
+					},
+				}
+
+				// Create a RateLimitPolicy that targets a route NOT attached to this Gateway
+				unrelatedRouteRateLimitPolicy := &graph.Policy{
+					Source: &ngfAPIv1alpha1.RateLimitPolicy{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "unrelated-route-rate-limit",
+							Namespace: "test",
+						},
+						Spec: ngfAPIv1alpha1.RateLimitPolicySpec{
+							RateLimit: &ngfAPIv1alpha1.RateLimit{
+								Local: &ngfAPIv1alpha1.LocalRateLimit{
+									Rules: []ngfAPIv1alpha1.RateLimitRule{
+										{
+											Key:      "$binary_remote_addr",
+											Rate:     "30r/m",
+											ZoneSize: helpers.GetPointer(ngfAPIv1alpha1.Size("15m")),
+											Burst:    helpers.GetPointer(int32(15)),
+										},
+									},
+								},
+							},
+							TargetRefs: []v1.LocalPolicyTargetReference{
+								{
+									Group: "gateway.networking.k8s.io",
+									Kind:  "HTTPRoute",
+									Name:  "unrelated-hr",
+								},
+							},
+						},
+					},
+					Valid: true,
+					TargetRefs: []graph.PolicyTargetRef{
+						{
+							Group: "gateway.networking.k8s.io",
+							Kind:  "HTTPRoute",
+							Nsname: types.NamespacedName{
+								Namespace: "test",
+								Name:      "unrelated-hr", // This route is not attached to this gateway
+							},
+						},
+					},
+				}
+
+				// Add all policies to NGFPolicies
+				g.NGFPolicies = map[graph.PolicyKey]*graph.Policy{
+					{
+						NsName: types.NamespacedName{
+							Namespace: "test",
+							Name:      "gateway-rate-limit",
+						},
+						GVK: schema.GroupVersionKind{
+							Kind:    "RateLimitPolicy",
+							Group:   "nginx.org",
+							Version: "v1alpha1",
+						},
+					}: gatewayRateLimitPolicy,
+					{
+						NsName: types.NamespacedName{
+							Namespace: "test",
+							Name:      "route-rate-limit",
+						},
+						GVK: schema.GroupVersionKind{
+							Kind:    "RateLimitPolicy",
+							Group:   "nginx.org",
+							Version: "v1alpha1",
+						},
+					}: routeRateLimitPolicy,
+					{
+						NsName: types.NamespacedName{
+							Namespace: "test",
+							Name:      "unrelated-route-rate-limit",
+						},
+						GVK: schema.GroupVersionKind{
+							Kind:    "RateLimitPolicy",
+							Group:   "nginx.org",
+							Version: "v1alpha1",
+						},
+					}: unrelatedRouteRateLimitPolicy,
+				}
+
+				// Add the Gateway policy to the Gateway itself
+				gw.Policies = []*graph.Policy{gatewayRateLimitPolicy}
+
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes: map[graph.RouteKey]*graph.L7Route{
+						graph.CreateRouteKey(hr1): routeHR1,
+					},
+				})
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hr1): routeHR1,
+				}
+
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				// The Gateway RateLimitPolicy should be included as-is (no HTTP context version)
+				gatewayRateLimitPolicyOriginal := &ngfAPIv1alpha1.RateLimitPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "gateway-rate-limit",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.RateLimitPolicySpec{
+						RateLimit: &ngfAPIv1alpha1.RateLimit{
+							Local: &ngfAPIv1alpha1.LocalRateLimit{
+								Rules: []ngfAPIv1alpha1.RateLimitRule{
+									{
+										Key:      "$binary_remote_addr",
+										Rate:     "20r/m",
+										ZoneSize: helpers.GetPointer(ngfAPIv1alpha1.Size("5m")),
+										Burst:    helpers.GetPointer(int32(10)),
+									},
+								},
+							},
+						},
+						TargetRefs: []v1.LocalPolicyTargetReference{
+							{
+								Group: "gateway.networking.k8s.io",
+								Kind:  kinds.Gateway,
+								Name:  "gateway",
+							},
+						},
+					},
+				}
+
+				// HTTP context RateLimit policy for the route-targeting policy
+				expectedHTTPContextPolicy := &ngfAPIv1alpha1.RateLimitPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "route-rate-limit",
+						Namespace: "test",
+						Annotations: map[string]string{
+							InternalRLPAnnotationKey: InternalRLPAnnotationValue,
+						},
+					},
+					Spec: ngfAPIv1alpha1.RateLimitPolicySpec{
+						RateLimit: &ngfAPIv1alpha1.RateLimit{
+							Local: &ngfAPIv1alpha1.LocalRateLimit{
+								Rules: []ngfAPIv1alpha1.RateLimitRule{
+									{
+										Key:      "$binary_remote_addr",
+										Rate:     "10r/m",
+										ZoneSize: helpers.GetPointer(ngfAPIv1alpha1.Size("10m")),
+										Burst:    helpers.GetPointer(int32(5)),
+									},
+								},
+							},
+						},
+						TargetRefs: []v1.LocalPolicyTargetReference{
+							{
+								Group: "gateway.networking.k8s.io",
+								Kind:  "HTTPRoute",
+								Name:  "hr-1",
+							},
+						},
+					},
+				}
+
+				// BaseHTTPConfig should include both the original Gateway policy and the HTTP context route policy
+				conf.BaseHTTPConfig.Policies = []policies.Policy{
+					gatewayRateLimitPolicyOriginal,
+					expectedHTTPContextPolicy,
+				}
+
+				conf.HTTPServers = []VirtualServer{
+					{
+						IsDefault: true,
+						Port:      80,
+						Policies:  []policies.Policy{gatewayRateLimitPolicyOriginal}, // Gateway policies are also applied to servers
+					},
+					{
+						Hostname: "foo.example.com",
+						PathRules: []PathRule{
+							{
+								Path:     "/",
+								PathType: PathTypePrefix,
+								MatchRules: []MatchRule{
+									{
+										BackendGroup: expHR1Groups[0],
+										Source:       &hr1.ObjectMeta,
+									},
+								},
+							},
+						},
+						Port:     80,
+						Policies: []policies.Policy{gatewayRateLimitPolicyOriginal}, // Gateway policies are also applied to servers
+					},
+				}
+
+				conf.SSLServers = []VirtualServer{}
+				conf.Upstreams = []Upstream{fooUpstream}
+				conf.BackendGroups = []BackendGroup{expHR1Groups[0]}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+
+				return conf
+			}),
+			msg: "Internal RateLimitPolices are generated in BaseHTTPConfig correctly",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				g.SnippetsFilters = map[types.NamespacedName]*graph.SnippetsFilter{
+					client.ObjectKeyFromObject(sf1.Source):             sf1,
+					client.ObjectKeyFromObject(sfNotReferenced.Source): sfNotReferenced,
+				}
+
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				// With proper scoping, no snippets should be included since no routes
+				// attached to this gateway reference the SnippetsFilters
+				conf.MainSnippets = nil            // nil - no snippets should be included
+				conf.BaseHTTPConfig.Snippets = nil // nil - no snippets should be included
+				conf.HTTPServers = []VirtualServer{}
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+
+				return conf
+			}),
+			msg: "SnippetsFilters scoped per gateway - no routes reference SnippetsFilters",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				listenerSetNsName := types.NamespacedName{Namespace: "test", Name: "listener-set"}
+
+				// Create a new route that uses ListenerSet key
+				modifiedRouteHR1 := *routeHR1
+				modifiedRouteHR1.ParentRefs = []graph.ParentRef{
+					{
+						Kind:           kinds.ListenerSet,
+						NamespacedName: listenerSetNsName,
+						GatewayNsName:  gatewayNsName,
+						Attachment: &graph.ParentRefAttachmentStatus{
+							Listeners: []graph.ListenerAttachmentStatus{{
+								Key:               graph.CreateParentRefListenerKey(listenerSetNsName, "listener-80-1"),
+								AcceptedHostnames: []string{"foo.example.com"},
+								Port:              80,
+							}},
+						},
+					},
+				}
+
+				// Create a new route key for the modified route
+				modifiedRouteKey := graph.RouteKey{
+					NamespacedName: types.NamespacedName{
+						Namespace: "test",
+						Name:      "hr-1-listenerSet",
+					},
+					RouteType: graph.RouteTypeHTTP,
+				}
+
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:            "listener-80-1",
+					GatewayName:     gatewayNsName,
+					ListenerSetName: listenerSetNsName,
+					Source:          listener80,
+					Valid:           true,
+					Routes: map[graph.RouteKey]*graph.L7Route{
+						modifiedRouteKey: &modifiedRouteHR1,
+					},
+				})
+
+				// Add the modified route to the graph's routes
+				g.Routes[modifiedRouteKey] = &modifiedRouteHR1
+
+				// Also need to set up referenced services for the route
+				g.ReferencedServices = map[types.NamespacedName]*graph.ReferencedService{
+					{Namespace: "test", Name: "foo"}: {},
+				}
+
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = append(conf.HTTPServers, VirtualServer{
+					Hostname: "foo.example.com",
+					PathRules: []PathRule{
+						{
+							Path:     "/",
+							PathType: PathTypePrefix,
+							MatchRules: []MatchRule{
+								{
+									BackendGroup: expHR1Groups[0],
+									Source:       &hr1.ObjectMeta,
+								},
+							},
+						},
+					},
+					Port: 80,
+				})
+				conf.SSLServers = []VirtualServer{}
+				conf.Upstreams = []Upstream{fooUpstream}
+				conf.BackendGroups = []BackendGroup{expHR1Groups[0]}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+
+				return conf
+			}),
+			msg: "HTTP listener from ListenerSet with correct key generation",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				listenerSetNsName := types.NamespacedName{Namespace: "test", Name: "listener-set-tls"}
+
+				tlsListener := v1.Listener{
+					Name:     "listener-443-tls",
+					Hostname: (*v1.Hostname)(helpers.GetPointer("app.example.com")),
+					Port:     443,
+					Protocol: v1.TLSProtocolType,
+				}
+
+				tlsRoute := graph.L4Route{
+					Spec: graph.L4RouteSpec{
+						Hostnames: []v1.Hostname{"app.example.com"},
+						BackendRef: graph.BackendRef{
+							SvcNsName: types.NamespacedName{
+								Namespace: "default",
+								Name:      "secure-app",
+							},
+							ServicePort: apiv1.ServicePort{
+								Name:     "https",
+								Protocol: "TCP",
+								Port:     8443,
+								TargetPort: intstr.IntOrString{
+									Type:   intstr.Int,
+									IntVal: 8443,
+								},
+							},
+							Valid: true,
+						},
+					},
+					ParentRefs: []graph.ParentRef{
+						{
+							Kind:           kinds.ListenerSet,
+							NamespacedName: listenerSetNsName,
+							GatewayNsName:  gatewayNsName,
+							Attachment: &graph.ParentRefAttachmentStatus{
+								Listeners: []graph.ListenerAttachmentStatus{{
+									// Key uses ListenerSet name instead of Gateway name
+									Key:               graph.CreateParentRefListenerKey(listenerSetNsName, "listener-443-tls"),
+									AcceptedHostnames: []string{"app.example.com"},
+									Port:              443,
+								}},
+							},
+						},
+					},
+					Valid: true,
+				}
+
+				tlsRouteKey := graph.L4RouteKey{NamespacedName: types.NamespacedName{
+					Namespace: "default",
+					Name:      "secure-app-listenerSet",
+				}}
+
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:            "listener-443-tls",
+					GatewayName:     gatewayNsName,
+					ListenerSetName: listenerSetNsName,
+					Source:          tlsListener,
+					Valid:           true,
+					L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+						tlsRouteKey: &tlsRoute,
+					},
+				})
+
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.TLSServers = []Layer4VirtualServer{
+					{
+						Hostname: "app.example.com",
+						Port:     443,
+						Upstreams: []Layer4Upstream{
+							{
+								Name:   "default_secure-app_8443",
+								Weight: 0,
+							},
+						},
+					},
+				}
+				conf.HTTPServers = []VirtualServer{}
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				conf.Upstreams = []Upstream{}
+				conf.BackendGroups = []BackendGroup{}
+
+				return conf
+			}),
+			msg: "TLS passthrough listener from ListenerSet with correct key generation",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := BuildConfiguration(
+				t.Context(),
+				logr.Discard(),
+				test.graph,
+				test.graph.Gateways[gatewayNsName],
+				fakeResolver,
+				false,
+				ngfAPIv1alpha2.Dual,
+			)
+
+			assertBuildConfiguration(g, result, test.expConf)
+		})
+	}
+}
+
+func TestBuildConfiguration_Guardrails(t *testing.T) {
+	t.Parallel()
+
+	fakeResolver := &resolverfakes.ServiceResolverMock{}
+	fakeResolver.ResolveFunc = func(
+		context.Context, logr.Logger, types.NamespacedName, apiv1.ServicePort, []discoveryV1.AddressType) (
+		[]resolver.Endpoint, error,
+	) {
+		return fooEndpoints, nil
+	}
+
+	tokenSecretNsName := types.NamespacedName{Namespace: "test", Name: "guardrails-token"}
+
+	guardrailsPolicy := func() *graph.Policy {
+		return &graph.Policy{
+			Valid: true,
+			PayloadProcessorState: &graph.PolicyPayloadProcessorState{
+				APIURL:            "http://ext-svc.test.svc.cluster.local:9000",
+				AuthTokenSecret:   &tokenSecretNsName,
+				ResolvedAuthToken: []byte("tok"),
+			},
+		}
+	}
+
+	// buildGraph creates a graph with a single HTTP listener and route, optionally attaching a
+	// PayloadProcessor policy to that route as its effective processor.
+	buildGraph := func(processor *graph.Policy) *graph.Graph {
+		hr, _, route := createTestResources(
+			"hr-guardrails",
+			"foo.example.com",
+			"listener-80-1",
+			pathAndType{path: "/", pathType: prefix},
+		)
+		if processor != nil {
+			route.EffectivePayloadProcessors = map[types.NamespacedName]*graph.Policy{
+				gatewayNsName: processor,
+			}
+		}
+
+		return getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+			gw := g.Gateways[gatewayNsName]
+			gw.Listeners = append(gw.Listeners, &graph.Listener{
+				Name:        "listener-80-1",
+				GatewayName: gatewayNsName,
+				Source:      listener80,
+				Valid:       true,
+				Routes: map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(hr): route,
+				},
+			})
+			g.Routes = map[graph.RouteKey]*graph.L7Route{
+				graph.CreateRouteKey(hr): route,
+			}
+			return g
+		})
+	}
+
+	// findGuardrails returns the Guardrails config on the first MatchRule of the first HTTP server's
+	// first path rule, or nil.
+	findGuardrails := func(conf Configuration) *GuardrailsConfig {
+		for _, s := range conf.HTTPServers {
+			for _, pr := range s.PathRules {
+				for _, mr := range pr.MatchRules {
+					if mr.Guardrails != nil {
+						return mr.Guardrails
+					}
+				}
+			}
+		}
+		return nil
+	}
+
+	t.Run("route with effective processor enables guardrails and wires auth secret", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+
+		gr := buildGraph(guardrailsPolicy())
+
+		result := BuildConfiguration(
+			t.Context(),
+			logr.Discard(),
+			gr,
+			gr.Gateways[gatewayNsName],
+			fakeResolver,
+			false,
+			ngfAPIv1alpha2.Dual,
+		)
+
+		g.Expect(result.GuardrailsEnabled).To(BeTrue())
+
+		tokenFileID := GenerateGuardrailsTokenFileID(tokenSecretNsName.Namespace, tokenSecretNsName.Name)
+		g.Expect(result.AuthSecrets).To(HaveKeyWithValue(tokenFileID, AuthFileData("tok")))
+
+		gc := findGuardrails(result)
+		g.Expect(gc).ToNot(BeNil())
+		g.Expect(gc.Enabled).To(BeTrue())
+		g.Expect(gc.APIURL).To(Equal("http://ext-svc.test.svc.cluster.local:9000"))
+		g.Expect(gc.APITokenAuthFileID).To(Equal(tokenFileID))
+	})
+
+	t.Run("route without processor leaves guardrails disabled", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+
+		gr := buildGraph(nil)
+
+		result := BuildConfiguration(
+			t.Context(),
+			logr.Discard(),
+			gr,
+			gr.Gateways[gatewayNsName],
+			fakeResolver,
+			false,
+			ngfAPIv1alpha2.Dual,
+		)
+
+		g.Expect(result.GuardrailsEnabled).To(BeFalse())
+		g.Expect(findGuardrails(result)).To(BeNil())
+
+		tokenFileID := GenerateGuardrailsTokenFileID(tokenSecretNsName.Namespace, tokenSecretNsName.Name)
+		g.Expect(result.AuthSecrets).ToNot(HaveKey(tokenFileID))
+	})
+}
+
+func TestBuildConfiguration_Plus(t *testing.T) {
+	t.Parallel()
+	fooEndpoints := []resolver.Endpoint{
+		{
+			Address: "10.0.0.0",
+			Port:    8080,
+		},
+	}
+
+	fakeResolver := &resolverfakes.ServiceResolverMock{}
+	fakeResolver.ResolveFunc = func(
+		context.Context, logr.Logger, types.NamespacedName, apiv1.ServicePort, []discoveryV1.AddressType) (
+		[]resolver.Endpoint, error,
+	) {
+		return fooEndpoints, nil
+	}
+
+	listener80 := v1.Listener{
+		Name:     "listener-80-1",
+		Hostname: nil,
+		Port:     80,
+		Protocol: v1.HTTPProtocolType,
+	}
+
+	defaultPlusConfig := Configuration{
+		Logging:   Logging{ErrorLevel: defaultErrorLogLevel},
+		NginxPlus: NginxPlus{AllowedAddresses: []string{"127.0.0.1"}},
+	}
+
+	tests := []struct {
+		graph   *graph.Graph
+		msg     string
+		expConf Configuration
+	}{
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Source.ObjectMeta = metav1.ObjectMeta{
+					Name:      "gw",
+					Namespace: "ns",
+				}
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes:      map[graph.RouteKey]*graph.L7Route{},
+				})
+				gw.EffectiveNginxProxy = &graph.EffectiveNginxProxy{
+					NginxPlus: &ngfAPIv1alpha2.NginxPlus{
+						AllowedAddresses: []ngfAPIv1alpha2.NginxPlusAllowAddress{
+							{Type: ngfAPIv1alpha2.NginxPlusAllowIPAddressType, Value: "127.0.0.3"},
+							{Type: ngfAPIv1alpha2.NginxPlusAllowIPAddressType, Value: "25.0.0.3"},
+						},
+					},
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				conf.NginxPlus = NginxPlus{AllowedAddresses: []string{"127.0.0.3", "25.0.0.3"}}
+				conf.BaseHTTPConfig.ServerTokens = graph.ServerTokenOff
+				return conf
+			}),
+			msg: "NginxProxy with NginxPlus allowed addresses configured",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				g.GatewayClass.Valid = false
+				return g
+			}),
+			expConf: defaultPlusConfig,
+			msg:     "invalid gatewayclass",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				g.GatewayClass = nil
+				return g
+			}),
+			expConf: defaultPlusConfig,
+			msg:     "missing gatewayclass",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				delete(g.Gateways, gatewayNsName)
+				return g
+			}),
+			expConf: defaultPlusConfig,
+			msg:     "missing gateway",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := BuildConfiguration(
+				t.Context(),
+				logr.Discard(),
+				test.graph,
+				test.graph.Gateways[gatewayNsName],
+				fakeResolver,
+				true,
+				ngfAPIv1alpha2.Dual,
+			)
+
+			g.Expect(result.BackendGroups).To(ConsistOf(test.expConf.BackendGroups))
+			g.Expect(result.Upstreams).To(ConsistOf(test.expConf.Upstreams))
+			g.Expect(result.HTTPServers).To(ConsistOf(test.expConf.HTTPServers))
+			g.Expect(result.SSLServers).To(ConsistOf(test.expConf.SSLServers))
+			g.Expect(result.TLSServers).To(ConsistOf(test.expConf.TLSServers))
+			g.Expect(result.SSLKeyPairs).To(Equal(test.expConf.SSLKeyPairs))
+			g.Expect(result.CertBundles).To(Equal(test.expConf.CertBundles))
+			g.Expect(result.Telemetry).To(Equal(test.expConf.Telemetry))
+			g.Expect(result.BaseHTTPConfig).To(Equal(test.expConf.BaseHTTPConfig))
+			g.Expect(result.Logging).To(Equal(test.expConf.Logging))
+			g.Expect(result.NginxPlus).To(Equal(test.expConf.NginxPlus))
+			g.Expect(result.SSLListenerHostnames).To(Equal(test.expConf.SSLListenerHostnames))
+		})
+	}
+}
+
+func TestUpsertRoute_PathRuleHasInferenceBackend(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	// Setup minimal route with one BackendRef marked as IsInferencePool
+	backendRef := graph.BackendRef{
+		SvcNsName:       types.NamespacedName{Name: "svc", Namespace: "test"},
+		ServicePort:     apiv1.ServicePort{Port: 80},
+		Valid:           true,
+		IsInferencePool: true,
+	}
+
+	listenerName := "listener-80"
+	gwName := types.NamespacedName{Namespace: "test", Name: "gw"}
+
+	route := &graph.L7Route{
+		RouteType: graph.RouteTypeHTTP,
+		Source: &v1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "hr",
+				Namespace: "test",
+			},
+		},
+		Spec: graph.L7RouteSpec{
+			Rules: []graph.RouteRule{
+				{
+					ValidMatches: true,
+					Filters:      graph.RouteRuleFilters{Valid: true},
+					BackendRefs:  []graph.BackendRef{backendRef},
+					Matches: []v1.HTTPRouteMatch{
+						{
+							Path: &v1.HTTPPathMatch{
+								Type:  helpers.GetPointer(v1.PathMatchPathPrefix),
+								Value: helpers.GetPointer("/infer"),
+							},
+						},
+					},
+				},
+			},
+		},
+		ParentRefs: []graph.ParentRef{
+			{
+				Attachment: &graph.ParentRefAttachmentStatus{
+					Listeners: []graph.ListenerAttachmentStatus{{
+						Key:               graph.CreateParentRefListenerKey(gwName, listenerName),
+						AcceptedHostnames: []string{"*"},
+						Port:              0,
+					}},
+				},
+			},
+		},
+		Valid: true,
+	}
+
+	listener := &graph.Listener{
+		Name:        listenerName,
+		GatewayName: gwName,
+		Valid:       true,
+		Routes: map[graph.RouteKey]*graph.L7Route{
+			graph.CreateRouteKey(route.Source): route,
+		},
+	}
+
+	gateway := &graph.Gateway{
+		Source: &v1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "gw",
+				Namespace: "test",
+			},
+		},
+		Listeners: []*graph.Listener{listener},
+	}
+
+	hpr := newHostPathRules()
+	hpr.upsertRoute(route, listener, gateway, nil, nil, nil)
+
+	// Find the PathRule for "/infer"
+	found := false
+	for _, rules := range hpr.rulesPerHost {
+		for _, pr := range rules {
+			if pr.Path == "/infer" {
+				found = true
+				g.Expect(pr.HasInferenceBackends).To(BeTrue())
+			}
+		}
+	}
+	g.Expect(found).To(BeTrue(), "PathRule for '/infer' not found")
+}
+
+func TestNewBackendGroup_Mirror(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	backendRef := graph.BackendRef{
+		SvcNsName:       types.NamespacedName{Name: "mirror-backend", Namespace: "test"},
+		ServicePort:     apiv1.ServicePort{Port: 80},
+		Valid:           true,
+		IsMirrorBackend: true,
+	}
+
+	group, _ := newBackendGroup([]graph.BackendRef{backendRef}, types.NamespacedName{}, types.NamespacedName{}, 0, nil)
+
+	g.Expect(group.Backends).To(BeEmpty())
+}
+
+func TestNewBackendGroup_AppProtocol(t *testing.T) {
+	t.Parallel()
+
+	h2c := helpers.GetPointer("kubernetes.io/h2c")
+
+	tests := []struct {
+		name        string
+		appProtocol *string
+		expected    string
+	}{
+		{
+			name:        "nil appProtocol – empty string",
+			appProtocol: nil,
+			expected:    "",
+		},
+		{
+			name:        "h2c appProtocol – propagated",
+			appProtocol: h2c,
+			expected:    "kubernetes.io/h2c",
+		},
+		{
+			name:        "arbitrary appProtocol – propagated",
+			appProtocol: helpers.GetPointer("example.com/custom"),
+			expected:    "example.com/custom",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			backendRef := graph.BackendRef{
+				SvcNsName:   types.NamespacedName{Name: "svc", Namespace: "default"},
+				ServicePort: apiv1.ServicePort{Port: 80, AppProtocol: tc.appProtocol},
+				Valid:       true,
+				Weight:      1,
+			}
+
+			group, _ := newBackendGroup(
+				[]graph.BackendRef{backendRef},
+				types.NamespacedName{Name: "gateway", Namespace: "default"},
+				types.NamespacedName{Name: "gateway", Namespace: "default"},
+				0,
+				nil,
+			)
+
+			g.Expect(group.Backends).To(HaveLen(1))
+			g.Expect(group.Backends[0].AppProtocol).To(Equal(tc.expected))
+		})
+	}
+}
+
+func TestGetPath(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		path     *v1.HTTPPathMatch
+		expected string
+		msg      string
+	}{
+		{
+			path:     &v1.HTTPPathMatch{Value: helpers.GetPointer("/abc")},
+			expected: "/abc",
+			msg:      "normal case",
+		},
+		{
+			path:     nil,
+			expected: "/",
+			msg:      "nil path",
+		},
+		{
+			path:     &v1.HTTPPathMatch{Value: nil},
+			expected: "/",
+			msg:      "nil value",
+		},
+		{
+			path:     &v1.HTTPPathMatch{Value: helpers.GetPointer("")},
+			expected: "/",
+			msg:      "empty value",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			result := getPath(test.path)
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestCreateFilters(t *testing.T) {
+	t.Parallel()
+
+	redirect1 := graph.Filter{
+		FilterType: graph.FilterRequestRedirect,
+		RequestRedirect: &v1.HTTPRequestRedirectFilter{
+			Hostname: helpers.GetPointer[v1.PreciseHostname]("foo.example.com"),
+		},
+	}
+	redirect2 := graph.Filter{
+		FilterType: graph.FilterRequestRedirect,
+		RequestRedirect: &v1.HTTPRequestRedirectFilter{
+			Hostname: helpers.GetPointer[v1.PreciseHostname]("bar.example.com"),
+		},
+	}
+	rewrite1 := graph.Filter{
+		FilterType: graph.FilterURLRewrite,
+		URLRewrite: &v1.HTTPURLRewriteFilter{
+			Hostname: helpers.GetPointer[v1.PreciseHostname]("foo.example.com"),
+		},
+	}
+	rewrite2 := graph.Filter{
+		FilterType: graph.FilterURLRewrite,
+		URLRewrite: &v1.HTTPURLRewriteFilter{
+			Hostname: helpers.GetPointer[v1.PreciseHostname]("bar.example.com"),
+		},
+	}
+	mirror1 := graph.Filter{
+		FilterType: graph.FilterRequestMirror,
+		RequestMirror: &v1.HTTPRequestMirrorFilter{
+			BackendRef: v1.BackendObjectReference{
+				Group: helpers.GetPointer(v1.Group("core")),
+				Kind:  helpers.GetPointer(v1.Kind("Service")),
+				Name:  v1.ObjectName("mirror-backend"),
+			},
+		},
+	}
+	mirror2 := graph.Filter{
+		FilterType: graph.FilterRequestMirror,
+		RequestMirror: &v1.HTTPRequestMirrorFilter{
+			BackendRef: v1.BackendObjectReference{
+				Group: helpers.GetPointer(v1.Group("core")),
+				Kind:  helpers.GetPointer(v1.Kind("Service")),
+				Name:  v1.ObjectName("mirror-backend2"),
+			},
+			Percent: helpers.GetPointer(int32(50)),
+		},
+	}
+	requestHeaderModifiers1 := graph.Filter{
+		FilterType: graph.FilterRequestHeaderModifier,
+		RequestHeaderModifier: &v1.HTTPHeaderFilter{
+			Set: []v1.HTTPHeader{
+				{
+					Name:  "MyBespokeHeader",
+					Value: "my-value",
+				},
+			},
+		},
+	}
+	requestHeaderModifiers2 := graph.Filter{
+		FilterType: graph.FilterRequestHeaderModifier,
+		RequestHeaderModifier: &v1.HTTPHeaderFilter{
+			Add: []v1.HTTPHeader{
+				{
+					Name:  "Content-Accepted",
+					Value: "gzip",
+				},
+			},
+		},
+	}
+
+	responseHeaderModifiers1 := graph.Filter{
+		FilterType: graph.FilterResponseHeaderModifier,
+		ResponseHeaderModifier: &v1.HTTPHeaderFilter{
+			Add: []v1.HTTPHeader{
+				{
+					Name:  "X-Server-Version",
+					Value: "2.3",
+				},
+			},
+		},
+	}
+
+	responseHeaderModifiers2 := graph.Filter{
+		FilterType: graph.FilterResponseHeaderModifier,
+		ResponseHeaderModifier: &v1.HTTPHeaderFilter{
+			Set: []v1.HTTPHeader{
+				{
+					Name:  "X-Route",
+					Value: "new-response-value",
+				},
+			},
+		},
+	}
+
+	expectedRedirect1 := HTTPRequestRedirectFilter{
+		Hostname: helpers.GetPointer("foo.example.com"),
+	}
+	expectedRewrite1 := HTTPURLRewriteFilter{
+		Hostname: helpers.GetPointer("foo.example.com"),
+	}
+
+	expectedMirror1 := HTTPRequestMirrorFilter{
+		Name:    helpers.GetPointer("mirror-backend"),
+		Target:  helpers.GetPointer("/_ngf-internal-mirror-mirror-backend-test/route1-0"),
+		Percent: helpers.GetPointer(float64(100)),
+	}
+	expectedMirror2 := HTTPRequestMirrorFilter{
+		Name:    helpers.GetPointer("mirror-backend2"),
+		Target:  helpers.GetPointer("/_ngf-internal-mirror-mirror-backend2-test/route1-0"),
+		Percent: helpers.GetPointer(float64(50)),
+	}
+
+	expectedHeaderModifier1 := HTTPHeaderFilter{
+		Set: []HTTPHeader{
+			{
+				Name:  "MyBespokeHeader",
+				Value: "my-value",
+			},
+		},
+	}
+
+	expectedresponseHeaderModifier := HTTPHeaderFilter{
+		Add: []HTTPHeader{
+			{
+				Name:  "X-Server-Version",
+				Value: "2.3",
+			},
+		},
+	}
+
+	snippetsFilter1 := graph.Filter{
+		FilterType: graph.FilterExtensionRef,
+		ExtensionRef: &v1.LocalObjectReference{
+			Group: ngfAPIv1alpha1.GroupName,
+			Kind:  kinds.SnippetsFilter,
+			Name:  "sf1",
+		},
+		ResolvedExtensionRef: &graph.ExtensionRefFilter{
+			Valid: true,
+			SnippetsFilter: &graph.SnippetsFilter{
+				Source: &ngfAPIv1alpha1.SnippetsFilter{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "sf1",
+						Namespace: "default",
+					},
+				},
+				Valid:      true,
+				Referenced: true,
+				Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+					ngfAPIv1alpha1.NginxContextHTTPServerLocation: "location snippet 1",
+					ngfAPIv1alpha1.NginxContextMain:               "main snippet 1",
+					ngfAPIv1alpha1.NginxContextHTTPServer:         "server snippet 1",
+					ngfAPIv1alpha1.NginxContextHTTP:               "http snippet 1",
+				},
+			},
+		},
+	}
+
+	corsFilter1 := graph.Filter{
+		FilterType: graph.FilterCORS,
+		CORS: &v1.HTTPCORSFilter{
+			AllowOrigins:     []v1.CORSOrigin{"https://example.com", "*.test.com"},
+			AllowMethods:     []v1.HTTPMethodWithWildcard{"GET", "POST"},
+			AllowHeaders:     []v1.HTTPHeaderName{"Content-Type", "Authorization"},
+			ExposeHeaders:    []v1.HTTPHeaderName{"X-Custom-Header"},
+			AllowCredentials: helpers.GetPointer(true),
+			MaxAge:           int32(3600),
+		},
+	}
+
+	corsFilter2 := graph.Filter{
+		FilterType: graph.FilterCORS,
+		CORS: &v1.HTTPCORSFilter{
+			AllowOrigins: []v1.CORSOrigin{"https://another.com"},
+			MaxAge:       int32(7200),
+		},
+	}
+
+	expectedCORS1 := HTTPCORSFilter{
+		AllowOrigins:     []string{"https://example.com", "*.test.com"},
+		AllowMethods:     []string{"GET", "POST"},
+		AllowHeaders:     []string{"Content-Type", "Authorization"},
+		ExposeHeaders:    []string{"X-Custom-Header"},
+		AllowCredentials: true,
+		MaxAge:           int32(3600),
+	}
+
+	snippetsFilter2 := graph.Filter{
+		FilterType: graph.FilterExtensionRef,
+		ExtensionRef: &v1.LocalObjectReference{
+			Group: ngfAPIv1alpha1.GroupName,
+			Kind:  kinds.SnippetsFilter,
+			Name:  "sf2",
+		},
+		ResolvedExtensionRef: &graph.ExtensionRefFilter{
+			Valid: true,
+			SnippetsFilter: &graph.SnippetsFilter{
+				Source: &ngfAPIv1alpha1.SnippetsFilter{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "sf2",
+						Namespace: "default",
+					},
+				},
+				Valid:      true,
+				Referenced: true,
+				Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+					ngfAPIv1alpha1.NginxContextHTTPServerLocation: "location snippet 2",
+					ngfAPIv1alpha1.NginxContextMain:               "main snippet 2",
+					ngfAPIv1alpha1.NginxContextHTTPServer:         "server snippet 2",
+					ngfAPIv1alpha1.NginxContextHTTP:               "http snippet 2",
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		expected HTTPFilters
+		msg      string
+		filters  []graph.Filter
+	}{
+		{
+			filters:  []graph.Filter{},
+			expected: HTTPFilters{},
+			msg:      "no filters",
+		},
+		{
+			filters: []graph.Filter{
+				redirect1,
+			},
+			expected: HTTPFilters{
+				RequestRedirect: &expectedRedirect1,
+			},
+			msg: "one request redirect filter",
+		},
+		{
+			filters: []graph.Filter{
+				corsFilter1,
+			},
+			expected: HTTPFilters{
+				CORSFilter: &expectedCORS1,
+			},
+			msg: "one CORS filter",
+		},
+		{
+			filters: []graph.Filter{
+				redirect1,
+				redirect2,
+				rewrite1,
+				rewrite2,
+				mirror1,
+				mirror2,
+				requestHeaderModifiers1,
+				requestHeaderModifiers2,
+				responseHeaderModifiers1,
+				responseHeaderModifiers2,
+				snippetsFilter1,
+				snippetsFilter2,
+				corsFilter1,
+				corsFilter2,
+			},
+			expected: HTTPFilters{
+				RequestRedirect:   &expectedRedirect1,
+				RequestURLRewrite: &expectedRewrite1,
+				RequestMirrors: []*HTTPRequestMirrorFilter{
+					&expectedMirror1,
+					&expectedMirror2,
+				},
+				RequestHeaderModifiers:  &expectedHeaderModifier1,
+				ResponseHeaderModifiers: &expectedresponseHeaderModifier,
+				SnippetsFilters: []SnippetsFilter{
+					{
+						LocationSnippet: &Snippet{
+							Name: createSnippetName(
+								ngfAPIv1alpha1.NginxContextHTTPServerLocation,
+								types.NamespacedName{Namespace: "default", Name: "sf1"},
+							),
+							Contents: "location snippet 1",
+						},
+						ServerSnippet: &Snippet{
+							Name: createSnippetName(
+								ngfAPIv1alpha1.NginxContextHTTPServer,
+								types.NamespacedName{Namespace: "default", Name: "sf1"},
+							),
+							Contents: "server snippet 1",
+						},
+					},
+					{
+						LocationSnippet: &Snippet{
+							Name: createSnippetName(
+								ngfAPIv1alpha1.NginxContextHTTPServerLocation,
+								types.NamespacedName{Namespace: "default", Name: "sf2"},
+							),
+							Contents: "location snippet 2",
+						},
+						ServerSnippet: &Snippet{
+							Name: createSnippetName(
+								ngfAPIv1alpha1.NginxContextHTTPServer,
+								types.NamespacedName{Namespace: "default", Name: "sf2"},
+							),
+							Contents: "server snippet 2",
+						},
+					},
+				},
+				CORSFilter: &expectedCORS1,
+			},
+			msg: "two of each filter, first value for each standard filter wins, all mirror and ext ref filters added",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			routeNsName := types.NamespacedName{Namespace: "test", Name: "route1"}
+			result := createHTTPFilters(test.filters, 0, routeNsName, nil, nil, types.NamespacedName{}, nil)
+
+			g.Expect(helpers.Diff(test.expected, result)).To(BeEmpty())
+		})
+	}
+}
+
+func TestGetListenerHostname(t *testing.T) {
+	t.Parallel()
+	var emptyHostname v1.Hostname
+	var hostname v1.Hostname = "example.com"
+
+	tests := []struct {
+		hostname *v1.Hostname
+		expected string
+		msg      string
+	}{
+		{
+			hostname: nil,
+			expected: wildcardHostname,
+			msg:      "nil hostname",
+		},
+		{
+			hostname: &emptyHostname,
+			expected: wildcardHostname,
+			msg:      "empty hostname",
+		},
+		{
+			hostname: &hostname,
+			expected: string(hostname),
+			msg:      "normal hostname",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			result := getListenerHostname(test.hostname)
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func refsToValidRules(backendRefs ...[]graph.BackendRef) []graph.RouteRule {
+	rules := make([]graph.RouteRule, 0, len(backendRefs))
+
+	for _, ref := range backendRefs {
+		rules = append(rules, graph.RouteRule{
+			ValidMatches: true,
+			Filters:      graph.RouteRuleFilters{Valid: true},
+			BackendRefs:  ref,
+		})
+	}
+
+	return rules
+}
+
+func TestBuildUpstreams(t *testing.T) {
+	t.Parallel()
+	fooEndpoints := []resolver.Endpoint{
+		{
+			Address: "10.0.0.0",
+			Port:    8080,
+		},
+		{
+			Address: "10.0.0.1",
+			Port:    8080,
+		},
+		{
+			Address: "10.0.0.2",
+			Port:    8080,
+		},
+		{
+			Address: "fd00:10:244::6",
+			Port:    8080,
+		},
+	}
+
+	barEndpoints := []resolver.Endpoint{
+		{
+			Address: "11.0.0.0",
+			Port:    80,
+		},
+		{
+			Address: "11.0.0.1",
+			Port:    80,
+		},
+		{
+			Address: "11.0.0.2",
+			Port:    80,
+		},
+		{
+			Address: "11.0.0.3",
+			Port:    80,
+		},
+	}
+
+	invalidEndpoints := []resolver.Endpoint{
+		{
+			Address: "11.5.5.5",
+			Port:    80,
+		},
+	}
+
+	bazEndpoints := []resolver.Endpoint{
+		{
+			Address: "12.0.0.0",
+			Port:    80,
+		},
+		{
+			Address: "fd00:10:244::9",
+			Port:    80,
+		},
+	}
+
+	baz2Endpoints := []resolver.Endpoint{
+		{
+			Address: "13.0.0.0",
+			Port:    80,
+		},
+	}
+
+	abcEndpoints := []resolver.Endpoint{
+		{
+			Address: "14.0.0.0",
+			Port:    80,
+		},
+	}
+
+	ipv6Endpoints := []resolver.Endpoint{
+		{
+			Address: "fd00:10:244::7",
+			Port:    80,
+		},
+		{
+			Address: "fd00:10:244::8",
+			Port:    80,
+		},
+		{
+			Address: "fd00:10:244::9",
+			Port:    80,
+		},
+	}
+
+	policyEndpoints := []resolver.Endpoint{
+		{
+			Address: "16.0.0.0",
+			Port:    80,
+		},
+	}
+
+	createBackendRefs := func(sp *graph.SessionPersistenceConfig, serviceNames ...string) []graph.BackendRef {
+		var backends []graph.BackendRef
+		for _, name := range serviceNames {
+			backends = append(backends, graph.BackendRef{
+				SvcNsName:          types.NamespacedName{Namespace: "test", Name: name},
+				ServicePort:        apiv1.ServicePort{Port: 80},
+				Valid:              name != "",
+				SessionPersistence: sp,
+			})
+		}
+		return backends
+	}
+
+	createSPConfig := func(idx string) *graph.SessionPersistenceConfig {
+		return &graph.SessionPersistenceConfig{
+			Name:        "session-persistence",
+			SessionType: v1.CookieBasedSessionPersistence,
+			Expiry:      "24h",
+			Path:        "/",
+			Valid:       true,
+			Idx:         idx,
+		}
+	}
+
+	hr1Refs0 := createBackendRefs(createSPConfig("foo-bar-sp"), "foo", "bar")
+
+	hr1Refs1 := createBackendRefs(nil, "baz", "", "") // empty service names should be ignored
+
+	hr1Refs2 := createBackendRefs(nil, "invalid-for-gateway")
+	hr1Refs2[0].InvalidForGateways = map[types.NamespacedName]conditions.Condition{
+		{Namespace: "test", Name: "gateway"}: {},
+	}
+
+	// should duplicate foo upstream because it has a different SP config
+	hr2Refs0 := createBackendRefs(createSPConfig("foo-baz-sp"), "foo", "baz")
+
+	hr2Refs1 := createBackendRefs(nil, "nil-endpoints")
+
+	hr3Refs0 := createBackendRefs(nil, "baz") // shouldn't duplicate baz upstream
+
+	hr4Refs0 := createBackendRefs(nil, "empty-endpoints", "")
+
+	hr4Refs1 := createBackendRefs(nil, "baz2")
+
+	hr5Refs0 := createBackendRefs(nil, "ipv6-endpoints")
+
+	nonExistingRefs := createBackendRefs(nil, "non-existing")
+
+	invalidHRRefs := createBackendRefs(nil, "abc")
+
+	refsWithPolicies := createBackendRefs(createSPConfig("policies-sp"), "policies")
+
+	getExpectedSPConfig := func() SessionPersistenceConfig {
+		return SessionPersistenceConfig{
+			Name:        "session-persistence",
+			SessionType: CookieBasedSessionPersistence,
+			Expiry:      "24h",
+			Path:        "/",
+		}
+	}
+
+	routes := map[graph.RouteKey]*graph.L7Route{
+		{NamespacedName: types.NamespacedName{Name: "hr1", Namespace: "test"}}: {
+			Valid: true,
+			Spec: graph.L7RouteSpec{
+				Rules: refsToValidRules(hr1Refs0, hr1Refs1, hr1Refs2),
+			},
+		},
+		{NamespacedName: types.NamespacedName{Name: "hr2", Namespace: "test"}}: {
+			Valid: true,
+			Spec: graph.L7RouteSpec{
+				Rules: refsToValidRules(hr2Refs0, hr2Refs1),
+			},
+		},
+		{NamespacedName: types.NamespacedName{Name: "hr3", Namespace: "test"}}: {
+			Valid: true,
+			Spec: graph.L7RouteSpec{
+				Rules: refsToValidRules(hr3Refs0),
+			},
+		},
+	}
+
+	routes2 := map[graph.RouteKey]*graph.L7Route{
+		{NamespacedName: types.NamespacedName{Name: "hr4", Namespace: "test"}}: {
+			Valid: true,
+			Spec: graph.L7RouteSpec{
+				Rules: refsToValidRules(hr4Refs0, hr4Refs1),
+			},
+		},
+	}
+
+	routes3 := map[graph.RouteKey]*graph.L7Route{
+		{NamespacedName: types.NamespacedName{Name: "hr4", Namespace: "test"}}: {
+			Valid: true,
+			Spec: graph.L7RouteSpec{
+				Rules: refsToValidRules(hr5Refs0, hr2Refs1),
+			},
+		},
+	}
+
+	routesWithNonExistingRefs := map[graph.RouteKey]*graph.L7Route{
+		{NamespacedName: types.NamespacedName{Name: "non-existing", Namespace: "test"}}: {
+			Valid: true,
+			Spec: graph.L7RouteSpec{
+				Rules: refsToValidRules(nonExistingRefs),
+			},
+		},
+	}
+
+	invalidRoutes := map[graph.RouteKey]*graph.L7Route{
+		{NamespacedName: types.NamespacedName{Name: "invalid", Namespace: "test"}}: {
+			Valid: false,
+			Spec: graph.L7RouteSpec{
+				Rules: refsToValidRules(invalidHRRefs),
+			},
+		},
+	}
+
+	routesWithPolicies := map[graph.RouteKey]*graph.L7Route{
+		{NamespacedName: types.NamespacedName{Name: "policies", Namespace: "test"}}: {
+			Valid: true,
+			Spec: graph.L7RouteSpec{
+				Rules: refsToValidRules(refsWithPolicies),
+			},
+		},
+	}
+
+	gateway := &graph.Gateway{
+		Source: &v1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "test",
+				Name:      "gateway",
+			},
+		},
+		Listeners: []*graph.Listener{
+			{
+				Name:   "invalid-listener",
+				Valid:  false,
+				Routes: routesWithNonExistingRefs, // shouldn't be included since listener is invalid
+			},
+			{
+				Name:   "listener-1",
+				Valid:  true,
+				Routes: routes,
+			},
+			{
+				Name:   "listener-2",
+				Valid:  true,
+				Routes: routes2,
+			},
+			{
+				Name:   "listener-3",
+				Valid:  true,
+				Routes: invalidRoutes, // shouldn't be included since routes are invalid
+			},
+			{
+				Name:   "listener-4",
+				Valid:  true,
+				Routes: routes3,
+			},
+			{
+				Name:   "listener-5",
+				Valid:  true,
+				Routes: routesWithPolicies,
+			},
+		},
+	}
+
+	validPolicy1 := &policiesfakes.PolicyMock{}
+	validPolicy2 := &policiesfakes.PolicyMock{}
+	invalidPolicy := &policiesfakes.PolicyMock{}
+
+	referencedServices := map[types.NamespacedName]*graph.ReferencedService{
+		{Name: "bar", Namespace: "test"}:                 {},
+		{Name: "invalid-for-gateway", Namespace: "test"}: {},
+		{Name: "baz", Namespace: "test"}:                 {},
+		{Name: "baz2", Namespace: "test"}:                {},
+		{Name: "foo", Namespace: "test"}:                 {},
+		{Name: "empty-endpoints", Namespace: "test"}:     {},
+		{Name: "nil-endpoints", Namespace: "test"}:       {},
+		{Name: "ipv6-endpoints", Namespace: "test"}:      {},
+		{Name: "policies", Namespace: "test"}: {
+			Policies: []*graph.Policy{
+				{
+					Valid:  true,
+					Source: validPolicy1,
+				},
+				{
+					Valid:  false,
+					Source: invalidPolicy,
+				},
+				{
+					Valid:  true,
+					Source: validPolicy2,
+				},
+			},
+		},
+	}
+
+	emptyEndpointsErrMsg := "empty endpoints error"
+	nilEndpointsErrMsg := "nil endpoints error"
+
+	expUpstreams := []Upstream{
+		{
+			Name:               "test_bar_80_foo-bar-sp",
+			Endpoints:          barEndpoints,
+			SessionPersistence: getExpectedSPConfig(),
+			StateFileKey:       "test_bar_80",
+		},
+		{
+			Name:               "test_baz2_80",
+			Endpoints:          baz2Endpoints,
+			SessionPersistence: SessionPersistenceConfig{},
+			StateFileKey:       "test_baz2_80",
+		},
+		{
+			Name:               "test_baz_80",
+			Endpoints:          bazEndpoints,
+			SessionPersistence: SessionPersistenceConfig{},
+			StateFileKey:       "test_baz_80",
+		},
+		{
+			Name:               "test_baz_80_foo-baz-sp",
+			Endpoints:          bazEndpoints,
+			SessionPersistence: getExpectedSPConfig(),
+			StateFileKey:       "test_baz_80",
+		},
+		{
+			Name:               "test_empty-endpoints_80",
+			Endpoints:          []resolver.Endpoint{},
+			ErrorMsg:           emptyEndpointsErrMsg,
+			SessionPersistence: SessionPersistenceConfig{},
+			StateFileKey:       "test_empty-endpoints_80",
+		},
+		{
+			Name:               "test_foo_80_foo-bar-sp",
+			Endpoints:          fooEndpoints,
+			SessionPersistence: getExpectedSPConfig(),
+			StateFileKey:       "test_foo_80",
+		},
+		{
+			Name:               "test_foo_80_foo-baz-sp",
+			Endpoints:          fooEndpoints,
+			SessionPersistence: getExpectedSPConfig(),
+			StateFileKey:       "test_foo_80",
+		},
+		{
+			Name:               "test_ipv6-endpoints_80",
+			Endpoints:          ipv6Endpoints,
+			SessionPersistence: SessionPersistenceConfig{},
+			StateFileKey:       "test_ipv6-endpoints_80",
+		},
+		{
+			Name:         "test_nil-endpoints_80",
+			Endpoints:    nil,
+			ErrorMsg:     nilEndpointsErrMsg,
+			StateFileKey: "test_nil-endpoints_80",
+		},
+
+		{
+			Name:               "test_policies_80_policies-sp",
+			Endpoints:          policyEndpoints,
+			Policies:           []policies.Policy{validPolicy1, validPolicy2},
+			SessionPersistence: getExpectedSPConfig(),
+			StateFileKey:       "test_policies_80",
+		},
+	}
+
+	fakeResolver := &resolverfakes.ServiceResolverMock{}
+	fakeResolver.ResolveFunc = func(
+		_ context.Context,
+		_ logr.Logger,
+		svcNsName types.NamespacedName,
+		_ apiv1.ServicePort,
+		_ []discoveryV1.AddressType,
+	) ([]resolver.Endpoint, error) {
+		switch svcNsName.Name {
+		case "bar":
+			return barEndpoints, nil
+		case "invalid-for-gateway":
+			return invalidEndpoints, nil
+		case "baz":
+			return bazEndpoints, nil
+		case "baz2":
+			return baz2Endpoints, nil
+		case "empty-endpoints":
+			return []resolver.Endpoint{}, errors.New(emptyEndpointsErrMsg)
+		case "foo":
+			return fooEndpoints, nil
+		case "nil-endpoints":
+			return nil, errors.New(nilEndpointsErrMsg)
+		case "abc":
+			return abcEndpoints, nil
+		case "ipv6-endpoints":
+			return ipv6Endpoints, nil
+		case "policies":
+			return policyEndpoints, nil
+		default:
+			return nil, fmt.Errorf("unexpected service %s", svcNsName.Name)
+		}
+	}
+
+	g := NewWithT(t)
+
+	upstreams := buildUpstreams(
+		t.Context(),
+		logr.Discard(),
+		gateway,
+		fakeResolver,
+		referencedServices,
+	)
+	g.Expect(upstreams).To(ConsistOf(expUpstreams))
+}
+
+func TestBuildUpstreamsAlwaysResolvesAllAddressTypes(t *testing.T) {
+	t.Parallel()
+
+	ref := graph.BackendRef{
+		SvcNsName:   types.NamespacedName{Namespace: "test", Name: "svc"},
+		ServicePort: apiv1.ServicePort{Port: 80},
+		Valid:       true,
+	}
+	referencedServices := map[types.NamespacedName]*graph.ReferencedService{
+		{Name: "svc", Namespace: "test"}: {},
+	}
+	makeGateway := func(np *graph.EffectiveNginxProxy) *graph.Gateway {
+		return &graph.Gateway{
+			Source:              &v1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "gateway"}},
+			EffectiveNginxProxy: np,
+			Listeners: []*graph.Listener{
+				{
+					Valid: true,
+					Routes: map[graph.RouteKey]*graph.L7Route{
+						{NamespacedName: types.NamespacedName{Name: "hr", Namespace: "test"}}: {
+							Valid: true,
+							Spec:  graph.L7RouteSpec{Rules: refsToValidRules([]graph.BackendRef{ref})},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		gateway *graph.Gateway
+		name    string
+	}{
+		{
+			name: "NginxProxy configured with IPv4" +
+				" resolver receives both IPv4 and IPv6 address types",
+			gateway: makeGateway(&graph.EffectiveNginxProxy{IPFamily: helpers.GetPointer(ngfAPIv1alpha2.IPv4)}),
+		},
+		{
+			name: "NginxProxy configured with IPv6" +
+				" resolver receives both IPv4 and IPv6 address types",
+			gateway: makeGateway(&graph.EffectiveNginxProxy{IPFamily: helpers.GetPointer(ngfAPIv1alpha2.IPv6)}),
+		},
+		{
+			name: "NginxProxy configured with Dual" +
+				" resolver receives both IPv4 and IPv6 address types",
+			gateway: makeGateway(&graph.EffectiveNginxProxy{IPFamily: helpers.GetPointer(ngfAPIv1alpha2.Dual)}),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			fakeResolver := &resolverfakes.ServiceResolverMock{
+				ResolveFunc: func(
+					context.Context, logr.Logger, types.NamespacedName, apiv1.ServicePort, []discoveryV1.AddressType) (
+					[]resolver.Endpoint, error,
+				) {
+					return []resolver.Endpoint{{Address: "10.0.0.1", Port: 80}}, nil
+				},
+			}
+
+			buildUpstreams(t.Context(), logr.Discard(), tc.gateway, fakeResolver, referencedServices)
+
+			g.Expect(fakeResolver.ResolveCalls()).To(HaveLen(1))
+			g.Expect(fakeResolver.ResolveCalls()[0].AllowedAddressType).To(
+				ConsistOf(discoveryV1.AddressTypeIPv4, discoveryV1.AddressTypeIPv6),
+			)
+		})
+	}
+}
+
+func createBackendGroup(name string, ruleIdx int, backendNames ...string) BackendGroup {
+	backends := make([]Backend, len(backendNames))
+	for i, name := range backendNames {
+		backends[i] = Backend{UpstreamName: name}
+	}
+
+	return BackendGroup{
+		Source:   types.NamespacedName{Namespace: "test", Name: name},
+		RuleIdx:  ruleIdx,
+		Backends: backends,
+	}
+}
+
+func TestBuildBackendGroups(t *testing.T) {
+	t.Parallel()
+
+	hr1Group0 := createBackendGroup("hr1", 0, "foo", "bar")
+
+	hr1Group1 := createBackendGroup("hr1", 1, "foo")
+
+	hr2Group0 := createBackendGroup("hr2", 0, "foo", "bar")
+
+	hr2Group1 := createBackendGroup("hr2", 1, "foo")
+
+	hr3Group0 := createBackendGroup("hr3", 0, "foo", "bar")
+
+	hr3Group1 := createBackendGroup("hr3", 1, "foo")
+
+	// groups with no backends should still be included
+	hrNoBackends := createBackendGroup("no-backends", 0)
+
+	createServer := func(groups ...BackendGroup) VirtualServer {
+		matchRules := make([]MatchRule, 0, len(groups))
+		for _, g := range groups {
+			matchRules = append(matchRules, MatchRule{BackendGroup: g})
+		}
+
+		server := VirtualServer{
+			PathRules: []PathRule{
+				{
+					MatchRules: matchRules,
+				},
+			},
+		}
+
+		return server
+	}
+	servers := []VirtualServer{
+		createServer(hr1Group0, hr1Group1),
+		createServer(hr2Group0, hr2Group1),
+		createServer(hr3Group0, hr3Group1),
+		createServer(hr1Group0, hr1Group1), // next three are duplicates
+		createServer(hr2Group0, hr2Group1),
+		createServer(hr3Group0, hr3Group1),
+		createServer(hrNoBackends),
+	}
+
+	expGroups := []BackendGroup{
+		hr1Group0,
+		hr1Group1,
+		hr2Group0,
+		hr2Group1,
+		hr3Group0,
+		hr3Group1,
+		hrNoBackends,
+	}
+
+	g := NewWithT(t)
+
+	result := buildBackendGroups(servers)
+	g.Expect(result).To(ConsistOf(expGroups))
+}
+
+func TestBackendGroupName(t *testing.T) {
+	t.Parallel()
+	backendGroup := createBackendGroup("route1", 2, "foo", "bar")
+
+	expectedGroupName := "group_test__route1_rule2_pathRule0"
+
+	g := NewWithT(t)
+	g.Expect(backendGroup.Name()).To(Equal(expectedGroupName))
+}
+
+func TestHostnameMoreSpecific(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		host1     *v1.Hostname
+		host2     *v1.Hostname
+		msg       string
+		host1Wins bool
+	}{
+		{
+			host1:     nil,
+			host2:     helpers.GetPointer(v1.Hostname("")),
+			host1Wins: true,
+			msg:       "host1 nil; host2 empty",
+		},
+		{
+			host1:     helpers.GetPointer(v1.Hostname("")),
+			host2:     nil,
+			host1Wins: true,
+			msg:       "host1 empty; host2 nil",
+		},
+		{
+			host1:     helpers.GetPointer(v1.Hostname("")),
+			host2:     helpers.GetPointer(v1.Hostname("")),
+			host1Wins: true,
+			msg:       "both hosts empty",
+		},
+		{
+			host1:     helpers.GetPointer(v1.Hostname("example.com")),
+			host2:     helpers.GetPointer(v1.Hostname("")),
+			host1Wins: true,
+			msg:       "host1 has value; host2 empty",
+		},
+		{
+			host1:     helpers.GetPointer(v1.Hostname("")),
+			host2:     helpers.GetPointer(v1.Hostname("example.com")),
+			host1Wins: false,
+			msg:       "host2 has value; host1 empty",
+		},
+		{
+			host1:     helpers.GetPointer(v1.Hostname("foo.example.com")),
+			host2:     helpers.GetPointer(v1.Hostname("*.example.com")),
+			host1Wins: true,
+			msg:       "host1 more specific than host2",
+		},
+		{
+			host1:     helpers.GetPointer(v1.Hostname("*.example.com")),
+			host2:     helpers.GetPointer(v1.Hostname("foo.example.com")),
+			host1Wins: false,
+			msg:       "host2 more specific than host1",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(listenerHostnameMoreSpecific(tc.host1, tc.host2)).To(Equal(tc.host1Wins))
+		})
+	}
+}
+
+func TestConvertBackendTLS(t *testing.T) {
+	t.Parallel()
+
+	testGateway := types.NamespacedName{Namespace: "test", Name: "gateway"}
+
+	btpCaCertRefs := &graph.BackendTLSPolicy{
+		Source: &v1.BackendTLSPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "btp",
+				Namespace: "test",
+			},
+			Spec: v1.BackendTLSPolicySpec{
+				Validation: v1.BackendTLSPolicyValidation{
+					CACertificateRefs: []v1.LocalObjectReference{
+						{
+							Name: "ca-cert",
+						},
+					},
+					Hostname: "example.com",
+				},
+			},
+		},
+		Valid:     true,
+		CaCertRef: types.NamespacedName{Namespace: "test", Name: "ca-cert"},
+		Gateways:  []types.NamespacedName{testGateway},
+	}
+
+	btpWellKnownCerts := &graph.BackendTLSPolicy{
+		Source: &v1.BackendTLSPolicy{
+			Spec: v1.BackendTLSPolicySpec{
+				Validation: v1.BackendTLSPolicyValidation{
+					Hostname: "example.com",
+				},
+			},
+		},
+		Valid:    true,
+		Gateways: []types.NamespacedName{testGateway},
+	}
+
+	expectedWithCertPath := &VerifyTLS{
+		CertBundleID: generateCertBundleID(
+			types.NamespacedName{Namespace: "test", Name: "ca-cert"},
+		),
+		Hostname: "example.com",
+	}
+
+	expectedWithWellKnownCerts := &VerifyTLS{
+		Hostname:   "example.com",
+		RootCAPath: AlpineSSLRootCAPath,
+	}
+
+	tests := []struct {
+		btp      *graph.BackendTLSPolicy
+		gwNsName types.NamespacedName
+		expected *VerifyTLS
+		msg      string
+	}{
+		{
+			btp:      nil,
+			gwNsName: testGateway,
+			expected: nil,
+			msg:      "nil backend tls policy",
+		},
+		{
+			btp:      btpCaCertRefs,
+			gwNsName: testGateway,
+			expected: expectedWithCertPath,
+			msg:      "normal case with cert path",
+		},
+		{
+			btp:      btpWellKnownCerts,
+			gwNsName: testGateway,
+			expected: expectedWithWellKnownCerts,
+			msg:      "normal case no cert path",
+		},
+		{
+			btp:      btpCaCertRefs,
+			gwNsName: types.NamespacedName{Namespace: "test", Name: "unsupported-gateway"},
+			expected: nil,
+			msg:      "gateway not supported by policy",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			g.Expect(convertBackendTLS(tc.btp, tc.gwNsName)).To(Equal(tc.expected))
+		})
+	}
+}
+
+func TestBuildTelemetry(t *testing.T) {
+	t.Parallel()
+	telemetryConfigured := &graph.EffectiveNginxProxy{
+		Telemetry: &ngfAPIv1alpha2.Telemetry{
+			Exporter: &ngfAPIv1alpha2.TelemetryExporter{
+				Endpoint:   helpers.GetPointer("my-otel.svc:4563"),
+				BatchSize:  helpers.GetPointer(int32(512)),
+				BatchCount: helpers.GetPointer(int32(4)),
+				Interval:   helpers.GetPointer(ngfAPIv1alpha1.Duration("5s")),
+			},
+			ServiceName: helpers.GetPointer("my-svc"),
+			SpanAttributes: []ngfAPIv1alpha1.SpanAttribute{
+				{Key: "key", Value: "value"},
+			},
+		},
+	}
+
+	createTelemetry := func() Telemetry {
+		return Telemetry{
+			Endpoint:    "my-otel.svc:4563",
+			ServiceName: "ngf:ns:gw:my-svc",
+			Interval:    "5s",
+			BatchSize:   512,
+			BatchCount:  4,
+			Ratios:      []Ratio{},
+			SpanAttributes: []SpanAttribute{
+				{Key: "key", Value: "value"},
+			},
+		}
+	}
+
+	createModifiedTelemetry := func(mod func(Telemetry) Telemetry) Telemetry {
+		return mod(createTelemetry())
+	}
+
+	tests := []struct {
+		g            *graph.Graph
+		msg          string
+		expTelemetry Telemetry
+	}{
+		{
+			g:            &graph.Graph{},
+			expTelemetry: Telemetry{},
+			msg:          "nil Gateway",
+		},
+		{
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {
+						EffectiveNginxProxy: nil,
+					},
+				},
+			},
+			expTelemetry: Telemetry{},
+			msg:          "nil effective NginxProxy",
+		},
+		{
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {EffectiveNginxProxy: &graph.EffectiveNginxProxy{}},
+				},
+			},
+			expTelemetry: Telemetry{},
+			msg:          "No telemetry configured",
+		},
+		{
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {
+						EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+							Telemetry: &ngfAPIv1alpha2.Telemetry{
+								Exporter: &ngfAPIv1alpha2.TelemetryExporter{
+									Endpoint: helpers.GetPointer("my-otel.svc:4563"),
+								},
+								DisabledFeatures: []ngfAPIv1alpha2.DisableTelemetryFeature{
+									ngfAPIv1alpha2.DisableTracing,
+								},
+							},
+						},
+					},
+				},
+			},
+			expTelemetry: Telemetry{},
+			msg:          "Telemetry disabled explicitly",
+		},
+		{
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {
+						EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+							Telemetry: &ngfAPIv1alpha2.Telemetry{
+								Exporter: nil,
+							},
+						},
+					},
+				},
+			},
+			expTelemetry: Telemetry{},
+			msg:          "Telemetry disabled implicitly (nil exporter)",
+		},
+		{
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {
+						EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+							Telemetry: &ngfAPIv1alpha2.Telemetry{
+								Exporter: &ngfAPIv1alpha2.TelemetryExporter{
+									Endpoint: nil,
+								},
+							},
+						},
+					},
+				},
+			},
+			expTelemetry: Telemetry{},
+			msg:          "Telemetry disabled implicitly (nil exporter endpoint)",
+		},
+		{
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {
+						Source: &v1.Gateway{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "gw",
+								Namespace: "ns",
+							},
+						},
+						EffectiveNginxProxy: telemetryConfigured,
+					},
+				},
+			},
+			expTelemetry: createTelemetry(),
+			msg:          "Telemetry configured",
+		},
+		{
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {
+						Source: &v1.Gateway{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "gw",
+								Namespace: "ns",
+							},
+						},
+						EffectiveNginxProxy: telemetryConfigured,
+					},
+				},
+				NGFPolicies: map[graph.PolicyKey]*graph.Policy{
+					{NsName: types.NamespacedName{Name: "obsPolicy"}}: {
+						Source: &ngfAPIv1alpha2.ObservabilityPolicy{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "obsPolicy",
+								Namespace: "custom-ns",
+							},
+							Spec: ngfAPIv1alpha2.ObservabilityPolicySpec{
+								Tracing: &ngfAPIv1alpha2.Tracing{
+									Ratio: helpers.GetPointer[int32](25),
+								},
+							},
+						},
+					},
+				},
+			},
+			expTelemetry: createModifiedTelemetry(func(t Telemetry) Telemetry {
+				t.Ratios = []Ratio{
+					{Name: "$otel_ratio_25", Value: 25},
+				}
+				return t
+			}),
+			msg: "Telemetry configured with observability policy ratio",
+		},
+		{
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {
+						Source: &v1.Gateway{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "gw",
+								Namespace: "ns",
+							},
+						},
+						EffectiveNginxProxy: telemetryConfigured,
+					},
+				},
+				NGFPolicies: map[graph.PolicyKey]*graph.Policy{
+					{NsName: types.NamespacedName{Name: "obsPolicy"}}: {
+						Source: &ngfAPIv1alpha2.ObservabilityPolicy{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "obsPolicy",
+								Namespace: "custom-ns",
+							},
+							Spec: ngfAPIv1alpha2.ObservabilityPolicySpec{
+								Tracing: &ngfAPIv1alpha2.Tracing{
+									Ratio: helpers.GetPointer[int32](25),
+								},
+							},
+						},
+					},
+					{NsName: types.NamespacedName{Name: "obsPolicy2"}}: {
+						Source: &ngfAPIv1alpha2.ObservabilityPolicy{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "obsPolicy2",
+								Namespace: "custom-ns",
+							},
+							Spec: ngfAPIv1alpha2.ObservabilityPolicySpec{
+								Tracing: &ngfAPIv1alpha2.Tracing{
+									Ratio: helpers.GetPointer[int32](50),
+								},
+							},
+						},
+					},
+					{NsName: types.NamespacedName{Name: "obsPolicy3"}}: {
+						Source: &ngfAPIv1alpha2.ObservabilityPolicy{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "obsPolicy3",
+								Namespace: "custom-ns",
+							},
+							Spec: ngfAPIv1alpha2.ObservabilityPolicySpec{
+								Tracing: &ngfAPIv1alpha2.Tracing{
+									Ratio: helpers.GetPointer[int32](25),
+								},
+							},
+						},
+					},
+					{NsName: types.NamespacedName{Name: "csPolicy"}}: {
+						Source: &ngfAPIv1alpha1.ClientSettingsPolicy{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "csPolicy",
+								Namespace: "custom-ns",
+							},
+						},
+					},
+				},
+			},
+			expTelemetry: createModifiedTelemetry(func(t Telemetry) Telemetry {
+				t.Ratios = []Ratio{
+					{Name: "$otel_ratio_25", Value: 25},
+					{Name: "$otel_ratio_50", Value: 50},
+				}
+				return t
+			}),
+			msg: "Multiple policies exist; telemetry ratio is properly set",
+		},
+		{
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {
+						Source: &v1.Gateway{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "gw",
+								Namespace: "ns",
+							},
+						},
+						EffectiveNginxProxy: telemetryConfigured,
+					},
+				},
+				NGFPolicies: map[graph.PolicyKey]*graph.Policy{
+					{NsName: types.NamespacedName{Name: "obsPolicy"}}: {
+						Source: &ngfAPIv1alpha2.ObservabilityPolicy{
+							ObjectMeta: metav1.ObjectMeta{
+								Name:      "obsPolicy",
+								Namespace: "custom-ns",
+							},
+							Spec: ngfAPIv1alpha2.ObservabilityPolicySpec{
+								Tracing: &ngfAPIv1alpha2.Tracing{
+									Ratio: helpers.GetPointer[int32](0),
+								},
+							},
+						},
+					},
+				},
+			},
+			expTelemetry: createTelemetry(),
+			msg:          "Telemetry configured with zero observability policy ratio",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			tel := buildTelemetry(tc.g, tc.g.Gateways[types.NamespacedName{}])
+			sort.Slice(tel.Ratios, func(i, j int) bool {
+				return tel.Ratios[i].Value < tel.Ratios[j].Value
+			})
+			g.Expect(tel).To(Equal(tc.expTelemetry))
+		})
+	}
+}
+
+func TestBuildPolicies(t *testing.T) {
+	t.Parallel()
+	getPolicy := func(kind, name string) policies.Policy {
+		return &policiesfakes.PolicyMock{
+			GetNameFunc: func() string {
+				return name
+			},
+			GetNamespaceFunc: func() string {
+				return "test"
+			},
+			GetObjectKindFunc: func() schema.ObjectKind {
+				objKind := &policiesfakes.ObjectKindMock{
+					GroupVersionKindFunc: func() schema.GroupVersionKind {
+						return schema.GroupVersionKind{Kind: kind}
+					},
+				}
+
+				return objKind
+			},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		gateway     *graph.Gateway
+		policies    []*graph.Policy
+		expPolicies []string
+	}{
+		{
+			name:        "nil policies",
+			policies:    nil,
+			expPolicies: nil,
+		},
+		{
+			name: "mix of valid and invalid policies",
+			policies: []*graph.Policy{
+				{
+					Source:             getPolicy("Kind1", "valid1"),
+					Valid:              true,
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+				},
+				{
+					Source:             getPolicy("Kind2", "valid2"),
+					Valid:              true,
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+				},
+				{
+					Source:             getPolicy("Kind1", "invalid1"),
+					Valid:              false,
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+				},
+				{
+					Source:             getPolicy("Kind2", "invalid2"),
+					Valid:              false,
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+				},
+				{
+					Source:             getPolicy("Kind3", "valid3"),
+					Valid:              true,
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+				},
+			},
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "gateway",
+						Namespace: "test",
+					},
+				},
+			},
+			expPolicies: []string{
+				"valid1",
+				"valid2",
+				"valid3",
+			},
+		},
+		{
+			name: "invalid for a Gateway",
+			policies: []*graph.Policy{
+				{
+					Source: getPolicy("Kind1", "valid1"),
+					Valid:  true,
+					InvalidForGateways: map[types.NamespacedName]struct{}{
+						{Namespace: "test", Name: "gateway"}: {},
+					},
+				},
+			},
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "gateway",
+						Namespace: "test",
+					},
+				},
+			},
+			expPolicies: nil,
+		},
+		{
+			name: "WAF policy with pending bundle is excluded",
+			policies: []*graph.Policy{
+				{
+					Source:             getPolicy("WAFPolicy", "waf-pending"),
+					Valid:              true,
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+					WAFState:           &graph.PolicyWAFState{BundlePending: true},
+				},
+				{
+					Source:             getPolicy("Kind1", "other-valid"),
+					Valid:              true,
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+				},
+			},
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "gateway",
+						Namespace: "test",
+					},
+				},
+			},
+			expPolicies: []string{"other-valid"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			pols := buildPolicies(test.gateway, test.policies)
+			g.Expect(pols).To(HaveLen(len(test.expPolicies)))
+			for _, pol := range pols {
+				g.Expect(test.expPolicies).To(ContainElement(pol.GetName()))
+			}
+		})
+	}
+}
+
+func TestInjectGatewayAccessPolicies(t *testing.T) {
+	t.Parallel()
+
+	gwNsName := types.NamespacedName{Namespace: "test", Name: "gateway"}
+	routeNsName := types.NamespacedName{Namespace: "default", Name: "coffee"}
+
+	makeAP := func(name string, action ngfAPIv1alpha1.AccessPolicyActionType,
+		annotations map[string]string,
+	) *ngfAPIv1alpha1.AccessPolicy {
+		return &ngfAPIv1alpha1.AccessPolicy{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: name, Annotations: annotations},
+			Spec:       ngfAPIv1alpha1.AccessPolicySpec{Action: action},
+		}
+	}
+
+	wrapGraphPolicy := func(src policies.Policy) *graph.Policy {
+		return &graph.Policy{Source: src, Valid: true, InvalidForGateways: map[types.NamespacedName]struct{}{}}
+	}
+
+	makeGateway := func(gwPolicies ...*graph.Policy) *graph.Gateway {
+		return &graph.Gateway{
+			Source:   &v1.Gateway{ObjectMeta: metav1.ObjectMeta{Namespace: gwNsName.Namespace, Name: gwNsName.Name}},
+			Policies: gwPolicies,
+		}
+	}
+
+	isGWAnnotated := func(p policies.Policy) bool {
+		ap, ok := p.(*ngfAPIv1alpha1.AccessPolicy)
+		if !ok {
+			return false
+		}
+		return ap.Annotations[GatewayLevelAccessPolicyAnnotationKey] == GatewayLevelAccessPolicyAnnotationValue
+	}
+
+	gwAP := makeAP("gw-allow", ngfAPIv1alpha1.AccessPolicyActionAllow, nil)
+	routeAP := makeAP("route-deny", ngfAPIv1alpha1.AccessPolicyActionDeny, nil)
+
+	tests := []struct {
+		name                            string
+		routeGraphPolicies              []*graph.Policy
+		gateway                         *graph.Gateway
+		wantAnnotationsClearedFromRoute []string
+		wantEffectiveAllowsOnRoute      []string
+		wantLen                         int
+		wantAnnotatedLen                int
+	}{
+		{
+			name:               "no route policies: gateway policies injected",
+			routeGraphPolicies: nil,
+			gateway:            makeGateway(wrapGraphPolicy(gwAP)),
+			wantLen:            1,
+			wantAnnotatedLen:   1,
+		},
+		{
+			name:               "non-AccessPolicy route entry: gateway policies still injected",
+			routeGraphPolicies: []*graph.Policy{wrapGraphPolicy(&ngfAPIv1alpha1.ClientSettingsPolicy{})},
+			gateway:            makeGateway(wrapGraphPolicy(gwAP)),
+			wantLen:            2,
+			wantAnnotatedLen:   1,
+		},
+		{
+			name:               "route AccessPolicy alongside gateway AccessPolicy",
+			routeGraphPolicies: []*graph.Policy{wrapGraphPolicy(routeAP)},
+			gateway:            makeGateway(wrapGraphPolicy(gwAP)),
+			wantLen:            2,
+			wantAnnotatedLen:   1,
+		},
+		{
+			name:               "non-AccessPolicy gateway entries are not injected",
+			routeGraphPolicies: []*graph.Policy{wrapGraphPolicy(routeAP)},
+			gateway:            makeGateway(wrapGraphPolicy(gwAP), wrapGraphPolicy(&ngfAPIv1alpha1.ClientSettingsPolicy{})),
+			wantLen:            2,
+			wantAnnotatedLen:   1,
+		},
+		{
+			name:               "no gateway policies: route policies only",
+			routeGraphPolicies: []*graph.Policy{wrapGraphPolicy(routeAP)},
+			gateway:            makeGateway(),
+			wantLen:            1,
+			wantAnnotatedLen:   0,
+		},
+		{
+			name: "gateway-level annotation on route policy is cleared",
+			routeGraphPolicies: []*graph.Policy{
+				wrapGraphPolicy(makeAP("route-deny", ngfAPIv1alpha1.AccessPolicyActionDeny, map[string]string{
+					GatewayLevelAccessPolicyAnnotationKey: GatewayLevelAccessPolicyAnnotationValue,
+				})),
+			},
+			gateway:                         makeGateway(wrapGraphPolicy(gwAP)),
+			wantLen:                         2,
+			wantAnnotatedLen:                1,
+			wantAnnotationsClearedFromRoute: []string{GatewayLevelAccessPolicyAnnotationKey},
+		},
+		{
+			name: "geo annotation on route policy is cleared",
+			routeGraphPolicies: []*graph.Policy{
+				wrapGraphPolicy(makeAP("route-deny", ngfAPIv1alpha1.AccessPolicyActionDeny, map[string]string{
+					GeoAccessPolicyAnnotationKey: GeoAccessPolicyAnnotationValue,
+				})),
+			},
+			gateway:                         makeGateway(),
+			wantLen:                         1,
+			wantAnnotatedLen:                0,
+			wantAnnotationsClearedFromRoute: []string{GeoAccessPolicyAnnotationKey},
+		},
+		{
+			name: "clipped route Allow policy is annotated with effective allows",
+			routeGraphPolicies: func() []*graph.Policy {
+				ap := makeAP("route-allow", ngfAPIv1alpha1.AccessPolicyActionAllow, nil)
+				gp := wrapGraphPolicy(ap)
+				gp.EffectiveAllows = []graph.GatewayEffectiveAllow{
+					{Route: routeNsName, Gateway: gwNsName, Addresses: []string{"192.0.2.128/25"}},
+				}
+				return []*graph.Policy{gp}
+			}(),
+			gateway:                    makeGateway(wrapGraphPolicy(gwAP)),
+			wantLen:                    2,
+			wantAnnotatedLen:           1,
+			wantEffectiveAllowsOnRoute: []string{"192.0.2.128/25"},
+		},
+		{
+			name: "clipped route Allow policy with empty intersection annotated as deny-all",
+			routeGraphPolicies: func() []*graph.Policy {
+				ap := makeAP("route-allow", ngfAPIv1alpha1.AccessPolicyActionAllow, nil)
+				gp := wrapGraphPolicy(ap)
+				gp.EffectiveAllows = []graph.GatewayEffectiveAllow{
+					{Route: routeNsName, Gateway: gwNsName, Addresses: nil},
+				}
+				return []*graph.Policy{gp}
+			}(),
+			gateway:                    makeGateway(wrapGraphPolicy(gwAP)),
+			wantLen:                    2,
+			wantAnnotatedLen:           1,
+			wantEffectiveAllowsOnRoute: []string{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := injectGatewayAccessPolicies(routeNsName, tc.routeGraphPolicies, tc.gateway)
+
+			g.Expect(result).To(HaveLen(tc.wantLen))
+
+			var annotatedCount int
+			for _, p := range result {
+				if isGWAnnotated(p) {
+					annotatedCount++
+				}
+			}
+			g.Expect(annotatedCount).To(Equal(tc.wantAnnotatedLen))
+
+			for _, gp := range tc.gateway.Policies {
+				if ap, ok := gp.Source.(*ngfAPIv1alpha1.AccessPolicy); ok {
+					g.Expect(ap.Annotations).NotTo(HaveKey(GatewayLevelAccessPolicyAnnotationKey))
+				}
+			}
+
+			if len(tc.wantAnnotationsClearedFromRoute) > 0 {
+				routeResult, ok := result[0].(*ngfAPIv1alpha1.AccessPolicy)
+				g.Expect(ok).To(BeTrue())
+				for _, key := range tc.wantAnnotationsClearedFromRoute {
+					g.Expect(routeResult.Annotations).NotTo(HaveKey(key))
+				}
+				origAP, ok := tc.routeGraphPolicies[0].Source.(*ngfAPIv1alpha1.AccessPolicy)
+				g.Expect(ok).To(BeTrue())
+				for _, key := range tc.wantAnnotationsClearedFromRoute {
+					g.Expect(origAP.Annotations).To(HaveKey(key))
+				}
+			}
+
+			if tc.wantEffectiveAllowsOnRoute != nil {
+				var routeResult *ngfAPIv1alpha1.AccessPolicy
+				for _, p := range result {
+					if ap, ok := p.(*ngfAPIv1alpha1.AccessPolicy); ok && !isGWAnnotated(ap) {
+						routeResult = ap
+						break
+					}
+				}
+				g.Expect(routeResult).NotTo(BeNil())
+				wantVal := strings.Join(tc.wantEffectiveAllowsOnRoute, ",")
+				g.Expect(routeResult.Annotations).To(HaveKeyWithValue(EffectiveAllowsAnnotationKey, wantVal))
+			}
+		})
+	}
+}
+
+func TestCreateRatioVarName(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+	g.Expect(CreateRatioVarName(25)).To(Equal("$otel_ratio_25"))
+}
+
+func TestBuildTLSServers(t *testing.T) {
+	t.Parallel()
+
+	getL4RouteKey := func(name string) graph.L4RouteKey {
+		return graph.L4RouteKey{
+			NamespacedName: types.NamespacedName{
+				Namespace: "default",
+				Name:      name,
+			},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		gateway  *graph.Gateway
+		expected []Layer4VirtualServer
+	}{
+		{
+			name: "gateway with multiple TLS listeners",
+			gateway: func() *graph.Gateway {
+				secureAppKey := getL4RouteKey("secure-app")
+				secureApp2Key := getL4RouteKey("secure-app2")
+				secureApp3Key := getL4RouteKey("secure-app3")
+
+				return &graph.Gateway{
+					Listeners: []*graph.Listener{
+						{
+							Name: "testingListener",
+							GatewayName: types.NamespacedName{
+								Namespace: "test",
+								Name:      "gateway",
+							},
+							Valid: true,
+							Source: v1.Listener{
+								Protocol: v1.TLSProtocolType,
+								Port:     443,
+								Hostname: helpers.GetPointer[v1.Hostname]("*.example.com"),
+							},
+							Routes: make(map[graph.RouteKey]*graph.L7Route),
+							L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+								secureAppKey: {
+									Valid: true,
+									Spec: graph.L4RouteSpec{
+										Hostnames: []v1.Hostname{"app.example.com", "cafe.example.com"},
+										BackendRef: graph.BackendRef{
+											Valid:     true,
+											SvcNsName: secureAppKey.NamespacedName,
+											ServicePort: apiv1.ServicePort{
+												Name:     "https",
+												Protocol: "TCP",
+												Port:     8443,
+												TargetPort: intstr.IntOrString{
+													Type:   intstr.Int,
+													IntVal: 8443,
+												},
+											},
+										},
+									},
+									ParentRefs: []graph.ParentRef{
+										{
+											Kind:           kinds.Gateway,
+											NamespacedName: gatewayNsName,
+											GatewayNsName:  gatewayNsName,
+											Attachment: &graph.ParentRefAttachmentStatus{
+												Listeners: []graph.ListenerAttachmentStatus{{
+													Key: graph.CreateParentRefListenerKey(
+														gatewayNsName,
+														"testingListener",
+													),
+													AcceptedHostnames: []string{"app.example.com", "cafe.example.com"},
+													Port:              443,
+												}},
+											},
+											SectionName: nil,
+											Port:        nil,
+											Idx:         0,
+										},
+									},
+								},
+								secureApp2Key: {},
+							},
+						},
+						{
+							Name:  "testingListener2",
+							Valid: true,
+							Source: v1.Listener{
+								Protocol: v1.TLSProtocolType,
+								Port:     443,
+								Hostname: helpers.GetPointer[v1.Hostname]("cafe.example.com"),
+							},
+							Routes: make(map[graph.RouteKey]*graph.L7Route),
+							L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+								secureApp3Key: {
+									Valid: true,
+									Spec: graph.L4RouteSpec{
+										Hostnames: []v1.Hostname{"app.example.com", "cafe.example.com"},
+										BackendRef: graph.BackendRef{
+											Valid:     true,
+											SvcNsName: secureAppKey.NamespacedName,
+											ServicePort: apiv1.ServicePort{
+												Name:     "https",
+												Protocol: "TCP",
+												Port:     8443,
+												TargetPort: intstr.IntOrString{
+													Type:   intstr.Int,
+													IntVal: 8443,
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+						{
+							Name:  "httpListener",
+							Valid: true,
+							Source: v1.Listener{
+								Protocol: v1.HTTPProtocolType,
+							},
+						},
+					},
+				}
+			}(),
+			expected: []Layer4VirtualServer{
+				{
+					Hostname: "app.example.com",
+					Upstreams: []Layer4Upstream{
+						{Name: "default_secure-app_8443", Weight: 0},
+					},
+					Port:      443,
+					IsDefault: false,
+				},
+				{
+					Hostname: "cafe.example.com",
+					Upstreams: []Layer4Upstream{
+						{Name: "default_secure-app_8443", Weight: 0},
+					},
+					Port:      443,
+					IsDefault: false,
+				},
+				{
+					Hostname:  "*.example.com",
+					Upstreams: []Layer4Upstream{},
+					Port:      443,
+					IsDefault: true,
+				},
+				{
+					Hostname:  "cafe.example.com",
+					Upstreams: []Layer4Upstream{},
+					Port:      443,
+					IsDefault: true,
+				},
+			},
+		},
+		{
+			name: "ListenerSet-based TLS listener",
+			gateway: func() *graph.Gateway {
+				listenerSetNsName := types.NamespacedName{Namespace: "test", Name: "listener-set-tls"}
+				listenerSetRouteKey := getL4RouteKey("secure-app-listenerset")
+
+				return &graph.Gateway{
+					Listeners: []*graph.Listener{
+						{
+							Name: "listenerSet-tls-listener",
+							GatewayName: types.NamespacedName{
+								Namespace: "test",
+								Name:      "gateway",
+							},
+							ListenerSetName: listenerSetNsName,
+							Valid:           true,
+							Source: v1.Listener{
+								Protocol: v1.TLSProtocolType,
+								Port:     443,
+								Hostname: helpers.GetPointer[v1.Hostname]("listenerSet.example.com"),
+							},
+							Routes: make(map[graph.RouteKey]*graph.L7Route),
+							L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+								listenerSetRouteKey: {
+									Valid: true,
+									Spec: graph.L4RouteSpec{
+										Hostnames: []v1.Hostname{"listenerSet.example.com"},
+										BackendRef: graph.BackendRef{
+											Valid:     true,
+											SvcNsName: listenerSetRouteKey.NamespacedName,
+											ServicePort: apiv1.ServicePort{
+												Name:     "https",
+												Protocol: "TCP",
+												Port:     8443,
+												TargetPort: intstr.IntOrString{
+													Type:   intstr.Int,
+													IntVal: 8443,
+												},
+											},
+										},
+									},
+									ParentRefs: []graph.ParentRef{
+										{
+											Kind:           kinds.ListenerSet,
+											NamespacedName: listenerSetNsName,
+											GatewayNsName:  types.NamespacedName{Namespace: "test", Name: "gateway"},
+											Attachment: &graph.ParentRefAttachmentStatus{
+												Listeners: []graph.ListenerAttachmentStatus{{
+													// Key uses ListenerSet name instead of Gateway name
+													Key: graph.CreateParentRefListenerKey(
+														listenerSetNsName,
+														"listenerSet-tls-listener",
+													),
+													AcceptedHostnames: []string{"listenerSet.example.com"},
+													Port:              443,
+												}},
+											},
+											SectionName: nil,
+											Port:        nil,
+											Idx:         0,
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+			}(),
+			expected: []Layer4VirtualServer{
+				{
+					Hostname: "listenerSet.example.com",
+					Upstreams: []Layer4Upstream{
+						{Name: "default_secure-app-listenerset_8443", Weight: 0},
+					},
+					Port:      443,
+					IsDefault: false,
+				},
+			},
+		},
+		{
+			name: "TLS Terminate listener with route",
+			gateway: func() *graph.Gateway {
+				terminateKey := getL4RouteKey("terminate-app")
+				gatewayNsName := types.NamespacedName{Namespace: "test", Name: "gateway"}
+
+				return &graph.Gateway{
+					Listeners: []*graph.Listener{
+						{
+							Name:        "terminateListener",
+							GatewayName: gatewayNsName,
+							Valid:       true,
+							Source: v1.Listener{
+								Protocol: v1.TLSProtocolType,
+								Port:     443,
+								Hostname: helpers.GetPointer[v1.Hostname]("secure.example.com"),
+								TLS: &v1.ListenerTLSConfig{
+									Mode: helpers.GetPointer(v1.TLSModeTerminate),
+									CertificateRefs: []v1.SecretObjectReference{
+										{Name: "tls-secret"},
+									},
+								},
+							},
+							ResolvedSecrets: []types.NamespacedName{
+								{Namespace: "test", Name: "tls-secret"},
+							},
+							Routes: make(map[graph.RouteKey]*graph.L7Route),
+							L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+								terminateKey: {
+									Valid: true,
+									Spec: graph.L4RouteSpec{
+										Hostnames: []v1.Hostname{"secure.example.com"},
+										BackendRef: graph.BackendRef{
+											Valid:     true,
+											SvcNsName: terminateKey.NamespacedName,
+											ServicePort: apiv1.ServicePort{
+												Name:     "https",
+												Protocol: "TCP",
+												Port:     8443,
+												TargetPort: intstr.IntOrString{
+													Type:   intstr.Int,
+													IntVal: 8443,
+												},
+											},
+										},
+									},
+									ParentRefs: []graph.ParentRef{
+										{
+											Kind:           kinds.Gateway,
+											NamespacedName: gatewayNsName,
+											GatewayNsName:  gatewayNsName,
+											Attachment: &graph.ParentRefAttachmentStatus{
+												Listeners: []graph.ListenerAttachmentStatus{{
+													Key: graph.CreateParentRefListenerKey(
+														gatewayNsName,
+														"terminateListener",
+													),
+													AcceptedHostnames: []string{"secure.example.com"},
+													Port:              443,
+												}},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+			}(),
+			expected: []Layer4VirtualServer{
+				{
+					Hostname: "secure.example.com",
+					Upstreams: []Layer4Upstream{
+						{Name: "default_terminate-app_8443", Weight: 0},
+					},
+					Port: 443,
+					SSL: &SSL{
+						KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_tls-secret"},
+					},
+				},
+			},
+		},
+		{
+			name: "TLS Terminate listener with no matching route creates default server with SSL",
+			gateway: func() *graph.Gateway {
+				gatewayNsName := types.NamespacedName{Namespace: "test", Name: "gateway"}
+
+				return &graph.Gateway{
+					Listeners: []*graph.Listener{
+						{
+							Name:        "terminateListener",
+							GatewayName: gatewayNsName,
+							Valid:       true,
+							Source: v1.Listener{
+								Protocol: v1.TLSProtocolType,
+								Port:     443,
+								Hostname: helpers.GetPointer[v1.Hostname]("secure.example.com"),
+								TLS: &v1.ListenerTLSConfig{
+									Mode: helpers.GetPointer(v1.TLSModeTerminate),
+									CertificateRefs: []v1.SecretObjectReference{
+										{Name: "tls-secret"},
+									},
+								},
+							},
+							ResolvedSecrets: []types.NamespacedName{
+								{Namespace: "test", Name: "tls-secret"},
+							},
+							Routes:   make(map[graph.RouteKey]*graph.L7Route),
+							L4Routes: make(map[graph.L4RouteKey]*graph.L4Route),
+						},
+					},
+				}
+			}(),
+			expected: []Layer4VirtualServer{
+				{
+					Hostname:  "secure.example.com",
+					IsDefault: true,
+					Port:      443,
+					Upstreams: []Layer4Upstream{},
+					SSL: &SSL{
+						KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_tls-secret"},
+					},
+				},
+			},
+		},
+		{
+			name: "mixed Passthrough and Terminate listeners on same port",
+			gateway: func() *graph.Gateway {
+				passthroughKey := getL4RouteKey("passthrough-app")
+				terminateKey := getL4RouteKey("terminate-app")
+				gatewayNsName := types.NamespacedName{Namespace: "test", Name: "gateway"}
+
+				return &graph.Gateway{
+					Listeners: []*graph.Listener{
+						{
+							Name:        "passthroughListener",
+							GatewayName: gatewayNsName,
+							Valid:       true,
+							Source: v1.Listener{
+								Protocol: v1.TLSProtocolType,
+								Port:     443,
+								Hostname: helpers.GetPointer[v1.Hostname]("passthrough.example.com"),
+								TLS: &v1.ListenerTLSConfig{
+									Mode: helpers.GetPointer(v1.TLSModePassthrough),
+								},
+							},
+							Routes: make(map[graph.RouteKey]*graph.L7Route),
+							L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+								passthroughKey: {
+									Valid: true,
+									Spec: graph.L4RouteSpec{
+										Hostnames: []v1.Hostname{"passthrough.example.com"},
+										BackendRef: graph.BackendRef{
+											Valid:     true,
+											SvcNsName: passthroughKey.NamespacedName,
+											ServicePort: apiv1.ServicePort{
+												Name:     "https",
+												Protocol: "TCP",
+												Port:     8443,
+												TargetPort: intstr.IntOrString{
+													Type:   intstr.Int,
+													IntVal: 8443,
+												},
+											},
+										},
+									},
+									ParentRefs: []graph.ParentRef{
+										{
+											Kind:           kinds.Gateway,
+											NamespacedName: gatewayNsName,
+											GatewayNsName:  gatewayNsName,
+											Attachment: &graph.ParentRefAttachmentStatus{
+												Listeners: []graph.ListenerAttachmentStatus{{
+													Key: graph.CreateParentRefListenerKey(
+														gatewayNsName,
+														"passthroughListener",
+													),
+													AcceptedHostnames: []string{"passthrough.example.com"},
+													Port:              443,
+												}},
+											},
+										},
+									},
+								},
+							},
+						},
+						{
+							Name:        "terminateListener",
+							GatewayName: gatewayNsName,
+							Valid:       true,
+							Source: v1.Listener{
+								Protocol: v1.TLSProtocolType,
+								Port:     443,
+								Hostname: helpers.GetPointer[v1.Hostname]("terminate.example.com"),
+								TLS: &v1.ListenerTLSConfig{
+									Mode: helpers.GetPointer(v1.TLSModeTerminate),
+									CertificateRefs: []v1.SecretObjectReference{
+										{Name: "tls-secret"},
+									},
+								},
+							},
+							ResolvedSecrets: []types.NamespacedName{
+								{Namespace: "test", Name: "tls-secret"},
+							},
+							Routes: make(map[graph.RouteKey]*graph.L7Route),
+							L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+								terminateKey: {
+									Valid: true,
+									Spec: graph.L4RouteSpec{
+										Hostnames: []v1.Hostname{"terminate.example.com"},
+										BackendRef: graph.BackendRef{
+											Valid:     true,
+											SvcNsName: terminateKey.NamespacedName,
+											ServicePort: apiv1.ServicePort{
+												Name:     "https",
+												Protocol: "TCP",
+												Port:     8443,
+												TargetPort: intstr.IntOrString{
+													Type:   intstr.Int,
+													IntVal: 8443,
+												},
+											},
+										},
+									},
+									ParentRefs: []graph.ParentRef{
+										{
+											Kind:           kinds.Gateway,
+											NamespacedName: gatewayNsName,
+											GatewayNsName:  gatewayNsName,
+											Attachment: &graph.ParentRefAttachmentStatus{
+												Listeners: []graph.ListenerAttachmentStatus{{
+													Key: graph.CreateParentRefListenerKey(
+														gatewayNsName,
+														"terminateListener",
+													),
+													AcceptedHostnames: []string{"terminate.example.com"},
+													Port:              443,
+												}},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+			}(),
+			expected: []Layer4VirtualServer{
+				{
+					Hostname: "passthrough.example.com",
+					Upstreams: []Layer4Upstream{
+						{Name: "default_passthrough-app_8443", Weight: 0},
+					},
+					Port: 443,
+				},
+				{
+					Hostname: "terminate.example.com",
+					Upstreams: []Layer4Upstream{
+						{Name: "default_terminate-app_8443", Weight: 0},
+					},
+					Port: 443,
+					SSL: &SSL{
+						KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_tls-secret"},
+					},
+				},
+			},
+		},
+		{
+			name: "TLS Terminate listener with TLS options",
+			gateway: func() *graph.Gateway {
+				terminateKey := getL4RouteKey("terminate-app")
+				gatewayNsName := types.NamespacedName{Namespace: "test", Name: "gateway"}
+
+				return &graph.Gateway{
+					Listeners: []*graph.Listener{
+						{
+							Name:        "terminateListener",
+							GatewayName: gatewayNsName,
+							Valid:       true,
+							Source: v1.Listener{
+								Protocol: v1.TLSProtocolType,
+								Port:     443,
+								Hostname: helpers.GetPointer[v1.Hostname]("secure.example.com"),
+								TLS: &v1.ListenerTLSConfig{
+									Mode: helpers.GetPointer(v1.TLSModeTerminate),
+									CertificateRefs: []v1.SecretObjectReference{
+										{Name: "tls-secret"},
+									},
+									Options: map[v1.AnnotationKey]v1.AnnotationValue{
+										graph.SSLProtocolsKey:           "TLSv1.2 TLSv1.3",
+										graph.SSLCiphersKey:             "HIGH:!aNULL",
+										graph.SSLPreferServerCiphersKey: "on",
+									},
+								},
+							},
+							ResolvedSecrets: []types.NamespacedName{
+								{Namespace: "test", Name: "tls-secret"},
+							},
+							Routes: make(map[graph.RouteKey]*graph.L7Route),
+							L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+								terminateKey: {
+									Valid: true,
+									Spec: graph.L4RouteSpec{
+										Hostnames: []v1.Hostname{"secure.example.com"},
+										BackendRef: graph.BackendRef{
+											Valid:     true,
+											SvcNsName: terminateKey.NamespacedName,
+											ServicePort: apiv1.ServicePort{
+												Name:     "https",
+												Protocol: "TCP",
+												Port:     8443,
+												TargetPort: intstr.IntOrString{
+													Type:   intstr.Int,
+													IntVal: 8443,
+												},
+											},
+										},
+									},
+									ParentRefs: []graph.ParentRef{
+										{
+											Kind:           kinds.Gateway,
+											NamespacedName: gatewayNsName,
+											GatewayNsName:  gatewayNsName,
+											Attachment: &graph.ParentRefAttachmentStatus{
+												Listeners: []graph.ListenerAttachmentStatus{{
+													Key: graph.CreateParentRefListenerKey(
+														gatewayNsName,
+														"terminateListener",
+													),
+													AcceptedHostnames: []string{"secure.example.com"},
+													Port:              443,
+												}},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				}
+			}(),
+			expected: []Layer4VirtualServer{
+				{
+					Hostname: "secure.example.com",
+					Upstreams: []Layer4Upstream{
+						{Name: "default_terminate-app_8443", Weight: 0},
+					},
+					Port: 443,
+					SSL: &SSL{
+						KeyPairIDs:          []SSLKeyPairID{"ssl_keypair_test_tls-secret"},
+						Protocols:           "TLSv1.2 TLSv1.3",
+						Ciphers:             "HIGH:!aNULL",
+						PreferServerCiphers: true,
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := buildTLSServers(test.gateway)
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestBuildStreamUpstreams(t *testing.T) {
+	t.Parallel()
+	getL4RouteKey := func(name string) graph.L4RouteKey {
+		return graph.L4RouteKey{
+			NamespacedName: types.NamespacedName{
+				Namespace: "default",
+				Name:      name,
+			},
+		}
+	}
+	secureAppKey := getL4RouteKey("secure-app")
+	secureApp2Key := getL4RouteKey("secure-app2")
+	secureApp3Key := getL4RouteKey("secure-app3")
+	secureApp4Key := getL4RouteKey("secure-app4")
+	secureApp5Key := getL4RouteKey("secure-app5")
+	secureApp6Key := getL4RouteKey("secure-app6")
+	clusterAppKey := getL4RouteKey("cluster-app")
+	externalAppKey := getL4RouteKey("external-app")
+
+	gateway := &graph.Gateway{
+		Source: &v1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "test",
+				Name:      "gateway",
+			},
+		},
+		Listeners: []*graph.Listener{
+			{
+				Name:  "testingListener",
+				Valid: true,
+				Source: v1.Listener{
+					Protocol: v1.TLSProtocolType,
+					Port:     443,
+				},
+				Routes: make(map[graph.RouteKey]*graph.L7Route),
+				L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+					secureAppKey: {
+						Valid: true,
+						Spec: graph.L4RouteSpec{
+							Hostnames: []v1.Hostname{"app.example.com", "cafe.example.com"},
+							BackendRef: graph.BackendRef{
+								Valid:     true,
+								SvcNsName: secureAppKey.NamespacedName,
+								ServicePort: apiv1.ServicePort{
+									Name:     "https",
+									Protocol: "TCP",
+									Port:     8443,
+									TargetPort: intstr.IntOrString{
+										Type:   intstr.Int,
+										IntVal: 8443,
+									},
+								},
+							},
+						},
+					},
+					secureApp2Key: {},
+					secureApp3Key: {
+						Valid: true,
+						Spec: graph.L4RouteSpec{
+							Hostnames:  []v1.Hostname{"test.example.com"},
+							BackendRef: graph.BackendRef{},
+						},
+					},
+					secureApp4Key: {
+						Valid: true,
+						Spec: graph.L4RouteSpec{
+							Hostnames: []v1.Hostname{"app.example.com", "cafe.example.com"},
+							BackendRef: graph.BackendRef{
+								Valid:     true,
+								SvcNsName: secureAppKey.NamespacedName,
+								ServicePort: apiv1.ServicePort{
+									Name:     "https",
+									Protocol: "TCP",
+									Port:     8443,
+									TargetPort: intstr.IntOrString{
+										Type:   intstr.Int,
+										IntVal: 8443,
+									},
+								},
+							},
+						},
+					},
+					secureApp5Key: {
+						Valid: true,
+						Spec: graph.L4RouteSpec{
+							Hostnames: []v1.Hostname{"app2.example.com"},
+							BackendRef: graph.BackendRef{
+								Valid:     true,
+								SvcNsName: secureApp5Key.NamespacedName,
+								ServicePort: apiv1.ServicePort{
+									Name:     "https",
+									Protocol: "TCP",
+									Port:     8443,
+									TargetPort: intstr.IntOrString{
+										Type:   intstr.Int,
+										IntVal: 8443,
+									},
+								},
+							},
+						},
+					},
+					secureApp6Key: {
+						Valid: true,
+						Spec: graph.L4RouteSpec{
+							Hostnames: []v1.Hostname{"app2.example.com"},
+							BackendRef: graph.BackendRef{
+								Valid: true,
+								InvalidForGateways: map[types.NamespacedName]conditions.Condition{
+									{Namespace: "test", Name: "gateway"}: {},
+								},
+								SvcNsName: secureApp6Key.NamespacedName,
+								ServicePort: apiv1.ServicePort{
+									Name:     "https",
+									Protocol: "TCP",
+									Port:     8443,
+									TargetPort: intstr.IntOrString{
+										Type:   intstr.Int,
+										IntVal: 8443,
+									},
+								},
+							},
+						},
+					},
+					clusterAppKey: {
+						Valid: true,
+						Spec: graph.L4RouteSpec{
+							Hostnames: []v1.Hostname{"cluster.example.com"},
+							BackendRef: graph.BackendRef{
+								Valid:     true,
+								SvcNsName: clusterAppKey.NamespacedName,
+								ServicePort: apiv1.ServicePort{
+									Name:     "https",
+									Protocol: "TCP",
+									Port:     8443,
+									TargetPort: intstr.IntOrString{
+										Type:   intstr.Int,
+										IntVal: 8443,
+									},
+								},
+							},
+						},
+					},
+					externalAppKey: {
+						Valid: true,
+						Spec: graph.L4RouteSpec{
+							Hostnames: []v1.Hostname{"external.example.com"},
+							BackendRef: graph.BackendRef{
+								Valid:     true,
+								SvcNsName: externalAppKey.NamespacedName,
+								ServicePort: apiv1.ServicePort{
+									Name:     "https",
+									Protocol: "TCP",
+									Port:     443,
+									TargetPort: intstr.IntOrString{
+										Type:   intstr.Int,
+										IntVal: 443,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	fakeResolver := resolverfakes.ServiceResolverMock{}
+	fakeEndpoints := []resolver.Endpoint{
+		{Address: "1.1.1.1", Port: 80},
+	}
+
+	fakeResolver.ResolveFunc = func(
+		_ context.Context,
+		_ logr.Logger,
+		nsName types.NamespacedName,
+		_ apiv1.ServicePort,
+		_ []discoveryV1.AddressType,
+	) ([]resolver.Endpoint, error) {
+		if nsName == secureAppKey.NamespacedName {
+			return nil, errors.New("error")
+		}
+		return fakeEndpoints, nil
+	}
+
+	// Add an ExternalName service for testing DNS resolution
+	externalNameService := &graph.ReferencedService{
+		IsExternalName: true,
+		ExternalName:   "external.example.com",
+	}
+
+	referencedServices := map[types.NamespacedName]*graph.ReferencedService{
+		{Namespace: "default", Name: "external-app"}: externalNameService,
+		clusterAppKey.NamespacedName: {
+			ClusterIP: "10.96.0.1",
+			Policies: []*graph.Policy{
+				{
+					Source: &ngfAPIv1alpha1.UpstreamSettingsPolicy{
+						ObjectMeta: metav1.ObjectMeta{
+							Namespace: "default",
+							Name:      "usp-use-cluster-ip",
+						},
+						Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{UseClusterIP: helpers.GetPointer(true)},
+					},
+					Valid: true,
+				},
+			},
+			GatewayNsNames: map[types.NamespacedName]struct{}{{Name: "gateway", Namespace: "test"}: {}},
+		},
+	}
+
+	streamUpstreams := buildStreamUpstreams(
+		t.Context(),
+		logr.Discard(),
+		gateway,
+		&fakeResolver,
+		referencedServices,
+	)
+
+	// Upstreams are sorted by name so that identical input produces a stable order and doesn't
+	// trigger spurious NGINX reloads.
+	expectedStreamUpstreams := []Upstream{
+		{
+			Name:      "default_cluster-app_8443",
+			Endpoints: fakeEndpoints,
+		},
+		{
+			Name: "default_external-app_443",
+			Endpoints: []resolver.Endpoint{
+				{Address: "external.example.com", Port: 443, Resolve: true},
+			},
+		},
+		{
+			Name:      "default_secure-app5_8443",
+			Endpoints: fakeEndpoints,
+		},
+		{
+			Name:     "default_secure-app_8443",
+			ErrorMsg: "error",
+		},
+	}
+	g := NewWithT(t)
+
+	g.Expect(streamUpstreams).To(Equal(expectedStreamUpstreams))
+}
+
+func TestBuildL4Servers(t *testing.T) {
+	t.Parallel()
+
+	baseTime := metav1.NewTime(time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC))
+
+	createL4Route := func(name string, valid bool, backendRefs []graph.BackendRef) *graph.L4Route {
+		return &graph.L4Route{
+			Valid: valid,
+			Source: &v1.TCPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:         "default",
+					Name:              name,
+					CreationTimestamp: baseTime,
+				},
+			},
+			Spec: graph.L4RouteSpec{
+				BackendRefs: backendRefs,
+			},
+		}
+	}
+
+	createL4RouteWithTimestamp := func(
+		name string,
+		valid bool,
+		backendRefs []graph.BackendRef,
+		ts metav1.Time,
+	) *graph.L4Route {
+		return &graph.L4Route{
+			Valid: valid,
+			Source: &v1.TCPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace:         "default",
+					Name:              name,
+					CreationTimestamp: ts,
+				},
+			},
+			Spec: graph.L4RouteSpec{
+				BackendRefs: backendRefs,
+			},
+		}
+	}
+
+	tests := []struct {
+		name            string
+		gateway         *graph.Gateway
+		protocol        v1.ProtocolType
+		expectedServers []Layer4VirtualServer
+	}{
+		{
+			name: "TCP route with single backend",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Name:  "tcp-listener",
+						Valid: true,
+						Source: v1.Listener{
+							Protocol: v1.TCPProtocolType,
+							Port:     8080,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "tcp-route-1"}}: createL4Route(
+								"tcp-route-1",
+								true,
+								[]graph.BackendRef{
+									{
+										Valid:     true,
+										SvcNsName: types.NamespacedName{Namespace: "default", Name: "svc1"},
+										ServicePort: apiv1.ServicePort{
+											Name: "http",
+											Port: 8080,
+										},
+										Weight: 1,
+									},
+								},
+							),
+						},
+					},
+				},
+			},
+			protocol: v1.TCPProtocolType,
+			expectedServers: []Layer4VirtualServer{
+				{
+					Hostname: "",
+					Port:     8080,
+					Upstreams: []Layer4Upstream{
+						{
+							Name:   "default_svc1_8080",
+							Weight: 1,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "TCP route with multiple weighted backends",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Name:  "tcp-listener",
+						Valid: true,
+						Source: v1.Listener{
+							Protocol: v1.TCPProtocolType,
+							Port:     8080,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "tcp-route-weighted"}}: createL4Route(
+								"tcp-route-weighted",
+								true,
+								[]graph.BackendRef{
+									{
+										Valid:     true,
+										SvcNsName: types.NamespacedName{Namespace: "default", Name: "svc1"},
+										ServicePort: apiv1.ServicePort{
+											Name: "http",
+											Port: 8080,
+										},
+										Weight: 80,
+									},
+									{
+										Valid:     true,
+										SvcNsName: types.NamespacedName{Namespace: "default", Name: "svc2"},
+										ServicePort: apiv1.ServicePort{
+											Name: "http",
+											Port: 8080,
+										},
+										Weight: 20,
+									},
+								},
+							),
+						},
+					},
+				},
+			},
+			protocol: v1.TCPProtocolType,
+			expectedServers: []Layer4VirtualServer{
+				{
+					Hostname: "",
+					Port:     8080,
+					Upstreams: []Layer4Upstream{
+						{
+							Name:   "default_svc1_8080",
+							Weight: 80,
+						},
+						{
+							Name:   "default_svc2_8080",
+							Weight: 20,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "UDP route with backends",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Name:  "udp-listener",
+						Valid: true,
+						Source: v1.Listener{
+							Protocol: v1.UDPProtocolType,
+							Port:     5353,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "udp-route-1"}}: createL4Route(
+								"udp-route-1",
+								true,
+								[]graph.BackendRef{
+									{
+										Valid:     true,
+										SvcNsName: types.NamespacedName{Namespace: "default", Name: "dns-svc"},
+										ServicePort: apiv1.ServicePort{
+											Name: "dns",
+											Port: 53,
+										},
+										Weight: 1,
+									},
+								},
+							),
+						},
+					},
+				},
+			},
+			protocol: v1.UDPProtocolType,
+			expectedServers: []Layer4VirtualServer{
+				{
+					Hostname: "",
+					Port:     5353,
+					Upstreams: []Layer4Upstream{
+						{
+							Name:   "default_dns-svc_53",
+							Weight: 1,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "skips invalid routes",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Name:  "tcp-listener",
+						Valid: true,
+						Source: v1.Listener{
+							Protocol: v1.TCPProtocolType,
+							Port:     8080,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "invalid-route"}}: createL4Route(
+								"invalid-route",
+								false, // invalid route
+								[]graph.BackendRef{
+									{
+										Valid:     true,
+										SvcNsName: types.NamespacedName{Namespace: "default", Name: "svc1"},
+										ServicePort: apiv1.ServicePort{
+											Name: "http",
+											Port: 8080,
+										},
+										Weight: 1,
+									},
+								},
+							),
+						},
+					},
+				},
+			},
+			protocol:        v1.TCPProtocolType,
+			expectedServers: nil,
+		},
+		{
+			name: "skips routes with no valid backends",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Name:  "tcp-listener",
+						Valid: true,
+						Source: v1.Listener{
+							Protocol: v1.TCPProtocolType,
+							Port:     8080,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "no-backends"}}: createL4Route(
+								"no-backends",
+								true,
+								[]graph.BackendRef{
+									{
+										Valid:     false, // invalid backend
+										SvcNsName: types.NamespacedName{Namespace: "default", Name: "svc1"},
+										ServicePort: apiv1.ServicePort{
+											Name: "http",
+											Port: 8080,
+										},
+										Weight: 1,
+									},
+								},
+							),
+						},
+					},
+				},
+			},
+			protocol:        v1.TCPProtocolType,
+			expectedServers: nil,
+		},
+		{
+			name: "skips routes with empty backend refs",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Name:  "tcp-listener",
+						Valid: true,
+						Source: v1.Listener{
+							Protocol: v1.TCPProtocolType,
+							Port:     8080,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "empty-backends"}}: createL4Route(
+								"empty-backends",
+								true,
+								[]graph.BackendRef{}, // empty
+							),
+						},
+					},
+				},
+			},
+			protocol:        v1.TCPProtocolType,
+			expectedServers: nil,
+		},
+		{
+			name: "skips invalid listeners",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Name:  "tcp-listener",
+						Valid: false, // invalid listener
+						Source: v1.Listener{
+							Protocol: v1.TCPProtocolType,
+							Port:     8080,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "tcp-route"}}: createL4Route(
+								"tcp-route",
+								true,
+								[]graph.BackendRef{
+									{
+										Valid:     true,
+										SvcNsName: types.NamespacedName{Namespace: "default", Name: "svc1"},
+										ServicePort: apiv1.ServicePort{
+											Name: "http",
+											Port: 8080,
+										},
+										Weight: 1,
+									},
+								},
+							),
+						},
+					},
+				},
+			},
+			protocol:        v1.TCPProtocolType,
+			expectedServers: nil,
+		},
+		{
+			name: "filters by protocol - TCP listener ignored for UDP protocol",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Name:  "tcp-listener",
+						Valid: true,
+						Source: v1.Listener{
+							Protocol: v1.TCPProtocolType,
+							Port:     8080,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "tcp-route"}}: createL4Route(
+								"tcp-route",
+								true,
+								[]graph.BackendRef{
+									{
+										Valid:     true,
+										SvcNsName: types.NamespacedName{Namespace: "default", Name: "svc1"},
+										ServicePort: apiv1.ServicePort{
+											Name: "http",
+											Port: 8080,
+										},
+										Weight: 1,
+									},
+								},
+							),
+						},
+					},
+				},
+			},
+			protocol:        v1.UDPProtocolType,
+			expectedServers: nil,
+		},
+		{
+			name: "multiple listeners and routes",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Name:  "tcp-listener-1",
+						Valid: true,
+						Source: v1.Listener{
+							Protocol: v1.TCPProtocolType,
+							Port:     8080,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "tcp-route-1"}}: createL4Route(
+								"tcp-route-1",
+								true,
+								[]graph.BackendRef{
+									{
+										Valid:     true,
+										SvcNsName: types.NamespacedName{Namespace: "default", Name: "svc1"},
+										ServicePort: apiv1.ServicePort{
+											Name: "http",
+											Port: 8080,
+										},
+										Weight: 1,
+									},
+								},
+							),
+						},
+					},
+					{
+						Name:  "tcp-listener-2",
+						Valid: true,
+						Source: v1.Listener{
+							Protocol: v1.TCPProtocolType,
+							Port:     9090,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "tcp-route-2"}}: createL4Route(
+								"tcp-route-2",
+								true,
+								[]graph.BackendRef{
+									{
+										Valid:     true,
+										SvcNsName: types.NamespacedName{Namespace: "default", Name: "svc2"},
+										ServicePort: apiv1.ServicePort{
+											Name: "http",
+											Port: 9090,
+										},
+										Weight: 1,
+									},
+								},
+							),
+						},
+					},
+				},
+			},
+			protocol: v1.TCPProtocolType,
+			expectedServers: []Layer4VirtualServer{
+				{
+					Hostname: "",
+					Port:     8080,
+					Upstreams: []Layer4Upstream{
+						{
+							Name:   "default_svc1_8080",
+							Weight: 1,
+						},
+					},
+				},
+				{
+					Hostname: "",
+					Port:     9090,
+					Upstreams: []Layer4Upstream{
+						{
+							Name:   "default_svc2_9090",
+							Weight: 1,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "filters by protocol - UDP listener ignored for TCP protocol",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Name:  "udp-listener",
+						Valid: true,
+						Source: v1.Listener{
+							Protocol: v1.UDPProtocolType,
+							Port:     53,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "udp-route"}}: {
+								Valid: true,
+								Source: &v1.UDPRoute{
+									ObjectMeta: metav1.ObjectMeta{
+										Namespace: "default",
+										Name:      "udp-route",
+									},
+								},
+								Spec: graph.L4RouteSpec{
+									BackendRefs: []graph.BackendRef{
+										{
+											Valid:     true,
+											SvcNsName: types.NamespacedName{Namespace: "default", Name: "dns-svc"},
+											ServicePort: apiv1.ServicePort{
+												Name: "dns",
+												Port: 53,
+											},
+											Weight: 1,
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			protocol:        v1.TCPProtocolType,
+			expectedServers: nil,
+		},
+		{
+			// Per Gateway API conflict resolution, only the oldest route is programmed.
+			// route-older was created first; route-newer (created 1 minute later) is ignored.
+			name: "oldest route wins when multiple TCP routes target same listener",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Name:  "tcp-listener",
+						Valid: true,
+						Source: v1.Listener{
+							Protocol: v1.TCPProtocolType,
+							Port:     8080,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "route-newer"}}: createL4RouteWithTimestamp(
+								"route-newer", true, []graph.BackendRef{{
+									Valid:       true,
+									SvcNsName:   types.NamespacedName{Namespace: "default", Name: "svc-newer"},
+									ServicePort: apiv1.ServicePort{Name: "tcp", Port: 8080},
+									Weight:      1,
+								}},
+								metav1.NewTime(baseTime.Add(time.Minute)),
+							),
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "route-older"}}: createL4RouteWithTimestamp(
+								"route-older", true, []graph.BackendRef{{
+									Valid:       true,
+									SvcNsName:   types.NamespacedName{Namespace: "default", Name: "svc-older"},
+									ServicePort: apiv1.ServicePort{Name: "tcp", Port: 8080},
+									Weight:      1,
+								}},
+								baseTime,
+							),
+						},
+					},
+				},
+			},
+			protocol: v1.TCPProtocolType,
+			expectedServers: []Layer4VirtualServer{
+				{
+					Hostname: "",
+					Port:     8080,
+					Upstreams: []Layer4Upstream{
+						{Name: "default_svc-older_8080", Weight: 1},
+					},
+				},
+			},
+		},
+		{
+			// When timestamps are equal, the route with the alphabetically-first
+			// namespace/name wins (Gateway API tie-breaking rule).
+			name: "same timestamp tie broken by name",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      "gateway",
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Name:  "tcp-listener",
+						Valid: true,
+						Source: v1.Listener{
+							Protocol: v1.TCPProtocolType,
+							Port:     8080,
+						},
+						L4Routes: map[graph.L4RouteKey]*graph.L4Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "route-z"}}: createL4RouteWithTimestamp(
+								"route-z", true, []graph.BackendRef{{
+									Valid:       true,
+									SvcNsName:   types.NamespacedName{Namespace: "default", Name: "svc-z"},
+									ServicePort: apiv1.ServicePort{Name: "tcp", Port: 8080},
+									Weight:      1,
+								}},
+								baseTime,
+							),
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "route-a"}}: createL4RouteWithTimestamp(
+								"route-a", true, []graph.BackendRef{{
+									Valid:       true,
+									SvcNsName:   types.NamespacedName{Namespace: "default", Name: "svc-a"},
+									ServicePort: apiv1.ServicePort{Name: "tcp", Port: 8080},
+									Weight:      1,
+								}},
+								baseTime,
+							),
+						},
+					},
+				},
+			},
+			protocol: v1.TCPProtocolType,
+			expectedServers: []Layer4VirtualServer{
+				{
+					Hostname: "",
+					Port:     8080,
+					Upstreams: []Layer4Upstream{
+						{Name: "default_svc-a_8080", Weight: 1},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			servers := buildL4Servers(logr.Discard(), tt.gateway, tt.protocol)
+
+			// Equal (not ConsistOf) so that the deterministic, sorted order of servers is verified.
+			g.Expect(servers).To(Equal(tt.expectedServers))
+		})
+	}
+}
+
+func TestBuildOIDCProviderFromAuthenticationFilters(t *testing.T) {
+	t.Parallel()
+
+	makeOIDCFilter := func(ns, name string, valid, referenced bool) *graph.AuthenticationFilter {
+		return &graph.AuthenticationFilter{
+			Source: &ngfAPIv1alpha1.AuthenticationFilter{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+				Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+					Type: ngfAPIv1alpha1.AuthTypeOIDC,
+					OIDC: &ngfAPIv1alpha1.OIDCAuth{
+						Issuer:   "https://idp.example.com",
+						ClientID: "my-client-id",
+						ClientSecretRef: ngfAPIv1alpha1.LocalObjectReference{
+							Name: "oidc-client-secret",
+						},
+					},
+				},
+			},
+			Valid:      valid,
+			Referenced: referenced,
+		}
+	}
+
+	makeOIDCFilterWithCAAndCRL := func(ns, name string) *graph.AuthenticationFilter {
+		af := makeOIDCFilter(ns, name, true, true)
+		af.Source.Spec.OIDC.CACertificateRefs = []ngfAPIv1alpha1.LocalObjectReference{
+			{Name: "oidc-ca-cert"},
+		}
+		af.Source.Spec.OIDC.CRLSecretRef = &ngfAPIv1alpha1.LocalObjectReference{Name: "oidc-crl-secret"}
+		return af
+	}
+
+	clientSecretNsName := types.NamespacedName{Namespace: "test", Name: "oidc-client-secret"}
+	caSecretNsName := types.NamespacedName{Namespace: "test", Name: "oidc-ca-cert"}
+	crlSecretNsName := types.NamespacedName{Namespace: "test", Name: "oidc-crl-secret"}
+
+	validClientSecret := &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "oidc-client-secret"},
+			Data:       map[string][]byte{secrets.ClientSecretKey: []byte("super-secret")},
+		},
+	}
+	validCASecret := &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "oidc-ca-cert"},
+			Data:       map[string][]byte{secrets.CAKey: []byte("ca-cert-data")},
+		},
+	}
+	validCRLSecret := &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "oidc-crl-secret"},
+			Data:       map[string][]byte{secrets.CRLKey: []byte("crl-pem-data")},
+		},
+	}
+
+	tests := []struct {
+		authFilters         map[types.NamespacedName]*graph.AuthenticationFilter
+		referencedSecrets   map[types.NamespacedName]*secrets.Secret
+		expectedCertBundles map[CertBundleID]CertBundle
+		name                string
+		expected            []OIDCProvider
+	}{
+		{
+			name:              "nil auth filters",
+			authFilters:       nil,
+			referencedSecrets: nil,
+			expected:          nil,
+		},
+		{
+			name:              "empty auth filters",
+			authFilters:       map[types.NamespacedName]*graph.AuthenticationFilter{},
+			referencedSecrets: nil,
+			expected:          nil,
+		},
+		{
+			name: "filter is invalid",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilter("test", "oidc-filter", false, true),
+			},
+			referencedSecrets: map[types.NamespacedName]*secrets.Secret{clientSecretNsName: validClientSecret},
+			expected:          nil,
+		},
+		{
+			name: "filter is not referenced",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilter("test", "oidc-filter", true, false),
+			},
+			referencedSecrets: map[types.NamespacedName]*secrets.Secret{clientSecretNsName: validClientSecret},
+			expected:          nil,
+		},
+		{
+			name: "filter is not OIDC type",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "basic-filter"}: {
+					Source: &ngfAPIv1alpha1.AuthenticationFilter{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "basic-filter"},
+						Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+							Type:  ngfAPIv1alpha1.AuthTypeBasic,
+							Basic: &ngfAPIv1alpha1.BasicAuth{SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "auth-secret"}},
+						},
+					},
+					Valid:      true,
+					Referenced: true,
+				},
+			},
+			referencedSecrets: nil,
+			expected:          nil,
+		},
+		{
+			name: "client secret not in referencedSecrets",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilter("test", "oidc-filter", true, true),
+			},
+			referencedSecrets: map[types.NamespacedName]*secrets.Secret{},
+			expected:          nil,
+		},
+		{
+			name: "valid OIDC filter without CA cert",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilter("test", "oidc-filter", true, true),
+			},
+			referencedSecrets: map[types.NamespacedName]*secrets.Secret{
+				clientSecretNsName: validClientSecret,
+			},
+			expected: []OIDCProvider{
+				{
+					Name:         "test_oidc-filter",
+					Issuer:       "https://idp.example.com",
+					ClientID:     "my-client-id",
+					ClientSecret: "super-secret",
+					RedirectURI:  "/oidc_callback_test_oidc-filter",
+				},
+			},
+		},
+		{
+			name: "valid OIDC filter with CA cert and CRL secret populates both bundle IDs and certBundles map",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilterWithCAAndCRL("test", "oidc-filter"),
+			},
+			referencedSecrets: map[types.NamespacedName]*secrets.Secret{
+				clientSecretNsName: validClientSecret,
+				caSecretNsName:     validCASecret,
+				crlSecretNsName:    validCRLSecret,
+			},
+			expected: []OIDCProvider{
+				{
+					Name:           "test_oidc-filter",
+					Issuer:         "https://idp.example.com",
+					ClientID:       "my-client-id",
+					ClientSecret:   "super-secret",
+					CACertBundleID: generateCertBundleID(caSecretNsName),
+					CACertData:     []byte("ca-cert-data"),
+					CRLBundleID:    generateCRLBundleID(crlSecretNsName),
+					CRLData:        []byte("crl-pem-data"),
+					RedirectURI:    "/oidc_callback_test_oidc-filter",
+				},
+			},
+			expectedCertBundles: map[CertBundleID]CertBundle{
+				generateCertBundleID(caSecretNsName): []byte("ca-cert-data"),
+				generateCRLBundleID(crlSecretNsName): []byte("crl-pem-data"),
+			},
+		},
+		{
+			name: "two valid OIDC filters both appear in the result",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter-one"}: makeOIDCFilter("test", "oidc-filter-one", true, true),
+				{Namespace: "test", Name: "oidc-filter-two"}: makeOIDCFilterWithCAAndCRL("test", "oidc-filter-two"),
+			},
+			referencedSecrets: map[types.NamespacedName]*secrets.Secret{
+				clientSecretNsName: validClientSecret,
+				caSecretNsName:     validCASecret,
+				crlSecretNsName:    validCRLSecret,
+			},
+			expected: []OIDCProvider{
+				{
+					Name:         "test_oidc-filter-one",
+					Issuer:       "https://idp.example.com",
+					ClientID:     "my-client-id",
+					ClientSecret: "super-secret",
+					RedirectURI:  "/oidc_callback_test_oidc-filter-one",
+				},
+				{
+					Name:           "test_oidc-filter-two",
+					Issuer:         "https://idp.example.com",
+					ClientID:       "my-client-id",
+					ClientSecret:   "super-secret",
+					CACertBundleID: generateCertBundleID(caSecretNsName),
+					CACertData:     []byte("ca-cert-data"),
+					CRLBundleID:    generateCRLBundleID(crlSecretNsName),
+					CRLData:        []byte("crl-pem-data"),
+					RedirectURI:    "/oidc_callback_test_oidc-filter-two",
+				},
+			},
+			expectedCertBundles: map[CertBundleID]CertBundle{
+				generateCertBundleID(caSecretNsName): []byte("ca-cert-data"),
+				generateCRLBundleID(crlSecretNsName): []byte("crl-pem-data"),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result, certBundles := buildOIDCProviderFromAuthenticationFilters(tc.authFilters, tc.referencedSecrets)
+			g.Expect(result).To(ConsistOf(tc.expected))
+			g.Expect(certBundles).To(Equal(tc.expectedCertBundles))
+		})
+	}
+}
+
+func TestBuildJWTAuthZConfigFromAuthenticationFilters(t *testing.T) {
+	t.Parallel()
+	makeJWTFilter := func(
+		ns, name string,
+		valid, referenced bool,
+		authZ ngfAPIv1alpha1.Authorization,
+	) *graph.AuthenticationFilter {
+		return &graph.AuthenticationFilter{
+			Source: &ngfAPIv1alpha1.AuthenticationFilter{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+				Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+					Type: ngfAPIv1alpha1.AuthTypeJWT,
+					JWT: &ngfAPIv1alpha1.JWTAuth{
+						Realm: "nginx-gateway",
+						File: &ngfAPIv1alpha1.JWTFileKeySource{
+							SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "jwt-secret"},
+						},
+						Authorization: &authZ,
+					},
+				},
+			},
+			Valid:      valid,
+			Referenced: referenced,
+		}
+	}
+
+	makeJWTFilterWithNoRules := func(
+		ns, name string,
+		valid, referenced bool,
+	) *graph.AuthenticationFilter {
+		return makeJWTFilter(ns, name, valid, referenced, ngfAPIv1alpha1.Authorization{})
+	}
+
+	makeJWTFilterWithOneRuleAndDefaultSettings := func(
+		ns, name string,
+		valid, referenced bool,
+	) *graph.AuthenticationFilter {
+		authZ := ngfAPIv1alpha1.Authorization{
+			Rules: []ngfAPIv1alpha1.Rule{
+				{
+					Claims: []ngfAPIv1alpha1.Claim{
+						{
+							Name:   "role",
+							Values: []string{"admin"},
+						},
+					},
+				},
+			},
+		}
+		return makeJWTFilter(ns, name, valid, referenced, authZ)
+	}
+
+	makeJWTFilterWithNestedClaim := func(
+		ns, name string,
+		valid, referenced bool,
+	) *graph.AuthenticationFilter {
+		authZ := ngfAPIv1alpha1.Authorization{
+			Rules: []ngfAPIv1alpha1.Rule{
+				{
+					Claims: []ngfAPIv1alpha1.Claim{
+						{
+							Name:   "realm_access/roles",
+							Values: []string{"admin"},
+						},
+					},
+					Require: helpers.GetPointer(ngfAPIv1alpha1.RequireTypeAll),
+				},
+			},
+			Require: helpers.GetPointer(ngfAPIv1alpha1.RequireTypeAll),
+		}
+		return makeJWTFilter(ns, name, valid, referenced, authZ)
+	}
+
+	makeJWTFilterWithOneRuleAndCustomRequireTypesAndProxySetHeader := func(
+		ns, name string,
+		valid, referenced bool,
+	) *graph.AuthenticationFilter {
+		authZ := ngfAPIv1alpha1.Authorization{
+			Require: helpers.GetPointer(ngfAPIv1alpha1.RequireTypeAll),
+			Rules: []ngfAPIv1alpha1.Rule{
+				{
+					Claims: []ngfAPIv1alpha1.Claim{
+						{
+							Name:           "role",
+							Values:         []string{"admin"},
+							ProxySetHeader: helpers.GetPointer("X-Role"),
+						},
+					},
+					Require: helpers.GetPointer(ngfAPIv1alpha1.RequireTypeAll),
+				},
+			},
+		}
+		return makeJWTFilter(ns, name, valid, referenced, authZ)
+	}
+
+	makeJWTFilterWithOneRuleAndCustomMatchType := func(
+		ns, name string,
+		valid, referenced bool,
+		match ngfAPIv1alpha1.ClaimMatchType,
+	) *graph.AuthenticationFilter {
+		authZ := ngfAPIv1alpha1.Authorization{
+			Rules: []ngfAPIv1alpha1.Rule{
+				{
+					Claims: []ngfAPIv1alpha1.Claim{
+						{
+							Name:   "aud",
+							Values: []string{"a(.*)ws"},
+							Match:  match,
+						},
+					},
+				},
+			},
+		}
+		return makeJWTFilter(ns, name, valid, referenced, authZ)
+	}
+
+	makeJWTFilterWithMixOfAnyAndAllRequireTypes := func(
+		ns, name string,
+		valid, referenced bool,
+		rtTopLevel ngfAPIv1alpha1.RequireType,
+	) *graph.AuthenticationFilter {
+		authZ := ngfAPIv1alpha1.Authorization{
+			Require: helpers.GetPointer(rtTopLevel),
+			Rules: []ngfAPIv1alpha1.Rule{
+				{
+					Claims: []ngfAPIv1alpha1.Claim{
+						{
+							Name:   "role",
+							Values: []string{"admin"},
+						},
+						{
+							Name:   "tenant",
+							Values: []string{"acme-co"},
+						},
+					},
+					Require: helpers.GetPointer(ngfAPIv1alpha1.RequireTypeAny),
+				},
+				{
+					Claims: []ngfAPIv1alpha1.Claim{
+						{
+							Name:   "department",
+							Values: []string{"sales", "ops"},
+						},
+						{
+							Name:   "iss",
+							Values: []string{"http://foo.com"},
+						},
+					},
+					Require: helpers.GetPointer(ngfAPIv1alpha1.RequireTypeAll),
+				},
+			},
+		}
+		return makeJWTFilter(ns, name, valid, referenced, authZ)
+	}
+
+	tests := []struct {
+		authFilters map[types.NamespacedName]*graph.AuthenticationFilter
+		name        string
+		expected    []*AuthZConfig
+	}{
+		{
+			name:        "nil auth filters",
+			authFilters: nil,
+			expected:    nil,
+		},
+		{
+			name:        "empty auth filters",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{},
+			expected:    nil,
+		},
+		{
+			name: "filter is invalid",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "jwt-filter"}: makeJWTFilterWithOneRuleAndDefaultSettings(
+					"test", "jwt-filter", false, true,
+				),
+			},
+			expected: nil,
+		},
+		{
+			name: "filter is not referenced",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "jwt-filter"}: makeJWTFilterWithOneRuleAndDefaultSettings(
+					"test", "jwt-filter", true, false,
+				),
+			},
+			expected: nil,
+		},
+		{
+			name: "filter is not JWT type",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "basic-filter"}: {
+					Source: &ngfAPIv1alpha1.AuthenticationFilter{
+						ObjectMeta: metav1.ObjectMeta{Namespace: "test", Name: "basic-filter"},
+						Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+							Type:  ngfAPIv1alpha1.AuthTypeBasic,
+							Basic: &ngfAPIv1alpha1.BasicAuth{SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "auth-secret"}},
+						},
+					},
+					Valid:      true,
+					Referenced: true,
+				},
+			},
+			expected: nil,
+		},
+		{
+			name: "valid JWT filter with no rules results in empty AuthZConfig",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "jwt-filter"}: makeJWTFilterWithNoRules("test", "jwt-filter", true, true),
+			},
+			expected: nil,
+		},
+		{
+			name: "valid JWT filter with one rule and default settings",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "jwt-filter"}: makeJWTFilterWithOneRuleAndDefaultSettings(
+					"test",
+					"jwt-filter",
+					true,
+					true,
+				),
+			},
+			expected: []*AuthZConfig{
+				{
+					FilterNsName: "test_jwt-filter",
+					RuleMaps: []AuthZRuleMap{
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_jwt_filter_claim_role",
+									Variable: "$test_jwt_filter_claim_role_rule_0",
+									Parameters: []shared.MapParameter{
+										{Value: `"~(?:^|,)admin(?:,|$)"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+								{
+									Source:   "$test_jwt_filter_claim_role_rule_0",
+									Variable: "$test_jwt_filter_rule_0_any",
+									Parameters: []shared.MapParameter{
+										{Value: "~1", Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAny,
+						},
+					},
+					AuthClaimSets: map[string][]string{
+						"$test_jwt_filter_claim_role": {"role"},
+					},
+					// Single rule: use rule's result variable directly.
+					// No aggregation map is generated.
+					RequireVariable: "$test_jwt_filter_rule_0_any",
+				},
+			},
+		},
+		{
+			name: "valid JWT filter with nested claim",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "jwt-filter"}: makeJWTFilterWithNestedClaim(
+					"test",
+					"jwt-filter",
+					true,
+					true,
+				),
+			},
+			expected: []*AuthZConfig{
+				{
+					FilterNsName: "test_jwt-filter",
+					RuleMaps: []AuthZRuleMap{
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_jwt_filter_claim_realm_access_roles",
+									Variable: "$test_jwt_filter_rule_0_all",
+									Parameters: []shared.MapParameter{
+										{Value: `"~^(?:.*,)?admin(?:,.*)?$"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAll,
+						},
+					},
+					AuthClaimSets: map[string][]string{
+						"$test_jwt_filter_claim_realm_access_roles": {"realm_access", "roles"},
+					},
+					// Single rule: use rule's result variable directly.
+					// No aggregation map is generated.
+					RequireVariable: "$test_jwt_filter_rule_0_all",
+				},
+			},
+		},
+		{
+			name: "valid JWT filter with one rules with regex match",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "jwt-filter"}: makeJWTFilterWithOneRuleAndCustomMatchType(
+					"test",
+					"jwt-filter",
+					true,
+					true,
+					ngfAPIv1alpha1.ClaimMatchTypeRegex,
+				),
+			},
+			expected: []*AuthZConfig{
+				{
+					FilterNsName: "test_jwt-filter",
+					RuleMaps: []AuthZRuleMap{
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_jwt_filter_claim_aud",
+									Variable: "$test_jwt_filter_claim_aud_rule_0",
+									Parameters: []shared.MapParameter{
+										// Regex matches are inserted as-is
+										// We don't escape any characters
+										{Value: `"~(?:^|,)a(.*)ws(?:,|$)"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+								{
+									Source:   "$test_jwt_filter_claim_aud_rule_0",
+									Variable: "$test_jwt_filter_rule_0_any",
+									Parameters: []shared.MapParameter{
+										{Value: "~1", Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAny,
+						},
+					},
+					AuthClaimSets: map[string][]string{
+						"$test_jwt_filter_claim_aud": {"aud"},
+					},
+					// Single rule: use rule's result variable directly.
+					// No aggregation map is generated.
+					RequireVariable: "$test_jwt_filter_rule_0_any",
+				},
+			},
+		},
+		{
+			name: "valid JWT filter with one rule, custom require types and proxy set header",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "jwt-filter"}: makeJWTFilterWithOneRuleAndCustomRequireTypesAndProxySetHeader(
+					"test",
+					"jwt-filter",
+					true,
+					true,
+				),
+			},
+			expected: []*AuthZConfig{
+				{
+					FilterNsName: "test_jwt-filter",
+					RuleMaps: []AuthZRuleMap{
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_jwt_filter_claim_role",
+									Variable: "$test_jwt_filter_rule_0_all",
+									Parameters: []shared.MapParameter{
+										{Value: `"~^(?:.*,)?admin(?:,.*)?$"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAll,
+						},
+					},
+					AuthClaimSets: map[string][]string{
+						"$test_jwt_filter_claim_role": {"role"},
+					},
+					// Single rule: use rule's result variable directly.
+					// No aggregation map is generated.
+					RequireVariable: "$test_jwt_filter_rule_0_all",
+					ProxySetHeaders: []HTTPHeader{
+						{
+							Name:  "X-Role",
+							Value: "$test_jwt_filter_claim_role",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "valid JWT filter with multiple rules, top level require set to All, claim 1 set to Any, claim 2 set to All",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "jwt-filter"}: makeJWTFilterWithMixOfAnyAndAllRequireTypes(
+					"test",
+					"jwt-filter",
+					true,
+					true,
+					ngfAPIv1alpha1.RequireTypeAll,
+				),
+			},
+			expected: []*AuthZConfig{
+				{
+					FilterNsName: "test_jwt-filter",
+					RuleMaps: []AuthZRuleMap{
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_jwt_filter_claim_role",
+									Variable: "$test_jwt_filter_claim_role_rule_0",
+									Parameters: []shared.MapParameter{
+										{Value: `"~(?:^|,)admin(?:,|$)"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+								{
+									Source:   "$test_jwt_filter_claim_tenant",
+									Variable: "$test_jwt_filter_claim_tenant_rule_0",
+									Parameters: []shared.MapParameter{
+										{Value: `"~(?:^|,)acme-co(?:,|$)"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+								{
+									Source:   "$test_jwt_filter_claim_role_rule_0$test_jwt_filter_claim_tenant_rule_0",
+									Variable: "$test_jwt_filter_rule_0_any",
+									Parameters: []shared.MapParameter{
+										{Value: "~1", Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAny,
+						},
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_jwt_filter_claim_department+$test_jwt_filter_claim_iss",
+									Variable: "$test_jwt_filter_rule_1_all",
+									Parameters: []shared.MapParameter{
+										{
+											Value:  `"~^(?:.*,)?(sales|ops)(?:,.*)?\+(?:.*,)?http://foo\.com(?:,.*)?$"`,
+											Result: "1",
+										},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAll,
+						},
+					},
+					AuthZMap: &AuthZMap{
+						Require: ngfAPIv1alpha1.RequireTypeAll,
+						Map: shared.Map{
+							Source:   "$test_jwt_filter_rule_0_any$test_jwt_filter_rule_1_all",
+							Variable: "$test_jwt_filter_authz_require_all",
+							Parameters: []shared.MapParameter{
+								{Value: "11", Result: "1"},
+								{Value: "default", Result: "0"},
+							},
+						},
+					},
+					AuthClaimSets: map[string][]string{
+						"$test_jwt_filter_claim_department": {"department"},
+						"$test_jwt_filter_claim_iss":        {"iss"},
+						"$test_jwt_filter_claim_role":       {"role"},
+						"$test_jwt_filter_claim_tenant":     {"tenant"},
+					},
+					// Multiple rules: generate aggregation map that combines rules according to top level require type.
+					RequireVariable: "$test_jwt_filter_authz_require_all",
+				},
+			},
+		},
+		{
+			name: "valid JWT filter with multiple rules, top level require set to Any, claim 1 set to Any, claim 2 set to All",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "jwt-filter"}: makeJWTFilterWithMixOfAnyAndAllRequireTypes(
+					"test",
+					"jwt-filter",
+					true,
+					true,
+					ngfAPIv1alpha1.RequireTypeAny,
+				),
+			},
+			expected: []*AuthZConfig{
+				{
+					FilterNsName: "test_jwt-filter",
+					RuleMaps: []AuthZRuleMap{
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_jwt_filter_claim_role",
+									Variable: "$test_jwt_filter_claim_role_rule_0",
+									Parameters: []shared.MapParameter{
+										{Value: `"~(?:^|,)admin(?:,|$)"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+								{
+									Source:   "$test_jwt_filter_claim_tenant",
+									Variable: "$test_jwt_filter_claim_tenant_rule_0",
+									Parameters: []shared.MapParameter{
+										{Value: `"~(?:^|,)acme-co(?:,|$)"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+								{
+									Source:   "$test_jwt_filter_claim_role_rule_0$test_jwt_filter_claim_tenant_rule_0",
+									Variable: "$test_jwt_filter_rule_0_any",
+									Parameters: []shared.MapParameter{
+										{Value: "~1", Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAny,
+						},
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_jwt_filter_claim_department+$test_jwt_filter_claim_iss",
+									Variable: "$test_jwt_filter_rule_1_all",
+									Parameters: []shared.MapParameter{
+										{
+											Value:  `"~^(?:.*,)?(sales|ops)(?:,.*)?\+(?:.*,)?http://foo\.com(?:,.*)?$"`,
+											Result: "1",
+										},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAll,
+						},
+					},
+					AuthZMap: &AuthZMap{
+						Require: ngfAPIv1alpha1.RequireTypeAny,
+						Map: shared.Map{
+							Source:   "$test_jwt_filter_rule_0_any$test_jwt_filter_rule_1_all",
+							Variable: "$test_jwt_filter_authz_require_any",
+							Parameters: []shared.MapParameter{
+								{Value: "~1", Result: "1"},
+								{Value: "default", Result: "0"},
+							},
+						},
+					},
+					AuthClaimSets: map[string][]string{
+						"$test_jwt_filter_claim_department": {"department"},
+						"$test_jwt_filter_claim_iss":        {"iss"},
+						"$test_jwt_filter_claim_role":       {"role"},
+						"$test_jwt_filter_claim_tenant":     {"tenant"},
+					},
+					// Multiple rules: generate aggregation map that combines rules according to top level require type.
+					RequireVariable: "$test_jwt_filter_authz_require_any",
+				},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			result := buildAuthZConfigs(tc.authFilters)
+			g.Expect(result).To(HaveLen(len(tc.expected)))
+			if len(tc.expected) == 0 {
+				return
+			}
+
+			r := result[0]
+			g.Expect(r.AuthClaimSets).To(Equal(tc.expected[0].AuthClaimSets))
+			g.Expect(r.RuleMaps).To(ContainElements(tc.expected[0].RuleMaps))
+			g.Expect(r.ProxySetHeaders).To(ContainElements(tc.expected[0].ProxySetHeaders))
+			if r.AuthZMap != nil {
+				g.Expect(*r.AuthZMap).To(Equal(*tc.expected[0].AuthZMap))
+			} else {
+				g.Expect(tc.expected[0].AuthZMap).To(BeNil())
+			}
+			g.Expect(r.FilterNsName).To(Equal(tc.expected[0].FilterNsName))
+			g.Expect(r.RequireVariable).To(Equal(tc.expected[0].RequireVariable))
+		})
+	}
+}
+
+// TestBuildAuthZConfigs_MultipleFiltersNoVariableCollision is a regression test that verifies
+// two AuthenticationFilters sharing the same rule index produce unique NGINX map variable names.
+func TestBuildAuthZConfigs_MultipleFiltersNoVariableCollision(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	requireAll := ngfAPIv1alpha1.RequireTypeAll
+
+	authFilters := map[types.NamespacedName]*graph.AuthenticationFilter{
+		{Namespace: "team-a", Name: "auth"}: {
+			Source: &ngfAPIv1alpha1.AuthenticationFilter{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "auth"},
+				Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+					Type: ngfAPIv1alpha1.AuthTypeJWT,
+					JWT: &ngfAPIv1alpha1.JWTAuth{
+						Realm:  "team-a-realm",
+						Source: ngfAPIv1alpha1.JWTKeySourceFile,
+						File: &ngfAPIv1alpha1.JWTFileKeySource{
+							SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "jwt-secret"},
+						},
+						Authorization: &ngfAPIv1alpha1.Authorization{
+							Require: &requireAll,
+							Rules: []ngfAPIv1alpha1.Rule{
+								{
+									Require: &requireAll,
+									Claims: []ngfAPIv1alpha1.Claim{
+										{
+											Name:   "sub",
+											Values: []string{"alice"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			Valid:      true,
+			Referenced: true,
+		},
+		{Namespace: "team-b", Name: "auth"}: {
+			Source: &ngfAPIv1alpha1.AuthenticationFilter{
+				ObjectMeta: metav1.ObjectMeta{Namespace: "team-b", Name: "auth"},
+				Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+					Type: ngfAPIv1alpha1.AuthTypeJWT,
+					JWT: &ngfAPIv1alpha1.JWTAuth{
+						Realm:  "team-b-realm",
+						Source: ngfAPIv1alpha1.JWTKeySourceFile,
+						File: &ngfAPIv1alpha1.JWTFileKeySource{
+							SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "jwt-secret"},
+						},
+						Authorization: &ngfAPIv1alpha1.Authorization{
+							Require: &requireAll,
+							Rules: []ngfAPIv1alpha1.Rule{
+								{
+									Require: &requireAll,
+									Claims: []ngfAPIv1alpha1.Claim{
+										{
+											Name:   "sub",
+											Values: []string{"bob"},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			Valid:      true,
+			Referenced: true,
+		},
+	}
+
+	results := buildAuthZConfigs(authFilters)
+	g.Expect(results).To(HaveLen(2))
+
+	// Collect all variable names across both configs.
+	allVars := make(map[string]string)
+	for _, cfg := range results {
+		for _, rm := range cfg.RuleMaps {
+			for _, m := range rm.Maps {
+				owner, exists := allVars[m.Variable]
+				g.Expect(exists).To(
+					BeFalse(),
+					"variable %q from filter %q collides with filter %q",
+					m.Variable, cfg.FilterNsName, owner,
+				)
+				allVars[m.Variable] = cfg.FilterNsName
+			}
+		}
+		if cfg.AuthZMap != nil {
+			owner, exists := allVars[cfg.AuthZMap.Variable]
+			g.Expect(exists).To(
+				BeFalse(),
+				"authz map variable %q from filter %q collides with filter %q",
+				cfg.AuthZMap.Variable, cfg.FilterNsName, owner,
+			)
+			allVars[cfg.AuthZMap.Variable] = cfg.FilterNsName
+		}
+	}
+
+	// Collect all claim set variable names across both configs.
+	allClaimVars := make(map[string]string)
+	for _, cfg := range results {
+		for claimVar := range cfg.AuthClaimSets {
+			owner, exists := allClaimVars[claimVar]
+			g.Expect(exists).To(
+				BeFalse(),
+				"claim variable %q from filter %q collides with filter %q",
+				claimVar, cfg.FilterNsName, owner,
+			)
+			allClaimVars[claimVar] = cfg.FilterNsName
+		}
+	}
+
+	// Verify each config's variables contain its sanitized filter namespace prefix.
+	// FilterNsName uses ns_name format (e.g. "team-a_auth").
+	// Variable names are sanitized, so we sanitize the prefix too.
+	for _, cfg := range results {
+		sanitized := sanitizeVariablePrefix(cfg.FilterNsName)
+		prefix := "$" + sanitized + "_"
+		for _, rm := range cfg.RuleMaps {
+			for _, m := range rm.Maps {
+				g.Expect(m.Variable).To(
+					HavePrefix(prefix),
+					"variable %q should be prefixed with %q", m.Variable, prefix,
+				)
+			}
+		}
+		if cfg.AuthZMap != nil {
+			g.Expect(cfg.AuthZMap.Variable).To(
+				HavePrefix(prefix),
+				"authz map variable %q should be prefixed with %q",
+				cfg.AuthZMap.Variable, prefix,
+			)
+		}
+		for claimVar := range cfg.AuthClaimSets {
+			g.Expect(claimVar).To(
+				HavePrefix("$"+sanitized+"_claim_"),
+				"claim variable %q should contain filter namespace prefix", claimVar,
+			)
+		}
+	}
+}
+
+// TestBuildAuthZConfigs_OIDCFilter verifies that buildAuthZConfigs correctly processes
+// OIDC filters with Authorization configuration.
+func TestBuildAuthZConfigs_OIDCFilter(t *testing.T) {
+	t.Parallel()
+
+	makeOIDCFilter := func(
+		ns, name string,
+		valid, referenced bool,
+		authZ ngfAPIv1alpha1.Authorization,
+	) *graph.AuthenticationFilter {
+		return &graph.AuthenticationFilter{
+			Source: &ngfAPIv1alpha1.AuthenticationFilter{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+				Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+					Type: ngfAPIv1alpha1.AuthTypeOIDC,
+					OIDC: &ngfAPIv1alpha1.OIDCAuth{
+						Issuer:          "https://idp.example.com",
+						ClientID:        "client-id",
+						ClientSecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "oidc-secret"},
+						Authorization:   &authZ,
+					},
+				},
+			},
+			Valid:      valid,
+			Referenced: referenced,
+		}
+	}
+
+	makeOIDCFilterWithNoRules := func(
+		ns, name string,
+		valid, referenced bool,
+	) *graph.AuthenticationFilter {
+		return makeOIDCFilter(ns, name, valid, referenced, ngfAPIv1alpha1.Authorization{})
+	}
+
+	makeOIDCFilterWithOneRuleAndDefaultSettings := func(
+		ns, name string,
+		valid, referenced bool,
+	) *graph.AuthenticationFilter {
+		authZ := ngfAPIv1alpha1.Authorization{
+			Rules: []ngfAPIv1alpha1.Rule{
+				{
+					Claims: []ngfAPIv1alpha1.Claim{
+						{
+							Name:   "email",
+							Values: []string{"admin@example.com"},
+						},
+					},
+				},
+			},
+		}
+		return makeOIDCFilter(ns, name, valid, referenced, authZ)
+	}
+
+	makeOIDCFilterWithNestedClaim := func(
+		ns, name string,
+		valid, referenced bool,
+	) *graph.AuthenticationFilter {
+		authZ := ngfAPIv1alpha1.Authorization{
+			Rules: []ngfAPIv1alpha1.Rule{
+				{
+					Claims: []ngfAPIv1alpha1.Claim{
+						{
+							Name:   "realm_access/roles",
+							Values: []string{"admin"},
+						},
+					},
+					Require: helpers.GetPointer(ngfAPIv1alpha1.RequireTypeAll),
+				},
+			},
+			Require: helpers.GetPointer(ngfAPIv1alpha1.RequireTypeAll),
+		}
+		return makeOIDCFilter(ns, name, valid, referenced, authZ)
+	}
+
+	makeOIDCFilterWithOneRuleAndCustomRequireTypesAndProxySetHeader := func(
+		ns, name string,
+		valid, referenced bool,
+	) *graph.AuthenticationFilter {
+		authZ := ngfAPIv1alpha1.Authorization{
+			Require: helpers.GetPointer(ngfAPIv1alpha1.RequireTypeAll),
+			Rules: []ngfAPIv1alpha1.Rule{
+				{
+					Claims: []ngfAPIv1alpha1.Claim{
+						{
+							Name:           "groups",
+							Values:         []string{"engineering"},
+							ProxySetHeader: helpers.GetPointer("X-Groups"),
+						},
+					},
+					Require: helpers.GetPointer(ngfAPIv1alpha1.RequireTypeAll),
+				},
+			},
+		}
+		return makeOIDCFilter(ns, name, valid, referenced, authZ)
+	}
+
+	makeOIDCFilterWithOneRuleAndCustomMatchType := func(
+		ns, name string,
+		valid, referenced bool,
+		match ngfAPIv1alpha1.ClaimMatchType,
+	) *graph.AuthenticationFilter {
+		authZ := ngfAPIv1alpha1.Authorization{
+			Rules: []ngfAPIv1alpha1.Rule{
+				{
+					Claims: []ngfAPIv1alpha1.Claim{
+						{
+							Name:   "aud",
+							Values: []string{"a(.*)ws"},
+							Match:  match,
+						},
+					},
+				},
+			},
+		}
+		return makeOIDCFilter(ns, name, valid, referenced, authZ)
+	}
+
+	makeOIDCFilterWithMixOfAnyAndAllRequireTypes := func(
+		ns, name string,
+		valid, referenced bool,
+		rtTopLevel ngfAPIv1alpha1.RequireType,
+	) *graph.AuthenticationFilter {
+		authZ := ngfAPIv1alpha1.Authorization{
+			Require: helpers.GetPointer(rtTopLevel),
+			Rules: []ngfAPIv1alpha1.Rule{
+				{
+					Claims: []ngfAPIv1alpha1.Claim{
+						{
+							Name:   "email",
+							Values: []string{"admin@example.com"},
+						},
+						{
+							Name:   "tenant",
+							Values: []string{"acme-co"},
+						},
+					},
+					Require: helpers.GetPointer(ngfAPIv1alpha1.RequireTypeAny),
+				},
+				{
+					Claims: []ngfAPIv1alpha1.Claim{
+						{
+							Name:   "department",
+							Values: []string{"sales", "ops"},
+						},
+						{
+							Name:   "iss",
+							Values: []string{"https://idp.example.com"},
+						},
+					},
+					Require: helpers.GetPointer(ngfAPIv1alpha1.RequireTypeAll),
+				},
+			},
+		}
+		return makeOIDCFilter(ns, name, valid, referenced, authZ)
+	}
+
+	tests := []struct {
+		authFilters map[types.NamespacedName]*graph.AuthenticationFilter
+		name        string
+		expected    []*AuthZConfig
+	}{
+		{
+			name:        "nil auth filters",
+			authFilters: nil,
+			expected:    nil,
+		},
+		{
+			name:        "empty auth filters",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{},
+			expected:    nil,
+		},
+		{
+			name: "OIDC filter is invalid",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilterWithOneRuleAndDefaultSettings(
+					"test", "oidc-filter", false, true,
+				),
+			},
+			expected: nil,
+		},
+		{
+			name: "OIDC filter is not referenced",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilterWithOneRuleAndDefaultSettings(
+					"test", "oidc-filter", true, false,
+				),
+			},
+			expected: nil,
+		},
+		{
+			name: "valid OIDC filter with no rules results in nil",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilterWithNoRules(
+					"test", "oidc-filter", true, true,
+				),
+			},
+			expected: nil,
+		},
+		{
+			name: "valid OIDC filter with one rule and default settings",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilterWithOneRuleAndDefaultSettings(
+					"test", "oidc-filter", true, true,
+				),
+			},
+			expected: []*AuthZConfig{
+				{
+					FilterNsName: "test_oidc-filter",
+					RuleMaps: []AuthZRuleMap{
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_oidc_filter_claim_email",
+									Variable: "$test_oidc_filter_claim_email_rule_0",
+									Parameters: []shared.MapParameter{
+										{Value: `"~(?:^|,)admin@example\.com(?:,|$)"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+								{
+									Source:   "$test_oidc_filter_claim_email_rule_0",
+									Variable: "$test_oidc_filter_rule_0_any",
+									Parameters: []shared.MapParameter{
+										{Value: "~1", Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAny,
+						},
+					},
+					AuthClaimSets: map[string][]string{
+						"$test_oidc_filter_claim_email": {"email"},
+					},
+					RequireVariable: "$test_oidc_filter_rule_0_any",
+				},
+			},
+		},
+		{
+			name: "valid OIDC filter with nested claim",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilterWithNestedClaim(
+					"test", "oidc-filter", true, true,
+				),
+			},
+			expected: []*AuthZConfig{
+				{
+					FilterNsName: "test_oidc-filter",
+					RuleMaps: []AuthZRuleMap{
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_oidc_filter_claim_realm_access_roles",
+									Variable: "$test_oidc_filter_rule_0_all",
+									Parameters: []shared.MapParameter{
+										{Value: `"~^(?:.*,)?admin(?:,.*)?$"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAll,
+						},
+					},
+					AuthClaimSets: map[string][]string{
+						"$test_oidc_filter_claim_realm_access_roles": {"realm_access", "roles"},
+					},
+					RequireVariable: "$test_oidc_filter_rule_0_all",
+				},
+			},
+		},
+		{
+			name: "valid OIDC filter with one rule and regex match",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilterWithOneRuleAndCustomMatchType(
+					"test", "oidc-filter", true, true,
+					ngfAPIv1alpha1.ClaimMatchTypeRegex,
+				),
+			},
+			expected: []*AuthZConfig{
+				{
+					FilterNsName: "test_oidc-filter",
+					RuleMaps: []AuthZRuleMap{
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_oidc_filter_claim_aud",
+									Variable: "$test_oidc_filter_claim_aud_rule_0",
+									Parameters: []shared.MapParameter{
+										{Value: `"~(?:^|,)a(.*)ws(?:,|$)"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+								{
+									Source:   "$test_oidc_filter_claim_aud_rule_0",
+									Variable: "$test_oidc_filter_rule_0_any",
+									Parameters: []shared.MapParameter{
+										{Value: "~1", Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAny,
+						},
+					},
+					AuthClaimSets: map[string][]string{
+						"$test_oidc_filter_claim_aud": {"aud"},
+					},
+					RequireVariable: "$test_oidc_filter_rule_0_any",
+				},
+			},
+		},
+		{
+			name: "valid OIDC filter with one rule, custom require types and proxy set header",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilterWithOneRuleAndCustomRequireTypesAndProxySetHeader(
+					"test", "oidc-filter", true, true,
+				),
+			},
+			expected: []*AuthZConfig{
+				{
+					FilterNsName: "test_oidc-filter",
+					RuleMaps: []AuthZRuleMap{
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_oidc_filter_claim_groups",
+									Variable: "$test_oidc_filter_rule_0_all",
+									Parameters: []shared.MapParameter{
+										{Value: `"~^(?:.*,)?engineering(?:,.*)?$"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAll,
+						},
+					},
+					AuthClaimSets: map[string][]string{
+						"$test_oidc_filter_claim_groups": {"groups"},
+					},
+					RequireVariable: "$test_oidc_filter_rule_0_all",
+					ProxySetHeaders: []HTTPHeader{
+						{
+							Name:  "X-Groups",
+							Value: "$test_oidc_filter_claim_groups",
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "valid OIDC filter with multiple rules, top level require All, rule 1 Any, rule 2 All",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilterWithMixOfAnyAndAllRequireTypes(
+					"test", "oidc-filter", true, true,
+					ngfAPIv1alpha1.RequireTypeAll,
+				),
+			},
+
+			expected: []*AuthZConfig{
+				{
+					FilterNsName: "test_oidc-filter",
+					RuleMaps: []AuthZRuleMap{
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_oidc_filter_claim_email",
+									Variable: "$test_oidc_filter_claim_email_rule_0",
+									Parameters: []shared.MapParameter{
+										{Value: `"~(?:^|,)admin@example\.com(?:,|$)"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+								{
+									Source:   "$test_oidc_filter_claim_tenant",
+									Variable: "$test_oidc_filter_claim_tenant_rule_0",
+									Parameters: []shared.MapParameter{
+										{Value: `"~(?:^|,)acme-co(?:,|$)"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+								{
+									Source:   "$test_oidc_filter_claim_email_rule_0$test_oidc_filter_claim_tenant_rule_0",
+									Variable: "$test_oidc_filter_rule_0_any",
+									Parameters: []shared.MapParameter{
+										{Value: "~1", Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAny,
+						},
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_oidc_filter_claim_department+$test_oidc_filter_claim_iss",
+									Variable: "$test_oidc_filter_rule_1_all",
+									Parameters: []shared.MapParameter{
+										{
+											Value:  `"~^(?:.*,)?(sales|ops)(?:,.*)?\+(?:.*,)?https://idp\.example\.com(?:,.*)?$"`,
+											Result: "1",
+										},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAll,
+						},
+					},
+					AuthZMap: &AuthZMap{
+						Require: ngfAPIv1alpha1.RequireTypeAll,
+						Map: shared.Map{
+							Source:   "$test_oidc_filter_rule_0_any$test_oidc_filter_rule_1_all",
+							Variable: "$test_oidc_filter_authz_require_all",
+							Parameters: []shared.MapParameter{
+								{Value: "11", Result: "1"},
+								{Value: "default", Result: "0"},
+							},
+						},
+					},
+					AuthClaimSets: map[string][]string{
+						"$test_oidc_filter_claim_department": {"department"},
+						"$test_oidc_filter_claim_email":      {"email"},
+						"$test_oidc_filter_claim_iss":        {"iss"},
+						"$test_oidc_filter_claim_tenant":     {"tenant"},
+					},
+					RequireVariable: "$test_oidc_filter_authz_require_all",
+				},
+			},
+		},
+		{
+			name: "valid OIDC filter with multiple rules, top level require Any, rule 1 Any, rule 2 All",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: "test", Name: "oidc-filter"}: makeOIDCFilterWithMixOfAnyAndAllRequireTypes(
+					"test", "oidc-filter", true, true,
+					ngfAPIv1alpha1.RequireTypeAny,
+				),
+			},
+
+			expected: []*AuthZConfig{
+				{
+					FilterNsName: "test_oidc-filter",
+					RuleMaps: []AuthZRuleMap{
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_oidc_filter_claim_email",
+									Variable: "$test_oidc_filter_claim_email_rule_0",
+									Parameters: []shared.MapParameter{
+										{Value: `"~(?:^|,)admin@example\.com(?:,|$)"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+								{
+									Source:   "$test_oidc_filter_claim_tenant",
+									Variable: "$test_oidc_filter_claim_tenant_rule_0",
+									Parameters: []shared.MapParameter{
+										{Value: `"~(?:^|,)acme-co(?:,|$)"`, Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+								{
+									Source:   "$test_oidc_filter_claim_email_rule_0$test_oidc_filter_claim_tenant_rule_0",
+									Variable: "$test_oidc_filter_rule_0_any",
+									Parameters: []shared.MapParameter{
+										{Value: "~1", Result: "1"},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAny,
+						},
+						{
+							Maps: []shared.Map{
+								{
+									Source:   "$test_oidc_filter_claim_department+$test_oidc_filter_claim_iss",
+									Variable: "$test_oidc_filter_rule_1_all",
+									Parameters: []shared.MapParameter{
+										{
+											Value:  `"~^(?:.*,)?(sales|ops)(?:,.*)?\+(?:.*,)?https://idp\.example\.com(?:,.*)?$"`,
+											Result: "1",
+										},
+										{Value: "default", Result: "0"},
+									},
+								},
+							},
+							Require: ngfAPIv1alpha1.RequireTypeAll,
+						},
+					},
+					AuthZMap: &AuthZMap{
+						Require: ngfAPIv1alpha1.RequireTypeAny,
+						Map: shared.Map{
+							Source:   "$test_oidc_filter_rule_0_any$test_oidc_filter_rule_1_all",
+							Variable: "$test_oidc_filter_authz_require_any",
+							Parameters: []shared.MapParameter{
+								{Value: "~1", Result: "1"},
+								{Value: "default", Result: "0"},
+							},
+						},
+					},
+					AuthClaimSets: map[string][]string{
+						"$test_oidc_filter_claim_department": {"department"},
+						"$test_oidc_filter_claim_email":      {"email"},
+						"$test_oidc_filter_claim_iss":        {"iss"},
+						"$test_oidc_filter_claim_tenant":     {"tenant"},
+					},
+					RequireVariable: "$test_oidc_filter_authz_require_any",
+				},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			result := buildAuthZConfigs(tc.authFilters)
+			g.Expect(result).To(HaveLen(len(tc.expected)))
+			if len(tc.expected) == 0 {
+				return
+			}
+
+			r := result[0]
+			expected := tc.expected[0]
+			g.Expect(r.AuthClaimSets).To(Equal(expected.AuthClaimSets))
+			g.Expect(r.RuleMaps).To(ContainElements(expected.RuleMaps))
+			g.Expect(r.ProxySetHeaders).To(ContainElements(expected.ProxySetHeaders))
+			if r.AuthZMap != nil {
+				g.Expect(*r.AuthZMap).To(Equal(*expected.AuthZMap))
+			} else {
+				g.Expect(expected.AuthZMap).To(BeNil())
+			}
+			g.Expect(r.FilterNsName).To(Equal(expected.FilterNsName))
+			g.Expect(r.RequireVariable).To(Equal(expected.RequireVariable))
+		})
+	}
+}
+
+func TestBuildRewriteIPSettings(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		msg                  string
+		g                    *graph.Graph
+		expRewriteIPSettings RewriteClientIPSettings
+	}{
+		{
+			msg: "no rewrite IP settings configured",
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {
+						EffectiveNginxProxy: &graph.EffectiveNginxProxy{},
+					},
+				},
+			},
+			expRewriteIPSettings: RewriteClientIPSettings{},
+		},
+		{
+			msg: "rewrite IP settings configured with proxyProtocol",
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {
+						EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+							RewriteClientIP: &ngfAPIv1alpha2.RewriteClientIP{
+								Mode: helpers.GetPointer(ngfAPIv1alpha2.RewriteClientIPModeProxyProtocol),
+								TrustedAddresses: []ngfAPIv1alpha2.RewriteClientIPAddress{
+									{
+										Type:  ngfAPIv1alpha2.RewriteClientIPCIDRAddressType,
+										Value: "10.9.9.4/32",
+									},
+								},
+								SetIPRecursively: helpers.GetPointer(true),
+							},
+						},
+					},
+				},
+			},
+			expRewriteIPSettings: RewriteClientIPSettings{
+				Mode:             RewriteIPModeProxyProtocol,
+				TrustedAddresses: []string{"10.9.9.4/32"},
+				IPRecursive:      true,
+			},
+		},
+		{
+			msg: "rewrite IP settings configured with xForwardedFor",
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {
+						EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+							RewriteClientIP: &ngfAPIv1alpha2.RewriteClientIP{
+								Mode: helpers.GetPointer(ngfAPIv1alpha2.RewriteClientIPModeXForwardedFor),
+								TrustedAddresses: []ngfAPIv1alpha2.RewriteClientIPAddress{
+									{
+										Type:  ngfAPIv1alpha2.RewriteClientIPCIDRAddressType,
+										Value: "76.89.90.11/24",
+									},
+								},
+								SetIPRecursively: helpers.GetPointer(true),
+							},
+						},
+					},
+				},
+			},
+			expRewriteIPSettings: RewriteClientIPSettings{
+				Mode:             RewriteIPModeXForwardedFor,
+				TrustedAddresses: []string{"76.89.90.11/24"},
+				IPRecursive:      true,
+			},
+		},
+		{
+			msg: "rewrite IP settings configured with recursive set to false and multiple trusted addresses",
+			g: &graph.Graph{
+				Gateways: map[types.NamespacedName]*graph.Gateway{
+					{}: {
+						EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+							RewriteClientIP: &ngfAPIv1alpha2.RewriteClientIP{
+								Mode: helpers.GetPointer(ngfAPIv1alpha2.RewriteClientIPModeXForwardedFor),
+								TrustedAddresses: []ngfAPIv1alpha2.RewriteClientIPAddress{
+									{
+										Type:  ngfAPIv1alpha2.RewriteClientIPCIDRAddressType,
+										Value: "5.5.5.5/12",
+									},
+									{
+										Type:  ngfAPIv1alpha2.RewriteClientIPCIDRAddressType,
+										Value: "1.1.1.1/26",
+									},
+									{
+										Type:  ngfAPIv1alpha2.RewriteClientIPCIDRAddressType,
+										Value: "2.2.2.2/32",
+									},
+									{
+										Type:  ngfAPIv1alpha2.RewriteClientIPCIDRAddressType,
+										Value: "3.3.3.3/24",
+									},
+								},
+								SetIPRecursively: helpers.GetPointer(false),
+							},
+						},
+					},
+				},
+			},
+			expRewriteIPSettings: RewriteClientIPSettings{
+				Mode:             RewriteIPModeXForwardedFor,
+				TrustedAddresses: []string{"5.5.5.5/12", "1.1.1.1/26", "2.2.2.2/32", "3.3.3.3/24"},
+				IPRecursive:      false,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			baseConfig := buildBaseHTTPConfig(
+				tc.g.Gateways[types.NamespacedName{}],
+				make(map[types.NamespacedName]*graph.SnippetsFilter),
+				make(map[graph.PolicyKey]*graph.Policy),
+				ngfAPIv1alpha2.Dual,
+			)
+			g.Expect(baseConfig.RewriteClientIPSettings).To(Equal(tc.expRewriteIPSettings))
+		})
+	}
+}
+
+func TestBuildLogging(t *testing.T) {
+	defaultLogging := Logging{ErrorLevel: defaultErrorLogLevel}
+	logFormat := `'$remote_addr - $remote_user [$time_local] '
+							'"$request" $status $body_bytes_sent '
+							'"$http_referer" "$http_user_agent" '`
+
+	t.Parallel()
+	tests := []struct {
+		gw                 *graph.Gateway
+		msg                string
+		expLoggingSettings Logging
+	}{
+		{
+			msg:                "Gateway is nil",
+			gw:                 nil,
+			expLoggingSettings: defaultLogging,
+		},
+		{
+			msg: "Gateway has no effective NginxProxy",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: nil,
+			},
+			expLoggingSettings: defaultLogging,
+		},
+		{
+			msg: "Effective NginxProxy does not specify log level",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					IPFamily: helpers.GetPointer(ngfAPIv1alpha2.Dual),
+				},
+			},
+			expLoggingSettings: defaultLogging,
+		},
+		{
+			msg: "Effective NginxProxy log level set to debug",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelDebug),
+					},
+				},
+			},
+			expLoggingSettings: Logging{ErrorLevel: "debug"},
+		},
+		{
+			msg: "Effective NginxProxy log level set to info",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+					},
+				},
+			},
+			expLoggingSettings: Logging{ErrorLevel: defaultErrorLogLevel},
+		},
+		{
+			msg: "Effective NginxProxy log level set to notice",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelNotice),
+					},
+				},
+			},
+			expLoggingSettings: Logging{ErrorLevel: "notice"},
+		},
+		{
+			msg: "Effective NginxProxy log level set to warn",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelWarn),
+					},
+				},
+			},
+			expLoggingSettings: Logging{ErrorLevel: "warn"},
+		},
+		{
+			msg: "Effective NginxProxy log level set to error",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelError),
+					},
+				},
+			},
+			expLoggingSettings: Logging{ErrorLevel: "error"},
+		},
+		{
+			msg: "Effective NginxProxy log level set to crit",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelCrit),
+					},
+				},
+			},
+			expLoggingSettings: Logging{ErrorLevel: "crit"},
+		},
+		{
+			msg: "Effective NginxProxy log level set to alert",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelAlert),
+					},
+				},
+			},
+			expLoggingSettings: Logging{ErrorLevel: "alert"},
+		},
+		{
+			msg: "Effective NginxProxy log level set to emerg",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelEmerg),
+					},
+				},
+			},
+			expLoggingSettings: Logging{ErrorLevel: "emerg"},
+		},
+		{
+			msg: "errorLogFormat json emits JSON access log template when user has not supplied a custom format",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel:     helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						ErrorLogFormat: helpers.GetPointer(ngfAPIv1alpha2.NginxErrorLogFormatJSON),
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel:     "info",
+				ErrorLogFormat: "json",
+				AccessLog: &AccessLog{
+					Format: JSONAccessLogFormat,
+					Escape: "json",
+					Path:   DefaultAccessLogPath,
+				},
+			},
+		},
+		{
+			msg: "errorLogFormat json preserves user-supplied access log format and " +
+				"does not override with JSON access log template",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel:     helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						ErrorLogFormat: helpers.GetPointer(ngfAPIv1alpha2.NginxErrorLogFormatJSON),
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Format: helpers.GetPointer(logFormat),
+						},
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel:     "info",
+				ErrorLogFormat: "json",
+				AccessLog: &AccessLog{
+					Format: logFormat,
+					Path:   DefaultAccessLogPath,
+				},
+			},
+		},
+		{
+			msg: "errorLogFormat json with access log explicitly disabled leaves access log off",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel:     helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						ErrorLogFormat: helpers.GetPointer(ngfAPIv1alpha2.NginxErrorLogFormatJSON),
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Disable: helpers.GetPointer(true),
+						},
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel:     "info",
+				ErrorLogFormat: "json",
+				AccessLog: &AccessLog{
+					Disable: true,
+				},
+			},
+		},
+		{
+			msg: "errorLogFormat default is propagated to dataplane logging",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel:     helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						ErrorLogFormat: helpers.GetPointer(ngfAPIv1alpha2.NginxErrorLogFormatDefault),
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel:     "info",
+				ErrorLogFormat: "default",
+			},
+		},
+		{
+			msg: "errorLogFormat unset leaves dataplane Logging.ErrorLogFormat at zero value",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+					},
+				},
+			},
+			expLoggingSettings: Logging{ErrorLevel: "info"},
+		},
+		{
+			msg: "AccessLog configured",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Format: helpers.GetPointer(logFormat),
+						},
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel: "info",
+				AccessLog: &AccessLog{
+					Format: logFormat,
+					Path:   DefaultAccessLogPath,
+				},
+			},
+		},
+		{
+			msg: "AccessLog is configured and Disable = false",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Disable: helpers.GetPointer(false),
+							Format:  helpers.GetPointer(logFormat),
+						},
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel: "info",
+
+				AccessLog: &AccessLog{
+					Disable: false,
+					Format:  logFormat,
+					Path:    DefaultAccessLogPath,
+				},
+			},
+		},
+		{
+			msg: "Nothing configured if AccessLog Format is missing",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Disable: helpers.GetPointer(false),
+						},
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel: "info",
+				AccessLog:  nil,
+			},
+		},
+		{
+			msg: "AccessLog OFF while LogFormat is configured",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Disable: helpers.GetPointer(true),
+							Format:  helpers.GetPointer(logFormat),
+						},
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel: "info",
+				AccessLog: &AccessLog{
+					Disable: true,
+				},
+			},
+		},
+		{
+			msg: "AccessLog OFF",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Disable: helpers.GetPointer(true),
+						},
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel: "info",
+				AccessLog: &AccessLog{
+					Disable: true,
+				},
+			},
+		},
+		{
+			msg: "AccessLog with escape=json",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Format: helpers.GetPointer(logFormat),
+							Escape: helpers.GetPointer(ngfAPIv1alpha2.NginxAccessLogEscapeJSON),
+						},
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel: "info",
+				AccessLog: &AccessLog{
+					Format: logFormat,
+					Escape: "json",
+					Path:   DefaultAccessLogPath,
+				},
+			},
+		},
+		{
+			msg: "AccessLog with escape=default",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Format: helpers.GetPointer(logFormat),
+							Escape: helpers.GetPointer(ngfAPIv1alpha2.NginxAccessLogEscapeDefault),
+						},
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel: "info",
+				AccessLog: &AccessLog{
+					Format: logFormat,
+					Escape: "default",
+					Path:   DefaultAccessLogPath,
+				},
+			},
+		},
+		{
+			msg: "AccessLog with escape=none",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Format: helpers.GetPointer(logFormat),
+							Escape: helpers.GetPointer(ngfAPIv1alpha2.NginxAccessLogEscapeNone),
+						},
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel: "info",
+				AccessLog: &AccessLog{
+					Format: logFormat,
+					Escape: "none",
+					Path:   DefaultAccessLogPath,
+				},
+			},
+		},
+		{
+			msg: "AccessLog escape not set when format is missing",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelInfo),
+						AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+							Escape: helpers.GetPointer(ngfAPIv1alpha2.NginxAccessLogEscapeJSON),
+						},
+					},
+				},
+			},
+			expLoggingSettings: Logging{
+				ErrorLevel: "info",
+				AccessLog:  nil,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(buildLogging(tc.gw)).To(Equal(tc.expLoggingSettings))
+		})
+	}
+}
+
+func TestCreateSnippetName(t *testing.T) {
+	t.Parallel()
+
+	g := NewWithT(t)
+
+	name := createSnippetName(
+		ngfAPIv1alpha1.NginxContextHTTPServerLocation,
+		types.NamespacedName{Namespace: "some-ns", Name: "some-name"},
+	)
+	g.Expect(name).To(Equal("SnippetsFilter_http.server.location_some-ns_some-name"))
+}
+
+func TestBuildSnippetForContext(t *testing.T) {
+	t.Parallel()
+
+	validUnreferenced := &graph.SnippetsFilter{
+		Source: &ngfAPIv1alpha1.SnippetsFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "valid-unreferenced",
+				Namespace: "default",
+			},
+		},
+		Valid:      true,
+		Referenced: false,
+		Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+			ngfAPIv1alpha1.NginxContextHTTPServerLocation: "valid unreferenced",
+		},
+	}
+
+	invalidUnreferenced := &graph.SnippetsFilter{
+		Source: &ngfAPIv1alpha1.SnippetsFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "invalid-unreferenced",
+				Namespace: "default",
+			},
+		},
+		Valid:      false,
+		Referenced: false,
+		Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+			ngfAPIv1alpha1.NginxContextHTTPServerLocation: "invalid unreferenced",
+		},
+	}
+
+	invalidReferenced := &graph.SnippetsFilter{
+		Source: &ngfAPIv1alpha1.SnippetsFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "invalid-referenced",
+				Namespace: "default",
+			},
+		},
+		Valid:      false,
+		Referenced: true,
+		Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+			ngfAPIv1alpha1.NginxContextHTTPServerLocation: "invalid referenced",
+		},
+	}
+
+	validReferenced1 := &graph.SnippetsFilter{
+		Source: &ngfAPIv1alpha1.SnippetsFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "valid-referenced1",
+				Namespace: "default",
+			},
+		},
+		Valid:      true,
+		Referenced: true,
+		Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+			ngfAPIv1alpha1.NginxContextHTTP: "http valid referenced 1",
+			ngfAPIv1alpha1.NginxContextMain: "main valid referenced 1",
+		},
+	}
+
+	validReferenced2 := &graph.SnippetsFilter{
+		Source: &ngfAPIv1alpha1.SnippetsFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "valid-referenced2",
+				Namespace: "other-ns",
+			},
+		},
+		Valid:      true,
+		Referenced: true,
+		Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+			ngfAPIv1alpha1.NginxContextMain: "main valid referenced 2",
+			ngfAPIv1alpha1.NginxContextHTTP: "http valid referenced 2",
+		},
+	}
+
+	validReferenced3 := &graph.SnippetsFilter{
+		Source: &ngfAPIv1alpha1.SnippetsFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "valid-referenced3",
+				Namespace: "other-ns",
+			},
+		},
+		Valid:      true,
+		Referenced: true,
+		Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+			ngfAPIv1alpha1.NginxContextHTTPServerLocation: "location valid referenced 2",
+		},
+	}
+
+	expMainSnippets := []Snippet{
+		{
+			Name:     createSnippetName(ngfAPIv1alpha1.NginxContextMain, client.ObjectKeyFromObject(validReferenced1.Source)),
+			Contents: "main valid referenced 1",
+		},
+		{
+			Name:     createSnippetName(ngfAPIv1alpha1.NginxContextMain, client.ObjectKeyFromObject(validReferenced2.Source)),
+			Contents: "main valid referenced 2",
+		},
+	}
+
+	expHTTPSnippets := []Snippet{
+		{
+			Name:     createSnippetName(ngfAPIv1alpha1.NginxContextHTTP, client.ObjectKeyFromObject(validReferenced1.Source)),
+			Contents: "http valid referenced 1",
+		},
+		{
+			Name:     createSnippetName(ngfAPIv1alpha1.NginxContextHTTP, client.ObjectKeyFromObject(validReferenced2.Source)),
+			Contents: "http valid referenced 2",
+		},
+	}
+
+	getSnippetsFilters := func() map[types.NamespacedName]*graph.SnippetsFilter {
+		return map[types.NamespacedName]*graph.SnippetsFilter{
+			client.ObjectKeyFromObject(validUnreferenced.Source):   validUnreferenced,
+			client.ObjectKeyFromObject(invalidUnreferenced.Source): invalidUnreferenced,
+			client.ObjectKeyFromObject(invalidReferenced.Source):   invalidReferenced,
+			client.ObjectKeyFromObject(validReferenced1.Source):    validReferenced1,
+			client.ObjectKeyFromObject(validReferenced2.Source):    validReferenced2,
+			client.ObjectKeyFromObject(validReferenced3.Source):    validReferenced3,
+		}
+	}
+
+	tests := []struct {
+		name            string
+		snippetsFilters map[types.NamespacedName]*graph.SnippetsFilter
+		ctx             ngfAPIv1alpha1.NginxContext
+		expSnippets     []Snippet
+	}{
+		{
+			name:            "no snippets filters",
+			snippetsFilters: nil,
+			ctx:             ngfAPIv1alpha1.NginxContextMain,
+			expSnippets:     nil,
+		},
+		{
+			name:            "main context: mix of invalid, unreferenced, and valid, referenced snippets filters",
+			snippetsFilters: getSnippetsFilters(),
+			ctx:             ngfAPIv1alpha1.NginxContextMain,
+			expSnippets:     expMainSnippets,
+		},
+		{
+			name:            "http context: mix of invalid, unreferenced, and valid, referenced snippets filters",
+			snippetsFilters: getSnippetsFilters(),
+			ctx:             ngfAPIv1alpha1.NginxContextHTTP,
+			expSnippets:     expHTTPSnippets,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			g := NewWithT(t)
+			snippets := buildSnippetsForContext(test.snippetsFilters, test.ctx)
+			g.Expect(snippets).To(ConsistOf(test.expSnippets))
+		})
+	}
+}
+
+func TestBuildAuxiliarySecrets(t *testing.T) {
+	t.Parallel()
+
+	secretsMap := map[types.NamespacedName][]graph.PlusSecretFile{
+		{Name: "license", Namespace: "ngf"}: {
+			{
+				Type:    graph.PlusReportJWTToken,
+				Content: []byte("license"),
+			},
+		},
+		{Name: "ca", Namespace: "ngf"}: {
+			{
+				Type:    graph.PlusReportCACertificate,
+				Content: []byte("ca"),
+			},
+		},
+		{Name: "client", Namespace: "ngf"}: {
+			{
+				Type:    graph.PlusReportClientSSLCertificate,
+				Content: []byte("cert"),
+			},
+			{
+				Type:    graph.PlusReportClientSSLKey,
+				Content: []byte("key"),
+			},
+		},
+	}
+	expSecrets := map[graph.SecretFileType][]byte{
+		graph.PlusReportJWTToken:             []byte("license"),
+		graph.PlusReportCACertificate:        []byte("ca"),
+		graph.PlusReportClientSSLCertificate: []byte("cert"),
+		graph.PlusReportClientSSLKey:         []byte("key"),
+	}
+
+	g := NewWithT(t)
+
+	g.Expect(buildAuxiliarySecrets(secretsMap)).To(Equal(expSecrets))
+}
+
+func TestBuildNginxPlus(t *testing.T) {
+	defaultNginxPlus := NginxPlus{AllowedAddresses: []string{"127.0.0.1"}}
+
+	t.Parallel()
+	tests := []struct {
+		msg          string
+		gw           *graph.Gateway
+		expNginxPlus NginxPlus
+	}{
+		{
+			msg:          "NginxProxy is nil",
+			gw:           &graph.Gateway{},
+			expNginxPlus: defaultNginxPlus,
+		},
+		{
+			msg: "NginxPlus default values are used when NginxProxy doesn't specify NginxPlus settings",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{},
+			},
+			expNginxPlus: defaultNginxPlus,
+		},
+		{
+			msg: "NginxProxy specifies one allowed address",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					NginxPlus: &ngfAPIv1alpha2.NginxPlus{
+						AllowedAddresses: []ngfAPIv1alpha2.NginxPlusAllowAddress{
+							{Type: ngfAPIv1alpha2.NginxPlusAllowIPAddressType, Value: "127.0.0.3"},
+						},
+					},
+				},
+			},
+			expNginxPlus: NginxPlus{AllowedAddresses: []string{"127.0.0.3"}},
+		},
+		{
+			msg: "NginxProxy specifies multiple allowed addresses",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					NginxPlus: &ngfAPIv1alpha2.NginxPlus{
+						AllowedAddresses: []ngfAPIv1alpha2.NginxPlusAllowAddress{
+							{Type: ngfAPIv1alpha2.NginxPlusAllowIPAddressType, Value: "127.0.0.3"},
+							{Type: ngfAPIv1alpha2.NginxPlusAllowIPAddressType, Value: "25.0.0.3"},
+						},
+					},
+				},
+			},
+			expNginxPlus: NginxPlus{AllowedAddresses: []string{"127.0.0.3", "25.0.0.3"}},
+		},
+		{
+			msg: "NginxProxy specifies 127.0.0.1 as allowed address",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					NginxPlus: &ngfAPIv1alpha2.NginxPlus{
+						AllowedAddresses: []ngfAPIv1alpha2.NginxPlusAllowAddress{
+							{Type: ngfAPIv1alpha2.NginxPlusAllowIPAddressType, Value: "127.0.0.1"},
+						},
+					},
+				},
+			},
+			expNginxPlus: defaultNginxPlus,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(buildNginxPlus(tc.gw)).To(Equal(tc.expNginxPlus))
+		})
+	}
+}
+
+func TestBuildWorkerConnections(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		gw                   *graph.Gateway
+		msg                  string
+		expWorkerConnections int32
+	}{
+		{
+			msg:                  "NginxProxy is nil",
+			gw:                   &graph.Gateway{},
+			expWorkerConnections: DefaultWorkerConnections,
+		},
+		{
+			msg: "NginxProxy doesn't specify worker connections",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{},
+			},
+			expWorkerConnections: DefaultWorkerConnections,
+		},
+		{
+			msg: "NginxProxy specifies worker connections",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					WorkerConnections: helpers.GetPointer(int32(2048)),
+				},
+			},
+			expWorkerConnections: 2048,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(buildWorkerConnections(tc.gw)).To(Equal(tc.expWorkerConnections))
+		})
+	}
+}
+
+func TestBuildWorkerProcesses(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		gw                 *graph.Gateway
+		msg                string
+		expWorkerProcesses string
+	}{
+		{
+			msg:                "NginxProxy is nil",
+			gw:                 &graph.Gateway{},
+			expWorkerProcesses: DefaultWorkerProcesses,
+		},
+		{
+			msg: "NginxProxy doesn't specify worker processes",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{},
+			},
+			expWorkerProcesses: DefaultWorkerProcesses,
+		},
+		{
+			msg: "NginxProxy specifies worker processes",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					WorkerProcesses: helpers.GetPointer[int32](2),
+				},
+			},
+			expWorkerProcesses: "2",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(buildWorkerProcesses(tc.gw)).To(Equal(tc.expWorkerProcesses))
+		})
+	}
+}
+
+func TestBuildWorkerRlimitNofile(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		gw       *graph.Gateway
+		expValue *int32
+		msg      string
+	}{
+		{
+			msg:      "NginxProxy is nil",
+			gw:       &graph.Gateway{},
+			expValue: nil,
+		},
+		{
+			msg: "NginxProxy doesn't specify worker_rlimit_nofile",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{},
+			},
+			expValue: nil,
+		},
+		{
+			msg: "NginxProxy specifies worker_rlimit_nofile",
+			gw: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					WorkerRlimitNofile: helpers.GetPointer[int32](3124),
+				},
+			},
+			expValue: helpers.GetPointer[int32](3124),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(buildWorkerRlimitNofile(tc.gw)).To(Equal(tc.expValue))
+		})
+	}
+}
+
+func TestBuildBaseHTTPConfig_ReadinessProbe(t *testing.T) {
+	t.Parallel()
+
+	baseHTTPConfig := BaseHTTPConfig{
+		NginxReadinessProbePort: DefaultNginxReadinessProbePort,
+		NginxReadinessProbePath: DefaultNginxReadinessProbePath,
+		HTTP2:                   true,
+		IPFamily:                Dual,
+		ServerTokens:            graph.ServerTokenOff,
+	}
+
+	test := []struct {
+		gateway  *graph.Gateway
+		msg      string
+		expected BaseHTTPConfig
+	}{
+		{
+			msg: "nginx proxy config is nil",
+			gateway: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{},
+			},
+			expected: baseHTTPConfig,
+		},
+		{
+			msg: "kubernetes spec is nil",
+			gateway: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{},
+				},
+			},
+			expected: baseHTTPConfig,
+		},
+		{
+			msg: "readiness probe spec is nil",
+			gateway: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+						Deployment: &ngfAPIv1alpha2.DeploymentSpec{
+							Container: ngfAPIv1alpha2.ContainerSpec{
+								ReadinessProbe: nil,
+							},
+						},
+					},
+				},
+			},
+			expected: baseHTTPConfig,
+		},
+		{
+			msg: "readiness probe spec is empty",
+			gateway: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+						Deployment: &ngfAPIv1alpha2.DeploymentSpec{
+							Container: ngfAPIv1alpha2.ContainerSpec{
+								ReadinessProbe: &ngfAPIv1alpha2.ReadinessProbeSpec{},
+							},
+						},
+					},
+				},
+			},
+			expected: BaseHTTPConfig{
+				NginxReadinessProbePort: DefaultNginxReadinessProbePort,
+				NginxReadinessProbePath: DefaultNginxReadinessProbePath,
+				IPFamily:                Dual,
+				HTTP2:                   true,
+				ServerTokens:            graph.ServerTokenOff,
+			},
+		},
+		{
+			msg: "readiness probe is configured for deployment kind",
+			gateway: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+						Deployment: &ngfAPIv1alpha2.DeploymentSpec{
+							Container: ngfAPIv1alpha2.ContainerSpec{
+								ReadinessProbe: &ngfAPIv1alpha2.ReadinessProbeSpec{
+									Port: helpers.GetPointer(int32(7020)),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: BaseHTTPConfig{
+				NginxReadinessProbePort: int32(7020),
+				NginxReadinessProbePath: DefaultNginxReadinessProbePath,
+				IPFamily:                Dual,
+				HTTP2:                   true,
+				ServerTokens:            graph.ServerTokenOff,
+			},
+		},
+		{
+			msg: "readiness probe is configured for daemonset kind",
+			gateway: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+						DaemonSet: &ngfAPIv1alpha2.DaemonSetSpec{
+							Container: ngfAPIv1alpha2.ContainerSpec{
+								ReadinessProbe: &ngfAPIv1alpha2.ReadinessProbeSpec{
+									Port: helpers.GetPointer(int32(8881)),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: BaseHTTPConfig{
+				NginxReadinessProbePort: int32(8881),
+				NginxReadinessProbePath: DefaultNginxReadinessProbePath,
+				IPFamily:                Dual,
+				HTTP2:                   true,
+				ServerTokens:            graph.ServerTokenOff,
+			},
+		},
+		{
+			msg: "readiness probe is configured for deployment with custom path",
+			gateway: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+						Deployment: &ngfAPIv1alpha2.DeploymentSpec{
+							Container: ngfAPIv1alpha2.ContainerSpec{
+								ReadinessProbe: &ngfAPIv1alpha2.ReadinessProbeSpec{
+									Port: helpers.GetPointer(int32(9090)),
+									Path: helpers.GetPointer("/custom/health"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: BaseHTTPConfig{
+				NginxReadinessProbePort: int32(9090),
+				NginxReadinessProbePath: "/custom/health",
+				IPFamily:                Dual,
+				HTTP2:                   true,
+				ServerTokens:            graph.ServerTokenOff,
+			},
+		},
+		{
+			msg: "readiness probe is configured for daemonset with custom path",
+			gateway: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+						DaemonSet: &ngfAPIv1alpha2.DaemonSetSpec{
+							Container: ngfAPIv1alpha2.ContainerSpec{
+								ReadinessProbe: &ngfAPIv1alpha2.ReadinessProbeSpec{
+									Port: helpers.GetPointer(int32(7777)),
+									Path: helpers.GetPointer("/status"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: BaseHTTPConfig{
+				NginxReadinessProbePort: int32(7777),
+				NginxReadinessProbePath: "/status",
+				IPFamily:                Dual,
+				HTTP2:                   true,
+				ServerTokens:            graph.ServerTokenOff,
+			},
+		},
+		{
+			msg: "readiness probe is configured with only custom path and no port",
+			gateway: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					Kubernetes: &ngfAPIv1alpha2.KubernetesSpec{
+						Deployment: &ngfAPIv1alpha2.DeploymentSpec{
+							Container: ngfAPIv1alpha2.ContainerSpec{
+								ReadinessProbe: &ngfAPIv1alpha2.ReadinessProbeSpec{
+									Path: helpers.GetPointer("/healthz"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: BaseHTTPConfig{
+				NginxReadinessProbePort: DefaultNginxReadinessProbePort,
+				NginxReadinessProbePath: "/healthz",
+				IPFamily:                Dual,
+				HTTP2:                   true,
+				ServerTokens:            graph.ServerTokenOff,
+			},
+		},
+	}
+
+	for _, tc := range test {
+		t.Run(tc.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(buildBaseHTTPConfig(tc.gateway, nil, nil, ngfAPIv1alpha2.Dual)).To(Equal(tc.expected))
+		})
+	}
+}
+
+func TestBuildDNSResolverConfig(t *testing.T) {
+	t.Parallel()
+
+	addr := []ngfAPIv1alpha2.DNSResolverAddress{
+		{
+			Type:  ngfAPIv1alpha2.DNSResolverIPAddressType,
+			Value: "8.8.8.8",
+		},
+		{
+			Type:  ngfAPIv1alpha2.DNSResolverHostnameType,
+			Value: "dns.google",
+		},
+	}
+
+	tests := []struct {
+		dnsResolver *ngfAPIv1alpha2.DNSResolver
+		expected    *DNSResolverConfig
+		name        string
+	}{
+		{
+			name:        "nil DNS resolver",
+			dnsResolver: nil,
+			expected:    nil,
+		},
+		{
+			name: "DNS resolver with all options",
+			dnsResolver: &ngfAPIv1alpha2.DNSResolver{
+				Addresses:   addr,
+				Timeout:     helpers.GetPointer(ngfAPIv1alpha1.Duration("10s")),
+				CacheTTL:    helpers.GetPointer(ngfAPIv1alpha1.Duration("60s")),
+				DisableIPv6: helpers.GetPointer(true),
+			},
+			expected: &DNSResolverConfig{
+				Addresses:   []string{"8.8.8.8", "dns.google"},
+				Timeout:     "10s",
+				Valid:       "60s",
+				DisableIPv6: true,
+			},
+		},
+		{
+			name: "DNS resolver with minimal configuration",
+			dnsResolver: &ngfAPIv1alpha2.DNSResolver{
+				Addresses: addr,
+			},
+			expected: &DNSResolverConfig{
+				Addresses:   []string{"8.8.8.8", "dns.google"},
+				DisableIPv6: false,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := buildDNSResolverConfig(test.dnsResolver)
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestBuildDisableBaseProxySetHeaders(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		np       *graph.EffectiveNginxProxy
+		name     string
+		expected []string
+	}{
+		{
+			name:     "nil nginx proxy",
+			np:       nil,
+			expected: nil,
+		},
+		{
+			name:     "empty disabled headers",
+			np:       &graph.EffectiveNginxProxy{},
+			expected: nil,
+		},
+		{
+			name: "disabled headers configured",
+			np: &graph.EffectiveNginxProxy{
+				DisableBaseHeaders: []ngfAPIv1alpha2.BaseHeaderName{
+					ngfAPIv1alpha2.HeaderXForwardedFor,
+					ngfAPIv1alpha2.HeaderXForwardedProto,
+				},
+			},
+			expected: []string{
+				string(ngfAPIv1alpha2.HeaderXForwardedFor),
+				string(ngfAPIv1alpha2.HeaderXForwardedProto),
+			},
+		},
+		{
+			name: "wildcard disabled headers configured",
+			np: &graph.EffectiveNginxProxy{
+				DisableBaseHeaders: []ngfAPIv1alpha2.BaseHeaderName{
+					ngfAPIv1alpha2.AllXBaseHeaders,
+				},
+			},
+			expected: []string{"*"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := buildDisableBaseProxySetHeaders(tc.np)
+			g.Expect(result).To(Equal(tc.expected))
+		})
+	}
+}
+
+//nolint:gosec // Tests with mock SSL/TLS configuration data, not real credentials.
+func TestBuildConfiguration_GatewaysAndListeners(t *testing.T) {
+	t.Parallel()
+
+	fakeResolver := &resolverfakes.ServiceResolverMock{
+		ResolveFunc: func(
+			context.Context,
+			logr.Logger,
+			types.NamespacedName,
+			apiv1.ServicePort,
+			[]discoveryV1.AddressType,
+		) ([]resolver.Endpoint, error) {
+			return fooEndpoints, nil
+		},
+	}
+
+	secret1NsName := types.NamespacedName{Namespace: "test", Name: "secret-1"}
+	secret1 := &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secret1NsName.Name,
+				Namespace: secret1NsName.Namespace,
+			},
+			Data: map[string][]byte{
+				apiv1.TLSCertKey:       []byte("cert-1"),
+				apiv1.TLSPrivateKeyKey: []byte("privateKey-1"),
+			},
+		},
+		CertBundle: secrets.NewCertificateBundle(
+			secret1NsName,
+			"Secret",
+			&secrets.Certificate{
+				TLSCert:       []byte("cert-1"),
+				TLSPrivateKey: []byte("privateKey-1"),
+			},
+		),
+	}
+
+	listener80 := v1.Listener{
+		Name:     "listener-80-1",
+		Hostname: nil,
+		Port:     80,
+		Protocol: v1.HTTPProtocolType,
+	}
+
+	listener443 := v1.Listener{
+		Name:     "listener-443-1",
+		Hostname: nil,
+		Port:     443,
+		Protocol: v1.HTTPSProtocolType,
+		TLS: &v1.ListenerTLSConfig{
+			Mode: helpers.GetPointer(v1.TLSModeTerminate),
+			CertificateRefs: []v1.SecretObjectReference{
+				{
+					Kind:      (*v1.Kind)(helpers.GetPointer("Secret")),
+					Namespace: helpers.GetPointer(v1.Namespace(secret1NsName.Namespace)),
+					Name:      v1.ObjectName(secret1NsName.Name),
+				},
+			},
+		},
+	}
+
+	invalidListener := v1.Listener{
+		Name:     "invalid-listener",
+		Hostname: nil,
+		Port:     443,
+		Protocol: v1.HTTPSProtocolType,
+		TLS: &v1.ListenerTLSConfig{
+			// Mode is missing, that's why invalid
+			CertificateRefs: []v1.SecretObjectReference{
+				{
+					Kind:      helpers.GetPointer[v1.Kind]("Secret"),
+					Namespace: helpers.GetPointer(v1.Namespace(secret1NsName.Namespace)),
+					Name:      v1.ObjectName(secret1NsName.Name),
+				},
+			},
+		},
+	}
+
+	hr1Invalid, _, routeHR1Invalid := createTestResources(
+		"hr-1",
+		"foo.example.com",
+		"listener-80-1",
+		pathAndType{path: "/", pathType: prefix},
+	)
+
+	routeHR1Invalid.Valid = false
+
+	httpsHR1Invalid, _, httpsRouteHR1Invalid := createTestResources(
+		"https-hr-1",
+		"foo.example.com",
+		"listener-443-1",
+		pathAndType{path: "/", pathType: prefix},
+	)
+	httpsRouteHR1Invalid.Valid = false
+
+	tests := []commonTestCase{
+		{
+			graph: getNormalGraph(),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = []VirtualServer{}
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				return conf
+			}),
+			msg: "no listeners and routes",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+				})
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				return conf
+			}),
+			msg: "http listener with no routes",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, []*graph.Listener{
+					{
+						Name:        "listener-80-1",
+						GatewayName: gatewayNsName,
+						Source:      listener80,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(hr1Invalid): routeHR1Invalid,
+						},
+					},
+					{
+						Name:        "listener-443-1",
+						GatewayName: gatewayNsName,
+						Source:      listener443, // nil hostname
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(httpsHR1Invalid): httpsRouteHR1Invalid,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret1NsName},
+					},
+				}...)
+				g.Routes[graph.CreateRouteKey(hr1Invalid)] = routeHR1Invalid
+				g.ReferencedSecrets[secret1NsName] = secret1
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = []VirtualServer{{
+					IsDefault: true,
+					Port:      80,
+				}}
+				conf.SSLServers = append(conf.SSLServers, VirtualServer{
+					Hostname: wildcardHostname,
+					SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+					Port:     443,
+				})
+				conf.SSLServers[0].SSL = &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}}
+				conf.SSLListenerHostnames = map[int32][]string{443: {""}}
+				return conf
+			}),
+			msg: "http and https listeners with no valid routes",
+		},
+
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, []*graph.Listener{
+					{
+						Name:            "listener-443-1",
+						GatewayName:     gatewayNsName,
+						Source:          listener443, // nil hostname
+						Valid:           true,
+						Routes:          map[graph.RouteKey]*graph.L7Route{},
+						ResolvedSecrets: []types.NamespacedName{secret1NsName},
+					},
+					{
+						Name:            "listener-443-with-hostname",
+						GatewayName:     gatewayNsName,
+						Source:          listener443WithHostname, // non-nil hostname
+						Valid:           true,
+						Routes:          map[graph.RouteKey]*graph.L7Route{},
+						ResolvedSecrets: []types.NamespacedName{secret2NsName},
+					},
+				}...)
+				g.ReferencedSecrets = map[types.NamespacedName]*secrets.Secret{
+					secret1NsName: secret1,
+					secret2NsName: secret2,
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = []VirtualServer{}
+				conf.SSLServers = append(conf.SSLServers, []VirtualServer{
+					{
+						Hostname: string(hostname),
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-2"}},
+						Port:     443,
+					},
+					{
+						Hostname: wildcardHostname,
+						SSL:      &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}},
+						Port:     443,
+					},
+				}...)
+				conf.SSLKeyPairs["ssl_keypair_test_secret-2"] = SSLKeyPair{
+					Cert: []byte("cert-2"),
+					Key:  []byte("privateKey-2"),
+				}
+				conf.SSLServers[0].SSL = &SSL{KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_secret-1"}}
+				conf.SSLListenerHostnames = map[int32][]string{443: {"", "example.com"}}
+				return conf
+			}),
+			msg: "https listeners with no routes",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:            "invalid-listener",
+					GatewayName:     gatewayNsName,
+					Source:          invalidListener,
+					Valid:           false,
+					ResolvedSecrets: []types.NamespacedName{secret1NsName},
+				})
+				g.Routes = map[graph.RouteKey]*graph.L7Route{
+					graph.CreateRouteKey(httpsHR1): httpsRouteHR1,
+					graph.CreateRouteKey(httpsHR2): httpsRouteHR2,
+				}
+				g.ReferencedSecrets[secret1NsName] = secret1
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = []VirtualServer{}
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				return conf
+			}),
+			msg: "invalid https listener with resolved secret",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				g.GatewayClass.Valid = false
+				return g
+			}),
+			expConf: defaultConfig,
+			msg:     "invalid gatewayclass",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Valid = true
+				gw.SecretRef = &types.NamespacedName{
+					Namespace: secret1NsName.Namespace,
+					Name:      secret1NsName.Name,
+				}
+				g.ReferencedSecrets[secret1NsName] = secret1
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = []VirtualServer{}
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{
+					"ssl_keypair_test_secret-1": {
+						Cert: []byte("cert-1"),
+						Key:  []byte("privateKey-1"),
+					},
+				}
+				conf.BaseHTTPConfig = BaseHTTPConfig{
+					HTTP2:                   true,
+					IPFamily:                Dual,
+					NginxReadinessProbePort: DefaultNginxReadinessProbePort,
+					NginxReadinessProbePath: DefaultNginxReadinessProbePath,
+					GatewaySecretID:         "ssl_keypair_test_secret-1",
+				}
+				return conf
+			}),
+			msg: "gateway is valid and client certificate is set -- " +
+				"secret should be part of SSLKeyPairs and config",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.SecretRef = &types.NamespacedName{
+					Namespace: secret1NsName.Namespace,
+					Name:      secret1NsName.Name,
+				}
+				g.ReferencedSecrets[secret1NsName] = secret1
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.HTTPServers = []VirtualServer{}
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				conf.BaseHTTPConfig = defaultBaseHTTPConfig
+				return conf
+			}),
+			msg: "gateway is invalid and client certificate is set -- " +
+				"secret will be ignored",
+		},
+		{
+			msg: "https listener with TLS options",
+			graph: func() *graph.Graph {
+				tlsHR, _, tlsRoute := createTestResources(
+					"hr-1",
+					"foo.example.com",
+					"listener-443-tls-options",
+					pathAndType{path: "/", pathType: prefix},
+				)
+
+				return getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+					listenerTLSOptions := v1.Listener{
+						Name:     "listener-443-tls-options",
+						Hostname: nil,
+						Port:     443,
+						Protocol: v1.HTTPSProtocolType,
+						TLS: &v1.ListenerTLSConfig{
+							Mode: helpers.GetPointer(v1.TLSModeTerminate),
+							CertificateRefs: []v1.SecretObjectReference{
+								{
+									Kind:      (*v1.Kind)(helpers.GetPointer("Secret")),
+									Namespace: helpers.GetPointer(v1.Namespace(secret1NsName.Namespace)),
+									Name:      v1.ObjectName(secret1NsName.Name),
+								},
+							},
+							Options: map[v1.AnnotationKey]v1.AnnotationValue{
+								"nginx.org/ssl-protocols":             "TLSv1.2 TLSv1.3",
+								"nginx.org/ssl-ciphers":               "ECDHE-RSA-AES256-GCM-SHA384:HIGH:!aNULL:!MD5",
+								"nginx.org/ssl-prefer-server-ciphers": "on",
+							},
+						},
+					}
+
+					gw := g.Gateways[gatewayNsName]
+					gw.Listeners = append(gw.Listeners, &graph.Listener{
+						Name:        "listener-443-tls-options",
+						GatewayName: gatewayNsName,
+						Source:      listenerTLSOptions,
+						Valid:       true,
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							graph.CreateRouteKey(tlsHR): tlsRoute,
+						},
+						ResolvedSecrets: []types.NamespacedName{secret1NsName},
+					})
+					g.Routes = map[graph.RouteKey]*graph.L7Route{
+						graph.CreateRouteKey(tlsHR): tlsRoute,
+					}
+					g.ReferencedSecrets[secret1NsName] = secret1
+					return g
+				})
+			}(),
+			expConf: func() Configuration {
+				tlsHR, expTLSGroups, _ := createTestResources(
+					"hr-1",
+					"foo.example.com",
+					"listener-443-tls-options",
+					pathAndType{path: "/", pathType: prefix},
+				)
+
+				return getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+					conf.HTTPServers = []VirtualServer{}
+					conf.SSLServers = []VirtualServer{
+						{
+							IsDefault: true,
+							Port:      443,
+							SSL: &SSL{
+								KeyPairIDs:          []SSLKeyPairID{"ssl_keypair_test_secret-1"},
+								Protocols:           "TLSv1.2 TLSv1.3",
+								Ciphers:             "ECDHE-RSA-AES256-GCM-SHA384:HIGH:!aNULL:!MD5",
+								PreferServerCiphers: true,
+							},
+						},
+						{
+							IsDefault: false,
+							Port:      443,
+							Hostname:  "foo.example.com",
+							SSL: &SSL{
+								KeyPairIDs:          []SSLKeyPairID{"ssl_keypair_test_secret-1"},
+								Protocols:           "TLSv1.2 TLSv1.3",
+								Ciphers:             "ECDHE-RSA-AES256-GCM-SHA384:HIGH:!aNULL:!MD5",
+								PreferServerCiphers: true,
+							},
+							PathRules: []PathRule{
+								{
+									Path:     "/",
+									PathType: PathTypePrefix,
+									MatchRules: []MatchRule{
+										{
+											BackendGroup: expTLSGroups[0],
+											Source:       &tlsHR.ObjectMeta,
+										},
+									},
+								},
+							},
+						},
+						{
+							IsDefault: false,
+							Port:      443,
+							Hostname:  "~^",
+							SSL: &SSL{
+								KeyPairIDs:          []SSLKeyPairID{"ssl_keypair_test_secret-1"},
+								Protocols:           "TLSv1.2 TLSv1.3",
+								Ciphers:             "ECDHE-RSA-AES256-GCM-SHA384:HIGH:!aNULL:!MD5",
+								PreferServerCiphers: true,
+							},
+						},
+					}
+					conf.BackendGroups = []BackendGroup{expTLSGroups[0]}
+					conf.Upstreams = []Upstream{fooUpstream}
+					conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{
+						"ssl_keypair_test_secret-1": {
+							Cert: []byte("cert-1"),
+							Key:  []byte("privateKey-1"),
+						},
+					}
+					conf.SSLListenerHostnames = map[int32][]string{443: {""}}
+					return conf
+				})
+			}(),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := BuildConfiguration(
+				t.Context(),
+				logr.Discard(),
+				test.graph,
+				test.graph.Gateways[gatewayNsName],
+				fakeResolver,
+				false,
+				ngfAPIv1alpha2.Dual,
+			)
+
+			assertBuildConfiguration(g, result, test.expConf)
+		})
+	}
+}
+
+func TestBuildConfiguration_NginxProxy(t *testing.T) {
+	t.Parallel()
+
+	fakeResolver := &resolverfakes.ServiceResolverMock{
+		ResolveFunc: func(
+			context.Context, logr.Logger, types.NamespacedName, apiv1.ServicePort, []discoveryV1.AddressType) (
+			[]resolver.Endpoint, error,
+		) {
+			return fooEndpoints, nil
+		},
+	}
+
+	nginxProxy := &graph.EffectiveNginxProxy{
+		Telemetry: &ngfAPIv1alpha2.Telemetry{
+			Exporter: &ngfAPIv1alpha2.TelemetryExporter{
+				Endpoint:   helpers.GetPointer("my-otel.svc:4563"),
+				BatchSize:  helpers.GetPointer(int32(512)),
+				BatchCount: helpers.GetPointer(int32(4)),
+				Interval:   helpers.GetPointer(ngfAPIv1alpha1.Duration("5s")),
+			},
+			ServiceName: helpers.GetPointer("my-svc"),
+		},
+		DisableHTTP2:             helpers.GetPointer(true),
+		IPFamily:                 helpers.GetPointer(ngfAPIv1alpha2.Dual),
+		DisableSNIHostValidation: helpers.GetPointer(true),
+	}
+
+	nginxProxyIPv4 := &graph.EffectiveNginxProxy{
+		IPFamily: helpers.GetPointer(ngfAPIv1alpha2.IPv4),
+	}
+
+	nginxProxyIPv6 := &graph.EffectiveNginxProxy{
+		IPFamily: helpers.GetPointer(ngfAPIv1alpha2.IPv6),
+	}
+
+	tests := []commonTestCase{
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Source.ObjectMeta = metav1.ObjectMeta{
+					Name:      "gw",
+					Namespace: "ns",
+				}
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes:      map[graph.RouteKey]*graph.L7Route{},
+				})
+				gw.EffectiveNginxProxy = nginxProxy
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				conf.Telemetry = Telemetry{
+					Endpoint:       "my-otel.svc:4563",
+					Interval:       "5s",
+					BatchSize:      512,
+					BatchCount:     4,
+					ServiceName:    "ngf:ns:gw:my-svc",
+					Ratios:         []Ratio{},
+					SpanAttributes: []SpanAttribute{},
+				}
+				conf.BaseHTTPConfig = BaseHTTPConfig{
+					HTTP2:                    false,
+					IPFamily:                 Dual,
+					NginxReadinessProbePort:  DefaultNginxReadinessProbePort,
+					NginxReadinessProbePath:  DefaultNginxReadinessProbePath,
+					DisableSNIHostValidation: true,
+					ServerTokens:             graph.ServerTokenOff,
+				}
+				return conf
+			}),
+			msg: "EffectiveNginxProxy with tracing config and http2 disabled",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Source.ObjectMeta = metav1.ObjectMeta{
+					Name:      "gw",
+					Namespace: "ns",
+				}
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes:      map[graph.RouteKey]*graph.L7Route{},
+				})
+				gw.EffectiveNginxProxy = nginxProxyIPv4
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				conf.BaseHTTPConfig = BaseHTTPConfig{
+					HTTP2:                   true,
+					IPFamily:                IPv4,
+					NginxReadinessProbePort: DefaultNginxReadinessProbePort,
+					NginxReadinessProbePath: DefaultNginxReadinessProbePath,
+					ServerTokens:            graph.ServerTokenOff,
+				}
+				return conf
+			}),
+			msg: "GatewayClass has NginxProxy with IPv4 IPFamily and no routes",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Source.ObjectMeta = metav1.ObjectMeta{
+					Name:      "gw",
+					Namespace: "ns",
+				}
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes:      map[graph.RouteKey]*graph.L7Route{},
+				})
+				gw.EffectiveNginxProxy = nginxProxyIPv6
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				conf.BaseHTTPConfig = BaseHTTPConfig{
+					HTTP2:                   true,
+					IPFamily:                IPv6,
+					NginxReadinessProbePort: DefaultNginxReadinessProbePort,
+					NginxReadinessProbePath: DefaultNginxReadinessProbePath,
+					ServerTokens:            graph.ServerTokenOff,
+				}
+				return conf
+			}),
+			msg: "GatewayClass has NginxProxy with IPv6 IPFamily and no routes",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Source.ObjectMeta = metav1.ObjectMeta{
+					Name:      "gw",
+					Namespace: "ns",
+				}
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes:      map[graph.RouteKey]*graph.L7Route{},
+				})
+				gw.EffectiveNginxProxy = &graph.EffectiveNginxProxy{
+					RewriteClientIP: &ngfAPIv1alpha2.RewriteClientIP{
+						SetIPRecursively: helpers.GetPointer(true),
+						TrustedAddresses: []ngfAPIv1alpha2.RewriteClientIPAddress{
+							{
+								Type:  ngfAPIv1alpha2.RewriteClientIPCIDRAddressType,
+								Value: "1.1.1.1/32",
+							},
+						},
+						Mode: helpers.GetPointer(ngfAPIv1alpha2.RewriteClientIPModeProxyProtocol),
+					},
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				conf.BaseHTTPConfig = BaseHTTPConfig{
+					HTTP2:    true,
+					IPFamily: Dual,
+					RewriteClientIPSettings: RewriteClientIPSettings{
+						IPRecursive:      true,
+						TrustedAddresses: []string{"1.1.1.1/32"},
+						Mode:             RewriteIPModeProxyProtocol,
+					},
+					NginxReadinessProbePort: DefaultNginxReadinessProbePort,
+					NginxReadinessProbePath: DefaultNginxReadinessProbePath,
+					ServerTokens:            graph.ServerTokenOff,
+				}
+				return conf
+			}),
+			msg: "GatewayClass has NginxProxy with rewriteClientIP details set",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Source.ObjectMeta = metav1.ObjectMeta{
+					Name:      "gw",
+					Namespace: "ns",
+				}
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes:      map[graph.RouteKey]*graph.L7Route{},
+				})
+				gw.EffectiveNginxProxy = &graph.EffectiveNginxProxy{
+					Logging: &ngfAPIv1alpha2.NginxLogging{
+						ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelDebug),
+					},
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				conf.Logging = Logging{ErrorLevel: "debug"}
+				conf.BaseHTTPConfig.ServerTokens = graph.ServerTokenOff
+				return conf
+			}),
+			msg: "GatewayClass has NginxProxy with error log level set to debug",
+		},
+		{
+			graph: getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Source.ObjectMeta = metav1.ObjectMeta{
+					Name:      "gw",
+					Namespace: "ns",
+				}
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes:      map[graph.RouteKey]*graph.L7Route{},
+				})
+				gw.EffectiveNginxProxy = &graph.EffectiveNginxProxy{
+					NginxPlus: &ngfAPIv1alpha2.NginxPlus{
+						AllowedAddresses: []ngfAPIv1alpha2.NginxPlusAllowAddress{
+							{Type: ngfAPIv1alpha2.NginxPlusAllowIPAddressType, Value: "127.0.0.3"},
+							{Type: ngfAPIv1alpha2.NginxPlusAllowIPAddressType, Value: "25.0.0.3"},
+						},
+					},
+				}
+				return g
+			}),
+			expConf: getModifiedExpectedConfiguration(func(conf Configuration) Configuration {
+				conf.SSLServers = []VirtualServer{}
+				conf.SSLKeyPairs = map[SSLKeyPairID]SSLKeyPair{}
+				conf.BaseHTTPConfig.ServerTokens = graph.ServerTokenOff
+				return conf
+			}),
+			msg: "NginxProxy with NginxPlus allowed addresses configured but running on nginx oss",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := BuildConfiguration(
+				t.Context(),
+				logr.Discard(),
+				test.graph,
+				test.graph.Gateways[gatewayNsName],
+				fakeResolver,
+				false,
+				ngfAPIv1alpha2.Dual,
+			)
+
+			assertBuildConfiguration(g, result, test.expConf)
+		})
+	}
+}
+
+func TestBuildSSL(t *testing.T) {
+	t.Parallel()
+
+	gwNsName := types.NamespacedName{Namespace: "test", Name: "gateway"}
+
+	newListener := func(opts map[v1.AnnotationKey]v1.AnnotationValue) *graph.Listener {
+		return &graph.Listener{
+			Name:            "https",
+			GatewayName:     gwNsName,
+			ResolvedSecrets: []types.NamespacedName{{Namespace: "test", Name: "tls-secret"}},
+			Source: v1.Listener{
+				TLS: &v1.ListenerTLSConfig{
+					Options: opts,
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		listener *graph.Listener
+		expSSL   *SSL
+		name     string
+	}{
+		{
+			name:     "no TLS options",
+			listener: newListener(nil),
+			expSSL: &SSL{
+				KeyPairIDs: []SSLKeyPairID{"ssl_keypair_test_tls-secret"},
+			},
+		},
+		{
+			name: "all TLS options with shared session cache",
+			listener: newListener(map[v1.AnnotationKey]v1.AnnotationValue{
+				graph.SSLProtocolsKey:      "TLSv1.2 TLSv1.3",
+				graph.SSLCiphersKey:        "HIGH:!aNULL",
+				graph.SSLSessionCacheKey:   "10m",
+				graph.SSLSessionTimeoutKey: "1d",
+				graph.SSLEcdhCurveKey:      "secp384r1:prime256v1",
+			}),
+			expSSL: &SSL{
+				KeyPairIDs:     []SSLKeyPairID{"ssl_keypair_test_tls-secret"},
+				Protocols:      "TLSv1.2 TLSv1.3",
+				Ciphers:        "HIGH:!aNULL",
+				SessionCache:   "shared:ssl_test_gateway_https:10m",
+				SessionTimeout: "1d",
+				EcdhCurve:      "secp384r1:prime256v1",
+			},
+		},
+		{
+			name: "session cache off is passed through",
+			listener: newListener(map[v1.AnnotationKey]v1.AnnotationValue{
+				graph.SSLSessionCacheKey: "off",
+			}),
+			expSSL: &SSL{
+				KeyPairIDs:   []SSLKeyPairID{"ssl_keypair_test_tls-secret"},
+				SessionCache: "off",
+			},
+		},
+		{
+			name: "session cache none is passed through",
+			listener: newListener(map[v1.AnnotationKey]v1.AnnotationValue{
+				graph.SSLSessionCacheKey: "none",
+			}),
+			expSSL: &SSL{
+				KeyPairIDs:   []SSLKeyPairID{"ssl_keypair_test_tls-secret"},
+				SessionCache: "none",
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(buildSSL(tc.listener)).To(Equal(tc.expSSL))
+		})
+	}
+}
+
+func TestGenerateSSLSessionCacheZoneName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		listener *graph.Listener
+		name     string
+		expName  string
+	}{
+		{
+			name: "gateway listener",
+			listener: &graph.Listener{
+				Name:        "https",
+				GatewayName: types.NamespacedName{Namespace: "test", Name: "gateway"},
+			},
+			expName: "ssl_test_gateway_https",
+		},
+		{
+			name: "listenerset listener",
+			listener: &graph.Listener{
+				Name:            "https",
+				GatewayName:     types.NamespacedName{Namespace: "test", Name: "gateway"},
+				ListenerSetName: types.NamespacedName{Namespace: "other", Name: "my-set"},
+			},
+			expName: "ssl_test_gateway_other_my_set_https",
+		},
+		{
+			name: "gateways with the same name in different namespaces get different zone names",
+			listener: &graph.Listener{
+				Name:        "https",
+				GatewayName: types.NamespacedName{Namespace: "other", Name: "gateway"},
+			},
+			expName: "ssl_other_gateway_https",
+		},
+		{
+			name: "names with non-alphanumeric characters are sanitized",
+			listener: &graph.Listener{
+				Name:        "https.443",
+				GatewayName: types.NamespacedName{Namespace: "test", Name: "my.gateway"},
+			},
+			expName: "ssl_test_my_gateway_https_443",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(generateSSLSessionCacheZoneName(tc.listener)).To(Equal(tc.expName))
+		})
+	}
+}
+
+func TestBuildConfiguration_ClusterIPFamily(t *testing.T) {
+	t.Parallel()
+	fakeResolver := &resolverfakes.ServiceResolverMock{
+		ResolveFunc: func(
+			context.Context, logr.Logger, types.NamespacedName, apiv1.ServicePort, []discoveryV1.AddressType) (
+			[]resolver.Endpoint, error,
+		) {
+			return fooEndpoints, nil
+		},
+	}
+
+	tests := []struct {
+		msg             string
+		clusterIPFamily ngfAPIv1alpha2.IPFamilyType
+		expectedFamily  IPFamilyType
+	}{
+		{
+			msg:             "cluster is IPv4-only, no explicit NginxProxy IPFamily set",
+			clusterIPFamily: ngfAPIv1alpha2.IPv4,
+			expectedFamily:  IPv4,
+		},
+		{
+			msg:             "cluster is IPv6-only, no explicit NginxProxy IPFamily set",
+			clusterIPFamily: ngfAPIv1alpha2.IPv6,
+			expectedFamily:  IPv6,
+		},
+		{
+			msg:             "cluster is dual-stack, no explicit NginxProxy IPFamily set",
+			clusterIPFamily: ngfAPIv1alpha2.Dual,
+			expectedFamily:  Dual,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			graph := getModifiedGraph(func(g *graph.Graph) *graph.Graph {
+				gw := g.Gateways[gatewayNsName]
+				gw.Listeners = append(gw.Listeners, &graph.Listener{
+					Name:        "listener-80-1",
+					GatewayName: gatewayNsName,
+					Source:      listener80,
+					Valid:       true,
+					Routes:      map[graph.RouteKey]*graph.L7Route{},
+				})
+				// No IPFamily set on NginxProxy — should use clusterIPFamily
+				gw.EffectiveNginxProxy = &graph.EffectiveNginxProxy{}
+				return g
+			})
+
+			result := BuildConfiguration(
+				t.Context(),
+				logr.Discard(),
+				graph,
+				graph.Gateways[gatewayNsName],
+				fakeResolver,
+				false,
+				test.clusterIPFamily,
+			)
+
+			g.Expect(result.BaseHTTPConfig.IPFamily).To(Equal(test.expectedFamily))
+		})
+	}
+}
+
+func TestBuildSSLKeyPairs(t *testing.T) {
+	t.Parallel()
+
+	secretNsName := types.NamespacedName{Namespace: "test", Name: "secret"}
+	gatewaySecretNsName := types.NamespacedName{Namespace: "test", Name: "gateway-secret"}
+
+	validSecret := &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretNsName.Name,
+				Namespace: secretNsName.Namespace,
+			},
+		},
+		CertBundle: secrets.NewCertificateBundle(
+			secretNsName,
+			"Secret",
+			&secrets.Certificate{
+				TLSCert:       []byte("cert-data"),
+				TLSPrivateKey: []byte("key-data"),
+			},
+		),
+	}
+
+	nilCertBundleSecret := &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "nil-cert",
+				Namespace: "test",
+			},
+		},
+		CertBundle: nil,
+	}
+
+	tests := []struct {
+		secrets  map[types.NamespacedName]*secrets.Secret
+		gateway  *graph.Gateway
+		expected map[SSLKeyPairID]SSLKeyPair
+		name     string
+	}{
+		{
+			name: "valid listener with valid TLS secret",
+			secrets: map[types.NamespacedName]*secrets.Secret{
+				secretNsName: validSecret,
+			},
+			gateway: &graph.Gateway{
+				Listeners: []*graph.Listener{
+					{
+						Valid:           true,
+						ResolvedSecrets: []types.NamespacedName{secretNsName},
+					},
+				},
+			},
+			expected: map[SSLKeyPairID]SSLKeyPair{
+				generateSSLKeyPairID(secretNsName): {
+					Cert: []byte("cert-data"),
+					Key:  []byte("key-data"),
+				},
+			},
+		},
+		{
+			name: "listener with nil CertBundle secret",
+			secrets: map[types.NamespacedName]*secrets.Secret{
+				secretNsName: nilCertBundleSecret,
+			},
+			gateway: &graph.Gateway{
+				Listeners: []*graph.Listener{
+					{
+						Valid:           true,
+						ResolvedSecrets: []types.NamespacedName{secretNsName},
+					},
+				},
+			},
+			expected: map[SSLKeyPairID]SSLKeyPair{},
+		},
+		{
+			name: "gateway backend TLS with nil CertBundle",
+			secrets: map[types.NamespacedName]*secrets.Secret{
+				gatewaySecretNsName: nilCertBundleSecret,
+			},
+			gateway: &graph.Gateway{
+				Valid:     true,
+				SecretRef: &gatewaySecretNsName,
+			},
+			expected: map[SSLKeyPairID]SSLKeyPair{},
+		},
+		{
+			name: "invalid listener should not generate key pair",
+			secrets: map[types.NamespacedName]*secrets.Secret{
+				secretNsName: validSecret,
+			},
+			gateway: &graph.Gateway{
+				Listeners: []*graph.Listener{
+					{
+						Valid:           false,
+						ResolvedSecrets: []types.NamespacedName{secretNsName},
+					},
+				},
+			},
+			expected: map[SSLKeyPairID]SSLKeyPair{},
+		},
+		{
+			name: "listener with nil resolved secret",
+			secrets: map[types.NamespacedName]*secrets.Secret{
+				secretNsName: validSecret,
+			},
+			gateway: &graph.Gateway{
+				Listeners: []*graph.Listener{
+					{
+						Valid:           true,
+						ResolvedSecrets: nil,
+					},
+				},
+			},
+			expected: map[SSLKeyPairID]SSLKeyPair{},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := buildSSLKeyPairs(test.secrets, test.gateway)
+
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestBuildAuthSecrets(t *testing.T) {
+	t.Parallel()
+
+	tlsSecretNsName := types.NamespacedName{Namespace: "test", Name: "tls-secret"}
+	nilSourceSecretNsName := types.NamespacedName{Namespace: "test", Name: "nil-source"}
+	opaqueBasicAuthSecretNsName := types.NamespacedName{Namespace: "test", Name: "opaque-auth-basic-secret"}
+	opaqueJWTAuthSecretNsName := types.NamespacedName{Namespace: "test", Name: "opaque-auth-jwt-secret"}
+	invalidKeySecretNsName := types.NamespacedName{Namespace: "test", Name: "invalid-key-secret"}
+
+	opaqueAuthSecretBasicData := &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      opaqueBasicAuthSecretNsName.Name,
+				Namespace: opaqueBasicAuthSecretNsName.Namespace,
+			},
+			Type: apiv1.SecretTypeOpaque,
+			Data: map[string][]byte{
+				secrets.AuthKey: []byte("user:$apr1$cred"),
+			},
+		},
+	}
+
+	opaqueAuthSecretJwksData := &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      opaqueJWTAuthSecretNsName.Name,
+				Namespace: opaqueJWTAuthSecretNsName.Namespace,
+			},
+			Type: apiv1.SecretTypeOpaque,
+			Data: map[string][]byte{
+				secrets.AuthKey: []byte("jwks-token"),
+			},
+		},
+	}
+
+	tlsSecret := &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      tlsSecretNsName.Name,
+				Namespace: tlsSecretNsName.Namespace,
+			},
+			Type: apiv1.SecretTypeTLS,
+			Data: map[string][]byte{
+				apiv1.TLSCertKey:       []byte("cert"),
+				apiv1.TLSPrivateKeyKey: []byte("key"),
+			},
+		},
+		CertBundle: secrets.NewCertificateBundle(
+			tlsSecretNsName,
+			"Secret",
+			&secrets.Certificate{
+				TLSCert:       []byte("cert"),
+				TLSPrivateKey: []byte("key"),
+			},
+		),
+	}
+
+	nilSourceSecret := &secrets.Secret{
+		Source: nil,
+	}
+
+	invalidKeySecret := &secrets.Secret{
+		Source: &apiv1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "invalid-key-secret",
+				Namespace: "test",
+			},
+			Type: apiv1.SecretTypeOpaque,
+			Data: map[string][]byte{
+				"wrong-key": []byte("data"),
+			},
+		},
+	}
+
+	tests := []struct {
+		secrets  map[types.NamespacedName]*secrets.Secret
+		filters  map[types.NamespacedName]*graph.AuthenticationFilter
+		expected map[AuthFileID]AuthFileData
+		name     string
+	}{
+		{
+			name: "opaque secret with auth key for basic auth",
+			secrets: map[types.NamespacedName]*secrets.Secret{
+				opaqueBasicAuthSecretNsName: opaqueAuthSecretBasicData,
+			},
+			filters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				opaqueBasicAuthSecretNsName: buildBasicAuthFilter(
+					opaqueBasicAuthSecretNsName,
+					opaqueBasicAuthSecretNsName.Namespace,
+				),
+			},
+			expected: map[AuthFileID]AuthFileData{
+				"basic_auth_test_opaque-auth-basic-secret": []byte("user:$apr1$cred"),
+			},
+		},
+		{
+			name: "opaque secret with auth key for jwt auth",
+			secrets: map[types.NamespacedName]*secrets.Secret{
+				opaqueJWTAuthSecretNsName: opaqueAuthSecretJwksData,
+			},
+			filters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				opaqueJWTAuthSecretNsName: buildJWTAuthFilter(
+					opaqueJWTAuthSecretNsName,
+					opaqueJWTAuthSecretNsName.Namespace,
+					ngfAPIv1alpha1.JWTKeySourceFile,
+				),
+			},
+			expected: map[AuthFileID]AuthFileData{
+				"jwt_auth_test_opaque-auth-jwt-secret": []byte("jwks-token"),
+			},
+		},
+		{
+			name: "jwt auth with remote key source",
+			secrets: map[types.NamespacedName]*secrets.Secret{
+				opaqueJWTAuthSecretNsName: opaqueAuthSecretJwksData,
+			},
+			filters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				opaqueJWTAuthSecretNsName: buildJWTAuthFilter(
+					opaqueJWTAuthSecretNsName,
+					opaqueJWTAuthSecretNsName.Namespace,
+					ngfAPIv1alpha1.JWTKeySourceRemote,
+				),
+			},
+			expected: map[AuthFileID]AuthFileData{},
+		},
+		{
+			name: "TLS secret should be ignored",
+			secrets: map[types.NamespacedName]*secrets.Secret{
+				tlsSecretNsName: tlsSecret,
+			},
+			expected: map[AuthFileID]AuthFileData{},
+		},
+		{
+			name: "nil source secret should not panic",
+			secrets: map[types.NamespacedName]*secrets.Secret{
+				nilSourceSecretNsName: nilSourceSecret,
+			},
+			expected: map[AuthFileID]AuthFileData{},
+		},
+		{
+			name: "invalid secret name",
+			secrets: map[types.NamespacedName]*secrets.Secret{
+				invalidKeySecretNsName: invalidKeySecret,
+			},
+			filters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				invalidKeySecretNsName: buildBasicAuthFilter(
+					invalidKeySecretNsName,
+					invalidKeySecretNsName.Namespace,
+				),
+			},
+			expected: map[AuthFileID]AuthFileData{},
+		},
+		{
+			name: "mixed secrets",
+			secrets: map[types.NamespacedName]*secrets.Secret{
+				opaqueBasicAuthSecretNsName: opaqueAuthSecretBasicData,
+				opaqueJWTAuthSecretNsName:   opaqueAuthSecretJwksData,
+				tlsSecretNsName:             tlsSecret,
+				nilSourceSecretNsName:       nilSourceSecret,
+			},
+			filters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				opaqueBasicAuthSecretNsName: buildBasicAuthFilter(
+					opaqueBasicAuthSecretNsName,
+					opaqueBasicAuthSecretNsName.Namespace,
+				),
+				opaqueJWTAuthSecretNsName: buildJWTAuthFilter(
+					opaqueJWTAuthSecretNsName,
+					opaqueJWTAuthSecretNsName.Namespace,
+					ngfAPIv1alpha1.JWTKeySourceFile,
+				),
+			},
+			expected: map[AuthFileID]AuthFileData{
+				"basic_auth_test_opaque-auth-basic-secret": []byte("user:$apr1$cred"),
+				"jwt_auth_test_opaque-auth-jwt-secret":     []byte("jwks-token"),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := buildAuthSecrets(test.filters, test.secrets)
+
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestBuildServerTokens(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                 string
+		gateway              *graph.Gateway
+		expectedServerTokens string
+	}{
+		{
+			name:                 "default server token is set for empty Gateway",
+			gateway:              &graph.Gateway{},
+			expectedServerTokens: graph.ServerTokenOff,
+		},
+		{
+			name: "default server tokens is set for empty EffectiveNginxProxy",
+			gateway: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{},
+			},
+			expectedServerTokens: graph.ServerTokenOff,
+		},
+		{
+			name: "keyword server token is set properly when EffectiveNginxProxy is set",
+			gateway: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					ServerTokens: helpers.GetPointer("build"),
+				},
+			},
+			expectedServerTokens: "build",
+		},
+		{
+			name: "custom string value server token is set with quotes when EffectiveNginxProxy is set",
+			gateway: &graph.Gateway{
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					ServerTokens: helpers.GetPointer("custom_value"),
+				},
+			},
+			expectedServerTokens: `"custom_value"`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := buildServerTokens(test.gateway)
+			g.Expect(result).To(Equal(test.expectedServerTokens))
+		})
+	}
+}
+
+func buildBasicAuthFilter(secretRef types.NamespacedName, namespace string) *graph.AuthenticationFilter {
+	return &graph.AuthenticationFilter{
+		Source: &ngfAPIv1alpha1.AuthenticationFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+			},
+			Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+				Type: ngfAPIv1alpha1.AuthTypeBasic,
+				Basic: &ngfAPIv1alpha1.BasicAuth{
+					SecretRef: ngfAPIv1alpha1.LocalObjectReference{
+						Name: secretRef.Name,
+					},
+				},
+			},
+		},
+	}
+}
+
+func buildJWTAuthFilter(
+	secretRef types.NamespacedName,
+	namespace string,
+	source ngfAPIv1alpha1.JWTKeySource,
+) *graph.AuthenticationFilter {
+	var jwtAuth *ngfAPIv1alpha1.JWTAuth
+	switch source {
+	case ngfAPIv1alpha1.JWTKeySourceFile:
+		jwtAuth = &ngfAPIv1alpha1.JWTAuth{
+			Source: ngfAPIv1alpha1.JWTKeySourceFile,
+			File: &ngfAPIv1alpha1.JWTFileKeySource{
+				SecretRef: ngfAPIv1alpha1.LocalObjectReference{
+					Name: secretRef.Name,
+				},
+			},
+		}
+	case ngfAPIv1alpha1.JWTKeySourceRemote:
+		jwtAuth = &ngfAPIv1alpha1.JWTAuth{
+			Source: ngfAPIv1alpha1.JWTKeySourceRemote,
+			Remote: &ngfAPIv1alpha1.JWTRemoteKeySource{
+				URI: "",
+			},
+		}
+	}
+
+	return &graph.AuthenticationFilter{
+		Source: &ngfAPIv1alpha1.AuthenticationFilter{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: namespace,
+			},
+			Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+				Type: ngfAPIv1alpha1.AuthTypeJWT,
+				JWT:  jwtAuth,
+			},
+		},
+	}
+}
+
+func TestBuildJWTRemoteTLSCABundles(t *testing.T) {
+	t.Parallel()
+
+	const (
+		filterNS = "test"
+		caName1  = "ca-secret-1"
+		caName2  = "ca-secret-2"
+	)
+
+	caSecret1NsName := types.NamespacedName{Namespace: filterNS, Name: caName1}
+	caSecret2NsName := types.NamespacedName{Namespace: filterNS, Name: caName2}
+
+	caData1 := []byte("ca-cert-pem-data-1")
+	caData2 := []byte("ca-cert-pem-data-2")
+
+	makeRemoteJWTFilter := func(ns, name string, valid bool, caCertRefs ...string) *graph.AuthenticationFilter {
+		refs := make([]ngfAPIv1alpha1.LocalObjectReference, 0, len(caCertRefs))
+		for _, r := range caCertRefs {
+			refs = append(refs, ngfAPIv1alpha1.LocalObjectReference{Name: r})
+		}
+		return &graph.AuthenticationFilter{
+			Valid: valid,
+			Source: &ngfAPIv1alpha1.AuthenticationFilter{
+				ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name},
+				Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+					Type: ngfAPIv1alpha1.AuthTypeJWT,
+					JWT: &ngfAPIv1alpha1.JWTAuth{
+						Source: ngfAPIv1alpha1.JWTKeySourceRemote,
+						Remote: &ngfAPIv1alpha1.JWTRemoteKeySource{
+							URI:               "https://jwks.example.com/.well-known/jwks.json",
+							CACertificateRefs: refs,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	makeCASecret := func(nsName types.NamespacedName, caData []byte) *secrets.Secret {
+		return &secrets.Secret{
+			Source: &apiv1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: nsName.Namespace,
+					Name:      nsName.Name,
+				},
+				Data: map[string][]byte{
+					secrets.CAKey: caData,
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		authFilters map[types.NamespacedName]*graph.AuthenticationFilter
+		secretsMap  map[types.NamespacedName]*secrets.Secret
+		expected    map[CertBundleID]CertBundle
+		name        string
+	}{
+		{
+			name:        "nil auth filters returns empty map",
+			authFilters: nil,
+			secretsMap:  nil,
+			expected:    map[CertBundleID]CertBundle{},
+		},
+		{
+			name:        "empty auth filters returns empty map",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{},
+			secretsMap:  nil,
+			expected:    map[CertBundleID]CertBundle{},
+		},
+		{
+			name: "invalid filter is skipped",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: filterNS, Name: "f1"}: makeRemoteJWTFilter(filterNS, "f1", false, caName1),
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				caSecret1NsName: makeCASecret(caSecret1NsName, caData1),
+			},
+			expected: map[CertBundleID]CertBundle{},
+		},
+		{
+			name: "filter with nil JWT spec is skipped",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: filterNS, Name: "f1"}: {
+					Valid: true,
+					Source: &ngfAPIv1alpha1.AuthenticationFilter{
+						ObjectMeta: metav1.ObjectMeta{Namespace: filterNS, Name: "f1"},
+						Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+							Type: ngfAPIv1alpha1.AuthTypeBasic,
+							Basic: &ngfAPIv1alpha1.BasicAuth{
+								SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: "basic-secret"},
+							},
+						},
+					},
+				},
+			},
+			secretsMap: nil,
+			expected:   map[CertBundleID]CertBundle{},
+		},
+		{
+			name: "remote filter with nil Remote field is skipped",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: filterNS, Name: "f1"}: {
+					Valid: true,
+					Source: &ngfAPIv1alpha1.AuthenticationFilter{
+						ObjectMeta: metav1.ObjectMeta{Namespace: filterNS, Name: "f1"},
+						Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+							Type: ngfAPIv1alpha1.AuthTypeJWT,
+							JWT: &ngfAPIv1alpha1.JWTAuth{
+								Source: ngfAPIv1alpha1.JWTKeySourceRemote,
+								Remote: nil,
+							},
+						},
+					},
+				},
+			},
+			secretsMap: nil,
+			expected:   map[CertBundleID]CertBundle{},
+		},
+		{
+			name: "remote filter with empty CACertificateRefs is skipped",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: filterNS, Name: "f1"}: makeRemoteJWTFilter(filterNS, "f1", true /* no ca refs */),
+			},
+			secretsMap: nil,
+			expected:   map[CertBundleID]CertBundle{},
+		},
+		{
+			name: "CA secret not in secretsMap is skipped",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: filterNS, Name: "f1"}: makeRemoteJWTFilter(filterNS, "f1", true, caName1),
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{},
+			expected:   map[CertBundleID]CertBundle{},
+		},
+		{
+			name: "CA secret with nil Source is skipped",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: filterNS, Name: "f1"}: makeRemoteJWTFilter(filterNS, "f1", true, caName1),
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				caSecret1NsName: {Source: nil},
+			},
+			expected: map[CertBundleID]CertBundle{},
+		},
+		{
+			name: "CA secret missing ca.crt key is skipped",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: filterNS, Name: "f1"}: makeRemoteJWTFilter(filterNS, "f1", true, caName1),
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				caSecret1NsName: {
+					Source: &apiv1.Secret{
+						ObjectMeta: metav1.ObjectMeta{Namespace: filterNS, Name: caName1},
+						Data:       map[string][]byte{"wrong-key": []byte("data")},
+					},
+				},
+			},
+			expected: map[CertBundleID]CertBundle{},
+		},
+		{
+			name: "valid remote filter with one CA cert ref produces bundle",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: filterNS, Name: "f1"}: makeRemoteJWTFilter(filterNS, "f1", true, caName1),
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				caSecret1NsName: makeCASecret(caSecret1NsName, caData1),
+			},
+			expected: map[CertBundleID]CertBundle{
+				generateJWTRemoteTLSCABundleID(filterNS, caName1): caData1,
+			},
+		},
+		{
+			name: "two filters each with a different CA cert ref produce two bundles",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: filterNS, Name: "f1"}: makeRemoteJWTFilter(filterNS, "f1", true, caName1),
+				{Namespace: filterNS, Name: "f2"}: makeRemoteJWTFilter(filterNS, "f2", true, caName2),
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				caSecret1NsName: makeCASecret(caSecret1NsName, caData1),
+				caSecret2NsName: makeCASecret(caSecret2NsName, caData2),
+			},
+			expected: map[CertBundleID]CertBundle{
+				generateJWTRemoteTLSCABundleID(filterNS, caName1): caData1,
+				generateJWTRemoteTLSCABundleID(filterNS, caName2): caData2,
+			},
+		},
+		{
+			name: "two filters referencing the same CA cert ref produce one bundle",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: filterNS, Name: "f1"}: makeRemoteJWTFilter(filterNS, "f1", true, caName1),
+				{Namespace: filterNS, Name: "f2"}: makeRemoteJWTFilter(filterNS, "f2", true, caName1),
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				caSecret1NsName: makeCASecret(caSecret1NsName, caData1),
+			},
+			expected: map[CertBundleID]CertBundle{
+				generateJWTRemoteTLSCABundleID(filterNS, caName1): caData1,
+			},
+		},
+		{
+			name: "mix of valid and invalid filters only produces bundles for valid ones",
+			authFilters: map[types.NamespacedName]*graph.AuthenticationFilter{
+				{Namespace: filterNS, Name: "valid"}:   makeRemoteJWTFilter(filterNS, "valid", true, caName1),
+				{Namespace: filterNS, Name: "invalid"}: makeRemoteJWTFilter(filterNS, "invalid", false, caName2),
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				caSecret1NsName: makeCASecret(caSecret1NsName, caData1),
+				caSecret2NsName: makeCASecret(caSecret2NsName, caData2),
+			},
+			expected: map[CertBundleID]CertBundle{
+				generateJWTRemoteTLSCABundleID(filterNS, caName1): caData1,
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := buildJWTRemoteTLSCABundles(test.authFilters, test.secretsMap)
+
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func buildFrontendTLSRefCertBundles(
+	secretsMap map[types.NamespacedName]*secrets.Secret,
+	caCertConfigMaps map[types.NamespacedName]*configmaps.CaCertConfigMap,
+) []secrets.CertificateBundle {
+	bundles := make([]secrets.CertificateBundle, 0)
+
+	for nsName, secret := range secretsMap {
+		if secret == nil || secret.Source == nil {
+			continue
+		}
+
+		caData, exists := secret.Source.Data[secrets.CAKey]
+		if !exists {
+			continue
+		}
+
+		bundles = append(bundles, *secrets.NewCertificateBundle(
+			nsName,
+			kinds.Secret,
+			&secrets.Certificate{CACert: caData},
+		))
+	}
+
+	for nsName, cm := range caCertConfigMaps {
+		if cm == nil || cm.Source == nil {
+			continue
+		}
+
+		cert := &secrets.Certificate{}
+		hasData := false
+
+		if cm.Source.Data != nil {
+			if data, exists := cm.Source.Data[secrets.CAKey]; exists {
+				cert.CACert = []byte(data)
+				hasData = true
+			}
+		}
+
+		if cm.Source.BinaryData != nil {
+			if data, exists := cm.Source.BinaryData[secrets.CAKey]; exists {
+				cert.CACert = data
+				hasData = true
+			}
+		}
+
+		if !hasData {
+			continue
+		}
+
+		bundles = append(bundles, *secrets.NewCertificateBundle(
+			nsName,
+			kinds.ConfigMap,
+			cert,
+		))
+	}
+
+	return bundles
+}
+
+func buildFrontendTLSGateway(listeners []*graph.Listener) *graph.Gateway {
+	return &graph.Gateway{
+		Valid: true,
+		Source: &v1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "gateway-ns", Name: "test-gateway"},
+			Spec: v1.GatewaySpec{
+				TLS: &v1.GatewayTLSConfig{
+					Frontend: &v1.FrontendTLSConfig{
+						Default: v1.TLSConfig{
+							Validation: &v1.FrontendTLSValidation{
+								CACertificateRefs: []v1.ObjectReference{
+									{Name: v1.ObjectName("default-ca")},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Listeners: listeners,
+	}
+}
+
+func TestGetFrontendTLSCertBundleData(t *testing.T) {
+	t.Parallel()
+
+	gatewayNs := "gateway-ns"
+
+	gateway := &graph.Gateway{
+		Source: &v1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: gatewayNs},
+		},
+	}
+
+	encodedCMData := base64.StdEncoding.EncodeToString([]byte("cm-base64-ca"))
+
+	tests := []struct {
+		ref              v1.ObjectReference
+		secretsMap       map[types.NamespacedName]*secrets.Secret
+		caCertConfigMaps map[types.NamespacedName]*configmaps.CaCertConfigMap
+		name             string
+		expected         CertBundle
+	}{
+		{
+			name:     "Empty ref name",
+			ref:      v1.ObjectReference{},
+			expected: nil,
+		},
+		{
+			name: "CA bundle from secret",
+			ref: v1.ObjectReference{
+				Name:      v1.ObjectName("frontend-ca-secret"),
+				Kind:      v1.Kind(kinds.Secret),
+				Namespace: helpers.GetPointer(v1.Namespace(gatewayNs)),
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: gatewayNs, Name: "frontend-ca-secret"}: {
+					Source: &apiv1.Secret{
+						Data: map[string][]byte{
+							secrets.CAKey: []byte("secret-ca"),
+						},
+					},
+				},
+			},
+			expected: []byte("secret-ca"),
+		},
+		{
+			name: "CA bundle from configmap plaintext",
+			ref: v1.ObjectReference{
+				Name:      v1.ObjectName("frontend-ca-cm-plain"),
+				Kind:      v1.Kind(kinds.ConfigMap),
+				Namespace: helpers.GetPointer(v1.Namespace(gatewayNs)),
+			},
+			caCertConfigMaps: map[types.NamespacedName]*configmaps.CaCertConfigMap{
+				{Namespace: gatewayNs, Name: "frontend-ca-cm-plain"}: {
+					Source: &apiv1.ConfigMap{
+						Data: map[string]string{
+							secrets.CAKey: "cm-plain-ca",
+						},
+					},
+				},
+			},
+			expected: []byte("cm-plain-ca"),
+		},
+		{
+			name: "CA bundle from configmap base64 data",
+			ref: v1.ObjectReference{
+				Name:      v1.ObjectName("frontend-ca-cm-b64"),
+				Kind:      v1.Kind(kinds.ConfigMap),
+				Namespace: helpers.GetPointer(v1.Namespace(gatewayNs)),
+			},
+			caCertConfigMaps: map[types.NamespacedName]*configmaps.CaCertConfigMap{
+				{Namespace: gatewayNs, Name: "frontend-ca-cm-b64"}: {
+					Source: &apiv1.ConfigMap{
+						Data: map[string]string{
+							secrets.CAKey: encodedCMData,
+						},
+					},
+				},
+			},
+			expected: []byte("cm-base64-ca"),
+		},
+		{
+			name: "ConfigMap binary data takes precedence",
+			ref: v1.ObjectReference{
+				Name:      v1.ObjectName("frontend-ca-cm-bin"),
+				Kind:      v1.Kind(kinds.ConfigMap),
+				Namespace: helpers.GetPointer(v1.Namespace(gatewayNs)),
+			},
+			caCertConfigMaps: map[types.NamespacedName]*configmaps.CaCertConfigMap{
+				{Namespace: gatewayNs, Name: "frontend-ca-cm-bin"}: {
+					Source: &apiv1.ConfigMap{
+						Data: map[string]string{
+							secrets.CAKey: "cm-plain-ca",
+						},
+						BinaryData: map[string][]byte{
+							secrets.CAKey: []byte("cm-binary-ca"),
+						},
+					},
+				},
+			},
+			expected: []byte("cm-binary-ca"),
+		},
+		{
+			name: "Secret kind chooses secret data when both resources exist",
+			ref: v1.ObjectReference{
+				Name:      v1.ObjectName("frontend-ca-shared"),
+				Kind:      v1.Kind(kinds.Secret),
+				Namespace: helpers.GetPointer(v1.Namespace(gatewayNs)),
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: gatewayNs, Name: "frontend-ca-shared"}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("secret-kind-data")}},
+				},
+			},
+			caCertConfigMaps: map[types.NamespacedName]*configmaps.CaCertConfigMap{
+				{Namespace: gatewayNs, Name: "frontend-ca-shared"}: {
+					Source: &apiv1.ConfigMap{Data: map[string]string{secrets.CAKey: "configmap-kind-data"}},
+				},
+			},
+			expected: []byte("secret-kind-data"),
+		},
+		{
+			name: "ConfigMap kind chooses configmap data when both resources exist",
+			ref: v1.ObjectReference{
+				Name:      v1.ObjectName("frontend-ca-shared"),
+				Kind:      v1.Kind(kinds.ConfigMap),
+				Namespace: helpers.GetPointer(v1.Namespace(gatewayNs)),
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: gatewayNs, Name: "frontend-ca-shared"}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("secret-kind-data")}},
+				},
+			},
+			caCertConfigMaps: map[types.NamespacedName]*configmaps.CaCertConfigMap{
+				{Namespace: gatewayNs, Name: "frontend-ca-shared"}: {
+					Source: &apiv1.ConfigMap{Data: map[string]string{secrets.CAKey: "configmap-kind-data"}},
+				},
+			},
+			expected: []byte("configmap-kind-data"),
+		},
+		{
+			name: "Refs with the same name in different namespaces; choose the one in the ref namespace",
+			ref: v1.ObjectReference{
+				Name:      v1.ObjectName("frontend-ca-shared"),
+				Kind:      v1.Kind(kinds.Secret),
+				Namespace: helpers.GetPointer(v1.Namespace("other-ns")),
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: gatewayNs, Name: "frontend-ca-shared"}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("gateway-ns-data")}},
+				},
+				{Namespace: "other-ns", Name: "frontend-ca-shared"}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("other-ns-data")}},
+				},
+			},
+			expected: []byte("other-ns-data"),
+		},
+		{
+			name: "Ref with nil namespace, gateway with non-nil namespace",
+			ref: v1.ObjectReference{
+				Name:      v1.ObjectName("frontend-ca-secret"),
+				Kind:      v1.Kind(kinds.Secret),
+				Namespace: nil,
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: gatewayNs, Name: "frontend-ca-secret"}: {
+					Source: &apiv1.Secret{
+						Data: map[string][]byte{
+							secrets.CAKey: []byte("secret-ca"),
+						},
+					},
+				},
+			},
+			expected: []byte("secret-ca"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			bundles := make(map[CertBundleID]CertBundle)
+			refCertBundles := buildFrontendTLSRefCertBundles(test.secretsMap, test.caCertConfigMaps)
+			refCertBundleIndex := indexRefCertBundles(refCertBundles)
+			refs := []v1.ObjectReference{test.ref}
+			bundleID := CertBundleID("cert_bundle_test_listener")
+
+			result := getFrontendTLSCertBundles(bundleID, bundles, gateway, refCertBundleIndex, refs)
+
+			g.Expect(result[bundleID]).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestBuildFrontendTLSCertBundles(t *testing.T) {
+	t.Parallel()
+
+	gatewayNs := "gateway-ns"
+	gatewayName := "test-gateway"
+	caRefFormat := "%s_%d"
+	caRefName1 := "frontend-ca"
+	caRefSecret1 := v1.ObjectReference{
+		Name:      v1.ObjectName(caRefName1),
+		Kind:      v1.Kind(kinds.Secret),
+		Namespace: helpers.GetPointer(v1.Namespace(gatewayNs)),
+	}
+	caRefName2 := "frontend-ca-2"
+	caRefSecret2 := v1.ObjectReference{
+		Name:      v1.ObjectName(caRefName2),
+		Kind:      v1.Kind(kinds.Secret),
+		Namespace: helpers.GetPointer(v1.Namespace(gatewayNs)),
+	}
+	caConfigMapRef := v1.ObjectReference{
+		Name:      v1.ObjectName(caRefName1),
+		Kind:      v1.Kind(kinds.ConfigMap),
+		Namespace: helpers.GetPointer(v1.Namespace(gatewayNs)),
+	}
+
+	type expectedServerConfig struct {
+		expectedBundleID            CertBundleID
+		expectedVerifyClientMode    SSLVerifyClientMode
+		expectedRequireVerifiedCert bool
+	}
+
+	tests := []struct {
+		secretsMap               map[types.NamespacedName]*secrets.Secret
+		caCertConfigMaps         map[types.NamespacedName]*configmaps.CaCertConfigMap
+		gateway                  *graph.Gateway
+		expectedSSLServerConfigs map[int32]expectedServerConfig
+		name                     string
+		expectedBundleID         CertBundleID
+		expectedServerBundle     CertBundleID
+		expectedBundleData       CertBundle
+		sslServers               []VirtualServer
+		expectBundle             bool
+	}{
+		{
+			name: "Listener-resolved frontend CA refs from secret configure ssl servers",
+			gateway: buildFrontendTLSGateway([]*graph.Listener{{
+				Name:              "https-listener",
+				Valid:             true,
+				ValidationMode:    v1.AllowValidOnly,
+				CACertificateRefs: []v1.ObjectReference{caRefSecret1},
+				Source: v1.Listener{
+					Protocol: v1.HTTPSProtocolType,
+					Port:     443,
+				},
+			}}),
+			sslServers: []VirtualServer{
+				{Port: 443, SSL: &SSL{}},
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: gatewayNs, Name: caRefName1}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("frontend-ca-data")}},
+				},
+			},
+			expectedBundleID: generateCertBundleID(types.NamespacedName{
+				Namespace: gatewayNs,
+				Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+			}),
+			expectedBundleData: []byte("frontend-ca-data"),
+			expectedServerBundle: generateCertBundleID(types.NamespacedName{
+				Namespace: gatewayNs,
+				Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+			}),
+			expectBundle: true,
+			expectedSSLServerConfigs: map[int32]expectedServerConfig{
+				443: {
+					expectedBundleID: generateCertBundleID(types.NamespacedName{
+						Namespace: gatewayNs,
+						Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+					}),
+					expectedVerifyClientMode:    SSLVerifyClientOn,
+					expectedRequireVerifiedCert: true,
+				},
+			},
+		},
+		{
+			name: "AllowInsecureFallback disables verified cert requirement",
+			gateway: buildFrontendTLSGateway([]*graph.Listener{{
+				Name:              "https-listener",
+				Valid:             true,
+				ValidationMode:    v1.AllowInsecureFallback,
+				CACertificateRefs: []v1.ObjectReference{caRefSecret1},
+				Source: v1.Listener{
+					Protocol: v1.HTTPSProtocolType,
+					Port:     443,
+				},
+			}}),
+			sslServers: []VirtualServer{{Port: 443, SSL: &SSL{}}},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: gatewayNs, Name: caRefName1}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("frontend-ca-data")}},
+				},
+			},
+			expectedBundleID: generateCertBundleID(types.NamespacedName{
+				Namespace: gatewayNs,
+				Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+			}),
+			expectedBundleData:   []byte("frontend-ca-data"),
+			expectedServerBundle: "",
+			expectBundle:         false,
+			expectedSSLServerConfigs: map[int32]expectedServerConfig{
+				443: {
+					expectedBundleID:            "",
+					expectedVerifyClientMode:    SSLVerifyClientOptionalNoCA,
+					expectedRequireVerifiedCert: false,
+				},
+			},
+		},
+		{
+			name: "HTTPS listener with no resolved CA refs produces no bundle and no SSL mutation",
+			gateway: buildFrontendTLSGateway([]*graph.Listener{{
+				Name:           "https-listener",
+				Valid:          true,
+				ValidationMode: v1.AllowValidOnly,
+				Source: v1.Listener{
+					Protocol: v1.HTTPSProtocolType,
+					Port:     443,
+				},
+			}}),
+			sslServers: []VirtualServer{{
+				Port: 443,
+				SSL: &SSL{
+					ClientCertBundleID:  "existing-bundle",
+					VerifyClient:        "on",
+					RequireVerifiedCert: true,
+				},
+			}},
+			expectedServerBundle: "existing-bundle",
+			expectBundle:         false,
+			expectedSSLServerConfigs: map[int32]expectedServerConfig{
+				443: {
+					expectedBundleID:            "existing-bundle",
+					expectedVerifyClientMode:    SSLVerifyClientOn,
+					expectedRequireVerifiedCert: true,
+				},
+			},
+		},
+		{
+			name: "Multiple listener CA refs are concatenated in a single bundle",
+			gateway: buildFrontendTLSGateway([]*graph.Listener{{
+				Name:              "https-listener",
+				Valid:             true,
+				ValidationMode:    v1.AllowValidOnly,
+				CACertificateRefs: []v1.ObjectReference{caRefSecret1, caRefSecret2},
+				Source: v1.Listener{
+					Protocol: v1.HTTPSProtocolType,
+					Port:     443,
+				},
+			}}),
+			sslServers: []VirtualServer{{Port: 443, SSL: &SSL{}}},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: gatewayNs, Name: caRefName1}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("frontend-ca-data")}},
+				},
+				{Namespace: gatewayNs, Name: caRefName2}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("frontend-ca-data-2")}},
+				},
+			},
+			expectedBundleID: generateCertBundleID(types.NamespacedName{
+				Namespace: gatewayNs,
+				Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+			}),
+			expectedBundleData: []byte("frontend-ca-datafrontend-ca-data-2"),
+			expectedServerBundle: generateCertBundleID(types.NamespacedName{
+				Namespace: gatewayNs,
+				Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+			}),
+			expectBundle: true,
+			expectedSSLServerConfigs: map[int32]expectedServerConfig{
+				443: {
+					expectedBundleID: generateCertBundleID(types.NamespacedName{
+						Namespace: gatewayNs,
+						Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+					}),
+					expectedVerifyClientMode:    SSLVerifyClientOn,
+					expectedRequireVerifiedCert: true,
+				},
+			},
+		},
+		{
+			name: "ConfigMap CA ref produces bundle and SSL client config",
+			gateway: buildFrontendTLSGateway([]*graph.Listener{{
+				Name:              "https-listener",
+				Valid:             true,
+				ValidationMode:    v1.AllowValidOnly,
+				CACertificateRefs: []v1.ObjectReference{caConfigMapRef},
+				Source: v1.Listener{
+					Protocol: v1.HTTPSProtocolType,
+					Port:     443,
+				},
+			}}),
+			sslServers: []VirtualServer{{Port: 443, SSL: &SSL{}}},
+			caCertConfigMaps: map[types.NamespacedName]*configmaps.CaCertConfigMap{
+				{Namespace: gatewayNs, Name: caRefName1}: {
+					Source: &apiv1.ConfigMap{
+						Data: map[string]string{
+							secrets.CAKey: "configmap-ca-data",
+						},
+					},
+				},
+			},
+			expectedBundleID: generateCertBundleID(types.NamespacedName{
+				Namespace: gatewayNs,
+				Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+			}),
+			expectedBundleData: []byte("configmap-ca-data"),
+			expectedServerBundle: generateCertBundleID(types.NamespacedName{
+				Namespace: gatewayNs,
+				Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+			}),
+			expectBundle: true,
+			expectedSSLServerConfigs: map[int32]expectedServerConfig{
+				443: {
+					expectedBundleID: generateCertBundleID(types.NamespacedName{
+						Namespace: gatewayNs,
+						Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+					}),
+					expectedVerifyClientMode:    SSLVerifyClientOn,
+					expectedRequireVerifiedCert: true,
+				},
+			},
+		},
+		{
+			name: "Two HTTPS listeners with different CA refs",
+			gateway: buildFrontendTLSGateway([]*graph.Listener{
+				{
+					Name:              "https-listener",
+					Valid:             true,
+					ValidationMode:    v1.AllowValidOnly,
+					CACertificateRefs: []v1.ObjectReference{caRefSecret1},
+					Source: v1.Listener{
+						Protocol: v1.HTTPSProtocolType,
+						Port:     443,
+					},
+				},
+				{
+					Name:              "https-listener-2",
+					Valid:             true,
+					ValidationMode:    v1.AllowValidOnly,
+					CACertificateRefs: []v1.ObjectReference{caRefSecret2},
+					Source: v1.Listener{
+						Protocol: v1.HTTPSProtocolType,
+						Port:     8443,
+					},
+				},
+			}),
+			sslServers: []VirtualServer{
+				{Port: 443, SSL: &SSL{}},
+				{Port: 8443, SSL: &SSL{}},
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: gatewayNs, Name: caRefName1}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("frontend-ca-data")}},
+				},
+				{Namespace: gatewayNs, Name: caRefName2}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("frontend-ca-data-2")}},
+				},
+			},
+			expectedBundleID: generateCertBundleID(types.NamespacedName{
+				Namespace: gatewayNs,
+				Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+			}),
+			expectedBundleData: []byte("frontend-ca-data"),
+			expectedServerBundle: generateCertBundleID(types.NamespacedName{
+				Namespace: gatewayNs,
+				Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+			}),
+			expectBundle: true,
+			expectedSSLServerConfigs: map[int32]expectedServerConfig{
+				443: {
+					expectedBundleID: generateCertBundleID(types.NamespacedName{
+						Namespace: gatewayNs,
+						Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+					}),
+					expectedVerifyClientMode:    SSLVerifyClientOn,
+					expectedRequireVerifiedCert: true,
+				},
+				8443: {
+					expectedBundleID: generateCertBundleID(types.NamespacedName{
+						Namespace: gatewayNs,
+						Name:      fmt.Sprintf(caRefFormat, gatewayName, 8443),
+					}),
+					expectedVerifyClientMode:    SSLVerifyClientOn,
+					expectedRequireVerifiedCert: true,
+				},
+			},
+		},
+		{
+			name: "Two HTTPS listeners with different validation modes",
+			gateway: buildFrontendTLSGateway([]*graph.Listener{
+				{
+					Name:              "https-listener",
+					Valid:             true,
+					ValidationMode:    v1.AllowValidOnly,
+					CACertificateRefs: []v1.ObjectReference{caRefSecret1},
+					Source: v1.Listener{
+						Protocol: v1.HTTPSProtocolType,
+						Port:     443,
+					},
+				},
+				{
+					Name:              "https-listener-2",
+					Valid:             true,
+					ValidationMode:    v1.AllowInsecureFallback,
+					CACertificateRefs: []v1.ObjectReference{caRefSecret2},
+					Source: v1.Listener{
+						Protocol: v1.HTTPSProtocolType,
+						Port:     8443,
+					},
+				},
+			}),
+			sslServers: []VirtualServer{
+				{Port: 443, SSL: &SSL{}},
+				{Port: 8443, SSL: &SSL{}},
+			},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: gatewayNs, Name: caRefName1}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("frontend-ca-data")}},
+				},
+				{Namespace: gatewayNs, Name: caRefName2}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("frontend-ca-data-2")}},
+				},
+			},
+			expectedBundleID: generateCertBundleID(types.NamespacedName{
+				Namespace: gatewayNs,
+				Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+			}),
+			expectedBundleData: []byte("frontend-ca-data"),
+			expectedServerBundle: generateCertBundleID(types.NamespacedName{
+				Namespace: gatewayNs,
+				Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+			}),
+			expectBundle: true,
+			expectedSSLServerConfigs: map[int32]expectedServerConfig{
+				443: {
+					expectedBundleID: generateCertBundleID(types.NamespacedName{
+						Namespace: gatewayNs,
+						Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+					}),
+					expectedVerifyClientMode:    SSLVerifyClientOn,
+					expectedRequireVerifiedCert: true,
+				},
+				8443: {
+					expectedBundleID:            "",
+					expectedVerifyClientMode:    SSLVerifyClientOptionalNoCA,
+					expectedRequireVerifiedCert: false,
+				},
+			},
+		},
+		{
+			name: "Non-HTTPS listener is ignored",
+			gateway: buildFrontendTLSGateway([]*graph.Listener{{
+				Name:              "http-listener",
+				Valid:             true,
+				CACertificateRefs: []v1.ObjectReference{caRefSecret1},
+				Source: v1.Listener{
+					Protocol: v1.HTTPProtocolType,
+					Port:     80,
+				},
+			}}),
+			sslServers: []VirtualServer{{Port: 80, SSL: &SSL{}}},
+			secretsMap: map[types.NamespacedName]*secrets.Secret{
+				{Namespace: gatewayNs, Name: caRefName1}: {
+					Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("frontend-ca-data")}},
+				},
+			},
+			expectedServerBundle: "",
+			expectBundle:         false,
+			expectedSSLServerConfigs: map[int32]expectedServerConfig{
+				80: {
+					expectedBundleID:            "",
+					expectedVerifyClientMode:    "",
+					expectedRequireVerifiedCert: false,
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			refCertBundles := buildFrontendTLSRefCertBundles(test.secretsMap, test.caCertConfigMaps)
+
+			bundles := buildFrontendTLSCertBundles(
+				test.gateway,
+				test.sslServers,
+				refCertBundles,
+			)
+
+			if test.expectBundle {
+				g.Expect(bundles).To(HaveKey(test.expectedBundleID))
+				g.Expect(bundles[test.expectedBundleID]).To(Equal(test.expectedBundleData))
+			} else {
+				g.Expect(bundles).To(BeEmpty())
+			}
+
+			for _, server := range test.sslServers {
+				serverConfig := test.expectedSSLServerConfigs[server.Port]
+				g.Expect(server.SSL.ClientCertBundleID).To(Equal(serverConfig.expectedBundleID))
+				g.Expect(server.SSL.VerifyClient).To(Equal(serverConfig.expectedVerifyClientMode))
+				g.Expect(server.SSL.RequireVerifiedCert).To(Equal(serverConfig.expectedRequireVerifiedCert))
+			}
+		})
+	}
+}
+
+func TestBuildFrontendTLSCertBundlesValidationModes(t *testing.T) {
+	t.Parallel()
+
+	g := NewWithT(t)
+	gatewayNs := "gateway-ns"
+	gatewayName := "test-gateway"
+	caRefFormat := "%s_%d"
+
+	allowInsecureRef := v1.ObjectReference{
+		Name:      v1.ObjectName("frontend-ca-insecure"),
+		Kind:      v1.Kind(kinds.Secret),
+		Namespace: helpers.GetPointer(v1.Namespace(gatewayNs)),
+	}
+	allowValidOnlyRef := v1.ObjectReference{
+		Name:      v1.ObjectName("frontend-ca-valid"),
+		Kind:      v1.Kind(kinds.Secret),
+		Namespace: helpers.GetPointer(v1.Namespace(gatewayNs)),
+	}
+
+	gateway := &graph.Gateway{
+		Valid: true,
+		Source: &v1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: gatewayNs, Name: gatewayName},
+			Spec: v1.GatewaySpec{
+				TLS: &v1.GatewayTLSConfig{
+					Frontend: &v1.FrontendTLSConfig{
+						Default: v1.TLSConfig{
+							Validation: &v1.FrontendTLSValidation{
+								CACertificateRefs: []v1.ObjectReference{{Name: v1.ObjectName("default-ca")}},
+							},
+						},
+					},
+				},
+			},
+		},
+		Listeners: []*graph.Listener{
+			{
+				Name:              "https-insecure",
+				Valid:             true,
+				ValidationMode:    v1.AllowInsecureFallback,
+				CACertificateRefs: []v1.ObjectReference{allowInsecureRef},
+				Source: v1.Listener{
+					Protocol: v1.HTTPSProtocolType,
+					Port:     443,
+				},
+			},
+			{
+				Name:              "https-valid",
+				Valid:             true,
+				ValidationMode:    v1.AllowValidOnly,
+				CACertificateRefs: []v1.ObjectReference{allowValidOnlyRef},
+				Source: v1.Listener{
+					Protocol: v1.HTTPSProtocolType,
+					Port:     8443,
+				},
+			},
+		},
+	}
+
+	sslServers := []VirtualServer{
+		{Port: 443, SSL: &SSL{}},
+		{Port: 8443, SSL: &SSL{}},
+	}
+
+	secretsMap := map[types.NamespacedName]*secrets.Secret{
+		{Namespace: gatewayNs, Name: "frontend-ca-insecure"}: {
+			Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("frontend-ca-data-insecure")}},
+		},
+		{Namespace: gatewayNs, Name: "frontend-ca-valid"}: {
+			Source: &apiv1.Secret{Data: map[string][]byte{secrets.CAKey: []byte("frontend-ca-data-valid")}},
+		},
+	}
+
+	refCertBundles := buildFrontendTLSRefCertBundles(secretsMap, nil)
+	bundles := buildFrontendTLSCertBundles(gateway, sslServers, refCertBundles)
+
+	insecureID := generateCertBundleID(types.NamespacedName{
+		Namespace: gatewayNs,
+		Name:      fmt.Sprintf(caRefFormat, gatewayName, 443),
+	})
+	validID := generateCertBundleID(types.NamespacedName{
+		Namespace: gatewayNs,
+		Name:      fmt.Sprintf(caRefFormat, gatewayName, 8443),
+	})
+
+	g.Expect(bundles).NotTo(HaveKey(insecureID))
+	g.Expect(bundles).To(HaveKey(validID))
+	g.Expect(bundles[validID]).To(Equal(CertBundle([]byte("frontend-ca-data-valid"))))
+
+	g.Expect(sslServers[0].SSL.ClientCertBundleID).To(Equal(CertBundleID("")))
+	g.Expect(sslServers[0].SSL.VerifyClient).To(Equal(SSLVerifyClientOptionalNoCA))
+	g.Expect(sslServers[0].SSL.RequireVerifiedCert).To(BeFalse())
+
+	g.Expect(sslServers[1].SSL.ClientCertBundleID).To(Equal(validID))
+	g.Expect(sslServers[1].SSL.VerifyClient).To(Equal(SSLVerifyClientOn))
+	g.Expect(sslServers[1].SSL.RequireVerifiedCert).To(BeTrue())
+}
+
+func TestBuildClientConfigForSSLServersFrontendValidationModes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		mode                    v1.FrontendValidationModeType
+		expectedBundle          CertBundleID
+		expectedVerifyClient    SSLVerifyClientMode
+		name                    string
+		expectedRequireVerified bool
+	}{
+		{
+			name:                    "empty mode defaults to AllowValidOnly",
+			mode:                    "",
+			expectedBundle:          CertBundleID("cert_bundle_test_listener"),
+			expectedVerifyClient:    SSLVerifyClientOn,
+			expectedRequireVerified: true,
+		},
+		{
+			name:                    "AllowValidOnly requires verified cert",
+			mode:                    v1.AllowValidOnly,
+			expectedBundle:          CertBundleID("cert_bundle_test_listener"),
+			expectedVerifyClient:    SSLVerifyClientOn,
+			expectedRequireVerified: true,
+		},
+		{
+			name:                    "AllowInsecureFallback allows any cert",
+			mode:                    v1.AllowInsecureFallback,
+			expectedBundle:          "",
+			expectedVerifyClient:    SSLVerifyClientOptionalNoCA,
+			expectedRequireVerified: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			servers := []VirtualServer{{
+				Port: 443,
+				SSL:  &SSL{},
+			}}
+
+			clientSettingsMap := map[int32]listenerClientSettings{
+				443: {
+					CertBundleID:   CertBundleID("cert_bundle_test_listener"),
+					validationMode: test.mode,
+				},
+			}
+			addClientSettingsToSSLServers(servers, clientSettingsMap)
+
+			g.Expect(servers[0].SSL.ClientCertBundleID).To(Equal(test.expectedBundle))
+			g.Expect(servers[0].SSL.VerifyClient).To(Equal(test.expectedVerifyClient))
+			g.Expect(servers[0].SSL.RequireVerifiedCert).To(Equal(test.expectedRequireVerified))
+		})
+	}
+}
+
+func TestBuildCompressionConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		compression *ngfAPIv1alpha2.Compression
+		expected    *CompressionSettings
+		name        string
+	}{
+		{
+			name:        "nil compression",
+			compression: nil,
+			expected:    nil,
+		},
+		{
+			name:        "empty compression struct",
+			compression: &ngfAPIv1alpha2.Compression{},
+			expected:    &CompressionSettings{},
+		},
+		{
+			name: "compression with mime types only",
+			compression: &ngfAPIv1alpha2.Compression{
+				Type:      ngfAPIv1alpha2.GzipCompressionType,
+				MimeTypes: []string{"text/css", "application/json"},
+			},
+			expected: &CompressionSettings{
+				MimeTypes: []string{"text/css", "application/json"},
+			},
+		},
+		{
+			name: "compression with gzip but no http version defaults to 1.1",
+			compression: &ngfAPIv1alpha2.Compression{
+				Type:      ngfAPIv1alpha2.GzipCompressionType,
+				MimeTypes: []string{"text/css"},
+				Gzip:      &ngfAPIv1alpha2.GzipSettings{},
+			},
+			expected: &CompressionSettings{
+				MimeTypes:   []string{"text/css"},
+				HTTPVersion: "1.1",
+			},
+		},
+		{
+			name: "compression with all options",
+			compression: &ngfAPIv1alpha2.Compression{
+				Type:      ngfAPIv1alpha2.GzipCompressionType,
+				MimeTypes: []string{"text/css"},
+				Level:     helpers.GetPointer[int32](6),
+				MinLength: helpers.GetPointer[int32](256),
+				Buffers: &ngfAPIv1alpha2.CompressionBuffers{
+					Number: 32,
+					Size:   "4k",
+				},
+				Gzip: &ngfAPIv1alpha2.GzipSettings{
+					Proxied:     []ngfAPIv1alpha2.GzipProxiedType{ngfAPIv1alpha2.GzipProxiedAny},
+					Vary:        helpers.GetPointer(true),
+					Disable:     []string{"msie6"},
+					HTTPVersion: helpers.GetPointer(ngfAPIv1alpha2.GzipHTTPVersion10),
+				},
+			},
+			expected: &CompressionSettings{
+				Level:        6,
+				MinLength:    helpers.GetPointer[int32](256),
+				BufferNumber: 32,
+				BufferSize:   "4k",
+				MimeTypes:    []string{"text/css"},
+				Vary:         true,
+				Proxied:      []string{"any"},
+				Disable:      []string{"msie6"},
+				HTTPVersion:  "1.0",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := buildCompressionConfig(test.compression)
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestBuildWAF(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		gateway      *graph.Gateway
+		expWAFConfig WAFConfig
+	}{
+		{
+			name: "WAF disabled, no bundles",
+			gateway: &graph.Gateway{
+				Source:              &v1.Gateway{ObjectMeta: metav1.ObjectMeta{UID: "uid-disabled"}},
+				EffectiveNginxProxy: nil,
+				Policies:            []*graph.Policy{},
+			},
+			expWAFConfig: WAFConfig{
+				Enabled:    false,
+				WAFBundles: map[WAFBundleID]WAFBundle{},
+				CookieSeed: "uid-disabled",
+			},
+		},
+		{
+			name: "WAF enabled, no bundles",
+			gateway: &graph.Gateway{
+				Source:              &v1.Gateway{ObjectMeta: metav1.ObjectMeta{UID: "uid-enabled"}},
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)}},
+				Policies:            []*graph.Policy{},
+			},
+			expWAFConfig: WAFConfig{
+				Enabled:    true,
+				WAFBundles: map[WAFBundleID]WAFBundle{},
+				CookieSeed: "uid-enabled",
+			},
+		},
+		{
+			name: "WAF disabled, with bundles on policy",
+			gateway: &graph.Gateway{
+				Source:              &v1.Gateway{ObjectMeta: metav1.ObjectMeta{UID: "uid-disabled-bundles"}},
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(false)}},
+				Policies: []*graph.Policy{
+					{
+						WAFState: &graph.PolicyWAFState{
+							Bundles: map[graph.WAFBundleKey]*graph.WAFBundleData{
+								"bundle1.tgz": {Data: []byte("bundle data")},
+							},
+						},
+					},
+				},
+			},
+			expWAFConfig: WAFConfig{
+				Enabled:    false,
+				CookieSeed: "uid-disabled-bundles",
+				WAFBundles: map[WAFBundleID]WAFBundle{
+					"bundle1.tgz": WAFBundle([]byte("bundle data")),
+				},
+			},
+		},
+		{
+			name: "WAF enabled, with bundles on gateway-targeted policy",
+			gateway: &graph.Gateway{
+				Source:              &v1.Gateway{ObjectMeta: metav1.ObjectMeta{UID: "uid-gw-policy"}},
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)}},
+				Policies: []*graph.Policy{
+					{
+						WAFState: &graph.PolicyWAFState{
+							Bundles: map[graph.WAFBundleKey]*graph.WAFBundleData{
+								"bundle1.tgz": {Data: []byte("first bundle")},
+								"bundle2.tgz": nil,
+							},
+						},
+					},
+				},
+			},
+			expWAFConfig: WAFConfig{
+				Enabled:    true,
+				CookieSeed: "uid-gw-policy",
+				WAFBundles: map[WAFBundleID]WAFBundle{
+					"bundle1.tgz": WAFBundle([]byte("first bundle")),
+					"bundle2.tgz": WAFBundle(nil),
+				},
+			},
+		},
+		{
+			name: "WAF enabled, policy with nil WAFState",
+			gateway: &graph.Gateway{
+				Source:              &v1.Gateway{ObjectMeta: metav1.ObjectMeta{UID: "uid-nil-state"}},
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)}},
+				Policies: []*graph.Policy{
+					{
+						WAFState: nil, // Non-WAF policy.
+					},
+				},
+			},
+			expWAFConfig: WAFConfig{
+				Enabled:    true,
+				WAFBundles: map[WAFBundleID]WAFBundle{},
+				CookieSeed: "uid-nil-state",
+			},
+		},
+		{
+			name: "WAF enabled, multiple policies with bundles",
+			gateway: &graph.Gateway{
+				Source:              &v1.Gateway{ObjectMeta: metav1.ObjectMeta{UID: "uid-multi-policy"}},
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)}},
+				Policies: []*graph.Policy{
+					{
+						WAFState: &graph.PolicyWAFState{
+							Bundles: map[graph.WAFBundleKey]*graph.WAFBundleData{
+								"policy1_bundle": {Data: []byte("bundle 1")},
+							},
+						},
+					},
+					{
+						WAFState: &graph.PolicyWAFState{
+							Bundles: map[graph.WAFBundleKey]*graph.WAFBundleData{
+								"policy2_bundle": {Data: []byte("bundle 2")},
+							},
+						},
+					},
+				},
+			},
+			expWAFConfig: WAFConfig{
+				Enabled:    true,
+				CookieSeed: "uid-multi-policy",
+				WAFBundles: map[WAFBundleID]WAFBundle{
+					"policy1_bundle": WAFBundle([]byte("bundle 1")),
+					"policy2_bundle": WAFBundle([]byte("bundle 2")),
+				},
+			},
+		},
+		{
+			name: "WAF enabled, bundles on route-targeted policy",
+			gateway: &graph.Gateway{
+				Source:              &v1.Gateway{ObjectMeta: metav1.ObjectMeta{UID: "uid-route-policy"}},
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)}},
+				Policies:            []*graph.Policy{},
+				Listeners: []*graph.Listener{
+					{
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "route1"}}: {
+								Policies: []*graph.Policy{
+									{
+										WAFState: &graph.PolicyWAFState{
+											Bundles: map[graph.WAFBundleKey]*graph.WAFBundleData{
+												"route_bundle": {Data: []byte("route bundle data")},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expWAFConfig: WAFConfig{
+				Enabled:    true,
+				CookieSeed: "uid-route-policy",
+				WAFBundles: map[WAFBundleID]WAFBundle{
+					"route_bundle": WAFBundle([]byte("route bundle data")),
+				},
+			},
+		},
+		{
+			name: "WAF enabled, bundles on both gateway and route policies",
+			gateway: &graph.Gateway{
+				Source:              &v1.Gateway{ObjectMeta: metav1.ObjectMeta{UID: "uid-gw-route"}},
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)}},
+				Policies: []*graph.Policy{
+					{
+						WAFState: &graph.PolicyWAFState{
+							Bundles: map[graph.WAFBundleKey]*graph.WAFBundleData{
+								"gw_bundle": {Data: []byte("gateway bundle")},
+							},
+						},
+					},
+				},
+				Listeners: []*graph.Listener{
+					{
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							{NamespacedName: types.NamespacedName{Namespace: "ns", Name: "route1"}}: {
+								Policies: []*graph.Policy{
+									{
+										WAFState: &graph.PolicyWAFState{
+											Bundles: map[graph.WAFBundleKey]*graph.WAFBundleData{
+												"route_bundle": {Data: []byte("route bundle")},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expWAFConfig: WAFConfig{
+				Enabled:    true,
+				CookieSeed: "uid-gw-route",
+				WAFBundles: map[WAFBundleID]WAFBundle{
+					"gw_bundle":    WAFBundle([]byte("gateway bundle")),
+					"route_bundle": WAFBundle([]byte("route bundle")),
+				},
+			},
+		},
+		{
+			name: "nil gateway source",
+			gateway: &graph.Gateway{
+				Source:              nil,
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true)}},
+				Policies:            []*graph.Policy{},
+			},
+			expWAFConfig: WAFConfig{
+				Enabled:    true,
+				WAFBundles: map[WAFBundleID]WAFBundle{},
+				CookieSeed: "",
+			},
+		},
+		{
+			name: "WAF enabled, cookie seed disabled",
+			gateway: &graph.Gateway{
+				Source: &v1.Gateway{ObjectMeta: metav1.ObjectMeta{UID: "uid-disable-seed"}},
+				EffectiveNginxProxy: &graph.EffectiveNginxProxy{
+					WAF: &ngfAPIv1alpha2.WAFSpec{Enable: helpers.GetPointer(true), DisableCookieSeed: helpers.GetPointer(true)},
+				},
+				Policies: []*graph.Policy{},
+			},
+			expWAFConfig: WAFConfig{
+				Enabled:    true,
+				WAFBundles: map[WAFBundleID]WAFBundle{},
+				CookieSeed: "",
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := buildWAF(test.gateway)
+			g.Expect(result).To(Equal(test.expWAFConfig))
+		})
+	}
+}
+
+func TestCreateFiltersExternalAuthSkipsInvalidBackendRef(t *testing.T) {
+	t.Parallel()
+
+	port := v1.PortNumber(80)
+
+	extAuthFilter := graph.Filter{
+		FilterType: graph.FilterExternalAuth,
+		ExternalAuth: &v1.HTTPExternalAuthFilter{
+			ExternalAuthProtocol: v1.HTTPRouteExternalAuthHTTPProtocol,
+			BackendRef: v1.BackendObjectReference{
+				Name: "auth-svc",
+				Port: &port,
+			},
+		},
+	}
+
+	validBackendRef := graph.BackendRef{
+		SvcNsName:             types.NamespacedName{Namespace: "default", Name: "auth-svc"},
+		ServicePort:           apiv1.ServicePort{Port: 80},
+		Valid:                 true,
+		IsExternalAuthBackend: true,
+	}
+
+	invalidBackendRef := graph.BackendRef{
+		SvcNsName:             types.NamespacedName{Namespace: "default", Name: "auth-svc"},
+		ServicePort:           apiv1.ServicePort{Port: 80},
+		Valid:                 false,
+		IsExternalAuthBackend: true,
+	}
+
+	routeNsName := types.NamespacedName{Namespace: "test", Name: "route1"}
+	gwNsName := types.NamespacedName{Namespace: "default", Name: "gw"}
+
+	tests := []struct {
+		msg         string
+		backendRefs []graph.BackendRef
+		expectNil   bool
+	}{
+		{
+			msg:         "valid external auth backend ref produces ExternalAuthFilter",
+			backendRefs: []graph.BackendRef{validBackendRef},
+			expectNil:   false,
+		},
+		{
+			msg:         "invalid external auth backend ref is skipped and ExternalAuthFilter is nil",
+			backendRefs: []graph.BackendRef{invalidBackendRef},
+			expectNil:   true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := createHTTPFilters(
+				[]graph.Filter{extAuthFilter},
+				0,
+				routeNsName,
+				nil,
+				test.backendRefs,
+				gwNsName,
+				nil,
+			)
+
+			if test.expectNil {
+				g.Expect(result.ExternalAuthFilter).To(BeNil())
+			} else {
+				g.Expect(result.ExternalAuthFilter).ToNot(BeNil())
+				g.Expect(result.ExternalAuthFilter.UpstreamName).To(Equal("default_auth-svc_80"))
+			}
+		})
+	}
+}
+
+func TestBuildCertBundles(t *testing.T) {
+	t.Parallel()
+
+	backendBundle := secrets.CertificateBundle{
+		Name: types.NamespacedName{Namespace: "default", Name: "backend-ca"},
+		Cert: &secrets.Certificate{CACert: []byte("backend-ca-data")},
+	}
+	extAuthBundle := secrets.CertificateBundle{
+		Name: types.NamespacedName{Namespace: "default", Name: "ext-auth-ca"},
+		Cert: &secrets.Certificate{CACert: []byte("ext-auth-ca-data")},
+	}
+	eppBundle := secrets.CertificateBundle{
+		Name: types.NamespacedName{Namespace: "default", Name: "epp-ca"},
+		Cert: &secrets.Certificate{CACert: []byte("epp-ca-data")},
+	}
+
+	backendGroupWithTLS := []BackendGroup{
+		{
+			Backends: []Backend{
+				{Valid: true, VerifyTLS: &VerifyTLS{CertBundleID: generateCertBundleID(backendBundle.Name)}},
+			},
+		},
+	}
+
+	tlsServersWithTLS := []Layer4VirtualServer{
+		{
+			VerifyTLS: &VerifyTLS{CertBundleID: generateCertBundleID(backendBundle.Name)},
+		},
+	}
+
+	eppBackendGroupWithTLS := []BackendGroup{
+		{
+			Backends: []Backend{
+				{
+					Valid: true,
+					EndpointPickerConfig: &EndpointPickerConfig{
+						VerifyTLS: &VerifyTLS{CertBundleID: generateCertBundleID(eppBundle.Name)},
+					},
+				},
+			},
+		},
+	}
+
+	invalidEPPBackendGroupWithTLS := []BackendGroup{
+		{
+			Backends: []Backend{
+				{
+					Valid: false,
+					EndpointPickerConfig: &EndpointPickerConfig{
+						VerifyTLS: &VerifyTLS{CertBundleID: generateCertBundleID(eppBundle.Name)},
+					},
+				},
+			},
+		},
+	}
+
+	extAuthIDs := map[CertBundleID]struct{}{
+		generateCertBundleID(extAuthBundle.Name): {},
+	}
+
+	tests := []struct {
+		authBundles          map[CertBundleID]CertBundle
+		expected             map[CertBundleID]CertBundle
+		extAuthCertBundleIDs map[CertBundleID]struct{}
+		name                 string
+		refCertBundles       []secrets.CertificateBundle
+		backendGroups        []BackendGroup
+		tlsServers           []Layer4VirtualServer
+	}{
+		{
+			name:                 "external auth filter BTP cert bundle is written even when no backend group references it",
+			refCertBundles:       []secrets.CertificateBundle{extAuthBundle},
+			backendGroups:        nil,
+			extAuthCertBundleIDs: extAuthIDs,
+			expected: map[CertBundleID]CertBundle{
+				generateCertBundleID(extAuthBundle.Name): CertBundle("ext-auth-ca-data"),
+			},
+		},
+		{
+			name:                 "TLSRoute terminate verify cert bundle is written when only TLS servers reference it",
+			refCertBundles:       []secrets.CertificateBundle{backendBundle},
+			backendGroups:        nil,
+			tlsServers:           tlsServersWithTLS,
+			extAuthCertBundleIDs: nil,
+			expected: map[CertBundleID]CertBundle{
+				generateCertBundleID(backendBundle.Name): CertBundle("backend-ca-data"),
+			},
+		},
+		{
+			name:                 "both backend group BTP and external auth filter BTP cert bundles are written together",
+			refCertBundles:       []secrets.CertificateBundle{backendBundle, extAuthBundle},
+			backendGroups:        backendGroupWithTLS,
+			extAuthCertBundleIDs: extAuthIDs,
+			expected: map[CertBundleID]CertBundle{
+				generateCertBundleID(backendBundle.Name): CertBundle("backend-ca-data"),
+				generateCertBundleID(extAuthBundle.Name): CertBundle("ext-auth-ca-data"),
+			},
+		},
+		{
+			name:                 "no external auth cert bundle IDs and no backend groups results in empty bundle map",
+			refCertBundles:       []secrets.CertificateBundle{extAuthBundle},
+			extAuthCertBundleIDs: nil,
+			expected:             map[CertBundleID]CertBundle{},
+		},
+		{
+			name:        "auth cert bundles are always included regardless of backend or external auth references",
+			authBundles: map[CertBundleID]CertBundle{"auth-oidc-1": CertBundle("oidc-ca")},
+			expected:    map[CertBundleID]CertBundle{"auth-oidc-1": CertBundle("oidc-ca")},
+		},
+		{
+			name: "opaque secret CA cert bundle is included when referenced by ext-auth",
+			refCertBundles: []secrets.CertificateBundle{
+				{
+					Name: types.NamespacedName{Namespace: "default", Name: "opaque-ca"},
+					Kind: "Secret",
+					Cert: &secrets.Certificate{CACert: []byte("opaque-ca-data")},
+				},
+			},
+			extAuthCertBundleIDs: map[CertBundleID]struct{}{
+				generateCertBundleID(types.NamespacedName{Namespace: "default", Name: "opaque-ca"}): {},
+			},
+			expected: map[CertBundleID]CertBundle{
+				generateCertBundleID(types.NamespacedName{Namespace: "default", Name: "opaque-ca"}): CertBundle("opaque-ca-data"),
+			},
+		},
+		{
+			name: "opaque secret CA cert bundle is not included when unreferenced",
+			refCertBundles: []secrets.CertificateBundle{
+				{
+					Name: types.NamespacedName{Namespace: "default", Name: "opaque-ca-data"},
+					Kind: "Secret",
+					Cert: &secrets.Certificate{CACert: []byte("opaque-ca-data")},
+				},
+			},
+			extAuthCertBundleIDs: nil,
+			backendGroups:        nil,
+			expected:             map[CertBundleID]CertBundle{},
+		},
+		{
+			name:           "EndpointPicker BackendTLSPolicy cert bundle is written when referenced by valid backend",
+			refCertBundles: []secrets.CertificateBundle{eppBundle},
+			backendGroups:  eppBackendGroupWithTLS,
+			expected: map[CertBundleID]CertBundle{
+				generateCertBundleID(eppBundle.Name): CertBundle("epp-ca-data"),
+			},
+		},
+		{
+			name:           "EndpointPicker BackendTLSPolicy cert bundle is excluded when backend is invalid",
+			refCertBundles: []secrets.CertificateBundle{eppBundle},
+			backendGroups:  invalidEPPBackendGroupWithTLS,
+			expected:       map[CertBundleID]CertBundle{},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			result := buildCertBundles(
+				test.refCertBundles,
+				test.backendGroups,
+				test.tlsServers,
+				test.extAuthCertBundleIDs,
+				test.authBundles,
+			)
+
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestCollectGuardrailsCertBundleIDs(t *testing.T) {
+	t.Parallel()
+
+	serverWith := func(guardrails *GuardrailsConfig) VirtualServer {
+		return VirtualServer{
+			PathRules: []PathRule{
+				{MatchRules: []MatchRule{{Guardrails: guardrails}}},
+			},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		expected map[CertBundleID]struct{}
+		servers  []VirtualServer
+	}{
+		{
+			name:     "no guardrails",
+			servers:  []VirtualServer{serverWith(nil)},
+			expected: map[CertBundleID]struct{}{},
+		},
+		{
+			name:     "guardrails without VerifyTLS",
+			servers:  []VirtualServer{serverWith(&GuardrailsConfig{Enabled: true})},
+			expected: map[CertBundleID]struct{}{},
+		},
+		{
+			name: "guardrails VerifyTLS using system store (no CertBundleID) is skipped",
+			servers: []VirtualServer{
+				serverWith(&GuardrailsConfig{Enabled: true, VerifyTLS: &VerifyTLS{RootCAPath: AlpineSSLRootCAPath}}),
+			},
+			expected: map[CertBundleID]struct{}{},
+		},
+		{
+			name: "guardrails VerifyTLS with CertBundleID is collected",
+			servers: []VirtualServer{
+				serverWith(&GuardrailsConfig{Enabled: true, VerifyTLS: &VerifyTLS{CertBundleID: "guardrails-ca"}}),
+			},
+			expected: map[CertBundleID]struct{}{"guardrails-ca": {}},
+		},
+		{
+			name: "multiple guardrails backends across servers are deduplicated",
+			servers: []VirtualServer{
+				serverWith(&GuardrailsConfig{Enabled: true, VerifyTLS: &VerifyTLS{CertBundleID: "ca-a"}}),
+				serverWith(&GuardrailsConfig{Enabled: true, VerifyTLS: &VerifyTLS{CertBundleID: "ca-a"}}),
+				serverWith(&GuardrailsConfig{Enabled: true, VerifyTLS: &VerifyTLS{CertBundleID: "ca-b"}}),
+			},
+			expected: map[CertBundleID]struct{}{"ca-a": {}, "ca-b": {}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(collectGuardrailsCertBundleIDs(test.servers)).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestBuildUpstreamsWithClusterIP(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	clusterIP := "10.96.0.1"
+	svcKey := types.NamespacedName{Namespace: "default", Name: "my-svc"}
+
+	usp := &ngfAPIv1alpha1.UpstreamSettingsPolicy{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "usp"},
+		Spec:       ngfAPIv1alpha1.UpstreamSettingsPolicySpec{UseClusterIP: helpers.GetPointer(true)},
+	}
+
+	gateway := &graph.Gateway{
+		Source: &v1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"}},
+		Listeners: []*graph.Listener{
+			{
+				Valid: true,
+				Source: v1.Listener{
+					Protocol: v1.HTTPProtocolType,
+					Port:     80,
+				},
+				Routes: map[graph.RouteKey]*graph.L7Route{
+					{NamespacedName: types.NamespacedName{Namespace: "default", Name: "route"}}: {
+						Valid: true,
+						Spec: graph.L7RouteSpec{
+							Rules: []graph.RouteRule{
+								{
+									ValidMatches: true,
+									Filters:      graph.RouteRuleFilters{Valid: true},
+									BackendRefs: []graph.BackendRef{
+										{
+											Valid:       true,
+											SvcNsName:   svcKey,
+											ServicePort: apiv1.ServicePort{Port: 80},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	referencedServices := map[types.NamespacedName]*graph.ReferencedService{
+		svcKey: {
+			ClusterIP: clusterIP,
+			Policies: []*graph.Policy{
+				{
+					Source: usp,
+					Valid:  true,
+				},
+			},
+			GatewayNsNames: map[types.NamespacedName]struct{}{
+				{Name: "gw", Namespace: "default"}: {},
+			},
+		},
+	}
+
+	// Resolver should NOT be called when UseClusterIP is true
+	fakeResolver := &resolverfakes.ServiceResolverMock{}
+	fakeResolver.ResolveFunc = func(
+		_ context.Context,
+		_ logr.Logger,
+		_ types.NamespacedName,
+		_ apiv1.ServicePort,
+		_ []discoveryV1.AddressType,
+	) ([]resolver.Endpoint, error) {
+		t.Fatal("resolver should not be called when UseClusterIP is true")
+		return nil, nil
+	}
+
+	upstreams := buildUpstreams(t.Context(), logr.Discard(), gateway, fakeResolver, referencedServices)
+
+	g.Expect(upstreams).To(HaveLen(1))
+	g.Expect(upstreams[0].Endpoints).To(Equal([]resolver.Endpoint{
+		{Address: clusterIP, Port: 80},
+	}))
+}
+
+func TestBuildUpstreamsUseClusterIPPrecedence(t *testing.T) {
+	t.Parallel()
+
+	clusterIP := "10.96.0.1"
+	svcKey := types.NamespacedName{Namespace: "default", Name: "my-svc"}
+	podEndpoints := []resolver.Endpoint{{Address: "10.0.0.1", Port: 80}}
+
+	tests := []struct {
+		nginxProxyUseClusterIP *bool
+		uspUseClusterIP        *bool
+		name                   string
+		expectClusterIP        bool
+	}{
+		{
+			name:                   "NginxProxy enables, no UpstreamSettingsPolicy",
+			nginxProxyUseClusterIP: helpers.GetPointer(true),
+			uspUseClusterIP:        nil,
+			expectClusterIP:        true,
+		},
+		{
+			name:                   "UpstreamSettingsPolicy enables, NginxProxy unset",
+			nginxProxyUseClusterIP: nil,
+			uspUseClusterIP:        helpers.GetPointer(true),
+			expectClusterIP:        true,
+		},
+		{
+			name:                   "UpstreamSettingsPolicy disables, overriding NginxProxy enabled",
+			nginxProxyUseClusterIP: helpers.GetPointer(true),
+			uspUseClusterIP:        helpers.GetPointer(false),
+			expectClusterIP:        false,
+		},
+		{
+			name:                   "UpstreamSettingsPolicy enables, overriding NginxProxy disabled",
+			nginxProxyUseClusterIP: helpers.GetPointer(false),
+			uspUseClusterIP:        helpers.GetPointer(true),
+			expectClusterIP:        true,
+		},
+		{
+			name:                   "neither NginxProxy nor UpstreamSettingsPolicy set",
+			nginxProxyUseClusterIP: nil,
+			uspUseClusterIP:        nil,
+			expectClusterIP:        false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			var svcPolicies []*graph.Policy
+			if test.uspUseClusterIP != nil {
+				usp := &ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "usp"},
+					Spec:       ngfAPIv1alpha1.UpstreamSettingsPolicySpec{UseClusterIP: test.uspUseClusterIP},
+				}
+				svcPolicies = []*graph.Policy{{Source: usp, Valid: true}}
+			}
+
+			gateway := &graph.Gateway{
+				Source: &v1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"}},
+				Listeners: []*graph.Listener{
+					{
+						Valid:  true,
+						Source: v1.Listener{Protocol: v1.HTTPProtocolType, Port: 80},
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "route"}}: {
+								Valid: true,
+								Spec: graph.L7RouteSpec{
+									Rules: []graph.RouteRule{
+										{
+											ValidMatches: true,
+											Filters:      graph.RouteRuleFilters{Valid: true},
+											BackendRefs: []graph.BackendRef{
+												{
+													Valid:       true,
+													SvcNsName:   svcKey,
+													ServicePort: apiv1.ServicePort{Port: 80},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+			if test.nginxProxyUseClusterIP != nil {
+				gateway.EffectiveNginxProxy = &graph.EffectiveNginxProxy{UseClusterIP: test.nginxProxyUseClusterIP}
+			}
+
+			referencedServices := map[types.NamespacedName]*graph.ReferencedService{
+				svcKey: {
+					ClusterIP: clusterIP,
+					Policies:  svcPolicies,
+					GatewayNsNames: map[types.NamespacedName]struct{}{
+						{Name: "gw", Namespace: "default"}: {},
+					},
+				},
+			}
+
+			fakeResolver := &resolverfakes.ServiceResolverMock{
+				ResolveFunc: func(
+					context.Context, logr.Logger, types.NamespacedName, apiv1.ServicePort, []discoveryV1.AddressType) (
+					[]resolver.Endpoint, error,
+				) {
+					return podEndpoints, nil
+				},
+			}
+
+			upstreams := buildUpstreams(t.Context(), logr.Discard(), gateway, fakeResolver, referencedServices)
+
+			g.Expect(upstreams).To(HaveLen(1))
+			if test.expectClusterIP {
+				g.Expect(fakeResolver.ResolveCalls()).To(BeEmpty())
+				g.Expect(upstreams[0].Endpoints).To(Equal([]resolver.Endpoint{{Address: clusterIP, Port: 80}}))
+			} else {
+				g.Expect(fakeResolver.ResolveCalls()).To(HaveLen(1))
+				g.Expect(upstreams[0].Endpoints).To(Equal(podEndpoints))
+			}
+		})
+	}
+}
+
+func TestBuildAccessLogDestination(t *testing.T) {
+	t.Parallel()
+
+	logFormat := `'$remote_addr - $remote_user [$time_local] '
+							'"$request" $status $body_bytes_sent '
+							'"$http_referer" "$http_user_agent" '`
+
+	server := "syslog.example.com:514"
+	path := "/var/log/nginx/access.log"
+
+	tests := []struct {
+		name           string
+		src            *ngfAPIv1alpha2.NginxLogging
+		expectedPath   string
+		expectedFormat string
+	}{
+		{
+			name: "syslog server destination configuration set correctly",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Format: helpers.GetPointer(logFormat),
+					Destination: &ngfAPIv1alpha2.NginxAccessLogDestination{
+						Type: ngfAPIv1alpha2.NginxAccessLogDestinationTypeSyslog,
+						Syslog: &ngfAPIv1alpha2.NginxAccessLogSyslog{
+							Server: server,
+						},
+					},
+				},
+			},
+			expectedPath:   "syslog:server=" + server,
+			expectedFormat: logFormat,
+		},
+		{
+			name: "file path destination configuration sets correctly",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Format: helpers.GetPointer(logFormat),
+					Destination: &ngfAPIv1alpha2.NginxAccessLogDestination{
+						Type: ngfAPIv1alpha2.NginxAccessLogDestinationTypeFile,
+						File: &ngfAPIv1alpha2.NginxAccessLogFile{
+							Path: path,
+						},
+					},
+				},
+			},
+			expectedPath:   path,
+			expectedFormat: logFormat,
+		},
+		{
+			name: "unset destination falls back to default path",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Format: helpers.GetPointer(logFormat),
+				},
+			},
+			expectedPath:   DefaultAccessLogPath,
+			expectedFormat: logFormat,
+		},
+		{
+			name: "nil destination falls back to default path",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Format:      helpers.GetPointer(logFormat),
+					Destination: nil,
+				},
+			},
+			expectedPath:   DefaultAccessLogPath,
+			expectedFormat: logFormat,
+		},
+		{
+			name: "destination set without format uses default format",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Destination: &ngfAPIv1alpha2.NginxAccessLogDestination{
+						Type: ngfAPIv1alpha2.NginxAccessLogDestinationTypeFile,
+						File: &ngfAPIv1alpha2.NginxAccessLogFile{
+							Path: path,
+						},
+					},
+				},
+			},
+			expectedPath:   path,
+			expectedFormat: "",
+		},
+		{
+			name: "json access log template correctly applies destination",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				ErrorLogFormat: helpers.GetPointer(ngfAPIv1alpha2.NginxErrorLogFormatJSON),
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Destination: &ngfAPIv1alpha2.NginxAccessLogDestination{
+						Type: ngfAPIv1alpha2.NginxAccessLogDestinationTypeSyslog,
+						Syslog: &ngfAPIv1alpha2.NginxAccessLogSyslog{
+							Server: server,
+						},
+					},
+				},
+			},
+			expectedPath:   "syslog:server=" + server,
+			expectedFormat: JSONAccessLogFormat,
+		},
+		{
+			name: "nil file struct falls back to default path",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Destination: &ngfAPIv1alpha2.NginxAccessLogDestination{
+						Type: ngfAPIv1alpha2.NginxAccessLogDestinationTypeFile,
+						File: nil,
+					},
+				},
+			},
+			expectedPath: DefaultAccessLogPath,
+		},
+		{
+			name: "empty file struct falls back to default path",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Destination: &ngfAPIv1alpha2.NginxAccessLogDestination{
+						Type: ngfAPIv1alpha2.NginxAccessLogDestinationTypeFile,
+						File: &ngfAPIv1alpha2.NginxAccessLogFile{},
+					},
+				},
+			},
+			expectedPath: DefaultAccessLogPath,
+		},
+		{
+			name: "nil syslog struct falls back to default path",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Destination: &ngfAPIv1alpha2.NginxAccessLogDestination{
+						Type:   ngfAPIv1alpha2.NginxAccessLogDestinationTypeSyslog,
+						Syslog: nil,
+					},
+				},
+			},
+			expectedPath: DefaultAccessLogPath,
+		},
+		{
+			name: "empty syslog struct falls back to default path",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Destination: &ngfAPIv1alpha2.NginxAccessLogDestination{
+						Type:   ngfAPIv1alpha2.NginxAccessLogDestinationTypeSyslog,
+						Syslog: &ngfAPIv1alpha2.NginxAccessLogSyslog{},
+					},
+				},
+			},
+			expectedPath: DefaultAccessLogPath,
+		},
+		{
+			name: "empty file path string falls back to default path",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Destination: &ngfAPIv1alpha2.NginxAccessLogDestination{
+						Type: ngfAPIv1alpha2.NginxAccessLogDestinationTypeFile,
+						File: &ngfAPIv1alpha2.NginxAccessLogFile{
+							Path: "",
+						},
+					},
+				},
+			},
+			expectedPath: DefaultAccessLogPath,
+		},
+		{
+			name: "empty syslog string falls back to default path",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Destination: &ngfAPIv1alpha2.NginxAccessLogDestination{
+						Type: ngfAPIv1alpha2.NginxAccessLogDestinationTypeSyslog,
+						Syslog: &ngfAPIv1alpha2.NginxAccessLogSyslog{
+							Server: "",
+						},
+					},
+				},
+			},
+			expectedPath:   DefaultAccessLogPath,
+			expectedFormat: "",
+		},
+		{
+			name: "destination with empty type falls back to default path",
+			src: &ngfAPIv1alpha2.NginxLogging{
+				AccessLog: &ngfAPIv1alpha2.NginxAccessLog{
+					Destination: &ngfAPIv1alpha2.NginxAccessLogDestination{
+						Type: "",
+					},
+				},
+			},
+			expectedPath:   DefaultAccessLogPath,
+			expectedFormat: "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			g := NewWithT(t)
+			got := buildAccessLog(test.src)
+
+			g.Expect(got).ToNot(BeNil())
+			g.Expect(got.Path).To(Equal(test.expectedPath))
+			g.Expect(got.Format).To(Equal(test.expectedFormat))
+		})
+	}
+}
+
+func TestBuildUpstreamsZoneSizePrecedence(t *testing.T) {
+	t.Parallel()
+
+	podEndpoints := []resolver.Endpoint{{Address: "10.0.0.1", Port: 80}}
+	svcKey := types.NamespacedName{Namespace: "default", Name: "my-svc"}
+
+	tests := []struct {
+		nginxProxyZoneSize *ngfAPIv1alpha1.Size
+		uspZoneSize        *ngfAPIv1alpha1.Size
+		expectedZoneSize   *ngfAPIv1alpha1.Size
+		name               string
+	}{
+		{
+			name:               "NginxProxy sets zone size, no UpstreamSettingsPolicy",
+			nginxProxyZoneSize: helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+			uspZoneSize:        nil,
+			expectedZoneSize:   helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+		},
+		{
+			name:               "UpstreamSettingsPolicy sets zone size, NginxProxy unset",
+			nginxProxyZoneSize: nil,
+			uspZoneSize:        helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+			expectedZoneSize:   helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+		},
+		{
+			name:               "NginxProxy and UpstreamSettingsPolicy set zone size, UpstreamSettingsPolicy takes precedence",
+			nginxProxyZoneSize: helpers.GetPointer[ngfAPIv1alpha1.Size]("1m"),
+			uspZoneSize:        helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+			expectedZoneSize:   helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+		},
+		{
+			name:               "neither NginxProxy nor UpstreamSettingsPolicy set zone size",
+			nginxProxyZoneSize: nil,
+			uspZoneSize:        nil,
+			expectedZoneSize:   nil,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			var svcPolicies []*graph.Policy
+			if test.uspZoneSize != nil {
+				usp := &ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "usp"},
+					Spec:       ngfAPIv1alpha1.UpstreamSettingsPolicySpec{ZoneSize: test.uspZoneSize},
+				}
+				svcPolicies = []*graph.Policy{{Source: usp, Valid: true}}
+			}
+
+			gateway := &graph.Gateway{
+				Source: &v1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: "gw", Namespace: "default"}},
+				Listeners: []*graph.Listener{
+					{
+						Valid:  true,
+						Source: v1.Listener{Protocol: v1.HTTPProtocolType, Port: 80},
+						Routes: map[graph.RouteKey]*graph.L7Route{
+							{NamespacedName: types.NamespacedName{Namespace: "default", Name: "route"}}: {
+								Valid: true,
+								Spec: graph.L7RouteSpec{
+									Rules: []graph.RouteRule{
+										{
+											ValidMatches: true,
+											Filters:      graph.RouteRuleFilters{Valid: true},
+											BackendRefs: []graph.BackendRef{
+												{
+													Valid:       true,
+													SvcNsName:   types.NamespacedName{Namespace: "default", Name: "my-svc"},
+													ServicePort: apiv1.ServicePort{Port: 80},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			if test.nginxProxyZoneSize != nil {
+				gateway.EffectiveNginxProxy = &graph.EffectiveNginxProxy{ZoneSize: test.nginxProxyZoneSize}
+			}
+
+			referencedServices := map[types.NamespacedName]*graph.ReferencedService{
+				svcKey: {
+					Policies: svcPolicies,
+					GatewayNsNames: map[types.NamespacedName]struct{}{
+						{Name: "gw", Namespace: "default"}: {},
+					},
+				},
+			}
+
+			fakeResolver := &resolverfakes.ServiceResolverMock{
+				ResolveFunc: func(
+					context.Context, logr.Logger, types.NamespacedName, apiv1.ServicePort, []discoveryV1.AddressType) (
+					[]resolver.Endpoint, error,
+				) {
+					return podEndpoints, nil
+				},
+			}
+
+			upstreams := buildUpstreams(t.Context(), logr.Discard(), gateway, fakeResolver, referencedServices)
+
+			g.Expect(upstreams).To(HaveLen(1))
+			g.Expect(upstreams[0].UpstreamSettings.ZoneSize).To(Equal(test.expectedZoneSize))
+		})
+	}
+}
+
+func TestBuildGuardrailsAuthSecrets(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	secretNsName := types.NamespacedName{Namespace: "ns1", Name: "token-secret"}
+	otherSecretNsName := types.NamespacedName{Namespace: "ns1", Name: "other-token-secret"}
+
+	gwNsName := types.NamespacedName{Namespace: "ns1", Name: "gw"}
+	otherGwNsName := types.NamespacedName{Namespace: "ns1", Name: "other-gw"}
+
+	gwSource := func(nsName types.NamespacedName) *v1.Gateway {
+		return &v1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{Namespace: nsName.Namespace, Name: nsName.Name},
+		}
+	}
+
+	// routeWithToken builds a route whose per-Gateway effective processor (for the given gateways)
+	// carries a token backed by secret.
+	routeWithToken := func(
+		secret types.NamespacedName,
+		token string,
+		valid bool,
+		gateways ...types.NamespacedName,
+	) *graph.L7Route {
+		policy := &graph.Policy{
+			Valid: true,
+			PayloadProcessorState: &graph.PolicyPayloadProcessorState{
+				APIURL:            "http://svc:9000",
+				AuthTokenSecret:   &secret,
+				ResolvedAuthToken: []byte(token),
+			},
+		}
+		effective := make(map[types.NamespacedName]*graph.Policy)
+		for _, gw := range gateways {
+			effective[gw] = policy
+		}
+		return &graph.L7Route{Valid: valid, EffectivePayloadProcessors: effective}
+	}
+
+	withToken := routeWithToken(secretNsName, "tok", true, gwNsName)
+	withoutToken := &graph.L7Route{
+		Valid: true,
+		EffectivePayloadProcessors: map[types.NamespacedName]*graph.Policy{
+			gwNsName: {
+				Valid:                 true,
+				PayloadProcessorState: &graph.PolicyPayloadProcessorState{APIURL: "http://svc:9000"},
+			},
+		},
+	}
+	noProcessor := &graph.L7Route{Valid: true}
+	// invalidRoute carries a token but is not Valid, so it must be skipped.
+	invalidRoute := routeWithToken(otherSecretNsName, "invalid-route-tok", false, gwNsName)
+	// invalidListenerRoute carries a token but sits on an invalid listener, so it must be skipped.
+	invalidListenerRoute := routeWithToken(otherSecretNsName, "invalid-listener-tok", true, gwNsName)
+	// otherGwOnlyRoute has a token, but only for another Gateway; it must not leak into gw's config
+	// even though it is enumerated under gw's listener.
+	otherGwOnlyRoute := routeWithToken(otherSecretNsName, "other-gw-tok", true, otherGwNsName)
+
+	key := func(name string) graph.RouteKey {
+		return graph.RouteKey{NamespacedName: types.NamespacedName{Namespace: "ns1", Name: name}}
+	}
+
+	gateway := &graph.Gateway{
+		Source: gwSource(gwNsName),
+		Listeners: []*graph.Listener{
+			{
+				Valid: true,
+				Routes: map[graph.RouteKey]*graph.L7Route{
+					key("r1"): withToken,
+					key("r2"): withoutToken,
+					key("r3"): noProcessor,
+					key("r4"): invalidRoute,
+					key("r7"): otherGwOnlyRoute,
+				},
+			},
+			{
+				Valid: false,
+				Routes: map[graph.RouteKey]*graph.L7Route{
+					key("r5"): invalidListenerRoute,
+				},
+			},
+		},
+	}
+
+	got := buildGuardrailsAuthSecrets(gateway)
+
+	id := GenerateGuardrailsTokenFileID("ns1", "token-secret")
+	otherID := GenerateGuardrailsTokenFileID("ns1", "other-token-secret")
+	// Only the valid route on the valid listener with a processor for this gateway contributes a token.
+	g.Expect(got).To(HaveLen(1))
+	g.Expect(got).To(HaveKeyWithValue(id, AuthFileData("tok")))
+	// Tokens from an invalid route, a route on an invalid listener, or a route whose processor belongs
+	// to another gateway must not be included.
+	g.Expect(got).ToNot(HaveKey(otherID))
+
+	// The other gateway does collect its own token for the shared route, confirming per-gateway scoping
+	// rather than a global drop.
+	otherGateway := &graph.Gateway{
+		Source: gwSource(otherGwNsName),
+		Listeners: []*graph.Listener{
+			{
+				Valid:  true,
+				Routes: map[graph.RouteKey]*graph.L7Route{key("r7"): otherGwOnlyRoute},
+			},
+		},
+	}
+	g.Expect(buildGuardrailsAuthSecrets(otherGateway)).To(HaveKeyWithValue(otherID, AuthFileData("other-gw-tok")))
+
+	// A gateway with a nil Source yields no tokens.
+	g.Expect(buildGuardrailsAuthSecrets(&graph.Gateway{})).To(BeEmpty())
+	g.Expect(buildGuardrailsAuthSecrets(nil)).To(BeEmpty())
+}
+
+func TestGuardrailsEnabled(t *testing.T) {
+	t.Parallel()
+
+	withGuardrails := []VirtualServer{
+		{
+			PathRules: []PathRule{
+				{MatchRules: []MatchRule{{Guardrails: &GuardrailsConfig{Enabled: true}}}},
+			},
+		},
+	}
+	withoutGuardrails := []VirtualServer{
+		{PathRules: []PathRule{{MatchRules: []MatchRule{{}}}}},
+	}
+
+	g := NewWithT(t)
+	g.Expect(guardrailsEnabled(withoutGuardrails)).To(BeFalse())
+	g.Expect(guardrailsEnabled(withoutGuardrails, withGuardrails)).To(BeTrue())
+	g.Expect(guardrailsEnabled()).To(BeFalse())
+}

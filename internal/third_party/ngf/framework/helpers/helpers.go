@@ -1,0 +1,201 @@
+// Package helpers contains helper functions
+package helpers
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"net/url"
+	"runtime/debug"
+	"strconv"
+	"strings"
+	"text/template"
+
+	"github.com/go-logr/logr"
+	"github.com/google/go-cmp/cmp"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// Diff prints the diff between two structs.
+// It is useful in testing to compare two structs when they are large. In such a case, without Diff it will be difficult
+// to pinpoint the difference between the two structs.
+func Diff(want, got any) string {
+	r := cmp.Diff(want, got)
+
+	if r != "" {
+		return "(-want +got)\n" + r
+	}
+	return r
+}
+
+// GetPointer takes a value of any type and returns a pointer to it.
+func GetPointer[T any](v T) *T {
+	return &v
+}
+
+// PrepareTimeForFakeClient processes the time similarly to the fake client
+// from sigs.k8s.io/controller-runtime/pkg/client/fake
+// making it is possible to use it in tests when comparing against values returned by the fake client.
+// It panics if it fails to process the time.
+func PrepareTimeForFakeClient(t metav1.Time) metav1.Time {
+	b, err := t.Marshal()
+	if err != nil {
+		panic(fmt.Errorf("failed to marshal time: %w", err))
+	}
+
+	if err = t.Unmarshal(b); err != nil {
+		panic(fmt.Errorf("failed to unmarshal time: %w", err))
+	}
+
+	return t
+}
+
+// MustCastObject casts the client.Object to the specified type that implements it.
+func MustCastObject[T client.Object](object client.Object) T {
+	if obj, ok := object.(T); ok {
+		return obj
+	}
+
+	panic(fmt.Errorf("unexpected object type %T", object))
+}
+
+// EqualPointers returns whether two pointers are equal.
+// Pointers are considered equal if one of the following is true:
+// - They are both nil.
+// - One is nil and the other is empty (e.g. nil string and "").
+// - They are both non-nil, and their values are the same.
+func EqualPointers[T comparable](p1, p2 *T) bool {
+	if p1 == nil && p2 == nil {
+		return true
+	}
+
+	var p1Val, p2Val T
+
+	if p1 != nil {
+		p1Val = *p1
+	}
+
+	if p2 != nil {
+		p2Val = *p2
+	}
+
+	return p1Val == p2Val
+}
+
+// MustExecuteTemplate executes the template with the given data.
+func MustExecuteTemplate(templ *template.Template, data any) []byte {
+	var buf bytes.Buffer
+
+	if err := templ.Execute(&buf, data); err != nil {
+		panic(err)
+	}
+
+	return buf.Bytes()
+}
+
+// CapitalizeString capitalizes the first letter of the string.
+func CapitalizeString(s string) string {
+	if s == "" {
+		return s
+	}
+
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// URLHash returns the first 16 hex characters of the SHA-256 digest of rawURL.
+// Used to derive a stable, filesystem-safe component for keys.
+func URLHash(rawURL string) string {
+	sum := sha256.Sum256([]byte(rawURL))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// ToSafeFileName converts any string to a filesystem-safe filename using SHA256 hash.
+func ToSafeFileName(input string) string {
+	hasher := sha256.New()
+	hasher.Write([]byte(input))
+	return base64.URLEncoding.EncodeToString(hasher.Sum(nil))
+}
+
+// BuildPortFwdPort uses the specified portFwdPort if that is supplied, else uses the defaultPort provided.
+func BuildPortFwdPort(defaultPort int, portFwdPort int) int {
+	if portFwdPort != 0 {
+		return portFwdPort
+	}
+	return defaultPort
+}
+
+// BuildPortFwdURL builds a URL for port forwarding based on the given address and port.
+// If no scheme is provided in the rawURL parameter (i.e. "cafe.example.com"), http is used.
+func BuildPortFwdURL(rawURL string, port int) string {
+	input := rawURL
+	if !strings.Contains(input, "://") {
+		input = "//" + input
+	}
+
+	parsed, err := url.Parse(input)
+	if err != nil {
+		panic(fmt.Errorf("failed to parse url %q: %w", rawURL, err))
+	}
+
+	// use http if no scheme is defined
+	scheme := parsed.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+
+	host := parsed.Hostname() // existing ports stripped away
+	if port != 0 {
+		host = net.JoinHostPort(parsed.Hostname(), strconv.Itoa(port))
+	}
+
+	// include all parts of URL struct
+	builtURL := url.URL{
+		Scheme:      scheme,
+		Opaque:      parsed.Opaque,
+		User:        parsed.User,
+		Host:        host,
+		Path:        parsed.Path,
+		RawPath:     parsed.RawPath,
+		RawQuery:    parsed.RawQuery,
+		Fragment:    parsed.Fragment,
+		RawFragment: parsed.RawFragment,
+	}
+	return builtURL.String()
+}
+
+// SanitizeNginxVar replaces any character that is not an ASCII letter, digit, or underscore
+// with an underscore, producing a valid NGINX variable name segment.
+func SanitizeNginxVar(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			return r
+		}
+		return '_'
+	}, s)
+}
+
+// RecoverAndFlush logs a recovered panic value, flushes logs if provided, and optionally re-panics.
+// The caller must obtain the recovered value from recover() in the deferred panic boundary and pass it in.
+func RecoverAndFlush(logger logr.Logger, flush func(), message string, recovered any, repanic bool) {
+	if recovered == nil {
+		return
+	}
+
+	err := fmt.Errorf("%v", recovered)
+	logger.Error(
+		err,
+		"Panic recovered",
+		"originalMessage", message,
+		"stack", string(debug.Stack()),
+	)
+	if flush != nil {
+		flush()
+	}
+	if repanic {
+		panic(recovered)
+	}
+}

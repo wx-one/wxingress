@@ -1,0 +1,18 @@
+# What the runbook, step 1, adds to the HelmChartConfig of rke2-ingress-nginx:
+# no pod on a node labelled wx1.eu/ingress=wxingress, and OnDelete, so that
+# this change - and every later one of the chart until it goes - replaces no
+# running pod: a pod goes when its node is labelled, after the node is out of
+# the balancer. With RollingUpdate the affinity alone would restart every
+# pod of the cluster, one node after the other, each node refusing
+# connections while its pod restarts.
+controller:
+  updateStrategy:
+    type: OnDelete
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: wx1.eu/ingress
+                operator: NotIn
+                values: [wxingress]

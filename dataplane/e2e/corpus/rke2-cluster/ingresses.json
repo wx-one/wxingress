@@ -1,0 +1,3098 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-1",
+        "namespace": "ns-1",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "zone1.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-1",
+                      "port": {
+                        "number": 80
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "zone1.test"
+            ],
+            "secretName": "secret-1"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-2",
+        "namespace": "ns-2",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-2"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h2.zone2.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-2",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h2.zone2.test"
+            ],
+            "secretName": "secret-2"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-3",
+        "namespace": "ns-2",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-2"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h3.zone2.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-3",
+                      "port": {
+                        "name": "web"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h3.zone2.test"
+            ],
+            "secretName": "secret-3"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-4",
+        "namespace": "ns-2",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-2"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h4.zone2.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-4",
+                      "port": {
+                        "name": "widgets"
+                      }
+                    }
+                  },
+                  "path": "/widgetapi/v1",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-4",
+                      "port": {
+                        "name": "webhooks"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h4.zone2.test"
+            ],
+            "secretName": "secret-4"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-5",
+        "namespace": "ns-2",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-2"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h5.zone2.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "web"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/.well-known/openid-configuration",
+                  "pathType": "ImplementationSpecific"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h5.zone2.test"
+            ],
+            "secretName": "secret-5"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-6",
+        "namespace": "ns-2",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-2",
+          "nginx.ingress.kubernetes.io/proxy-buffering": "off",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "120",
+          "nginx.ingress.kubernetes.io/proxy-send-timeout": "120"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h6.zone2.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-6",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/sfu/get",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-7",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h6.zone2.test"
+            ],
+            "secretName": "secret-6"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-7",
+        "namespace": "ns-2",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-2",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "25M"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h7.zone2.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/api/v1/login",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/api/v1/refresh",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/api/v1/logout",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/r0/login",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/r0/refresh",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/r0/logout",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/v3/login",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/v3/refresh",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/v3/logout",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/unstable/login",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/unstable/refresh",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/unstable/logout",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-8",
+                      "port": {
+                        "name": "haproxy-synapse"
+                      }
+                    }
+                  },
+                  "path": "/_matrix",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-8",
+                      "port": {
+                        "name": "haproxy-synapse"
+                      }
+                    }
+                  },
+                  "path": "/_synapse",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h7.zone2.test"
+            ],
+            "secretName": "secret-7"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-8",
+        "namespace": "ns-2",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-2"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "zone2.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-9",
+                      "port": {
+                        "name": "haproxy-wkd"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-2",
+        "namespace": "ns-3",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-2",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-3"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h9.zone3.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-2",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h9.zone3.test"
+            ],
+            "secretName": "secret-2"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-3",
+        "namespace": "ns-3",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-2",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-3"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "zone3.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-3",
+                      "port": {
+                        "name": "web"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "zone3.test"
+            ],
+            "secretName": "secret-3"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-4",
+        "namespace": "ns-3",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-2",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-3"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h11.zone3.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-4",
+                      "port": {
+                        "name": "widgets"
+                      }
+                    }
+                  },
+                  "path": "/widgetapi/v1",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-4",
+                      "port": {
+                        "name": "webhooks"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h11.zone3.test"
+            ],
+            "secretName": "secret-4"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-5",
+        "namespace": "ns-3",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-2",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-3"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h12.zone3.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "web"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/.well-known/openid-configuration",
+                  "pathType": "ImplementationSpecific"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h12.zone3.test"
+            ],
+            "secretName": "secret-5"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-6",
+        "namespace": "ns-3",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-2",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-3",
+          "nginx.ingress.kubernetes.io/proxy-buffering": "off",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "120",
+          "nginx.ingress.kubernetes.io/proxy-send-timeout": "120"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h13.zone3.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-6",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/sfu/get",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-6",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/get_token",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-7",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h13.zone3.test"
+            ],
+            "secretName": "secret-6"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-7",
+        "namespace": "ns-3",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-2",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-3",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "25M"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "zone4.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/api/v1/login",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/api/v1/refresh",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/api/v1/logout",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/r0/login",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/r0/refresh",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/r0/logout",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/v3/login",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/v3/refresh",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/v3/logout",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/unstable/login",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/unstable/refresh",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-5",
+                      "port": {
+                        "name": "root"
+                      }
+                    }
+                  },
+                  "path": "/_matrix/client/unstable/logout",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-8",
+                      "port": {
+                        "name": "haproxy-synapse"
+                      }
+                    }
+                  },
+                  "path": "/_matrix",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-8",
+                      "port": {
+                        "name": "haproxy-synapse"
+                      }
+                    }
+                  },
+                  "path": "/_synapse",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "zone4.test"
+            ],
+            "secretName": "secret-7"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-8",
+        "namespace": "ns-3",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-2",
+          "meta.helm.sh/release-name": "release-1",
+          "meta.helm.sh/release-namespace": "ns-3"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "zone5.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-9",
+                      "port": {
+                        "name": "haproxy-wkd"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "zone5.test"
+            ],
+            "secretName": "secret-8"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-9",
+        "namespace": "ns-4",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-4"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "*.h16.zone6.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-10",
+                      "port": {
+                        "number": 8090
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h16.zone6.test",
+              "*.h16.zone6.test"
+            ],
+            "secretName": "secret-9"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-10",
+        "namespace": "ns-4",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-4",
+          "nginx.ingress.kubernetes.io/custom-http-errors": "",
+          "nginx.ingress.kubernetes.io/proxy-buffering": "off"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h17.zone7.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-11",
+                      "port": {
+                        "number": 8154
+                      }
+                    }
+                  },
+                  "path": "/k8s-proxy/",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-11",
+                      "port": {
+                        "number": 8150
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h17.zone7.test"
+            ],
+            "secretName": "secret-10"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-11",
+        "namespace": "ns-4",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-4",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "0",
+          "nginx.ingress.kubernetes.io/proxy-buffering": "off",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "900",
+          "nginx.ingress.kubernetes.io/proxy-request-buffering": "off"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h18.zone7.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-12",
+                      "port": {
+                        "number": 5000
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h18.zone7.test"
+            ],
+            "secretName": "secret-11"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-12",
+        "namespace": "ns-4",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-4",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "10g",
+          "nginx.ingress.kubernetes.io/proxy-connect-timeout": "15",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+          "nginx.ingress.kubernetes.io/service-upstream": "true"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h19.zone7.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-13",
+                      "port": {
+                        "number": 8181
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h19.zone7.test"
+            ],
+            "secretName": "secret-12"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-13",
+        "namespace": "ns-5",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "nginx.ingress.kubernetes.io/auth-url": "http://svc-28.ns-5.svc.cluster.local/auth",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "150m",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
+          "nginx.ingress.kubernetes.io/proxy-send-timeout": "3600"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h20.zone8.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-14",
+                      "port": {
+                        "number": 83
+                      }
+                    }
+                  },
+                  "path": "/ing-13_websocket",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-14",
+                      "port": {
+                        "number": 80
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          },
+          {
+            "host": "h21.zone8.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-14",
+                      "port": {
+                        "number": 83
+                      }
+                    }
+                  },
+                  "path": "/ing-13_websocket",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-14",
+                      "port": {
+                        "number": 80
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h20.zone8.test",
+              "h21.zone8.test"
+            ],
+            "secretName": "secret-13"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-14",
+        "namespace": "ns-5",
+        "annotations": {
+          "meta.helm.sh/release-name": "release-3",
+          "meta.helm.sh/release-namespace": "ns-5",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "0"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h22.zone8.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-15",
+                      "port": {
+                        "number": 6001
+                      }
+                    }
+                  },
+                  "path": "/ns-5-proxy",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h22.zone8.test"
+            ],
+            "secretName": "secret-14"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-15",
+        "namespace": "ns-5",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "meta.helm.sh/release-name": "release-4",
+          "meta.helm.sh/release-namespace": "ns-5"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h22.zone8.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-16",
+                      "port": {
+                        "number": 9200
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h22.zone8.test"
+            ],
+            "secretName": "secret-14"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-16",
+        "namespace": "ns-6",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-2",
+          "meta.helm.sh/release-name": "release-5",
+          "meta.helm.sh/release-namespace": "ns-6"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "zone9.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-17",
+                      "port": {
+                        "number": 80
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "ImplementationSpecific"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "zone9.test"
+            ],
+            "secretName": "secret-15"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-17",
+        "namespace": "ns-6",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-2",
+          "meta.helm.sh/release-name": "release-6",
+          "meta.helm.sh/release-namespace": "ns-6"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h24.zone10.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-18",
+                      "port": {
+                        "number": 80
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "ImplementationSpecific"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h24.zone10.test"
+            ],
+            "secretName": "secret-16"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-9",
+        "namespace": "ns-7",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-7"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "*.h25.zone6.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-10",
+                      "port": {
+                        "number": 8090
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h25.zone6.test",
+              "*.h25.zone6.test"
+            ],
+            "secretName": "secret-9"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-11",
+        "namespace": "ns-7",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-7",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "0",
+          "nginx.ingress.kubernetes.io/proxy-buffering": "off",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "900",
+          "nginx.ingress.kubernetes.io/proxy-request-buffering": "off"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h26.zone6.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-12",
+                      "port": {
+                        "number": 5000
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h26.zone6.test"
+            ],
+            "secretName": "secret-11"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-12",
+        "namespace": "ns-7",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-7",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "512m",
+          "nginx.ingress.kubernetes.io/proxy-connect-timeout": "15",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+          "nginx.ingress.kubernetes.io/service-upstream": "true"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h27.zone6.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-13",
+                      "port": {
+                        "number": 8181
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h27.zone6.test"
+            ],
+            "secretName": "secret-12"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-9",
+        "namespace": "ns-8",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-8"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "*.h28.zone11.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-10",
+                      "port": {
+                        "number": 8090
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h28.zone11.test",
+              "*.h28.zone11.test"
+            ],
+            "secretName": "secret-9"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-11",
+        "namespace": "ns-8",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-8",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "0",
+          "nginx.ingress.kubernetes.io/proxy-buffering": "off",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "900",
+          "nginx.ingress.kubernetes.io/proxy-request-buffering": "off"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h29.zone11.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-12",
+                      "port": {
+                        "number": 5000
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h29.zone11.test"
+            ],
+            "secretName": "secret-11"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-12",
+        "namespace": "ns-8",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-8",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "512m",
+          "nginx.ingress.kubernetes.io/proxy-connect-timeout": "15",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+          "nginx.ingress.kubernetes.io/service-upstream": "true"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h30.zone11.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-13",
+                      "port": {
+                        "number": 8181
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h30.zone11.test"
+            ],
+            "secretName": "secret-12"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-9",
+        "namespace": "ns-9",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-9"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "*.h31.zone6.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-10",
+                      "port": {
+                        "number": 8090
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h31.zone6.test",
+              "*.h31.zone6.test"
+            ],
+            "secretName": "secret-17"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-11",
+        "namespace": "ns-9",
+        "annotations": {
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-9",
+          "nginx.ingress.kubernetes.io/enable-access-log": "false",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "0",
+          "nginx.ingress.kubernetes.io/proxy-buffering": "off",
+          "nginx.ingress.kubernetes.io/proxy-http-version": "1.1",
+          "nginx.ingress.kubernetes.io/proxy-max-temp-file-size": "0",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "900",
+          "nginx.ingress.kubernetes.io/proxy-request-buffering": "off"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "zone12.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-12",
+                      "port": {
+                        "number": 5000
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "zone12.test"
+            ],
+            "secretName": "secret-18"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-12",
+        "namespace": "ns-9",
+        "annotations": {
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-9",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "5g",
+          "nginx.ingress.kubernetes.io/proxy-connect-timeout": "15",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+          "nginx.ingress.kubernetes.io/service-upstream": "true"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "zone13.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-13",
+                      "port": {
+                        "number": 8181
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "zone13.test"
+            ],
+            "secretName": "secret-19"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-9",
+        "namespace": "ns-10",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-10"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "*.h34.zone6.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-10",
+                      "port": {
+                        "number": 8090
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h34.zone6.test",
+              "*.h34.zone6.test"
+            ],
+            "secretName": "secret-17"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-11",
+        "namespace": "ns-10",
+        "annotations": {
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-10",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "0",
+          "nginx.ingress.kubernetes.io/proxy-buffering": "off",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "900",
+          "nginx.ingress.kubernetes.io/proxy-request-buffering": "off"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h35.zone14.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-12",
+                      "port": {
+                        "number": 5000
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h35.zone14.test"
+            ],
+            "secretName": "secret-18"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-12",
+        "namespace": "ns-10",
+        "annotations": {
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-10",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "512m",
+          "nginx.ingress.kubernetes.io/proxy-connect-timeout": "15",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+          "nginx.ingress.kubernetes.io/service-upstream": "true"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h36.zone14.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-13",
+                      "port": {
+                        "number": 8181
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h36.zone14.test"
+            ],
+            "secretName": "secret-19"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-18",
+        "namespace": "ns-11",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "meta.helm.sh/release-name": "release-7",
+          "meta.helm.sh/release-namespace": "ns-11",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "512m"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h37.zone15.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-19",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "ImplementationSpecific"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h37.zone15.test"
+            ],
+            "secretName": "secret-20"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-19",
+        "namespace": "ns-12",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-2",
+          "nginx.ingress.kubernetes.io/proxy-buffering": "off",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
+          "nginx.ingress.kubernetes.io/proxy-send-timeout": "3600"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h38.zone16.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-20",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h38.zone16.test"
+            ],
+            "secretName": "secret-21"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-18",
+        "namespace": "ns-13",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "meta.helm.sh/release-name": "release-7",
+          "meta.helm.sh/release-namespace": "ns-13",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "512m"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h39.zone8.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-19",
+                      "port": {
+                        "number": 80
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "ImplementationSpecific"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-19",
+                      "port": {
+                        "number": 8072
+                      }
+                    }
+                  },
+                  "path": "/websocket",
+                  "pathType": "ImplementationSpecific"
+                }
+              ]
+            }
+          },
+          {
+            "host": "h40.zone8.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-19",
+                      "port": {
+                        "number": 80
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-19",
+                      "port": {
+                        "number": 8072
+                      }
+                    }
+                  },
+                  "path": "/websocket",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h39.zone8.test",
+              "h40.zone8.test"
+            ],
+            "secretName": "secret-22"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-9",
+        "namespace": "ns-14",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-14"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "*.h41.zone6.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-10",
+                      "port": {
+                        "number": 8090
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h41.zone6.test",
+              "*.h41.zone6.test"
+            ],
+            "secretName": "secret-9"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-11",
+        "namespace": "ns-14",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-2",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-14",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "0",
+          "nginx.ingress.kubernetes.io/proxy-buffering": "off",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "900",
+          "nginx.ingress.kubernetes.io/proxy-request-buffering": "off"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h42.zone16.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-12",
+                      "port": {
+                        "number": 5000
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h42.zone16.test"
+            ],
+            "secretName": "secret-11"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-12",
+        "namespace": "ns-14",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-2",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-14",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "512m",
+          "nginx.ingress.kubernetes.io/proxy-connect-timeout": "15",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+          "nginx.ingress.kubernetes.io/service-upstream": "true"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h43.zone16.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-13",
+                      "port": {
+                        "number": 8181
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h43.zone16.test"
+            ],
+            "secretName": "secret-12"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-20",
+        "namespace": "ns-14",
+        "annotations": {
+          "nginx.ingress.kubernetes.io/rewrite-target": "/$2"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h43.zone16.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-21",
+                      "port": {
+                        "number": 8000
+                      }
+                    }
+                  },
+                  "path": "/-/ing-20(/|$)(.*)",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h43.zone16.test"
+            ],
+            "secretName": "secret-12"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-21",
+        "namespace": "ns-15",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "meta.helm.sh/release-name": "release-8",
+          "meta.helm.sh/release-namespace": "ns-15",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "0",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "3600",
+          "nginx.ingress.kubernetes.io/proxy-send-timeout": "3600",
+          "nginx.ingress.kubernetes.io/upstream-hash-by": "$arg_RouteToken"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h44.zone17.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-22",
+                      "port": {
+                        "number": 9980
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "ImplementationSpecific"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h44.zone17.test"
+            ],
+            "secretName": "secret-23"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-22",
+        "namespace": "ns-15",
+        "annotations": {
+          "meta.helm.sh/release-name": "release-8",
+          "meta.helm.sh/release-namespace": "ns-15"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h44.zone17.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-23",
+                      "port": {
+                        "number": 9000
+                      }
+                    }
+                  },
+                  "path": "/controller",
+                  "pathType": "ImplementationSpecific"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-9",
+        "namespace": "ns-16",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-16"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "*.h45.zone6.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-10",
+                      "port": {
+                        "number": 8090
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h45.zone6.test",
+              "*.h45.zone6.test"
+            ],
+            "secretName": "secret-17"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-10",
+        "namespace": "ns-16",
+        "annotations": {
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-16",
+          "nginx.ingress.kubernetes.io/custom-http-errors": "",
+          "nginx.ingress.kubernetes.io/proxy-buffering": "off"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h46.zone18.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-11",
+                      "port": {
+                        "number": 8154
+                      }
+                    }
+                  },
+                  "path": "/k8s-proxy/",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-11",
+                      "port": {
+                        "number": 8150
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h46.zone18.test"
+            ],
+            "secretName": "secret-9"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-11",
+        "namespace": "ns-16",
+        "annotations": {
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-16",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "0",
+          "nginx.ingress.kubernetes.io/proxy-buffering": "off",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "900",
+          "nginx.ingress.kubernetes.io/proxy-request-buffering": "off"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h47.zone18.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-12",
+                      "port": {
+                        "number": 5000
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h47.zone18.test"
+            ],
+            "secretName": "secret-24"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-12",
+        "namespace": "ns-16",
+        "annotations": {
+          "cert-manager.io/cluster-issuer": "issuer-1",
+          "kubernetes.io/ingress.provider": "nginx",
+          "meta.helm.sh/release-name": "release-2",
+          "meta.helm.sh/release-namespace": "ns-16",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "512m",
+          "nginx.ingress.kubernetes.io/proxy-connect-timeout": "15",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "600",
+          "nginx.ingress.kubernetes.io/service-upstream": "true"
+        }
+      },
+      "spec": {
+        "ingressClassName": "nginx",
+        "rules": [
+          {
+            "host": "h48.zone18.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-13",
+                      "port": {
+                        "number": 8181
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h48.zone18.test"
+            ],
+            "secretName": "secret-25"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-23",
+        "namespace": "ns-17",
+        "annotations": {
+          "cert-manager.io/issuer": "issuer-3"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h49.zone19.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-24",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h49.zone19.test"
+            ],
+            "secretName": "secret-26"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-24",
+        "namespace": "ns-17",
+        "annotations": {
+          "cert-manager.io/issuer": "issuer-4",
+          "nginx.ingress.kubernetes.io/proxy-body-size": "256m",
+          "nginx.ingress.kubernetes.io/proxy-read-timeout": "900"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h50.zone19.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-25",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h50.zone19.test"
+            ],
+            "secretName": "secret-27"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-19",
+        "namespace": "ns-17",
+        "annotations": {
+          "cert-manager.io/issuer": "issuer-5"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "h51.zone19.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-20",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "h51.zone19.test"
+            ],
+            "secretName": "secret-21"
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "name": "ing-25",
+        "namespace": "ns-17",
+        "annotations": {
+          "cert-manager.io/issuer": "issuer-5"
+        }
+      },
+      "spec": {
+        "rules": [
+          {
+            "host": "zone19.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-26",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/subscription",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-26",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/uploads",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-26",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/public",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-26",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/link",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-26",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/campaign",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-27",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          },
+          {
+            "host": "h53.zone19.test",
+            "http": {
+              "paths": [
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-26",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/subscription",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-26",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/uploads",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-26",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/public",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-26",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/link",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-26",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/campaign",
+                  "pathType": "Prefix"
+                },
+                {
+                  "backend": {
+                    "service": {
+                      "name": "svc-27",
+                      "port": {
+                        "name": "http"
+                      }
+                    }
+                  },
+                  "path": "/",
+                  "pathType": "Prefix"
+                }
+              ]
+            }
+          }
+        ],
+        "tls": [
+          {
+            "hosts": [
+              "zone19.test",
+              "h53.zone19.test"
+            ],
+            "secretName": "secret-28"
+          }
+        ]
+      }
+    }
+  ]
+}

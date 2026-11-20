@@ -1,0 +1,123 @@
+package validation
+
+import (
+	"testing"
+)
+
+func TestValidateHeaderNameInMatch(t *testing.T) {
+	t.Parallel()
+	validator := HTTPNJSMatchValidator{}
+
+	testValidValuesForSimpleValidator(
+		t,
+		validator.ValidateHeaderNameInMatch,
+		"header",
+		"version",
+		"version-2",
+	)
+	testInvalidValuesForSimpleValidator(
+		t,
+		validator.ValidateHeaderNameInMatch,
+		":",
+		"",
+		"version%!",
+		"version_2",
+		"hello$world",
+		"   ",
+	)
+}
+
+func TestValidateHeaderValueInMatch(t *testing.T) {
+	t.Parallel()
+	validator := HTTPNJSMatchValidator{}
+
+	testValidValuesForSimpleValidator(
+		t,
+		validator.ValidateHeaderValueInMatch,
+		"value",
+		"version%!",
+		"version-2",
+		"https://example.com",
+		`^https://zoom\.us(/|$)`,
+		"hello$world",
+	)
+	testInvalidValuesForSimpleValidator(
+		t,
+		validator.ValidateHeaderValueInMatch,
+		"",
+		"   ",
+	)
+}
+
+func TestValidateQueryParamNameInMatch(t *testing.T) {
+	t.Parallel()
+	validator := HTTPNJSMatchValidator{}
+
+	testValidValuesForSimpleValidator(
+		t,
+		validator.ValidateQueryParamNameInMatch,
+		"param",
+	)
+	testInvalidValuesForSimpleValidator(
+		t,
+		validator.ValidateQueryParamNameInMatch,
+		"",
+	)
+}
+
+func TestValidateQueryParamValueInMatch(t *testing.T) {
+	t.Parallel()
+	validator := HTTPNJSMatchValidator{}
+
+	testValidValuesForSimpleValidator(
+		t,
+		validator.ValidateQueryParamValueInMatch,
+		"value",
+	)
+	testInvalidValuesForSimpleValidator(
+		t,
+		validator.ValidateQueryParamValueInMatch,
+		"",
+	)
+}
+
+func TestValidateMethodInMatch(t *testing.T) {
+	t.Parallel()
+	validator := HTTPNJSMatchValidator{}
+
+	testValidValuesForSupportedValuesValidator(
+		t,
+		validator.ValidateMethodInMatch,
+		"GET",
+		"HEAD",
+		"POST",
+		"PUT",
+		"DELETE",
+		"OPTIONS",
+		"PATCH",
+	)
+	testInvalidValuesForSupportedValuesValidator(
+		t,
+		validator.ValidateMethodInMatch,
+		supportedMethods,
+		"GOT",
+		"TRACE",
+	)
+}
+
+func TestValidateCommonMatchPart(t *testing.T) {
+	t.Parallel()
+	testValidValuesForSimpleValidator(
+		t,
+		validateCommonNJSMatchPart,
+		"test",
+		"$",
+		"hello$world",
+	)
+	testInvalidValuesForSimpleValidator(
+		t,
+		validateCommonNJSMatchPart,
+		"",
+		" ",
+	)
+}

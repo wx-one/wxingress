@@ -1,0 +1,1901 @@
+package conditions
+
+import (
+	"fmt"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	inference "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+	v1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPI "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+)
+
+// Conditions and Reasons for Route resources.
+const (
+	// GatewayClassReasonGatewayClassConflict indicates there are multiple GatewayClass resources
+	// that reference this controller, and we ignored the resource in question and picked the
+	// GatewayClass that is referenced in the command-line argument.
+	// This reason is used with GatewayClassConditionAccepted (false).
+	GatewayClassReasonGatewayClassConflict v1.GatewayClassConditionReason = "GatewayClassConflict"
+
+	// GatewayClassMessageGatewayClassConflict is a message that describes GatewayClassReasonGatewayClassConflict.
+	GatewayClassMessageGatewayClassConflict = "The resource is ignored due to a conflicting GatewayClass resource"
+
+	// ListenerReasonUnsupportedValue is used with the "Accepted" condition when a value of a field in a Listener
+	// is invalid or not supported.
+	ListenerReasonUnsupportedValue v1.ListenerConditionReason = "UnsupportedValue"
+
+	// ListenerMessageFailedNginxReload is a message used with ListenerConditionProgrammed (false)
+	// when nginx fails to reload.
+	ListenerMessageFailedNginxReload = "The Listener is not programmed due to a failure to " +
+		"reload nginx with the configuration"
+
+	// ListenerMessageOverlappingHostnames is a message used with the "OverlappingTLSConfig" condition when the
+	// condition is true due to overlapping hostnames.
+	ListenerMessageOverlappingHostnames = "Listener hostname overlaps with hostname(s) of other Listener(s) " +
+		"on the same port"
+
+	// RouteReasonBackendRefUnsupportedValue is used with the "ResolvedRefs" condition when one of the
+	// Route rules has a backendRef with an unsupported value.
+	RouteReasonBackendRefUnsupportedValue v1.RouteConditionReason = "UnsupportedValue"
+
+	// RouteReasonUnsupportedField is used with the "Accepted" condition when a Route contains fields that are
+	// not yet supported.
+	RouteReasonUnsupportedField v1.RouteConditionReason = "UnsupportedField"
+
+	// RouteReasonInvalidGateway is used with the "Accepted" (false) condition when the Gateway the Route
+	// references is invalid.
+	RouteReasonInvalidGateway v1.RouteConditionReason = "InvalidGateway"
+
+	// RouteReasonInvalidListenerSet is used with the "Accepted" (False) condition
+	// when the Route references an invalid ListenerSet.
+	RouteReasonInvalidListenerSet v1.RouteConditionReason = "InvalidListenerSet"
+
+	// RouteReasonInvalidListener is used with the "Accepted" condition when the Route references an invalid listener.
+	RouteReasonInvalidListener v1.RouteConditionReason = "InvalidListener"
+
+	// RouteReasonHostnameConflict is used with the "Accepted" condition when a route has the exact same hostname
+	// as another route.
+	RouteReasonHostnameConflict v1.RouteConditionReason = "HostnameConflict"
+
+	// RouteReasonMultipleRoutesOnListener is used with the "Accepted" condition when multiple
+	// L4 Routes are attached to the same listener, which is not supported.
+	RouteReasonMultipleRoutesOnListener v1.RouteConditionReason = "MultipleRoutesOnListener"
+
+	// RouteReasonUnsupportedConfiguration is used when the associated Gateway does not support the Route.
+	// Used with Accepted (false).
+	RouteReasonUnsupportedConfiguration v1.RouteConditionReason = "UnsupportedConfiguration"
+
+	// RouteReasonInvalidFilter is used when an extension ref filter referenced by a Route cannot be resolved, or is
+	// invalid. Used with ResolvedRefs (false).
+	RouteReasonInvalidFilter v1.RouteConditionReason = "InvalidFilter"
+
+	// RouteReasonInvalidInferencePool is used when a InferencePool backendRef referenced by a Route is invalid.
+	RouteReasonInvalidInferencePool v1.RouteConditionReason = "InvalidInferencePool"
+
+	// RouteEndpointPickerTLSVerificationSkipped indicates that TLS certificate verification is skipped for an
+	// EndpointPicker because no BackendTLSPolicy is configured for its Service.
+	RouteEndpointPickerTLSVerificationSkipped v1.RouteConditionType = "gateway.nginx.org/" +
+		"EndpointPickerTLSVerificationSkipped"
+
+	// RouteReasonBackendTLSPolicyNotFound is used when no BackendTLSPolicy is configured for an EndpointPicker.
+	RouteReasonBackendTLSPolicyNotFound v1.RouteConditionReason = "BackendTLSPolicyNotFound"
+
+	// RouteMessageEndpointPickerTLSVerificationSkipped warns that the EndpointPicker's TLS certificate is not verified.
+	RouteMessageEndpointPickerTLSVerificationSkipped = "No BackendTLSPolicy configured for EndpointPicker; " +
+		"skipping TLS certificate verification"
+
+	// GatewayReasonUnsupportedField is used with the "Accepted" condition when a Gateway contains fields
+	// that are not yet supported.
+	GatewayReasonUnsupportedField v1.GatewayConditionReason = "UnsupportedField"
+
+	// GatewayReasonUnsupportedValue is used with GatewayConditionAccepted (false) when a value of a field in a Gateway
+	// is invalid or not supported.
+	GatewayReasonUnsupportedValue v1.GatewayConditionReason = "UnsupportedValue"
+
+	// GatewayMessageFailedNginxReload is a message used with GatewayConditionProgrammed (false)
+	// when nginx fails to reload.
+	GatewayMessageFailedNginxReload = "The Gateway is not programmed due to a failure to " +
+		"reload nginx with the configuration"
+
+	// GatewayClassResolvedRefs condition indicates whether the controller was able to resolve the
+	// parametersRef on the GatewayClass.
+	GatewayClassResolvedRefs v1.GatewayClassConditionType = "ResolvedRefs"
+
+	// GatewayClassReasonResolvedRefs is used with the "GatewayClassResolvedRefs" condition when the condition is true.
+	GatewayClassReasonResolvedRefs v1.GatewayClassConditionReason = "ResolvedRefs"
+
+	// GatewayClassReasonParamsRefNotFound is used with the "GatewayClassResolvedRefs" condition when the
+	// parametersRef resource does not exist.
+	GatewayClassReasonParamsRefNotFound v1.GatewayClassConditionReason = "ParametersRefNotFound"
+
+	// GatewayClassReasonParamsRefInvalid is used with the "GatewayClassResolvedRefs" condition when the
+	// parametersRef resource is invalid.
+	GatewayClassReasonParamsRefInvalid v1.GatewayClassConditionReason = "ParametersRefInvalid"
+)
+
+// Conditions and Reasons for Policy resources.
+const (
+	// PolicyReasonNginxProxyConfigNotSet is used with the "PolicyAccepted" condition when the
+	// NginxProxy resource is missing or invalid.
+	PolicyReasonNginxProxyConfigNotSet v1.PolicyConditionReason = "NginxProxyConfigNotSet"
+
+	// PolicyMessageNginxProxyInvalid is a message used with the PolicyReasonNginxProxyConfigNotSet reason
+	// when the NginxProxy resource is either invalid or not attached.
+	PolicyMessageNginxProxyInvalid = "The NginxProxy configuration is either invalid or not attached to the GatewayClass"
+
+	// PolicyMessageTelemetryNotEnabled is a message used with the PolicyReasonNginxProxyConfigNotSet reason
+	// when telemetry is not enabled in the NginxProxy resource.
+	PolicyMessageTelemetryNotEnabled = "Telemetry is not enabled in the NginxProxy resource"
+
+	// PolicyMessagePayloadProcessorResolverMissing is used when an ExternalName PayloadProcessor
+	// backend is attached to a Gateway whose NginxProxy has no DNS resolver configured.
+	PolicyMessagePayloadProcessorResolverMissing = "PayloadProcessor ExternalName backend requires " +
+		"DNS resolver configuration in Gateway's NginxProxy"
+
+	// PolicyReasonTargetConflict is used with the "PolicyAccepted" condition when a Route that it targets
+	// has an overlapping hostname:port/path combination with another Route.
+	PolicyReasonTargetConflict v1.PolicyConditionReason = "TargetConflict"
+
+	// WAFResolvedRefsConditionType is the condition type for WAF reference resolution.
+	WAFResolvedRefsConditionType v1.PolicyConditionType = "ResolvedRefs"
+
+	// WAFProgrammedConditionType is the condition type for WAF data plane deployment.
+	WAFProgrammedConditionType v1.PolicyConditionType = "Programmed"
+
+	// PolicyReasonResolvedRefs is used when all references are resolved.
+	// NOTE: Not defined in upstream Gateway API (which only provides Accepted-related reasons).
+	// This is an NGF-specific reason for WAF policy reference resolution.
+	PolicyReasonResolvedRefs v1.PolicyConditionReason = "ResolvedRefs"
+
+	// PolicyReasonProgrammed is used when the policy is deployed to the data plane.
+	// NOTE: Not defined in upstream Gateway API. NGF-specific reason for WAF data plane deployment.
+	PolicyReasonProgrammed v1.PolicyConditionReason = "Programmed"
+
+	// PolicyReasonInvalidRef is used when a referenced resource does not exist or is not valid.
+	// NOTE: Not defined in upstream Gateway API. NGF-specific reason for WAF reference errors.
+	PolicyReasonInvalidRef v1.PolicyConditionReason = "InvalidRef"
+
+	// PolicyReasonFetchError is used when a bundle cannot be fetched from storage.
+	PolicyReasonFetchError v1.PolicyConditionReason = "FetchError"
+
+	// PolicyReasonIntegrityError is used when a bundle checksum verification fails.
+	PolicyReasonIntegrityError v1.PolicyConditionReason = "IntegrityError"
+
+	// PolicyReasonStaleBundleWarning is used when a bundle fetch fails but a previously fetched bundle is used.
+	PolicyReasonStaleBundleWarning v1.PolicyConditionReason = "StaleBundleWarning"
+
+	// PolicyReasonBundleUpdated is used when polling detects a changed bundle and successfully
+	// pushes the new bundle to the data plane.
+	PolicyReasonBundleUpdated v1.PolicyConditionReason = "BundleUpdated"
+
+	// PolicyConditionProgrammed is the GEP-713 "Programmed" condition type. It indicates whether the policy's
+	// spec is guaranteed by the controller to be fully programmed for enforcement in the data plane.
+	// It shares the "Programmed" type value with WAFProgrammedConditionType; the two are kept separate for now
+	// and may be consolidated in a follow-up.
+	PolicyConditionProgrammed v1.PolicyConditionType = "Programmed"
+
+	// PolicyReasonPartiallyProgrammed is reserved for the "Programmed" condition (status True) when only part of
+	// the policy's spec is programmed because other parts were superseded during conflict resolution (GEP-713).
+	// NGF resolves policy conflicts all-or-nothing: a policy that loses conflict resolution is rejected in full
+	// and reported as Overridden, so no partial-override path sets this reason yet. It is kept defined ahead of
+	// field-level partial-override support.
+	PolicyReasonPartiallyProgrammed v1.PolicyConditionReason = "PartiallyProgrammed"
+
+	// PolicyReasonReconciling is used with the "Programmed" condition (status False) when the policy is not yet
+	// programmed because it is invalid or still being reconciled by the controller (GEP-713).
+	PolicyReasonReconciling v1.PolicyConditionReason = "Reconciling"
+
+	// PolicyReasonOverridden is used with the "Programmed" condition (status False) when the policy has been
+	// fully overridden by another policy of greater precedence during conflict resolution (GEP-713).
+	PolicyReasonOverridden v1.PolicyConditionReason = "Overridden"
+
+	// ClientSettingsPolicyAffected is used with the "PolicyAffected" condition when a
+	// ClientSettingsPolicy is applied to a Gateway, HTTPRoute, or GRPCRoute.
+	ClientSettingsPolicyAffected v1.PolicyConditionType = "ClientSettingsPolicyAffected"
+
+	// ObservabilityPolicyAffected is used with the "PolicyAffected" condition when an
+	// ObservabilityPolicy is applied to a HTTPRoute, or GRPCRoute.
+	ObservabilityPolicyAffected v1.PolicyConditionType = "ObservabilityPolicyAffected"
+
+	// SnippetsPolicyAffected is used with the "PolicyAffected" condition when a
+	// SnippetsPolicy is applied to a Gateway.
+	SnippetsPolicyAffected v1.PolicyConditionType = "SnippetsPolicyAffected"
+
+	// ProxySettingsPolicyAffected is used with the "PolicyAffected" condition when a
+	// ProxySettingsPolicy is applied to a Gateway, HTTPRoute, or GRPCRoute.
+	ProxySettingsPolicyAffected v1.PolicyConditionType = "ProxySettingsPolicyAffected"
+
+	// PolicyAffectedReason is used with the "PolicyAffected" condition when a
+	// ObservabilityPolicy, ClientSettingsPolicy, or ProxySettingsPolicy is applied to Gateways or Routes.
+	// RateLimitPolicyAffected is used with the "PolicyAffected" condition when a
+	// RateLimitPolicy is applied to a Gateway, HTTPRoute, or GRPCRoute.
+	RateLimitPolicyAffected v1.PolicyConditionType = "RateLimitPolicyAffected"
+
+	// PayloadProcessorPolicyAffected is used with the "PolicyAffected" condition when a
+	// PayloadProcessor is applied to a Gateway or HTTPRoute.
+	PayloadProcessorPolicyAffected v1.PolicyConditionType = "PayloadProcessorPolicyAffected"
+
+	// PolicyAffectedReason is used with the "PolicyAffected" condition when a
+	// custom policy is applied to Gateways or Routes.
+	PolicyAffectedReason v1.PolicyConditionReason = "PolicyAffected"
+
+	// GatewayResolvedRefs condition indicates whether the controller was able to resolve the
+	// parametersRef on the Gateway.
+	GatewayResolvedRefs v1.GatewayConditionType = "ResolvedRefs"
+
+	// GatewayReasonResolvedRefs is used with the "GatewayResolvedRefs" condition when the condition is true.
+	GatewayReasonResolvedRefs v1.GatewayConditionReason = "ResolvedRefs"
+
+	// GatewayReasonParamsRefNotFound is used with the "GatewayResolvedRefs" condition when the
+	// parametersRef resource does not exist.
+	GatewayReasonParamsRefNotFound v1.GatewayConditionReason = "ParametersRefNotFound"
+
+	// GatewayReasonParamsRefInvalid is used with the "GatewayResolvedRefs" condition when the
+	// parametersRef resource is invalid.
+	GatewayReasonParamsRefInvalid v1.GatewayConditionReason = "ParametersRefInvalid"
+
+	// PolicyReasonAncestorLimitReached is used with the "PolicyAccepted" condition when a policy
+	// cannot be applied because the ancestor status list has reached the maximum size of 16.
+	PolicyReasonAncestorLimitReached v1.PolicyConditionReason = "AncestorLimitReached"
+
+	// PolicyMessageAncestorLimitReached is a message used with PolicyReasonAncestorLimitReached
+	// when a policy cannot be applied due to the ancestor limit being reached.
+	PolicyMessageAncestorLimitReached = "Policies cannot be applied because the ancestor status list " +
+		"has reached the maximum size. The following policies have been ignored:"
+
+	// ListenerSetReasonParentNotProgrammed is used with the "Programmed" condition when the parent
+	// Gateway of a ListenerSet is not programmed.
+	ListenerSetReasonParentNotProgrammed v1.ListenerSetConditionReason = "ParentNotProgrammed"
+
+	// BackendTLSPolicyReasonInvalidCACertificateRef is used with the "ResolvedRefs" condition when a
+	// CACertificateRef refers to a resource that cannot be resolved or is misconfigured.
+	BackendTLSPolicyReasonInvalidCACertificateRef v1.PolicyConditionReason = "InvalidCACertificateRef"
+
+	// BackendTLSPolicyReasonInvalidKind is used with the "ResolvedRefs" condition when a
+	// CACertificateRef refers to an unknown or unsupported kind of resource.
+	BackendTLSPolicyReasonInvalidKind v1.PolicyConditionReason = "InvalidKind"
+
+	// BackendTLSPolicyReasonNoValidCACertificate is used with the "Accepted" condition when all
+	// CACertificateRefs are invalid.
+	BackendTLSPolicyReasonNoValidCACertificate v1.PolicyConditionReason = "NoValidCACertificate"
+
+	// AccessPolicyAffected is used with the "PolicyAffected" condition when an
+	// AccessPolicy is applied to a Gateway, HTTPRoute, or GRPCRoute.
+	AccessPolicyAffected v1.PolicyConditionType = "AccessPolicyAffected"
+
+	// WAFPolicyAffected is used with the "PolicyAffected" condition when a
+	// WAFPolicy is applied to a Gateway, HTTPRoute, or GRPCRoute.
+	WAFPolicyAffected v1.PolicyConditionType = "gateway.nginx.org/WAFPolicyAffected"
+
+	// PolicyReasonPending is used with the "PolicyAccepted" condition when a Policy is pending
+	// external processing (e.g., PLM compilation for WAF policies).
+	PolicyReasonPending v1.PolicyConditionReason = "Pending"
+)
+
+// Condition defines a condition to be reported in the status of resources.
+type Condition struct {
+	Type    string
+	Status  metav1.ConditionStatus
+	Reason  string
+	Message string
+}
+
+// DeduplicateConditions removes duplicate conditions based on the condition type.
+// The last condition wins. The order of conditions is preserved.
+func DeduplicateConditions(conds []Condition) []Condition {
+	type elem struct {
+		cond       Condition
+		reverseIdx int
+	}
+
+	uniqueElems := make(map[string]elem)
+
+	idx := 0
+	for i := len(conds) - 1; i >= 0; i-- {
+		if _, exist := uniqueElems[conds[i].Type]; exist {
+			continue
+		}
+
+		uniqueElems[conds[i].Type] = elem{
+			cond:       conds[i],
+			reverseIdx: idx,
+		}
+		idx++
+	}
+
+	result := make([]Condition, len(uniqueElems))
+
+	for _, el := range uniqueElems {
+		result[len(result)-el.reverseIdx-1] = el.cond
+	}
+
+	return result
+}
+
+// ConvertConditions converts conditions to Kubernetes API conditions.
+func ConvertConditions(
+	conds []Condition,
+	observedGeneration int64,
+	transitionTime metav1.Time,
+) []metav1.Condition {
+	apiConds := make([]metav1.Condition, len(conds))
+
+	for i := range conds {
+		apiConds[i] = metav1.Condition{
+			Type:               conds[i].Type,
+			Status:             conds[i].Status,
+			ObservedGeneration: observedGeneration,
+			LastTransitionTime: transitionTime,
+			Reason:             conds[i].Reason,
+			Message:            conds[i].Message,
+		}
+	}
+
+	return apiConds
+}
+
+// HasMatchingCondition checks if the given condition matches any of the existing conditions.
+func HasMatchingCondition(existingConditions []Condition, cond Condition) bool {
+	for _, existing := range existingConditions {
+		if existing.Type == cond.Type &&
+			existing.Status == cond.Status &&
+			existing.Reason == cond.Reason &&
+			existing.Message == cond.Message {
+			return true
+		}
+	}
+	return false
+}
+
+// NewDefaultGatewayClassConditions returns Conditions that indicate that the GatewayClass is accepted and that the
+// Gateway API CRD versions are supported.
+func NewDefaultGatewayClassConditions() []Condition {
+	return []Condition{
+		{
+			Type:    string(v1.GatewayClassConditionStatusAccepted),
+			Status:  metav1.ConditionTrue,
+			Reason:  string(v1.GatewayClassReasonAccepted),
+			Message: "The GatewayClass is accepted",
+		},
+		{
+			Type:    string(v1.GatewayClassConditionStatusSupportedVersion),
+			Status:  metav1.ConditionTrue,
+			Reason:  string(v1.GatewayClassReasonSupportedVersion),
+			Message: "The Gateway API CRD versions are supported",
+		},
+	}
+}
+
+// NewGatewayClassSupportedVersionBestEffort returns a Condition that indicates that the GatewayClass is accepted,
+// but the Gateway API CRD versions are not supported. This means NGF will attempt to generate configuration,
+// but it does not guarantee support.
+func NewGatewayClassSupportedVersionBestEffort(recommendedVersion string) []Condition {
+	return []Condition{
+		{
+			Type:   string(v1.GatewayClassConditionStatusSupportedVersion),
+			Status: metav1.ConditionFalse,
+			Reason: string(v1.GatewayClassReasonUnsupportedVersion),
+			Message: fmt.Sprintf(
+				"The Gateway API CRD versions are not recommended. Recommended version is %s",
+				recommendedVersion,
+			),
+		},
+	}
+}
+
+// NewGatewayClassUnsupportedVersion returns Conditions that indicate that the GatewayClass is not accepted because
+// the Gateway API CRD versions are not supported. NGF will not generate configuration in this case.
+func NewGatewayClassUnsupportedVersion(recommendedVersion string) []Condition {
+	return []Condition{
+		{
+			Type:   string(v1.GatewayClassConditionStatusAccepted),
+			Status: metav1.ConditionFalse,
+			Reason: string(v1.GatewayClassReasonUnsupportedVersion),
+			Message: fmt.Sprintf(
+				"The Gateway API CRD versions are not supported. Please install version %s",
+				recommendedVersion,
+			),
+		},
+		{
+			Type:   string(v1.GatewayClassConditionStatusSupportedVersion),
+			Status: metav1.ConditionFalse,
+			Reason: string(v1.GatewayClassReasonUnsupportedVersion),
+			Message: fmt.Sprintf(
+				"The Gateway API CRD versions are not supported. Please install version %s",
+				recommendedVersion,
+			),
+		},
+	}
+}
+
+// NewGatewayRefNotPermitted returns Condition that indicates that the Gateway references a resource that is not
+// permitted by any ReferenceGrant.
+func NewGatewayRefNotPermitted(msg string) Condition {
+	return Condition{
+		Type:    string(GatewayReasonResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.GatewayReasonRefNotPermitted),
+		Message: msg,
+	}
+}
+
+// NewGatewaySecretRefInvalid returns Condition that indicates that the Gateway references a TLS secret that is invalid.
+func NewGatewaySecretRefInvalid(msg string) Condition {
+	return Condition{
+		Type:    string(GatewayReasonResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.GatewayReasonInvalidClientCertificateRef),
+		Message: msg,
+	}
+}
+
+// NewGatewayClassConflict returns a Condition that indicates that the GatewayClass is not accepted
+// due to a conflict with another GatewayClass.
+func NewGatewayClassConflict() Condition {
+	return Condition{
+		Type:    string(v1.GatewayClassConditionStatusAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(GatewayClassReasonGatewayClassConflict),
+		Message: GatewayClassMessageGatewayClassConflict,
+	}
+}
+
+// NewDefaultRouteConditions returns the default conditions that must be present in the status of a Route.
+func NewDefaultRouteConditions() []Condition {
+	return []Condition{
+		NewRouteAccepted(),
+		NewRouteResolvedRefs(),
+	}
+}
+
+// NewRouteNotAllowedByListeners returns a Condition that indicates that the Route is not allowed by
+// any listener.
+func NewRouteNotAllowedByListeners() Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.RouteReasonNotAllowedByListeners),
+		Message: "The Route is not allowed by any listener",
+	}
+}
+
+// NewRouteNoMatchingListenerHostname returns a Condition that indicates that the hostname of the Listener
+// does not match the hostnames of the Route.
+func NewRouteNoMatchingListenerHostname() Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.RouteReasonNoMatchingListenerHostname),
+		Message: "The Listener hostname does not match the Route hostnames",
+	}
+}
+
+// NewRouteAccepted returns a Condition that indicates that the Route is accepted.
+func NewRouteAccepted() Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.RouteReasonAccepted),
+		Message: "The Route is accepted",
+	}
+}
+
+// NewRouteUnsupportedValue returns a Condition that indicates that the Route includes an unsupported value.
+func NewRouteUnsupportedValue(msg string) Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.RouteReasonUnsupportedValue),
+		Message: msg,
+	}
+}
+
+// NewRouteAcceptedUnsupportedField returns a Condition that indicates that the Route is accepted but
+// includes an unsupported field.
+func NewRouteAcceptedUnsupportedField(msg string) Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(RouteReasonUnsupportedField),
+		Message: fmt.Sprintf("The following unsupported parameters were ignored: %s", msg),
+	}
+}
+
+// NewRoutePartiallyInvalid returns a Condition that indicates that the Route contains a combination
+// of both valid and invalid rules.
+//
+// // nolint:lll
+// The message must start with "Dropped Rules(s)" according to the Gateway API spec
+// See https://github.com/kubernetes-sigs/gateway-api/blob/37d81593e5a965ed76582dbc1a2f56bbd57c0622/apis/v1/shared_types.go#L408-L413
+func NewRoutePartiallyInvalid(msg string) Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionPartiallyInvalid),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.RouteReasonUnsupportedValue),
+		Message: "Dropped Rule(s): " + msg,
+	}
+}
+
+// NewRouteInvalidListener returns a Condition that indicates that the Route is not accepted because of an
+// invalid listener.
+func NewRouteInvalidListener() Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(RouteReasonInvalidListener),
+		Message: "The Listener is invalid for this parent ref",
+	}
+}
+
+// NewRouteHostnameConflict returns a Condition that indicates that the Route is not accepted because of a
+// conflicting hostname on the same port.
+func NewRouteHostnameConflict() Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(RouteReasonHostnameConflict),
+		Message: "Hostname(s) conflict with another Route of the same kind on the same port",
+	}
+}
+
+// NewRouteResolvedRefs returns a Condition that indicates that all the references on the Route are resolved.
+func NewRouteResolvedRefs() Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionResolvedRefs),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.RouteReasonResolvedRefs),
+		Message: "All references are resolved",
+	}
+}
+
+// NewRouteBackendRefInvalidKind returns a Condition that indicates that the Route has a backendRef with an
+// invalid kind.
+func NewRouteBackendRefInvalidKind(msg string) Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.RouteReasonInvalidKind),
+		Message: msg,
+	}
+}
+
+// NewRouteBackendRefRefNotPermitted returns a Condition that indicates that the Route has a backendRef that
+// is not permitted.
+func NewRouteBackendRefRefNotPermitted(msg string) Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.RouteReasonRefNotPermitted),
+		Message: msg,
+	}
+}
+
+// NewRouteBackendRefRefBackendNotFound returns a Condition that indicates that the Route has a backendRef that
+// points to non-existing backend.
+func NewRouteBackendRefRefBackendNotFound(msg string) Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.RouteReasonBackendNotFound),
+		Message: msg,
+	}
+}
+
+// NewRouteBackendRefUnsupportedValue returns a Condition that indicates that the Route has a backendRef with
+// an unsupported value.
+func NewRouteBackendRefUnsupportedValue(msg string) Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(RouteReasonBackendRefUnsupportedValue),
+		Message: msg,
+	}
+}
+
+// NewRouteBackendRefInvalidInferencePool returns a Condition that indicates that the Route has a InferencePool
+// backendRef that is invalid.
+func NewRouteBackendRefInvalidInferencePool(msg string) Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(RouteReasonInvalidInferencePool),
+		Message: msg,
+	}
+}
+
+// NewRouteEndpointPickerTLSVerificationSkipped returns a Condition that warns that TLS certificate verification
+// is skipped for an EndpointPicker because no BackendTLSPolicy is configured for its Service.
+func NewRouteEndpointPickerTLSVerificationSkipped() Condition {
+	return Condition{
+		Type:    string(RouteEndpointPickerTLSVerificationSkipped),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(RouteReasonBackendTLSPolicyNotFound),
+		Message: RouteMessageEndpointPickerTLSVerificationSkipped,
+	}
+}
+
+// NewRouteBackendRefUnsupportedProtocol returns a Condition that indicates that the Route has a backendRef with
+// an unsupported protocol.
+func NewRouteBackendRefUnsupportedProtocol(msg string) Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.RouteReasonUnsupportedProtocol),
+		Message: msg,
+	}
+}
+
+// NewRouteInvalidGateway returns a Condition that indicates that the Route is not Accepted because the Gateway it
+// references is invalid.
+func NewRouteInvalidGateway() Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(RouteReasonInvalidGateway),
+		Message: "The Gateway is invalid",
+	}
+}
+
+// NewRouteInvalidListenerSet returns a Condition that indicates that the Route is not Accepted because
+// the ListenerSet it references is invalid.
+func NewRouteInvalidListenerSet() Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(RouteReasonInvalidListenerSet),
+		Message: "The ListenerSet is invalid",
+	}
+}
+
+// NewRouteNoMatchingParent returns a Condition that indicates that the Route is not Accepted because
+// it specifies a Port and/or SectionName that does not match any Listeners in the Gateway.
+func NewRouteNoMatchingParent() Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.RouteReasonNoMatchingParent),
+		Message: "The Listener is not found for this parent ref",
+	}
+}
+
+// NewRouteUnsupportedConfiguration returns a Condition that indicates that the Route is not Accepted because
+// it is incompatible with the Gateway's configuration.
+func NewRouteUnsupportedConfiguration(msg string) Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(RouteReasonUnsupportedConfiguration),
+		Message: msg,
+	}
+}
+
+// NewRouteResolvedRefsInvalidFilter returns a Condition that indicates that the Route has a filter that
+// cannot be resolved or is invalid.
+func NewRouteResolvedRefsInvalidFilter(msg string) Condition {
+	return Condition{
+		Type:    string(v1.RouteConditionResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(RouteReasonInvalidFilter),
+		Message: msg,
+	}
+}
+
+// NewDefaultListenerConditions returns the default Conditions that must be present in the status of a Listener.
+// If existingConditions contains conflict-related conditions (like OverlappingTLSConfig or Conflicted),
+// the NoConflicts condition is excluded to avoid conflicting condition states.
+func NewDefaultListenerConditions(existingConditions []Condition) []Condition {
+	defaultConds := []Condition{
+		NewListenerProgrammed(),
+		NewListenerAccepted(),
+	}
+
+	// Only add ResolvedRefs=true if there are no existing ResolvedRefs conditions
+	if !hasResolvedRefsConditions(existingConditions) {
+		defaultConds = append(defaultConds, NewListenerResolvedRefs())
+	}
+
+	// Only add NoConflicts condition if there are no existing conflict-related conditions
+	if !hasConflictConditions(existingConditions) {
+		defaultConds = append(defaultConds, NewListenerNoConflicts())
+	}
+
+	return defaultConds
+}
+
+// hasResolvedRefsConditions checks if the Listener has any ResolvedRefs=False conditions.
+func hasResolvedRefsConditions(conditions []Condition) bool {
+	for _, cond := range conditions {
+		if cond.Type == string(v1.ListenerConditionResolvedRefs) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasConflictConditions checks if the Listener has any conflict-related conditions.
+func hasConflictConditions(conditions []Condition) bool {
+	for _, cond := range conditions {
+		if cond.Type == string(v1.ListenerConditionConflicted) ||
+			cond.Type == string(v1.ListenerConditionOverlappingTLSConfig) {
+			return true
+		}
+	}
+	return false
+}
+
+// NewListenerAccepted returns a Condition that indicates that the Listener is accepted.
+func NewListenerAccepted() Condition {
+	return Condition{
+		Type:    string(v1.ListenerConditionAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.ListenerReasonAccepted),
+		Message: "The Listener is accepted",
+	}
+}
+
+// NewListenerProgrammed returns a Condition that indicates the Listener is programmed.
+func NewListenerProgrammed() Condition {
+	return Condition{
+		Type:    string(v1.ListenerConditionProgrammed),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.ListenerReasonProgrammed),
+		Message: "The Listener is programmed",
+	}
+}
+
+// NewListenerResolvedRefs returns a Condition that indicates that all references in a Listener are resolved.
+func NewListenerResolvedRefs() Condition {
+	return Condition{
+		Type:    string(v1.ListenerConditionResolvedRefs),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.ListenerReasonResolvedRefs),
+		Message: "All references are resolved",
+	}
+}
+
+// NewListenerNoConflicts returns a Condition that indicates that there are no conflicts in a Listener.
+func NewListenerNoConflicts() Condition {
+	return Condition{
+		Type:    string(v1.ListenerConditionConflicted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.ListenerReasonNoConflicts),
+		Message: "No conflicts",
+	}
+}
+
+// NewListenerNotProgrammedInvalid returns a Condition that indicates the Listener is not programmed because it is
+// semantically or syntactically invalid. The provided message contains the details of why the Listener is invalid.
+func NewListenerNotProgrammedInvalid(msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.ListenerReasonInvalid),
+		Message: msg,
+	}
+}
+
+// NewListenerNotProgrammedHostnameConflict returns a Condition that indicates the Listener is not programmed because
+// it has a hostname conflict. The provided message contains the details of the conflict.
+func NewListenerNotProgrammedHostnameConflict(msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.ListenerReasonHostnameConflict),
+		Message: msg,
+	}
+}
+
+// NewListenerNotProgrammedProtocolConflict returns a Condition that indicates the Listener is not programmed because
+// it has a protocol conflict. The provided message contains the details of the conflict.
+func NewListenerNotProgrammedProtocolConflict(msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.ListenerReasonProtocolConflict),
+		Message: msg,
+	}
+}
+
+// NewListenerUnsupportedValue returns Conditions that indicate that a field of a Listener has an unsupported value.
+// Unsupported means that the value is not supported by the implementation or invalid.
+func NewListenerUnsupportedValue(msg string) []Condition {
+	return []Condition{
+		{
+			Type:    string(v1.ListenerConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(ListenerReasonUnsupportedValue),
+			Message: msg,
+		},
+		NewListenerNotProgrammedInvalid(msg),
+	}
+}
+
+// NewListenerInvalidCertificateRefNotAccepted returns Conditions that marks the listener as not Accepted,
+// ResolvedRefs false, and not Programmed.
+func NewListenerInvalidCertificateRefNotAccepted(msg string) []Condition {
+	return []Condition{
+		{
+			Type:    string(v1.ListenerConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(v1.ListenerReasonInvalidCertificateRef),
+			Message: msg,
+		},
+		{
+			Type:    string(v1.ListenerConditionResolvedRefs),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(v1.ListenerReasonInvalidCertificateRef),
+			Message: msg,
+		},
+		NewListenerNotProgrammedInvalid(msg),
+	}
+}
+
+// NewListenerAllInvalidCertificateRefs returns Conditions that mark the listener as not Accepted,
+// ResolvedRefs false, and not Programmed when all CertificateRefs failed to resolve.
+// The reason should be one of the Gateway API ListenerConditionReason values
+// (e.g. InvalidCertificateRef or RefNotPermitted).
+func NewListenerAllInvalidCertificateRefs(msg string, reason string) []Condition {
+	return []Condition{
+		{
+			Type:    string(v1.ListenerConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  reason,
+			Message: msg,
+		},
+		{
+			Type:    string(v1.ListenerConditionResolvedRefs),
+			Status:  metav1.ConditionFalse,
+			Reason:  reason,
+			Message: msg,
+		},
+		NewListenerNotProgrammedInvalid(msg),
+	}
+}
+
+// NewListenerUnresolvedCertificateRef returns a Condition that indicates that one or more CertificateRefs
+// of a Listener could not be resolved, but the listener is still valid because other certificate refs
+// were resolved successfully. This only sets ResolvedRefs to false without affecting the Accepted condition.
+// The reason parameter should be one of the Gateway API ListenerConditionReason values
+// (e.g. InvalidCertificateRef or RefNotPermitted).
+func NewListenerUnresolvedCertificateRef(msg string, reason string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerConditionResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  reason,
+		Message: msg,
+	}
+}
+
+// NewListenerInvalidRouteKinds returns Conditions that indicate that an invalid or unsupported Route kind is
+// specified by the Listener.
+func NewListenerInvalidRouteKinds(msg string) []Condition {
+	return []Condition{
+		{
+			Type:    string(v1.ListenerConditionResolvedRefs),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(v1.ListenerReasonInvalidRouteKinds),
+			Message: msg,
+		},
+		NewListenerNotProgrammedInvalid(msg),
+	}
+}
+
+// NewListenerProtocolConflict returns Conditions that indicate multiple Listeners are specified with the same
+// Listener port number, but have conflicting protocol specifications.
+func NewListenerProtocolConflict(msg string) []Condition {
+	return []Condition{
+		{
+			Type:    string(v1.ListenerConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(v1.ListenerReasonProtocolConflict),
+			Message: msg,
+		},
+		{
+			Type:    string(v1.ListenerConditionConflicted),
+			Status:  metav1.ConditionTrue,
+			Reason:  string(v1.ListenerReasonProtocolConflict),
+			Message: msg,
+		},
+		NewListenerNotProgrammedProtocolConflict(msg),
+	}
+}
+
+// NewListenerHostnameConflict returns Conditions that indicate multiple Listeners are specified with the same
+// Listener port, but are HTTPS and TLS and have overlapping hostnames.
+func NewListenerHostnameConflict(msg string) []Condition {
+	return []Condition{
+		{
+			Type:    string(v1.ListenerConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(v1.ListenerReasonHostnameConflict),
+			Message: msg,
+		},
+		{
+			Type:    string(v1.ListenerConditionConflicted),
+			Status:  metav1.ConditionTrue,
+			Reason:  string(v1.ListenerReasonHostnameConflict),
+			Message: msg,
+		},
+		NewListenerNotProgrammedHostnameConflict(msg),
+	}
+}
+
+// NewListenerUnsupportedProtocol returns Conditions that indicate that the protocol of a Listener is unsupported.
+func NewListenerUnsupportedProtocol(msg string) []Condition {
+	return []Condition{
+		{
+			Type:    string(v1.ListenerConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(v1.ListenerReasonUnsupportedProtocol),
+			Message: msg,
+		},
+		NewListenerNotProgrammedInvalid(msg),
+	}
+}
+
+// NewListenerRefNotPermitted returns Conditions that indicates that the Listener references a TLS secret that is not
+// permitted by a ReferenceGrant.
+func NewListenerRefNotPermitted(msg string) []Condition {
+	return []Condition{
+		{
+			Type:    string(v1.ListenerConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(v1.ListenerReasonRefNotPermitted),
+			Message: msg,
+		},
+		{
+			Type:    string(v1.ListenerConditionResolvedRefs),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(v1.ListenerReasonRefNotPermitted),
+			Message: msg,
+		},
+		NewListenerNotProgrammedInvalid(msg),
+	}
+}
+
+// NewListenerOverlappingTLSConfig returns a Condition that indicates overlapping TLS configuration
+// between Listeners on the same port.
+func NewListenerOverlappingTLSConfig(reason v1.ListenerConditionReason, msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerConditionOverlappingTLSConfig),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(reason),
+		Message: msg,
+	}
+}
+
+// NewGatewayClassResolvedRefs returns a Condition that indicates that the parametersRef
+// on the GatewayClass is resolved.
+func NewGatewayClassResolvedRefs() Condition {
+	return Condition{
+		Type:    string(GatewayClassResolvedRefs),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(GatewayClassReasonResolvedRefs),
+		Message: "The ParametersRef resource is resolved",
+	}
+}
+
+// NewGatewayClassRefNotFound returns a Condition that indicates that the parametersRef
+// on the GatewayClass could not be resolved.
+func NewGatewayClassRefNotFound() Condition {
+	return Condition{
+		Type:    string(GatewayClassResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(GatewayClassReasonParamsRefNotFound),
+		Message: "The ParametersRef resource could not be found",
+	}
+}
+
+// NewGatewayClassRefInvalid returns a Condition that indicates that the parametersRef
+// on the GatewayClass could not be resolved because the resource it references is invalid.
+func NewGatewayClassRefInvalid(msg string) Condition {
+	return Condition{
+		Type:    string(GatewayClassResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(GatewayClassReasonParamsRefInvalid),
+		Message: msg,
+	}
+}
+
+// NewGatewayClassInvalidParameters returns a Condition that indicates that the GatewayClass has invalid parameters.
+// We are allowing Accepted to still be true to prevent nullifying the entire config tree if a parametersRef
+// is updated to something invalid.
+func NewGatewayClassInvalidParameters(msg string) Condition {
+	return Condition{
+		Type:    string(v1.GatewayClassConditionStatusAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.GatewayClassReasonInvalidParameters),
+		Message: fmt.Sprintf("The GatewayClass is accepted, but ParametersRef is ignored due to an error: %s", msg),
+	}
+}
+
+// NewDefaultGatewayConditions returns the default Conditions that must be present in the status of a Gateway.
+func NewDefaultGatewayConditions() []Condition {
+	return []Condition{
+		NewGatewayAccepted(),
+		NewGatewayProgrammed(),
+	}
+}
+
+// NewGatewayAccepted returns a Condition that indicates the Gateway is accepted.
+func NewGatewayAccepted() Condition {
+	return Condition{
+		Type:    string(v1.GatewayConditionAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.GatewayReasonAccepted),
+		Message: "The Gateway is accepted",
+	}
+}
+
+// NewGatewayAcceptedListenersNotValid returns a Condition that indicates the Gateway is accepted,
+// but has at least one listener that is invalid.
+func NewGatewayAcceptedListenersNotValid() Condition {
+	return Condition{
+		Type:    string(v1.GatewayConditionAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.GatewayReasonListenersNotValid),
+		Message: "The Gateway has at least one valid listener",
+	}
+}
+
+// NewGatewayNotAcceptedListenersNotValid returns Conditions that indicate the Gateway is not accepted,
+// because all listeners are invalid.
+func NewGatewayNotAcceptedListenersNotValid() []Condition {
+	msg := "The Gateway has no valid listeners"
+	return []Condition{
+		{
+			Type:    string(v1.GatewayConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(v1.GatewayReasonListenersNotValid),
+			Message: msg,
+		},
+		NewGatewayNotProgrammedInvalid(msg),
+	}
+}
+
+// NewGatewayInvalid returns Conditions that indicate the Gateway is not accepted and programmed because it is
+// semantically or syntactically invalid. The provided message contains the details of why the Gateway is invalid.
+func NewGatewayInvalid(msg string) []Condition {
+	return []Condition{
+		{
+			Type:    string(v1.GatewayConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(v1.GatewayReasonInvalid),
+			Message: msg,
+		},
+		NewGatewayNotProgrammedInvalid(msg),
+	}
+}
+
+// NewGatewayUnsupportedValue returns Conditions that indicate that a field of the Gateway has an unsupported value.
+// Unsupported means that the value is not supported by the implementation under certain conditions or invalid.
+func NewGatewayUnsupportedValue(msg string) []Condition {
+	return []Condition{
+		{
+			Type:    string(v1.GatewayConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(GatewayReasonUnsupportedValue),
+			Message: msg,
+		},
+		{
+			Type:    string(v1.GatewayConditionProgrammed),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(GatewayReasonUnsupportedValue),
+			Message: msg,
+		},
+	}
+}
+
+// NewGatewayUnsupportedAddress returns a Condition that indicates the Gateway is not accepted because it
+// contains an address type that is not supported.
+func NewGatewayUnsupportedAddress(msg string) Condition {
+	return Condition{
+		Type:    string(v1.GatewayConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.GatewayReasonUnsupportedAddress),
+		Message: msg,
+	}
+}
+
+// NewGatewayUnusableAddress returns a Condition that indicates the Gateway is not programmed because it
+// contains an address type that can't be used.
+func NewGatewayUnusableAddress(msg string) Condition {
+	return Condition{
+		Type:    string(v1.GatewayConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.GatewayReasonAddressNotUsable),
+		Message: msg,
+	}
+}
+
+// NewGatewayAddressNotAssigned returns a Condition that indicates the Gateway is not programmed because it
+// has not assigned an address for the Gateway.
+func NewGatewayAddressNotAssigned(msg string) Condition {
+	return Condition{
+		Type:    string(v1.GatewayConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.GatewayReasonAddressNotAssigned),
+		Message: msg,
+	}
+}
+
+// NewGatewayProgrammed returns a Condition that indicates the Gateway is programmed.
+func NewGatewayProgrammed() Condition {
+	return Condition{
+		Type:    string(v1.GatewayConditionProgrammed),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.GatewayReasonProgrammed),
+		Message: "The Gateway is programmed",
+	}
+}
+
+// NewGatewayNotProgrammedInvalid returns a Condition that indicates the Gateway is not programmed
+// because it is semantically or syntactically invalid. The provided message contains the details of
+// why the Gateway is invalid.
+func NewGatewayNotProgrammedInvalid(msg string) Condition {
+	return Condition{
+		Type:    string(v1.GatewayConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.GatewayReasonInvalid),
+		Message: msg,
+	}
+}
+
+// NewGatewayInsecureFrontendValidationMode returns a Condition that indicates
+// the Gateway is accepted, but is using an insecure frontend validation mode.
+func NewGatewayInsecureFrontendValidationMode(msg string) Condition {
+	return Condition{
+		Type:    string(v1.GatewayConditionInsecureFrontendValidationMode),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.GatewayReasonConfigurationChanged),
+		Message: msg,
+	}
+}
+
+// NewListenerInvalidCaCertificateRef returns a Condition indicating
+// that a CA CertificateRef for a Listener is invalid.
+func NewListenerInvalidCaCertificateRef(msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerConditionResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.ListenerReasonInvalidCACertificateRef),
+		Message: msg,
+	}
+}
+
+// NewListenerInvalidCaCertificateKind returns a Condition indicating
+// that a CA CertificateRef Kind for a Listener is invalid.
+func NewListenerInvalidCaCertificateKind(msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerConditionResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.ListenerReasonInvalidCACertificateKind),
+		Message: msg,
+	}
+}
+
+// NewListenerInvalidNoValidCACertificate returns Conditions indicating
+// that all CA Certificates for a Listener are invalid.
+// It marks the listener as not Accepted and not Programmed.
+func NewListenerInvalidNoValidCACertificate(msg string) []Condition {
+	return []Condition{
+		{
+			Type:    string(v1.ListenerConditionAccepted),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(v1.ListenerReasonNoValidCACertificate),
+			Message: msg,
+		},
+		NewListenerNotProgrammedInvalid(msg),
+	}
+}
+
+// NewNginxGatewayValid returns a Condition that indicates that the NginxGateway config is valid.
+func NewNginxGatewayValid() Condition {
+	return Condition{
+		Type:    string(ngfAPI.NginxGatewayConditionValid),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(ngfAPI.NginxGatewayReasonValid),
+		Message: "The NginxGateway is valid",
+	}
+}
+
+// NewNginxGatewayInvalid returns a Condition that indicates that the NginxGateway config is invalid.
+func NewNginxGatewayInvalid(msg string) Condition {
+	return Condition{
+		Type:    string(ngfAPI.NginxGatewayConditionValid),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(ngfAPI.NginxGatewayReasonInvalid),
+		Message: msg,
+	}
+}
+
+// NewGatewayResolvedRefs returns a Condition that indicates that the referenced resources
+// on the Gateway are resolved.
+func NewGatewayResolvedRefs() Condition {
+	return Condition{
+		Type:    string(GatewayResolvedRefs),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(GatewayReasonResolvedRefs),
+		Message: "The referenced resources are resolved",
+	}
+}
+
+// NewGatewayRefInvalid returns a Condition that indicates that the parametersRef
+// on the Gateway could not be resolved because the referenced resource is invalid.
+func NewGatewayRefInvalid(msg string) Condition {
+	return Condition{
+		Type:    string(GatewayResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(GatewayReasonParamsRefInvalid),
+		Message: msg,
+	}
+}
+
+// NewGatewayInvalidParameters returns a Condition that indicates that the Gateway has invalid parameters.
+// Per the Gateway API spec, the Gateway is not accepted when the parametersRef is invalid.
+// Note: The Gateway is still kept Valid in the graph to prevent nullifying the data plane config.
+func NewGatewayInvalidParameters(msg string) Condition {
+	return Condition{
+		Type:    string(v1.GatewayConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.GatewayReasonInvalidParameters),
+		Message: fmt.Sprintf("The Gateway is not accepted due to an invalid ParametersRef: %s", msg),
+	}
+}
+
+// NewGatewayAcceptedUnsupportedField returns a Condition that indicates the Gateway is accepted but
+// contains a field that is not supported.
+func NewGatewayAcceptedUnsupportedField(msg string) Condition {
+	return Condition{
+		Type:    string(v1.GatewayConditionAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(GatewayReasonUnsupportedField),
+		Message: fmt.Sprintf("The Gateway is accepted but the following unsupported parameters were ignored: %s", msg),
+	}
+}
+
+// NewPolicyAccepted returns a Condition that indicates that the Policy is accepted.
+func NewPolicyAccepted() Condition {
+	return Condition{
+		Type:    string(v1.PolicyConditionAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.PolicyReasonAccepted),
+		Message: "The Policy is accepted",
+	}
+}
+
+// NewPolicyInvalid returns a Condition that indicates that the Policy is not accepted because it is semantically or
+// syntactically invalid.
+func NewPolicyInvalid(msg string) Condition {
+	return Condition{
+		Type:    string(v1.PolicyConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.PolicyReasonInvalid),
+		Message: msg,
+	}
+}
+
+// NewPolicyRefNotPermitted returns a Condition that indicates that the Policy is not accepted because it
+// contains a cross-namespace reference that is not permitted by any ReferenceGrant.
+func NewPolicyRefNotPermitted(msg string) Condition {
+	return Condition{
+		Type:    string(v1.PolicyConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  "RefNotPermitted",
+		Message: msg,
+	}
+}
+
+// NewPolicyConflicted returns a Condition that indicates that the Policy is not accepted because it conflicts with
+// another Policy and a merge is not possible.
+func NewPolicyConflicted(msg string) Condition {
+	return Condition{
+		Type:    string(v1.PolicyConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.PolicyReasonConflicted),
+		Message: msg,
+	}
+}
+
+// NewSettingsPolicyProgrammed returns the GEP-713 "Programmed" Condition (status True) indicating that the
+// Policy has been fully programmed for enforcement in the data plane.
+func NewSettingsPolicyProgrammed() Condition {
+	return Condition{
+		Type:    string(PolicyConditionProgrammed),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyReasonProgrammed),
+		Message: "Policy is programmed in the data plane",
+	}
+}
+
+// NewSettingsPolicyNotProgrammed returns the GEP-713 "Programmed" Condition (status False) indicating that the
+// Policy is not programmed in the data plane because it is invalid or still being reconciled.
+func NewSettingsPolicyNotProgrammed() Condition {
+	return Condition{
+		Type:    string(PolicyConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(PolicyReasonReconciling),
+		Message: "Policy is not programmed in the data plane",
+	}
+}
+
+// NewSettingsPolicyOverridden returns the GEP-713 "Programmed" Condition (status False) indicating that the
+// Policy is not programmed in the data plane because it was fully overridden by a conflicting Policy of greater
+// precedence during conflict resolution.
+func NewSettingsPolicyOverridden() Condition {
+	return Condition{
+		Type:    string(PolicyConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(PolicyReasonOverridden),
+		Message: "Policy is overridden by a conflicting policy of greater precedence",
+	}
+}
+
+// NewAccessPolicyNotProgrammed returns Programmed=False/Overridden for a
+// route-level Allow AccessPolicy whose address set has no overlap with the gateway's permitted range.
+func NewAccessPolicyNotProgrammed(message string) Condition {
+	return Condition{
+		Type:    string(PolicyConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(PolicyReasonOverridden),
+		Message: message,
+	}
+}
+
+// NewAccessPolicyPartiallyProgrammed returns Programmed=True/PartiallyProgrammed for a
+// route-level Allow AccessPolicy whose effective address set was clipped by the gateway ceiling.
+func NewAccessPolicyPartiallyProgrammed(message string) Condition {
+	return Condition{
+		Type:    string(PolicyConditionProgrammed),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyReasonPartiallyProgrammed),
+		Message: message,
+	}
+}
+
+// NewPolicyTargetNotFound returns a Condition that indicates that the Policy is not accepted because the target
+// resource does not exist or can not be attached to.
+func NewPolicyTargetNotFound(msg string) Condition {
+	return Condition{
+		Type:    string(v1.PolicyConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.PolicyReasonTargetNotFound),
+		Message: msg,
+	}
+}
+
+// NewPolicyAncestorLimitReached returns a Condition that indicates that the Policy is not accepted because
+// the ancestor status list has reached the maximum size of 16.
+func NewPolicyAncestorLimitReached(policyType string, policyName string) Condition {
+	return Condition{
+		Type:    string(v1.PolicyConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(PolicyReasonAncestorLimitReached),
+		Message: fmt.Sprintf("%s %s %s", PolicyMessageAncestorLimitReached, policyType, policyName),
+	}
+}
+
+// NewPolicyNotAcceptedTargetConflict returns a Condition that indicates that the Policy is not accepted
+// because the target resource has a conflict with another resource when attempting to apply this policy.
+func NewPolicyNotAcceptedTargetConflict(msg string) Condition {
+	return Condition{
+		Type:    string(v1.PolicyConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(PolicyReasonTargetConflict),
+		Message: msg,
+	}
+}
+
+// NewPolicyNotAcceptedNginxProxyNotSet returns a Condition that indicates that the Policy is not accepted
+// because it relies on the NginxProxy configuration which is missing or invalid.
+func NewPolicyNotAcceptedNginxProxyNotSet(msg string) Condition {
+	return Condition{
+		Type:    string(v1.PolicyConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(PolicyReasonNginxProxyConfigNotSet),
+		Message: msg,
+	}
+}
+
+// NewSnippetsFilterInvalid returns a Condition that indicates that the SnippetsFilter is not accepted because it is
+// syntactically or semantically invalid.
+func NewSnippetsFilterInvalid(msg string) Condition {
+	return Condition{
+		Type:    string(ngfAPI.SnippetsFilterConditionTypeAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(ngfAPI.SnippetsFilterConditionReasonInvalid),
+		Message: msg,
+	}
+}
+
+// NewSnippetsFilterAccepted returns a Condition that indicates that the SnippetsFilter is accepted because it is
+// valid.
+func NewSnippetsFilterAccepted() Condition {
+	return Condition{
+		Type:    string(ngfAPI.SnippetsFilterConditionTypeAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(ngfAPI.SnippetsFilterConditionReasonAccepted),
+		Message: "The SnippetsFilter is accepted",
+	}
+}
+
+// NewExternalLoadBalancerAccepted returns a Condition that indicates that the ExternalLoadBalancer is accepted
+// and attached to its Gateway.
+func NewExternalLoadBalancerAccepted() Condition {
+	return Condition{
+		Type:    string(ngfAPI.ExternalLoadBalancerConditionTypeAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(ngfAPI.ExternalLoadBalancerConditionReasonAccepted),
+		Message: "The ExternalLoadBalancer is accepted",
+	}
+}
+
+// NewExternalLoadBalancerInvalid returns a Condition that indicates that the ExternalLoadBalancer is not accepted
+// because it is syntactically or semantically invalid.
+func NewExternalLoadBalancerInvalid(msg string) Condition {
+	return Condition{
+		Type:    string(ngfAPI.ExternalLoadBalancerConditionTypeAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(ngfAPI.ExternalLoadBalancerConditionReasonInvalid),
+		Message: msg,
+	}
+}
+
+// NewExternalLoadBalancerConflicted returns a Condition that indicates that the ExternalLoadBalancer is not accepted
+// because another ExternalLoadBalancer already fronts the same Gateway.
+func NewExternalLoadBalancerConflicted(msg string) Condition {
+	return Condition{
+		Type:    string(ngfAPI.ExternalLoadBalancerConditionTypeAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(ngfAPI.ExternalLoadBalancerConditionReasonConflicted),
+		Message: msg,
+	}
+}
+
+// NewAuthenticationFilterInvalid returns a Condition that indicates that the AuthenticationFilter is not accepted
+// because it is syntactically or semantically invalid.
+func NewAuthenticationFilterInvalid(msg string) Condition {
+	return Condition{
+		Type:    string(ngfAPI.AuthenticationFilterConditionTypeAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(ngfAPI.AuthenticationFilterConditionReasonInvalid),
+		Message: msg,
+	}
+}
+
+// NewAuthenticationFilterAccepted returns a Condition that indicates that the AuthenticationFilter is accepted
+// because it is valid.
+func NewAuthenticationFilterAccepted() Condition {
+	return Condition{
+		Type:    string(ngfAPI.AuthenticationFilterConditionTypeAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(ngfAPI.AuthenticationFilterConditionReasonAccepted),
+		Message: "The AuthenticationFilter is accepted",
+	}
+}
+
+// NewAuthenticationFilterAcceptedWithMessage returns a Condition that indicates that the AuthenticationFilter is
+// accepted, and provides a custom message. Useful for surfacing warning messages.
+func NewAuthenticationFilterAcceptedWithMessage(msg string) Condition {
+	return Condition{
+		Type:    string(ngfAPI.AuthenticationFilterConditionTypeAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(ngfAPI.AuthenticationFilterConditionReasonAccepted),
+		Message: msg,
+	}
+}
+
+// NewObservabilityPolicyAffected returns a Condition that indicates that an ObservabilityPolicy
+// is applied to the resource.
+func NewObservabilityPolicyAffected() Condition {
+	return Condition{
+		Type:    string(ObservabilityPolicyAffected),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyAffectedReason),
+		Message: "The ObservabilityPolicy is applied to the resource",
+	}
+}
+
+// NewClientSettingsPolicyAffected returns a Condition that indicates that a ClientSettingsPolicy
+// is applied to the resource.
+func NewClientSettingsPolicyAffected() Condition {
+	return Condition{
+		Type:    string(ClientSettingsPolicyAffected),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyAffectedReason),
+		Message: "The ClientSettingsPolicy is applied to the resource",
+	}
+}
+
+// NewSnippetsPolicyAffected returns a Condition that indicates that a SnippetsPolicy
+// is applied to the resource.
+func NewSnippetsPolicyAffected() Condition {
+	return Condition{
+		Type:    string(SnippetsPolicyAffected),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyAffectedReason),
+		Message: "The SnippetsPolicy is applied to the resource",
+	}
+}
+
+// NewProxySettingsPolicyAffected returns a Condition that indicates that a ProxySettingsPolicy
+// is applied to the resource.
+func NewProxySettingsPolicyAffected() Condition {
+	return Condition{
+		Type:    string(ProxySettingsPolicyAffected),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyAffectedReason),
+		Message: "The ProxySettingsPolicy is applied to the resource",
+	}
+}
+
+// NewRateLimitPolicyAffected returns a Condition that indicates that a RateLimitPolicy
+// is applied to the resource.
+func NewRateLimitPolicyAffected() Condition {
+	return Condition{
+		Type:    string(RateLimitPolicyAffected),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyAffectedReason),
+		Message: "The RateLimitPolicy is applied to the resource",
+	}
+}
+
+// NewAccessPolicyAffected returns a Condition that indicates that an AccessPolicy
+// is applied to the resource.
+func NewAccessPolicyAffected() Condition {
+	return Condition{
+		Type:    string(AccessPolicyAffected),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyAffectedReason),
+		Message: "The AccessPolicy is applied to the resource",
+	}
+}
+
+// NewPayloadProcessorPolicyAffected returns a Condition that indicates that a PayloadProcessor
+// is applied to the resource.
+func NewPayloadProcessorPolicyAffected() Condition {
+	return Condition{
+		Type:    string(PayloadProcessorPolicyAffected),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyAffectedReason),
+		Message: "PayloadProcessor is applied to the resource",
+	}
+}
+
+// NewBackendTLSPolicyResolvedRefs returns a Condition that indicates that all CACertificateRefs
+// in the BackendTLSPolicy are resolved.
+func NewBackendTLSPolicyResolvedRefs() Condition {
+	return Condition{
+		Type:    string(GatewayResolvedRefs),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(GatewayResolvedRefs),
+		Message: "All CACertificateRefs are resolved",
+	}
+}
+
+// NewBackendTLSPolicyInvalidCACertificateRef returns a Condition that indicates that a
+// CACertificateRef in the BackendTLSPolicy refers to a resource that cannot be resolved or is misconfigured.
+func NewBackendTLSPolicyInvalidCACertificateRef(message string) Condition {
+	return Condition{
+		Type:    string(GatewayResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.BackendTLSPolicyReasonInvalidCACertificateRef),
+		Message: message,
+	}
+}
+
+// NewBackendTLSPolicyInvalidKind returns a Condition that indicates that a CACertificateRef
+// in the BackendTLSPolicy refers to an unknown or unsupported kind of resource.
+func NewBackendTLSPolicyInvalidKind(message string) Condition {
+	return Condition{
+		Type:    string(GatewayResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.BackendTLSPolicyReasonInvalidKind),
+		Message: message,
+	}
+}
+
+// NewBackendTLSPolicyNoValidCACertificate returns a Condition that indicates that all
+// CACertificateRefs in the BackendTLSPolicy are invalid.
+func NewBackendTLSPolicyNoValidCACertificate(message string) Condition {
+	return Condition{
+		Type:    string(v1.PolicyConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.BackendTLSPolicyReasonNoValidCACertificate),
+		Message: message,
+	}
+}
+
+// NewInferencePoolAccepted returns a Condition that indicates that the InferencePool is accepted by the Gateway.
+func NewInferencePoolAccepted() Condition {
+	return Condition{
+		Type:    string(inference.InferencePoolConditionAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(inference.InferencePoolConditionAccepted),
+		Message: "The InferencePool is accepted by the Gateway.",
+	}
+}
+
+// NewInferencePoolResolvedRefs returns a Condition that
+// indicates that all references in the InferencePool are resolved.
+func NewInferencePoolResolvedRefs() Condition {
+	return Condition{
+		Type:    string(inference.InferencePoolConditionResolvedRefs),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(inference.InferencePoolConditionResolvedRefs),
+		Message: "The InferencePool references a valid ExtensionRef.",
+	}
+}
+
+// NewDefaultInferenceConditions returns the default Conditions
+// that must be present in the status of an InferencePool.
+func NewDefaultInferenceConditions() []Condition {
+	return []Condition{
+		NewInferencePoolAccepted(),
+		NewInferencePoolResolvedRefs(),
+	}
+}
+
+// NewInferencePoolInvalidHTTPRouteNotAccepted returns a Condition that indicates that the InferencePool is not
+// accepted because the associated HTTPRoute is not accepted by the Gateway.
+func NewInferencePoolInvalidHTTPRouteNotAccepted(msg string) Condition {
+	return Condition{
+		Type:    string(inference.InferencePoolConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(inference.InferencePoolReasonHTTPRouteNotAccepted),
+		Message: msg,
+	}
+}
+
+// NewInferencePoolInvalidExtensionref returns a Condition that indicates that the InferencePool is not
+// accepted because the ExtensionRef is invalid.
+func NewInferencePoolInvalidExtensionref(msg string) Condition {
+	return Condition{
+		Type:    string(inference.InferencePoolConditionResolvedRefs),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(inference.InferencePoolReasonInvalidExtensionRef),
+		Message: msg,
+	}
+}
+
+// NewInferencePoolEndpointPickerRefMissing returns a Condition that indicates that the InferencePool is not
+// accepted because the endpointPickerRef field is unset. NGF requires this field to be set.
+func NewInferencePoolEndpointPickerRefMissing(msg string) Condition {
+	return Condition{
+		Type:    string(inference.InferencePoolConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(inference.InferencePoolReasonEndpointPickerRefMissing),
+		Message: msg,
+	}
+}
+
+// NewDefaultListenerSetConditions returns the default conditions that must be present in the status of a ListenerSet.
+func NewDefaultListenerSetConditions() []Condition {
+	return []Condition{
+		NewListenerSetAccepted(),
+		NewListenerSetProgrammed(),
+	}
+}
+
+// NewListenerSetAccepted returns a Condition that indicates that the ListenerSet is accepted.
+func NewListenerSetAccepted() Condition {
+	return Condition{
+		Type:    string(v1.ListenerSetConditionAccepted),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.ListenerSetReasonAccepted),
+		Message: "The ListenerSet is accepted",
+	}
+}
+
+// NewListenerSetNotAllowed returns a Condition that indicates that the ListenerSet is not allowed
+// by the parent Gateway.
+func NewListenerSetNotAllowed(msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerSetConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.ListenerSetReasonNotAllowed),
+		Message: msg,
+	}
+}
+
+// NewListenerSetParentNotAccepted returns a Condition that indicates that the ListenerSet is not accepted
+// because the parent Gateway is not accepted.
+func NewListenerSetParentNotAccepted(msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerSetConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.ListenerSetReasonParentNotAccepted),
+		Message: msg,
+	}
+}
+
+// NewListenerSetListenersNotValid returns a Condition that indicates that the ListenerSet has
+// invalid listeners.
+func NewListenerSetListenersNotValid(msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerSetConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.ListenerSetReasonListenersNotValid),
+		Message: msg,
+	}
+}
+
+// NewListenerSetProgrammed returns a Condition that indicates that the ListenerSet is programmed.
+func NewListenerSetProgrammed() Condition {
+	return Condition{
+		Type:    string(v1.ListenerSetConditionProgrammed),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(v1.ListenerSetReasonProgrammed),
+		Message: "The ListenerSet is programmed",
+	}
+}
+
+// NewListenerSetNotProgrammedInvalid returns a Condition that indicates that the ListenerSet is
+// not programmed due to invalid configuration.
+func NewListenerSetNotProgrammedInvalid(msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerSetConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.ListenerSetReasonInvalid),
+		Message: msg,
+	}
+}
+
+// NewListenerSetNotProgrammedListenersNotValid returns a Condition that indicates that the
+// ListenerSet is not programmed due to invalid listeners.
+func NewListenerSetNotProgrammedListenersNotValid(msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerSetConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.ListenerSetReasonListenersNotValid),
+		Message: msg,
+	}
+}
+
+// NewListenerSetNotProgrammedNotAllowed returns a Condition that indicates that the ListenerSet
+// is not programmed due to it not being allowed by the parent Gateway.
+func NewListenerSetNotProgrammedNotAllowed(msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerSetConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.ListenerSetReasonNotAllowed),
+		Message: msg,
+	}
+}
+
+// NewListenerSetNotProgrammedParentNotAccepted returns a Condition that indicates that the ListenerSet
+// is not programmed due to the parent Gateway not being accepted.
+func NewListenerSetNotProgrammedParentNotAccepted(msg string) Condition {
+	return Condition{
+		Type:    string(v1.ListenerSetConditionProgrammed),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(ListenerSetReasonParentNotProgrammed),
+		Message: msg,
+	}
+}
+
+// NewWAFPolicyAffected returns a Condition that indicates that a WAFPolicy
+// is applied to the resource.
+func NewWAFPolicyAffected() Condition {
+	return Condition{
+		Type:    string(WAFPolicyAffected),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyAffectedReason),
+		Message: "WAFPolicy is applied to the resource",
+	}
+}
+
+// NewPolicyResolvedRefs returns the default happy-path Condition for WAF reference resolution.
+func NewPolicyResolvedRefs() Condition {
+	return Condition{
+		Type:    string(WAFResolvedRefsConditionType),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyReasonResolvedRefs),
+		Message: "All references are resolved",
+	}
+}
+
+// NewPolicyProgrammed returns the default happy-path Condition for WAF data plane deployment.
+func NewPolicyProgrammed() Condition {
+	return Condition{
+		Type:    string(WAFProgrammedConditionType),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyReasonProgrammed),
+		Message: "Policy is programmed in the data plane",
+	}
+}
+
+// NewPolicyRefsNotResolved returns a Condition that indicates a WAFPolicy reference could not be
+// resolved (e.g. missing/invalid secret, missing/not-ready/invalid AP resource). The caller is
+// expected to format the message to describe which reference failed.
+func NewPolicyRefsNotResolved(msg string) Condition {
+	return Condition{
+		Type:    string(WAFResolvedRefsConditionType),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(PolicyReasonInvalidRef),
+		Message: msg,
+	}
+}
+
+// NewPolicyNotProgrammedBundleFetchError returns a Condition that indicates a bundle fetch error.
+func NewPolicyNotProgrammedBundleFetchError(errMsg string) Condition {
+	return Condition{
+		Type:    string(WAFProgrammedConditionType),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(PolicyReasonFetchError),
+		Message: fmt.Sprintf("Failed to fetch bundle: %s", errMsg),
+	}
+}
+
+// NewPolicyNotProgrammedIntegrityError returns a Condition that indicates a bundle checksum verification failure.
+func NewPolicyNotProgrammedIntegrityError(errMsg string) Condition {
+	return Condition{
+		Type:    string(WAFProgrammedConditionType),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(PolicyReasonIntegrityError),
+		Message: fmt.Sprintf("Bundle integrity check failed: %s", errMsg),
+	}
+}
+
+// NewPolicyProgrammedBundleUpdated returns a Condition that indicates polling detected a changed
+// bundle and dispatched it to target deployments.
+// bundleDescription is a human-readable label, e.g. "policy bundle" or "security log bundle (profile: default)".
+func NewPolicyProgrammedBundleUpdated(bundleDescription, checksum string, updatedAt metav1.Time) Condition {
+	return Condition{
+		Type:   string(WAFProgrammedConditionType),
+		Status: metav1.ConditionTrue,
+		Reason: string(PolicyReasonBundleUpdated),
+		Message: fmt.Sprintf(
+			"%s updated at %s (checksum: %s)",
+			bundleDescription, updatedAt.UTC().Format(time.RFC3339), checksum,
+		),
+	}
+}
+
+// NewPolicyProgrammedStaleBundleWarning returns a Condition that indicates a bundle fetch failed
+// but the previously fetched bundle is being used to keep the policy active on the data plane.
+// bundleDescription is a human-readable label, e.g. "policy bundle" or "security log bundle (profile: default)".
+func NewPolicyProgrammedStaleBundleWarning(bundleDescription, errMsg string) Condition {
+	return Condition{
+		Type:    string(WAFProgrammedConditionType),
+		Status:  metav1.ConditionTrue,
+		Reason:  string(PolicyReasonStaleBundleWarning),
+		Message: fmt.Sprintf("%s fetch failed; using previously fetched bundle: %s", bundleDescription, errMsg),
+	}
+}
+
+// NewPolicyNotProgrammedBundlePending returns a Condition that indicates the WAF bundle has not
+// yet been successfully fetched. The Gateway config push is withheld until the bundle is available,
+// maintaining a fail-closed posture.
+func NewPolicyNotProgrammedBundlePending(errMsg string) Condition {
+	return Condition{
+		Type:    string(WAFProgrammedConditionType),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(PolicyReasonPending),
+		Message: fmt.Sprintf("Waiting for WAF bundle; last fetch error: %s", errMsg),
+	}
+}
+
+// NewPolicyRefsNotPermitted returns a Condition that indicates a cross-namespace reference
+// (APPolicy or APLogConf) is not permitted by a ReferenceGrant.
+func NewPolicyRefsNotPermitted(msg string) Condition {
+	return Condition{
+		Type:    string(WAFResolvedRefsConditionType),
+		Status:  metav1.ConditionFalse,
+		Reason:  "RefNotPermitted",
+		Message: msg,
+	}
+}
+
+// NewPolicyNotAcceptedPLMNotConfigured returns a Condition that indicates a PLM WAFPolicy was
+// created but PLM storage is not configured via CLI flags.
+func NewPolicyNotAcceptedPLMNotConfigured() Condition {
+	return Condition{
+		Type:    string(v1.PolicyConditionAccepted),
+		Status:  metav1.ConditionFalse,
+		Reason:  string(v1.PolicyReasonInvalid),
+		Message: "PLM storage not configured; set --plm-storage-url on the controller",
+	}
+}

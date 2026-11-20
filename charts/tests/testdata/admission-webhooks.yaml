@@ -1,0 +1,9 @@
+controller:
+  kind: daemonset
+  ingressNginxCompat: true
+  admissionWebhooks:
+    enabled: true
+    timeoutSeconds: 5
+    namespaceSelector:
+      matchExpressions:
+        - {key: kubernetes.io/metadata.name, operator: NotIn, values: [kube-system]}

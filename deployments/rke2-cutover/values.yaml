@@ -1,0 +1,134 @@
+# wxingress in the place of RKE2's rke2-ingress-nginx (ingress-nginx 1.12),
+# node by node: see docs/migration/rke2.md (the runbook).
+#
+#   helm upgrade --install wxingress charts/wxingress -n wxingress --create-namespace \
+#     -f deployments/rke2-cutover/values.yaml --set controller.image.tag=<tag>
+#
+# What it mirrors of the running rke2-ingress-nginx DaemonSet: a pod on every
+# Linux node that tolerates the taints app, customer and gitlab, hostPort 80
+# and 443 (no hostNetwork, no LoadBalancer Service), dnsPolicy
+# ClusterFirstWithHostNet, the class "nginx" of controller k8s.io/ingress-nginx,
+# Ingresses without a class served too, strict-validate-path-type off (wxingress
+# does not validate path types strictly), metrics on 10254.
+#
+# What differs during the cutover: the pods run only on nodes labelled
+# wx1.eu/ingress=wxingress (rke2-ingress-nginx gets the opposite affinity),
+# the chart does not create or own the IngressClass "nginx" (RKE2's Helm
+# release owns it), and wxingress writes no Ingress status. the runbook, step 7,
+# turns the status on and lets the chart take the class over once
+# rke2-ingress-nginx is gone.
+
+controller:
+  kind: daemonset
+
+  image:
+    repository: docker.io/wxone/wxingress
+    # tag: set on the command line
+
+  # as ingress-nginx: one pod per node, ports of the node, no Service of type LoadBalancer
+  hostPort:
+    enable: true
+    http: 80
+    https: 443
+  dnsPolicy: ClusterFirstWithHostNet
+  service:
+    create: true
+    type: ClusterIP
+
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations:
+    - key: app
+      operator: Exists
+    - key: customer
+      operator: Exists
+    - key: gitlab
+      operator: Exists
+  # only on the nodes already switched over (the runbook, step 4)
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: wx1.eu/ingress
+                operator: In
+                values: [wxingress]
+
+  # no restart of a running pod by an upgrade: a node refuses connections while
+  # its pod restarts, so a pod goes only when its node is out of the balancer
+  # (the runbook, step 3 and "Later changes"); and time to drain long requests
+  strategy:
+    type: OnDelete
+  terminationGracePeriodSeconds: 300
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
+  # the place of ingress-nginx: its defaults, dynamic upstreams, Ingresses without host, a preStop sleep
+  ingressNginxCompat: true
+
+  ingressClass:
+    # the class Ingresses name; RKE2's release owns the IngressClass until step 7
+    name: nginx
+    create: false
+    setAsDefaultIngress: false
+    # the IngressClass "nginx" has spec.controller k8s.io/ingress-nginx
+    controllers:
+      - k8s.io/ingress-nginx
+  # as --watch-ingress-without-class=true
+  watchIngressWithoutClass: true
+
+  # two controllers must not fight over .status of the same Ingresses; on in step 7
+  reportIngressStatus:
+    enable: false
+
+  # ingress-nginx's ConfigMap has only strict-validate-path-type: "false", which is wxingress's behaviour anyway
+  config:
+    entries:
+      # nginx closes what is open (WebSockets) 10 s after a reload or the
+      # pod's SIGTERM, not after ingress-nginx's 240 s
+      worker-shutdown-timeout: 10s
+
+  # ingress-nginx's snippet annotations are off by default in 1.12 as well
+  enableSnippets: false
+
+  readyStatus:
+    enable: true
+
+  # the admission webhook in the place of rke2-ingress-nginx-admission: as RKE2's, failurePolicy Fail, a self-signed
+  # certificate of kube-webhook-certgen (the image RKE2's chart runs). The pods serve it from step 2 on; step 2 installs
+  # with failurePolicy Ignore - with Fail, while no node runs wxingress, no Ingress could be written - and step 5 makes
+  # it Fail before rke2-ingress-nginx's webhook goes (the runbook). snippets are off, so it runs nginx -t.
+  admissionWebhooks:
+    enabled: true
+    failurePolicy: Fail
+    patch:
+      image:
+        repository: rancher/mirrored-ingress-nginx-kube-webhook-certgen
+        tag: v1.6.2
+        digest: ""
+
+prometheus:
+  create: true
+  # the port of ingress-nginx's metrics, with its metric names (docs/user-guide/ingress-nginx-compatibility.md, "Metrics")
+  port: 10254
+  # Rancher monitoring scrapes rke2-ingress-nginx through the Service
+  # pushprox-ingress-nginx-client of kube-system, which selects its pods by
+  # app.kubernetes.io/name - the key the chart's own selector has, so a pod
+  # cannot be in both. wxingress has a Service and a ServiceMonitor of its
+  # own instead, which Rancher's Prometheus takes (it selects every
+  # ServiceMonitor), with the job "ingress-nginx" as before: the runbook, step 6.
+  service:
+    create: true
+    labels:
+      service: wxingress-prometheus-service
+      component: ingress-nginx
+  serviceMonitor:
+    create: true
+    jobLabel: component
+    labels:
+      release: rancher-monitoring
+    endpoints:
+      - port: prometheus

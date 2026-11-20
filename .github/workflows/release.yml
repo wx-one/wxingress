@@ -1,0 +1,150 @@
+# Releases wxingress for a tag v<version> (for example v5.7.1-wx5):
+#
+#   ci       the whole of ci.yml - tests, controller binary, data plane
+#            module and its test, helm lint - which uploads the binary and
+#            the module as artifacts of this run
+#   image    docker.io/wxone/wxingress:<version> and :latest, built from
+#            build/Dockerfile.wxingress with that binary and module
+#   chart    charts/wxingress with appVersion <version>, pushed to
+#            oci://ghcr.io/wx-one/charts/wxingress
+#   release  a GitHub release for the tag with the chart attached
+#
+# Needs the repository secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (an
+# access token with read and write on wxone/wxingress). The chart is pushed
+# with GITHUB_TOKEN.
+#
+# The image is linux/amd64 only: the controller binary is built for amd64 and
+# the meta compiler image, which builds the data plane module, is amd64 only.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: docker.io/wxone/wxingress
+  CHART_REPOSITORY: oci://ghcr.io/wx-one/charts
+  # must match NGINX_VERSION in dataplane/build.sh
+  NGINX_OSS_VERSION: 1.31.9
+  HELM_VERSION: v4.3.0
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    name: Image
+    needs: ci
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # build/Dockerfile.wxingress expects both in the build context:
+      #   nginx-ingress                                  the controller binary
+      #   dataplane/build/ngx_http_wxingress_module.so   the data plane module
+      - uses: actions/download-artifact@v4
+        with:
+          name: nginx-ingress
+          path: .
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dataplane
+          path: dataplane/build
+
+      - name: Check the artifacts
+        run: |
+          chmod +x nginx-ingress
+          ./nginx-ingress -version
+          test -f dataplane/build/ngx_http_wxingress_module.so
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: build/Dockerfile.wxingress
+          platforms: linux/amd64
+          build-args: |
+            IC_VERSION=${{ github.ref_name }}
+            NGINX_OSS_VERSION=${{ env.NGINX_OSS_VERSION }}
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE }}:latest
+          push: true
+
+  chart:
+    name: Helm chart
+    needs: ci
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      # The chart keeps its own version from Chart.yaml; appVersion, which is
+      # the image tag the chart deploys by default, becomes the release's.
+      - name: Package
+        run: |
+          helm lint charts/wxingress
+          helm package charts/wxingress -d chart --app-version "${GITHUB_REF_NAME#v}"
+          ls -l chart
+
+      - name: Push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GITHUB_TOKEN"
+          for chart in chart/*.tgz; do
+            helm push "$chart" "$CHART_REPOSITORY"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chart-release
+          path: chart/*.tgz
+
+  release:
+    name: GitHub release
+    needs: [image, chart]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: chart-release
+          path: chart
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" chart/*.tgz \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "Image: \`docker.io/wxone/wxingress:${VERSION#v}\`
+
+          Helm chart: \`helm install wxingress oci://ghcr.io/wx-one/charts/wxingress\`"

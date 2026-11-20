@@ -1,0 +1,35 @@
+{{- if (dig "admissionWebhooks" "enabled" false .Values.controller) -}}
+{{- $svc := .Values.controller.admissionWebhooks.service -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "nginx-ingress.admissionWebhooks.serviceName" . }}
+  namespace: {{ .Release.Namespace }}
+  {{- with $svc.annotations }}
+  annotations: {{ toYaml . | nindent 4 }}
+  {{- end }}
+  labels:
+    {{- include "nginx-ingress.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admission-webhook
+spec:
+  type: {{ $svc.type }}
+  {{- with $svc.clusterIP }}
+  clusterIP: {{ . }}
+  {{- end }}
+  {{- with $svc.externalIPs }}
+  externalIPs: {{ toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $svc.loadBalancerIP }}
+  loadBalancerIP: {{ . }}
+  {{- end }}
+  {{- with $svc.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges: {{ toYaml . | nindent 4 }}
+  {{- end }}
+  ports:
+    - name: https-webhook
+      port: {{ $svc.servicePort }}
+      targetPort: webhook
+      appProtocol: https
+  selector:
+    {{- include "nginx-ingress.selectorLabels" . | nindent 4 }}
+{{- end }}

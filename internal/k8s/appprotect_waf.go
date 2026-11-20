@@ -1,0 +1,679 @@
+package k8s
+
+import (
+	"fmt"
+	"reflect"
+	"strings"
+
+	"github.com/wx-one/wxingress/internal/configs"
+	"github.com/wx-one/wxingress/internal/k8s/appprotect"
+	"github.com/wx-one/wxingress/internal/k8s/appprotectcommon"
+	nl "github.com/wx-one/wxingress/internal/logger"
+	"github.com/wx-one/wxingress/internal/nsutils"
+	conf_v1 "github.com/wx-one/wxingress/pkg/apis/configuration/v1"
+	api_v1 "k8s.io/api/core/v1"
+	networking "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/tools/cache"
+)
+
+func createAppProtectPolicyHandlers(lbc *LoadBalancerController) cache.ResourceEventHandlerFuncs {
+	handlers := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			pol := obj.(*unstructured.Unstructured)
+			nl.Debugf(lbc.Logger.With(logNamespaceKey, pol.GetNamespace(), logKindKey, pol.GetKind(), logNameKey, pol.GetName()), "Adding AppProtectPolicy: %v", pol.GetName())
+			lbc.AddSyncQueue(pol)
+		},
+		UpdateFunc: func(oldObj, obj interface{}) {
+			oldPol := oldObj.(*unstructured.Unstructured)
+			newPol := obj.(*unstructured.Unstructured)
+			different, err := areResourcesDifferent(lbc.Logger, oldPol, newPol)
+			if err != nil {
+				nl.Debugf(lbc.Logger.With(logNamespaceKey, oldPol.GetNamespace(), logKindKey, oldPol.GetKind(), logNameKey, oldPol.GetName()), "Error when comparing policy %v", err)
+				lbc.AddSyncQueue(newPol)
+			}
+			if different {
+				nl.Debugf(lbc.Logger, "ApPolicy %v changed, syncing", oldPol.GetName())
+				lbc.AddSyncQueue(newPol)
+				return
+			}
+			// PLM writes the compiled bundle location + checksum to .status.bundle;
+			// the spec is unchanged on recompile, so also sync on a status change so
+			// syncAppProtectPolicy re-enqueues the referencing PLM policies.
+			if lbc.plmEnabled && bundleStatusChanged(oldPol, newPol) {
+				nl.Debugf(lbc.Logger, "ApPolicy %v bundle status changed, syncing", oldPol.GetName())
+				lbc.AddSyncQueue(newPol)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			lbc.AddSyncQueue(obj)
+		},
+	}
+	return handlers
+}
+
+func createAppProtectLogConfHandlers(lbc *LoadBalancerController) cache.ResourceEventHandlerFuncs {
+	handlers := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			conf := obj.(*unstructured.Unstructured)
+			nl.Debugf(lbc.Logger.With(logNamespaceKey, conf.GetNamespace(), logKindKey, conf.GetKind(), logNameKey, conf.GetName()), "Adding AppProtectLogConf: %v", conf.GetName())
+			lbc.AddSyncQueue(conf)
+		},
+		UpdateFunc: func(oldObj, obj interface{}) {
+			oldConf := oldObj.(*unstructured.Unstructured)
+			newConf := obj.(*unstructured.Unstructured)
+			different, err := areResourcesDifferent(lbc.Logger, oldConf, newConf)
+			if err != nil {
+				nl.Debugf(lbc.Logger.With(logNamespaceKey, oldConf.GetNamespace(), logKindKey, oldConf.GetKind(), logNameKey, oldConf.GetName()), "Error when comparing LogConfs %v", err)
+				lbc.AddSyncQueue(newConf)
+			}
+			if different {
+				nl.Debugf(lbc.Logger, "ApLogConf %v changed, syncing", oldConf.GetName())
+				lbc.AddSyncQueue(newConf)
+				return
+			}
+			// PLM writes the compiled bundle location + checksum to .status.bundle;
+			// the spec is unchanged on recompile, so also sync on a status change so
+			// syncAppProtectLogConf re-enqueues the referencing PLM policies.
+			if lbc.plmEnabled && bundleStatusChanged(oldConf, newConf) {
+				nl.Debugf(lbc.Logger, "ApLogConf %v bundle status changed, syncing", oldConf.GetName())
+				lbc.AddSyncQueue(newConf)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			lbc.AddSyncQueue(obj)
+		},
+	}
+	return handlers
+}
+
+func createAppProtectUserSigHandlers(lbc *LoadBalancerController) cache.ResourceEventHandlerFuncs {
+	handlers := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			sig := obj.(*unstructured.Unstructured)
+			nl.Debugf(lbc.Logger.With(logNamespaceKey, sig.GetNamespace(), logKindKey, sig.GetKind(), logNameKey, sig.GetName()), "Adding AppProtectUserSig: %v", sig.GetName())
+			lbc.AddSyncQueue(sig)
+		},
+		UpdateFunc: func(oldObj, obj interface{}) {
+			oldSig := oldObj.(*unstructured.Unstructured)
+			newSig := obj.(*unstructured.Unstructured)
+			different, err := areResourcesDifferent(lbc.Logger, oldSig, newSig)
+			if err != nil {
+				nl.Debugf(lbc.Logger.With(logNamespaceKey, oldSig.GetNamespace(), logKindKey, oldSig.GetKind(), logNameKey, oldSig.GetName()), "Error when comparing UserSigs %v", err)
+				lbc.AddSyncQueue(newSig)
+			}
+			if different {
+				nl.Debugf(lbc.Logger.With(logNamespaceKey, newSig.GetNamespace(), logKindKey, newSig.GetKind(), logNameKey, newSig.GetName()), "ApUserSig %v changed, syncing", oldSig.GetName())
+				lbc.AddSyncQueue(newSig)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			lbc.AddSyncQueue(obj)
+		},
+	}
+	return handlers
+}
+
+// addAppProtectPolicyHandler creates dynamic informers for custom appprotect policy resource
+func (nsi *namespacedInformer) addAppProtectPolicyHandler(handlers cache.ResourceEventHandlerFuncs) error {
+	informer := nsi.dynInformerFactory.ForResource(appprotect.PolicyGVR).Informer()
+	if _, err := informer.AddEventHandler(handlers); err != nil {
+		return fmt.Errorf("failed to add AppProtectPolicy event handler: %w", err)
+	}
+	nsi.appProtectPolicyLister = informer.GetStore()
+
+	nsi.cacheSyncs = append(nsi.cacheSyncs, informer.HasSynced)
+	return nil
+}
+
+// addAppProtectLogConfHandler creates dynamic informer for custom appprotect logging config resource
+func (nsi *namespacedInformer) addAppProtectLogConfHandler(handlers cache.ResourceEventHandlerFuncs) error {
+	informer := nsi.dynInformerFactory.ForResource(appprotect.LogConfGVR).Informer()
+	if _, err := informer.AddEventHandler(handlers); err != nil {
+		return fmt.Errorf("failed to add AppProtectLogConf event handler: %w", err)
+	}
+	nsi.appProtectLogConfLister = informer.GetStore()
+
+	nsi.cacheSyncs = append(nsi.cacheSyncs, informer.HasSynced)
+	return nil
+}
+
+// addAppProtectUserSigHandler creates dynamic informer for custom appprotect user defined signature resource
+func (nsi *namespacedInformer) addAppProtectUserSigHandler(handlers cache.ResourceEventHandlerFuncs) error {
+	informer := nsi.dynInformerFactory.ForResource(appprotect.UserSigGVR).Informer()
+	if _, err := informer.AddEventHandler(handlers); err != nil {
+		return fmt.Errorf("failed to add AppProtectUserSig event handler: %w", err)
+	}
+	nsi.appProtectUserSigLister = informer.GetStore()
+
+	nsi.cacheSyncs = append(nsi.cacheSyncs, informer.HasSynced)
+	return nil
+}
+
+func (lbc *LoadBalancerController) syncAppProtectPolicy(task task) {
+	key := task.Key
+	nl.Debugf(lbc.Logger, "Syncing AppProtectPolicy %v", key)
+
+	var obj interface{}
+	var polExists bool
+	var err error
+
+	ns, n, _ := cache.SplitMetaNamespaceKey(key)
+	logger := lbc.Logger.With(logNamespaceKey, ns, logKindKey, appProtectKind, logNameKey, n)
+	nsi := lbc.getNamespacedInformer(ns)
+	if nsi == nil {
+		return
+	}
+	obj, polExists, err = nsi.appProtectPolicyLister.GetByKey(key)
+	if err != nil {
+		lbc.syncQueue.Requeue(task, err)
+		return
+	}
+
+	if lbc.plmEnabled {
+		lbc.enqueuePLMPoliciesForAppPolicy(key)
+		return
+	}
+
+	var changes []appprotect.Change
+	var problems []appprotect.Problem
+
+	if !polExists {
+		nl.Debugf(logger, "Deleting AppProtectPolicy: %v\n", key)
+
+		changes, problems = lbc.appProtectConfiguration.DeletePolicy(key)
+	} else {
+		nl.Debugf(logger, "Adding or Updating AppProtectPolicy: %v\n", key)
+
+		changes, problems = lbc.appProtectConfiguration.AddOrUpdatePolicy(obj.(*unstructured.Unstructured))
+	}
+
+	lbc.processAppProtectChanges(changes)
+	lbc.processAppProtectProblems(problems)
+}
+
+func (lbc *LoadBalancerController) syncAppProtectLogConf(task task) {
+	key := task.Key
+	nl.Debugf(lbc.Logger, "Syncing AppProtectLogConf %v", key)
+	var obj interface{}
+	var confExists bool
+	var err error
+
+	ns, n, _ := cache.SplitMetaNamespaceKey(key)
+	logger := lbc.Logger.With(logNamespaceKey, ns, logKindKey, appProtectLogConfKind, logNameKey, n)
+	nsi := lbc.getNamespacedInformer(ns)
+	if nsi == nil {
+		return
+	}
+	obj, confExists, err = nsi.appProtectLogConfLister.GetByKey(key)
+	if err != nil {
+		lbc.syncQueue.Requeue(task, err)
+		return
+	}
+
+	if lbc.plmEnabled {
+		lbc.enqueuePLMPoliciesForAppLogConf(key)
+		return
+	}
+
+	var changes []appprotect.Change
+	var problems []appprotect.Problem
+
+	if !confExists {
+		nl.Debugf(logger, "Deleting AppProtectLogConf: %v\n", key)
+
+		changes, problems = lbc.appProtectConfiguration.DeleteLogConf(key)
+	} else {
+		nl.Debugf(logger, "Adding or Updating AppProtectLogConf: %v\n", key)
+
+		changes, problems = lbc.appProtectConfiguration.AddOrUpdateLogConf(obj.(*unstructured.Unstructured))
+	}
+
+	lbc.processAppProtectChanges(changes)
+	lbc.processAppProtectProblems(problems)
+}
+
+func (lbc *LoadBalancerController) syncAppProtectUserSig(task task) {
+	key := task.Key
+	nl.Debugf(lbc.Logger, "Syncing AppProtectUserSig %v", key)
+	var obj interface{}
+	var sigExists bool
+	var err error
+
+	ns, n, _ := cache.SplitMetaNamespaceKey(key)
+	logger := lbc.Logger.With(logNamespaceKey, ns, logKindKey, appProtectUserSigKind, logNameKey, n)
+	nsi := lbc.getNamespacedInformer(ns)
+	if nsi == nil {
+		return
+	}
+	obj, sigExists, err = nsi.appProtectUserSigLister.GetByKey(key)
+	if err != nil {
+		lbc.syncQueue.Requeue(task, err)
+		return
+	}
+
+	var change appprotect.UserSigChange
+	var problems []appprotect.Problem
+
+	if !sigExists {
+		nl.Debugf(logger, "Deleting AppProtectUserSig: %v\n", key)
+
+		change, problems = lbc.appProtectConfiguration.DeleteUserSig(key)
+	} else {
+		nl.Debugf(logger, "Adding or Updating AppProtectUserSig: %v\n", key)
+
+		change, problems = lbc.appProtectConfiguration.AddOrUpdateUserSig(obj.(*unstructured.Unstructured))
+	}
+
+	lbc.processAppProtectUserSigChange(change)
+	lbc.processAppProtectProblems(problems)
+}
+
+func getWAFPoliciesForAppProtectPolicy(pols []*conf_v1.Policy, key string) []*conf_v1.Policy {
+	var policies []*conf_v1.Policy
+
+	for _, pol := range pols {
+		if pol.Spec.WAF != nil && isMatchingResourceRef(pol.Namespace, pol.Spec.WAF.ApPolicy, key) {
+			policies = append(policies, pol)
+		}
+	}
+
+	return policies
+}
+
+func getWAFPoliciesForAppProtectLogConf(pols []*conf_v1.Policy, key string) []*conf_v1.Policy {
+	var policies []*conf_v1.Policy
+
+	for _, pol := range pols {
+		if pol.Spec.WAF != nil && pol.Spec.WAF.SecurityLog != nil && isMatchingResourceRef(pol.Namespace, pol.Spec.WAF.SecurityLog.ApLogConf, key) {
+			policies = append(policies, pol)
+		}
+		if pol.Spec.WAF != nil && pol.Spec.WAF.SecurityLogs != nil {
+			for _, logConf := range pol.Spec.WAF.SecurityLogs {
+				if isMatchingResourceRef(pol.Namespace, logConf.ApLogConf, key) {
+					policies = append(policies, pol)
+				}
+			}
+		}
+	}
+
+	return policies
+}
+
+func isMatchingResourceRef(ownerNs, resRef, key string) bool {
+	if !nsutils.HasNamespace(resRef) {
+		resRef = fmt.Sprintf("%v/%v", ownerNs, resRef)
+	}
+	return resRef == key
+}
+
+// getPLMPoliciesForAppProtectPolicy returns the WAF Policies whose apPolicy
+// reference (under PLM) points at the APPolicy identified by key. Used to re-enqueue
+// those Policies when the APPolicy status changes (event-driven PLM refresh).
+func (lbc *LoadBalancerController) getPLMPoliciesForAppProtectPolicy(pols []*conf_v1.Policy, key string) []*conf_v1.Policy {
+	var policies []*conf_v1.Policy
+	for _, pol := range pols {
+		if pol.Spec.WAF == nil {
+			continue
+		}
+		ns, name, ok := lbc.effectivePLMPolicyRef(pol)
+		if ok && ns+"/"+name == key {
+			policies = append(policies, pol)
+		}
+	}
+	return policies
+}
+
+// getPLMPoliciesForAppProtectLogConf returns the WAF Policies whose securityLogs
+// apLogConf reference (under PLM) points at the APLogConf identified by key.
+func (lbc *LoadBalancerController) getPLMPoliciesForAppProtectLogConf(pols []*conf_v1.Policy, key string) []*conf_v1.Policy {
+	var policies []*conf_v1.Policy
+	for _, pol := range pols {
+		if pol.Spec.WAF == nil {
+			continue
+		}
+		for _, sl := range pol.Spec.WAF.SecurityLogs {
+			ns, name, ok := lbc.effectivePLMLogRef(sl, pol.Namespace)
+			if ok && ns+"/"+name == key {
+				policies = append(policies, pol)
+				break
+			}
+		}
+	}
+	return policies
+}
+
+// bundleStatusChanged reports whether the PLM-managed .status.bundle subtree differs
+// between the old and new APPolicy/APLogConf objects.
+func bundleStatusChanged(oldObj, newObj *unstructured.Unstructured) bool {
+	oldBundle, _, _ := unstructured.NestedMap(oldObj.Object, "status", "bundle")
+	newBundle, _, _ := unstructured.NestedMap(newObj.Object, "status", "bundle")
+	return !reflect.DeepEqual(oldBundle, newBundle)
+}
+
+// enqueuePLMPoliciesForAppPolicy re-enqueues every PLM WAF Policy that references the
+// APPolicy identified by key. No-op when PLM is disabled.
+func (lbc *LoadBalancerController) enqueuePLMPoliciesForAppPolicy(key string) {
+	if !lbc.plmEnabled {
+		return
+	}
+	for _, pol := range lbc.getPLMPoliciesForAppProtectPolicy(lbc.getAllPolicies(), key) {
+		nl.Debugf(lbc.Logger, "Re-enqueuing PLM policy %s/%s due to APPolicy %s change", pol.Namespace, pol.Name, key)
+		lbc.AddSyncQueue(pol)
+	}
+}
+
+// enqueuePLMPoliciesForAppLogConf re-enqueues every PLM WAF Policy that references the
+// APLogConf identified by key. No-op when PLM is disabled.
+func (lbc *LoadBalancerController) enqueuePLMPoliciesForAppLogConf(key string) {
+	if !lbc.plmEnabled {
+		return
+	}
+	for _, pol := range lbc.getPLMPoliciesForAppProtectLogConf(lbc.getAllPolicies(), key) {
+		nl.Debugf(lbc.Logger, "Re-enqueuing PLM policy %s/%s due to APLogConf %s change", pol.Namespace, pol.Name, key)
+		lbc.AddSyncQueue(pol)
+	}
+}
+
+func (lbc *LoadBalancerController) isConfiguredPLMStorageSecret(key string) bool {
+	_, exists := lbc.plmStorageSecrets[key]
+	return exists
+}
+
+// enqueuePoliciesUsingPLMStorage directly re-enqueues only Policy CRs with a
+// missing or stale PLM bundle after a configured storage Secret changes. The
+// subsequent bundle fetch resolves current S3 credentials and TLS material.
+func (lbc *LoadBalancerController) enqueuePoliciesUsingPLMStorage(key string) {
+	if !lbc.plmEnabled || !lbc.isConfiguredPLMStorageSecret(key) {
+		return
+	}
+	for _, pol := range lbc.getPoliciesUsingPLMStorage(lbc.getAllPolicies()) {
+		if !lbc.policyNeedsPLMBundleFetch(pol) {
+			continue
+		}
+		nl.Debugf(lbc.Logger, "Re-enqueuing PLM policy %s/%s due to storage Secret %s change", pol.Namespace, pol.Name, key)
+		lbc.AddSyncQueue(pol)
+	}
+}
+
+// getPoliciesUsingPLMStorage returns WAF Policies whose bundle references require the
+// configured PLM S3 storage. Under -plm-storage-url this is any Policy with an
+// apPolicy or securityLogs.apLogConf field.
+func (lbc *LoadBalancerController) getPoliciesUsingPLMStorage(policies []*conf_v1.Policy) []*conf_v1.Policy {
+	var result []*conf_v1.Policy
+	for _, pol := range policies {
+		if pol.Spec.WAF == nil {
+			continue
+		}
+		if _, _, ok := lbc.effectivePLMPolicyRef(pol); ok {
+			result = append(result, pol)
+			continue
+		}
+		for _, sl := range pol.Spec.WAF.SecurityLogs {
+			if _, _, ok := lbc.effectivePLMLogRef(sl, pol.Namespace); ok {
+				result = append(result, pol)
+				break
+			}
+		}
+	}
+	return result
+}
+
+// addWAFPolicyRefs ensures the app protect resources that are referenced in policies exist.
+// nolint:gocyclo
+func (lbc *LoadBalancerController) addWAFPolicyRefs(
+	apPolRef, logConfRef map[string]*unstructured.Unstructured,
+	policies []*conf_v1.Policy,
+) error {
+	for _, pol := range policies {
+		if pol.Spec.WAF == nil {
+			continue
+		}
+		// Under PLM these references resolve to PLM-compiled bundles fetched by
+		// syncWAFBundleSource, so there are no in-pod AP resources to collect here.
+		if lbc.plmEnabled {
+			continue
+		}
+
+		if pol.Spec.WAF.ApPolicy != "" {
+			apPolKey := pol.Spec.WAF.ApPolicy
+			if !nsutils.HasNamespace(apPolKey) {
+				apPolKey = fmt.Sprintf("%v/%v", pol.Namespace, apPolKey)
+			}
+
+			apPolicy, err := lbc.appProtectConfiguration.GetAppResource(appprotect.PolicyGVK.Kind, apPolKey)
+			if err != nil {
+				return fmt.Errorf("WAF policy %q is invalid: %w", apPolKey, err)
+			}
+			apPolRef[apPolKey] = apPolicy
+		}
+
+		if pol.Spec.WAF.SecurityLog != nil && pol.Spec.WAF.SecurityLogs == nil {
+			if pol.Spec.WAF.SecurityLog.ApLogConf != "" {
+				logConfKey := pol.Spec.WAF.SecurityLog.ApLogConf
+				if !nsutils.HasNamespace(logConfKey) {
+					logConfKey = fmt.Sprintf("%v/%v", pol.Namespace, logConfKey)
+				}
+
+				logConf, err := lbc.appProtectConfiguration.GetAppResource(appprotect.LogConfGVK.Kind, logConfKey)
+				if err != nil {
+					return fmt.Errorf("WAF policy %q is invalid: %w", logConfKey, err)
+				}
+				logConfRef[logConfKey] = logConf
+			}
+		}
+
+		if pol.Spec.WAF.SecurityLogs != nil {
+			for _, SecLog := range pol.Spec.WAF.SecurityLogs {
+				if SecLog.ApLogConf != "" {
+					logConfKey := SecLog.ApLogConf
+					if !nsutils.HasNamespace(logConfKey) {
+						logConfKey = fmt.Sprintf("%v/%v", pol.Namespace, logConfKey)
+					}
+
+					logConf, err := lbc.appProtectConfiguration.GetAppResource(appprotect.LogConfGVK.Kind, logConfKey)
+					if err != nil {
+						return fmt.Errorf("WAF policy %q is invalid: %w", logConfKey, err)
+					}
+					logConfRef[logConfKey] = logConf
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (lbc *LoadBalancerController) getAppProtectLogConfAndDst(ing *networking.Ingress) ([]configs.AppProtectLog, error) {
+	var apLogs []configs.AppProtectLog
+	if _, exists := ing.Annotations[configs.AppProtectLogConfDstAnnotation]; !exists {
+		return apLogs, fmt.Errorf("error: %v requires %v in %v", configs.AppProtectLogConfAnnotation, configs.AppProtectLogConfDstAnnotation, ing.Name)
+	}
+
+	logDsts := strings.Split(ing.Annotations[configs.AppProtectLogConfDstAnnotation], ",")
+	logConfNsNs := appprotectcommon.ParseResourceReferenceAnnotationList(ing.Namespace, ing.Annotations[configs.AppProtectLogConfAnnotation])
+	if len(logDsts) != len(logConfNsNs) {
+		return apLogs, fmt.Errorf("error Validating App Protect Destination and Config for Ingress %v: LogConf and LogDestination must have equal number of items", ing.Name)
+	}
+
+	for i, logConfNsN := range logConfNsNs {
+		logConf, err := lbc.appProtectConfiguration.GetAppResource(appprotect.LogConfGVK.Kind, logConfNsN)
+		if err != nil {
+			return apLogs, fmt.Errorf("error retrieving App Protect Log Config for Ingress %v: %w", ing.Name, err)
+		}
+		apLogs = append(apLogs, configs.AppProtectLog{
+			LogConf: logConf,
+			Dest:    logDsts[i],
+		})
+	}
+
+	return apLogs, nil
+}
+
+func (lbc *LoadBalancerController) getAppProtectPolicy(ing *networking.Ingress) (apPolicy *unstructured.Unstructured, err error) {
+	polNsN := appprotectcommon.ParseResourceReferenceAnnotation(ing.Namespace, ing.Annotations[configs.AppProtectPolicyAnnotation])
+
+	apPolicy, err = lbc.appProtectConfiguration.GetAppResource(appprotect.PolicyGVK.Kind, polNsN)
+	if err != nil {
+		return nil, fmt.Errorf("error retrieving App Protect Policy for Ingress %v: %w", ing.Name, err)
+	}
+
+	return apPolicy, nil
+}
+
+func (lbc *LoadBalancerController) processAppProtectChanges(changes []appprotect.Change) {
+	nl.Debugf(lbc.Logger, "Processing %v App Protect changes", len(changes))
+
+	for _, c := range changes {
+		if c.Op == appprotect.AddOrUpdate {
+			switch impl := c.Resource.(type) {
+			case *appprotect.PolicyEx:
+				namespace := impl.Obj.GetNamespace()
+				name := impl.Obj.GetName()
+				resources := lbc.configuration.FindResourcesForAppProtectPolicyAnnotation(namespace, name)
+
+				for _, wafPol := range getWAFPoliciesForAppProtectPolicy(lbc.getAllPolicies(), namespace+"/"+name) {
+					resources = append(resources, lbc.configuration.FindResourcesForPolicy(wafPol.Namespace, wafPol.Name)...)
+				}
+
+				resourceExes := lbc.createExtendedResources(resources)
+
+				warnings, updateErr := lbc.configurator.AddOrUpdateAppProtectResource(impl.Obj, resourceExes.IngressExes, resourceExes.MergeableIngresses, resourceExes.VirtualServerExes)
+				lbc.updateResourcesStatusAndEvents(resources, warnings, updateErr)
+				lbc.recorder.Eventf(impl.Obj, api_v1.EventTypeNormal, nl.EventReasonAddedOrUpdated, "AppProtectPolicy %v was added or updated", namespace+"/"+name)
+			case *appprotect.LogConfEx:
+				namespace := impl.Obj.GetNamespace()
+				name := impl.Obj.GetName()
+				resources := lbc.configuration.FindResourcesForAppProtectLogConfAnnotation(namespace, name)
+
+				for _, wafPol := range getWAFPoliciesForAppProtectLogConf(lbc.getAllPolicies(), namespace+"/"+name) {
+					resources = append(resources, lbc.configuration.FindResourcesForPolicy(wafPol.Namespace, wafPol.Name)...)
+				}
+
+				resourceExes := lbc.createExtendedResources(resources)
+
+				warnings, updateErr := lbc.configurator.AddOrUpdateAppProtectResource(impl.Obj, resourceExes.IngressExes, resourceExes.MergeableIngresses, resourceExes.VirtualServerExes)
+				lbc.updateResourcesStatusAndEvents(resources, warnings, updateErr)
+				lbc.recorder.Eventf(impl.Obj, api_v1.EventTypeNormal, nl.EventReasonAddedOrUpdated, "AppProtectLogConfig %v was added or updated", namespace+"/"+name)
+			}
+		} else if c.Op == appprotect.Delete {
+			switch impl := c.Resource.(type) {
+			case *appprotect.PolicyEx:
+				namespace := impl.Obj.GetNamespace()
+				name := impl.Obj.GetName()
+				resources := lbc.configuration.FindResourcesForAppProtectPolicyAnnotation(namespace, name)
+
+				for _, wafPol := range getWAFPoliciesForAppProtectPolicy(lbc.getAllPolicies(), namespace+"/"+name) {
+					resources = append(resources, lbc.configuration.FindResourcesForPolicy(wafPol.Namespace, wafPol.Name)...)
+				}
+
+				resourceExes := lbc.createExtendedResources(resources)
+
+				warnings, deleteErr := lbc.configurator.DeleteAppProtectPolicy(impl.Obj, resourceExes.IngressExes, resourceExes.MergeableIngresses, resourceExes.VirtualServerExes)
+
+				lbc.updateResourcesStatusAndEvents(resources, warnings, deleteErr)
+
+			case *appprotect.LogConfEx:
+				namespace := impl.Obj.GetNamespace()
+				name := impl.Obj.GetName()
+				resources := lbc.configuration.FindResourcesForAppProtectLogConfAnnotation(namespace, name)
+
+				for _, wafPol := range getWAFPoliciesForAppProtectLogConf(lbc.getAllPolicies(), namespace+"/"+name) {
+					resources = append(resources, lbc.configuration.FindResourcesForPolicy(wafPol.Namespace, wafPol.Name)...)
+				}
+
+				resourceExes := lbc.createExtendedResources(resources)
+
+				warnings, deleteErr := lbc.configurator.DeleteAppProtectLogConf(impl.Obj, resourceExes.IngressExes, resourceExes.MergeableIngresses, resourceExes.VirtualServerExes)
+
+				lbc.updateResourcesStatusAndEvents(resources, warnings, deleteErr)
+			}
+		}
+	}
+}
+
+func (lbc *LoadBalancerController) processAppProtectUserSigChange(change appprotect.UserSigChange) {
+	var delPols []string
+	var allIngExes []*configs.IngressEx
+	var allMergeableIngresses []*configs.MergeableIngresses
+	var allVsExes []*configs.VirtualServerEx
+	var allResources []Resource
+
+	for _, poladd := range change.PolicyAddsOrUpdates {
+		resources := lbc.configuration.FindResourcesForAppProtectPolicyAnnotation(poladd.GetNamespace(), poladd.GetName())
+
+		for _, wafPol := range getWAFPoliciesForAppProtectPolicy(lbc.getAllPolicies(), appprotectcommon.GetNsName(poladd)) {
+			resources = append(resources, lbc.configuration.FindResourcesForPolicy(wafPol.Namespace, wafPol.Name)...)
+		}
+
+		resourceExes := lbc.createExtendedResources(resources)
+		allIngExes = append(allIngExes, resourceExes.IngressExes...)
+		allMergeableIngresses = append(allMergeableIngresses, resourceExes.MergeableIngresses...)
+		allVsExes = append(allVsExes, resourceExes.VirtualServerExes...)
+		allResources = append(allResources, resources...)
+	}
+	for _, poldel := range change.PolicyDeletions {
+		resources := lbc.configuration.FindResourcesForAppProtectPolicyAnnotation(poldel.GetNamespace(), poldel.GetName())
+
+		polNsName := appprotectcommon.GetNsName(poldel)
+		for _, wafPol := range getWAFPoliciesForAppProtectPolicy(lbc.getAllPolicies(), polNsName) {
+			resources = append(resources, lbc.configuration.FindResourcesForPolicy(wafPol.Namespace, wafPol.Name)...)
+		}
+
+		resourceExes := lbc.createExtendedResources(resources)
+		allIngExes = append(allIngExes, resourceExes.IngressExes...)
+		allMergeableIngresses = append(allMergeableIngresses, resourceExes.MergeableIngresses...)
+		allVsExes = append(allVsExes, resourceExes.VirtualServerExes...)
+		allResources = append(allResources, resources...)
+		if len(resourceExes.IngressExes)+len(resourceExes.MergeableIngresses)+len(resourceExes.VirtualServerExes) > 0 {
+			delPols = append(delPols, polNsName)
+		}
+	}
+
+	warnings, err := lbc.configurator.RefreshAppProtectUserSigs(change.UserSigs, delPols, allIngExes, allMergeableIngresses, allVsExes)
+	if err != nil {
+		nl.Errorf(lbc.Logger, "Error when refreshing App Protect Policy User defined signatures: %v", err)
+	}
+	lbc.updateResourcesStatusAndEvents(allResources, warnings, err)
+}
+
+func (lbc *LoadBalancerController) processAppProtectProblems(problems []appprotect.Problem) {
+	nl.Debugf(lbc.Logger, "Processing %v App Protect problems", len(problems))
+
+	for _, p := range problems {
+		eventType := api_v1.EventTypeWarning
+		lbc.recorder.Event(p.Object, eventType, p.Reason, p.Message)
+	}
+}
+
+func (lbc *LoadBalancerController) cleanupUnwatchedAppWafResources(nsi *namespacedInformer) {
+	for _, obj := range nsi.appProtectPolicyLister.List() {
+		nl.Debugf(lbc.Logger, "Cleaning up unwatched appprotect policies in namespace: %v", nsi.namespace)
+		appPol := obj.((*unstructured.Unstructured))
+		namespace := appPol.GetNamespace()
+		name := appPol.GetName()
+
+		changes, problems := lbc.appProtectConfiguration.DeletePolicy(namespace + "/" + name)
+		lbc.processAppProtectChanges(changes)
+		lbc.processAppProtectProblems(problems)
+	}
+	for _, obj := range nsi.appProtectLogConfLister.List() {
+		nl.Debugf(lbc.Logger, "Cleaning up unwatched approtect logconfs in namespace: %v", nsi.namespace)
+		appLogConf := obj.((*unstructured.Unstructured))
+		namespace := appLogConf.GetNamespace()
+		name := appLogConf.GetName()
+
+		changes, problems := lbc.appProtectConfiguration.DeleteLogConf(namespace + "/" + name)
+		lbc.processAppProtectChanges(changes)
+		lbc.processAppProtectProblems(problems)
+	}
+	for _, obj := range nsi.appProtectUserSigLister.List() {
+		nl.Debugf(lbc.Logger, "Cleaning up unwatched usersigs in namespace: %v", nsi.namespace)
+		appUserSig := obj.((*unstructured.Unstructured))
+		namespace := appUserSig.GetNamespace()
+		name := appUserSig.GetName()
+
+		changes, problems := lbc.appProtectConfiguration.DeleteUserSig(namespace + "/" + name)
+		lbc.processAppProtectUserSigChange(changes)
+		lbc.processAppProtectProblems(problems)
+	}
+}

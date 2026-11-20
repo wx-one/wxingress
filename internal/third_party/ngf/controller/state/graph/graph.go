@@ -1,0 +1,724 @@
+package graph
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"slices"
+
+	"github.com/go-logr/logr"
+	v1 "k8s.io/api/core/v1"
+	discoveryV1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	inference "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPIv1alpha1 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	ngfAPIv1alpha2 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha2"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/configmaps"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/secrets"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/resolver"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/validation"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/controller/index"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+	ngftypes "github.com/wx-one/wxingress/internal/third_party/ngf/framework/types"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/waf/fetch"
+	s3fetch "github.com/wx-one/wxingress/internal/third_party/ngf/framework/waf/fetch/s3"
+)
+
+// ClusterState includes cluster resources necessary to build the Graph.
+type ClusterState struct {
+	GatewayClasses        map[types.NamespacedName]*gatewayv1.GatewayClass
+	Gateways              map[types.NamespacedName]*gatewayv1.Gateway
+	HTTPRoutes            map[types.NamespacedName]*gatewayv1.HTTPRoute
+	TLSRoutes             map[types.NamespacedName]*gatewayv1.TLSRoute
+	TCPRoutes             map[types.NamespacedName]*gatewayv1.TCPRoute
+	UDPRoutes             map[types.NamespacedName]*gatewayv1.UDPRoute
+	Services              map[types.NamespacedName]*v1.Service
+	Namespaces            map[types.NamespacedName]*v1.Namespace
+	ReferenceGrants       map[types.NamespacedName]*gatewayv1.ReferenceGrant
+	Secrets               map[types.NamespacedName]*v1.Secret
+	CRDMetadata           map[types.NamespacedName]*metav1.PartialObjectMetadata
+	BackendTLSPolicies    map[types.NamespacedName]*gatewayv1.BackendTLSPolicy
+	ConfigMaps            map[types.NamespacedName]*v1.ConfigMap
+	NginxProxies          map[types.NamespacedName]*ngfAPIv1alpha2.NginxProxy
+	GRPCRoutes            map[types.NamespacedName]*gatewayv1.GRPCRoute
+	NGFPolicies           map[PolicyKey]policies.Policy
+	SnippetsFilters       map[types.NamespacedName]*ngfAPIv1alpha1.SnippetsFilter
+	AuthenticationFilters map[types.NamespacedName]*ngfAPIv1alpha1.AuthenticationFilter
+	InferencePools        map[types.NamespacedName]*inference.InferencePool
+	ListenerSets          map[types.NamespacedName]*gatewayv1.ListenerSet
+	APPolicies            map[types.NamespacedName]*unstructured.Unstructured
+	APLogConfs            map[types.NamespacedName]*unstructured.Unstructured
+	ExternalLoadBalancer  map[types.NamespacedName]*ngfAPIv1alpha1.ExternalLoadBalancer
+}
+
+// Graph is a Graph-like representation of Gateway API resources.
+type Graph struct {
+	// GatewayClass holds the GatewayClass resource.
+	GatewayClass *GatewayClass
+	// Gateways holds the all Gateway resource.
+	Gateways map[types.NamespacedName]*Gateway
+	// IgnoredGatewayClasses holds the ignored GatewayClass resources, which reference NGINX Gateway Fabric in the
+	// controllerName, but are not configured via the NGINX Gateway Fabric CLI argument. It doesn't hold the GatewayClass
+	// resources that do not belong to the NGINX Gateway Fabric.
+	IgnoredGatewayClasses map[types.NamespacedName]*gatewayv1.GatewayClass
+	// Routes hold Route resources.
+	Routes map[RouteKey]*L7Route
+	// L4Routes hold L4Route resources.
+	L4Routes map[L4RouteKey]*L4Route
+	// ReferencedSecrets includes Secrets referenced by Gateway Listeners or BackendTLSPolicies, including invalid ones.
+	// It is different from the other maps, because it includes entries for Secrets that do not exist
+	// in the cluster. We need such entries so that we can query the Graph to determine if a Secret is referenced
+	// by the Gateway, including the case when the Secret is newly created.
+	ReferencedSecrets map[types.NamespacedName]*secrets.Secret
+	// ReferencedNamespaces includes Namespaces with labels that match the Gateway Listener's label selector.
+	ReferencedNamespaces map[types.NamespacedName]*v1.Namespace
+	// ReferencedServices includes the NamespacedNames of all the Services that are referenced by at least one Route.
+	ReferencedServices map[types.NamespacedName]*ReferencedService
+	// ReferencedInferencePools includes the NamespacedNames of all the InferencePools
+	// that are referenced by at least one Route.
+	ReferencedInferencePools map[types.NamespacedName]*ReferencedInferencePool
+	// ReferencedCaCertConfigMaps includes ConfigMaps that have been referenced by any BackendTLSPolicies.
+	ReferencedCaCertConfigMaps map[types.NamespacedName]*configmaps.CaCertConfigMap
+	// ReferencedNginxProxies includes NginxProxies that have been referenced by a GatewayClass or a Gateway.
+	ReferencedNginxProxies map[types.NamespacedName]*NginxProxy
+	// BackendTLSPolicies holds BackendTLSPolicy resources.
+	BackendTLSPolicies map[types.NamespacedName]*BackendTLSPolicy
+	// NGFPolicies holds all NGF Policies.
+	NGFPolicies map[PolicyKey]*Policy
+	// ReferencedWAFBundles includes the WAFPolicy Bundles that have been referenced by any Gateways
+	// or Routes.
+	ReferencedWAFBundles map[WAFBundleKey]*WAFBundleData
+	// ReferencedAPPolicies includes APPolicy resources referenced by WAFPolicy resources.
+	ReferencedAPPolicies map[types.NamespacedName]*unstructured.Unstructured
+	// ReferencedAPLogConfs includes APLogConf resources referenced by WAFPolicy resources.
+	ReferencedAPLogConfs map[types.NamespacedName]*unstructured.Unstructured
+	// ReferencedWAFSecrets includes Secrets referenced by WAFPolicy (auth and TLS CA).
+	// Similar to ReferencedSecrets, it includes entries for Secrets that do not exist in the cluster.
+	// We need such entries so that we can query the Graph to determine if a Secret is referenced
+	// by a WAFPolicy, including the case when the Secret is newly created.
+	ReferencedWAFSecrets map[types.NamespacedName]*v1.Secret
+	// ReferencedPayloadProcessorSecrets includes Secrets referenced by PayloadProcessor (auth token).
+	// Similar to ReferencedSecrets, it includes invalid Secrets or those that do not exist
+	ReferencedPayloadProcessorSecrets map[types.NamespacedName]*v1.Secret
+	// ReferencedPayloadProcessorServices includes backend Services referenced by PayloadProcessor
+	// policies. Similar to ReferencedServices, it includes entries for Services that do not exist,
+	// so that a rebuild is triggered when a referenced Service is created, deleted, or changed.
+	ReferencedPayloadProcessorServices map[types.NamespacedName]struct{}
+	// SnippetsFilters holds all the SnippetsFilters.
+	SnippetsFilters map[types.NamespacedName]*SnippetsFilter
+	// AuthenticationFilters holds all the AuthenticationFilters.
+	AuthenticationFilters map[types.NamespacedName]*AuthenticationFilter
+	// ExternalLoadBalancers holds all the processed ExternalLoadBalancer resources.
+	ExternalLoadBalancers map[types.NamespacedName]*ExternalLoadBalancer
+	// ListenerSets holds all the ListenerSets.
+	ListenerSets map[types.NamespacedName]*ListenerSet
+	// PlusSecrets holds the secrets related to NGINX Plus licensing.
+	PlusSecrets map[types.NamespacedName][]PlusSecretFile
+	// PLMSecrets holds the PLM S3 storage secrets, keyed by NamespacedName with the configured roles as value.
+	// Used by IsReferenced to ensure PLM secrets trigger graph rebuilds when updated.
+	PLMSecrets map[types.NamespacedName][]PLMRole
+	// EndpointSliceOwnership tracks the last-known Service owner of EndpointSlices, used by
+	// IsReferenced to attribute EndpointSlice deletions (which carry no labels) to their Service.
+	// May be nil.
+	EndpointSliceOwnership *resolver.EndpointSliceOwnership
+}
+
+// Snapshot returns a defensive copy of the graph for read-only consumers.
+// It clones top-level maps and the gateway/policy/listener objects that status processing mutates.
+func (g *Graph) Snapshot() *Graph {
+	if g == nil {
+		return nil
+	}
+
+	clone := *g
+	clone.Gateways = cloneGateways(g.Gateways)
+	clone.NGFPolicies = clonePolicies(g.NGFPolicies)
+
+	return &clone
+}
+
+func cloneGateways(src map[types.NamespacedName]*Gateway) map[types.NamespacedName]*Gateway {
+	if src == nil {
+		return nil
+	}
+
+	cloned := make(map[types.NamespacedName]*Gateway, len(src))
+	for key, gateway := range src {
+		if gateway == nil {
+			cloned[key] = nil
+			continue
+		}
+
+		gatewayCopy := *gateway
+		gatewayCopy.AttachedListenerSets = maps.Clone(gateway.AttachedListenerSets)
+		gatewayCopy.Listeners = cloneListeners(gateway.Listeners)
+		gatewayCopy.Conditions = slices.Clone(gateway.Conditions)
+		gatewayCopy.Policies = slices.Clone(gateway.Policies)
+		cloned[key] = &gatewayCopy
+	}
+
+	return cloned
+}
+
+func cloneListeners(src []*Listener) []*Listener {
+	if src == nil {
+		return nil
+	}
+
+	cloned := make([]*Listener, 0, len(src))
+	for _, listener := range src {
+		if listener == nil {
+			cloned = append(cloned, nil)
+			continue
+		}
+
+		listenerCopy := *listener
+		listenerCopy.Conditions = slices.Clone(listener.Conditions)
+		listenerCopy.CACertificateRefs = slices.Clone(listener.CACertificateRefs)
+		listenerCopy.ResolvedSecrets = slices.Clone(listener.ResolvedSecrets)
+		listenerCopy.SupportedKinds = slices.Clone(listener.SupportedKinds)
+		cloned = append(cloned, &listenerCopy)
+	}
+
+	return cloned
+}
+
+func clonePolicies(src map[PolicyKey]*Policy) map[PolicyKey]*Policy {
+	if src == nil {
+		return nil
+	}
+
+	cloned := make(map[PolicyKey]*Policy, len(src))
+	for key, policy := range src {
+		if policy == nil {
+			cloned[key] = nil
+			continue
+		}
+
+		policyCopy := *policy
+		policyCopy.InvalidForGateways = maps.Clone(policy.InvalidForGateways)
+		policyCopy.Ancestors = slices.Clone(policy.Ancestors)
+		policyCopy.TargetRefs = slices.Clone(policy.TargetRefs)
+		policyCopy.Conditions = slices.Clone(policy.Conditions)
+		cloned[key] = &policyCopy
+	}
+
+	return cloned
+}
+
+// NginxReloadResult describes the result of an NGINX reload.
+type NginxReloadResult struct {
+	// Error is the error that occurred during the reload.
+	Error error
+}
+
+// ProtectedPorts are the ports that may not be configured by a listener with a descriptive name of each port.
+type ProtectedPorts map[int32]string
+
+// FeatureFlags hold the feature flags for building the Graph.
+type FeatureFlags struct {
+	// Plus indicates whether NGINX Plus features are enabled.
+	Plus bool
+	// Experimental indicates whether experimental features are enabled.
+	Experimental bool
+}
+
+// IsReferenced returns true if the Graph references the resource.
+func (g *Graph) IsReferenced(resourceType ngftypes.ObjectType, nsname types.NamespacedName) bool {
+	switch obj := resourceType.(type) {
+	case *v1.Secret:
+		return g.secretIsReferenced(nsname)
+	case *v1.ConfigMap:
+		return g.configMapIsReferenced(nsname)
+	case *v1.Namespace:
+		return g.namespaceIsReferenced(nsname, obj)
+	// Service reference exists if at least one Route references it, or a PayloadProcessor policy
+	// references it as its ExtProcess backend.
+	case *v1.Service:
+		return g.serviceIsReferenced(nsname)
+	// InferencePool reference exists if at least one Route references it.
+	case *inference.InferencePool:
+		return g.inferencePoolIsReferenced(nsname)
+	// EndpointSlice reference exists if its Service owner is referenced by at least one Route.
+	case *discoveryV1.EndpointSlice:
+		return g.endpointSliceIsReferenced(nsname, obj)
+	// NginxProxy reference exists if the GatewayClass or Gateway references it.
+	case *ngfAPIv1alpha2.NginxProxy:
+		return g.nginxProxyIsReferenced(nsname)
+	case *unstructured.Unstructured:
+		return g.unstructuredIsReferenced(nsname, obj)
+	default:
+		return false
+	}
+}
+
+func (g *Graph) secretIsReferenced(nsname types.NamespacedName) bool {
+	// Check if secret is a Gateway-referenced Secret, or if it's a Secret used for
+	// NGINX Plus reporting, WAF bundle auth, or PLM S3 storage.
+	_, exists := g.ReferencedSecrets[nsname]
+	_, plusSecretExists := g.PlusSecrets[nsname]
+	_, wafAuthSecretExists := g.ReferencedWAFSecrets[nsname]
+	_, plmSecretExists := g.PLMSecrets[nsname]
+	_, payloadProcessorSecretExists := g.ReferencedPayloadProcessorSecrets[nsname]
+	return exists || plusSecretExists || wafAuthSecretExists || plmSecretExists ||
+		payloadProcessorSecretExists
+}
+
+func (g *Graph) configMapIsReferenced(nsname types.NamespacedName) bool {
+	_, exists := g.ReferencedCaCertConfigMaps[nsname]
+	return exists
+}
+
+func (g *Graph) namespaceIsReferenced(nsname types.NamespacedName, obj *v1.Namespace) bool {
+	// `existed` is needed as it checks the graph's ReferencedNamespaces which stores all the namespaces that
+	// match the Gateway listener's label selector when the graph was created. This covers the case when
+	// a Namespace changes its label so it no longer matches a Gateway listener's label selector, but because
+	// it was in the graph's ReferencedNamespaces we know that the Graph did reference the Namespace.
+	//
+	// However, if there is a Namespace which changes its label (previously it did not match) to match a Gateway
+	// listener's label selector, it will not be in the current graph's ReferencedNamespaces until it is rebuilt
+	// and thus not be caught in `existed`. Therefore, we need `exists` to check the graph's Gateway and see if the
+	// new Namespace actually matches any of the Gateway listener's label selector.
+	//
+	// `exists` does not cover the case highlighted above by `existed` and vice versa so both are needed.
+	_, existed := g.ReferencedNamespaces[nsname]
+	exists := isNamespaceReferenced(obj, g.Gateways)
+	return existed || exists
+}
+
+func (g *Graph) serviceIsReferenced(nsname types.NamespacedName) bool {
+	_, exists := g.ReferencedServices[nsname]
+	_, payloadProcessorServiceExists := g.ReferencedPayloadProcessorServices[nsname]
+	return exists || payloadProcessorServiceExists
+}
+
+func (g *Graph) inferencePoolIsReferenced(nsname types.NamespacedName) bool {
+	_, exists := g.ReferencedInferencePools[nsname]
+	return exists
+}
+
+func (g *Graph) endpointSliceIsReferenced(nsname types.NamespacedName, obj *discoveryV1.EndpointSlice) bool {
+	svcName := index.GetServiceNameFromEndpointSlice(obj)
+	if svcName != "" {
+		// Service Namespace should be the same Namespace as the EndpointSlice.
+		_, exists := g.ReferencedServices[types.NamespacedName{Namespace: nsname.Namespace, Name: svcName}]
+		return exists
+	}
+
+	// The EndpointSlice carries no labels, which happens on delete: the reconciler cannot recover
+	// a deleted object's contents, so it delivers the delete event with only the registered
+	// prototype object (no labels) rather than the object as it last existed. Fall back to the
+	// Service owner recorded the last time this EndpointSlice's endpoints were resolved for the
+	// dataplane configuration, and re-verify that Service is still referenced.
+	if g.EndpointSliceOwnership == nil {
+		return false
+	}
+
+	svcNsName, ok := g.EndpointSliceOwnership.Owner(nsname)
+	if !ok {
+		return false
+	}
+
+	_, exists := g.ReferencedServices[svcNsName]
+	return exists
+}
+
+func (g *Graph) nginxProxyIsReferenced(nsname types.NamespacedName) bool {
+	_, exists := g.ReferencedNginxProxies[nsname]
+	return exists
+}
+
+func (g *Graph) unstructuredIsReferenced(nsname types.NamespacedName, obj *unstructured.Unstructured) bool {
+	switch obj.GroupVersionKind() {
+	case kinds.APPolicyGVK:
+		_, exists := g.ReferencedAPPolicies[nsname]
+		return exists
+	case kinds.APLogConfGVK:
+		_, exists := g.ReferencedAPLogConfs[nsname]
+		return exists
+	default:
+		return false
+	}
+}
+
+// IsNGFPolicyRelevant returns whether the NGF Policy is a part of the Graph, or targets a resource in the Graph.
+func (g *Graph) IsNGFPolicyRelevant(
+	policy policies.Policy,
+	gvk schema.GroupVersionKind,
+	nsname types.NamespacedName,
+) bool {
+	key := PolicyKey{
+		NsName: nsname,
+		GVK:    gvk,
+	}
+
+	if _, exists := g.NGFPolicies[key]; exists {
+		return true
+	}
+
+	if policy == nil {
+		panic("policy cannot be nil")
+	}
+
+	for _, ref := range policy.GetTargetRefs() {
+		switch ref.Group {
+		case gatewayv1.GroupName:
+			if g.gatewayAPIResourceExist(ref, policy.GetNamespace()) {
+				return true
+			}
+		case "", "core":
+			if ref.Kind == kinds.Service {
+				svcNsName := types.NamespacedName{Namespace: policy.GetNamespace(), Name: string(ref.Name)}
+				if _, exists := g.ReferencedServices[svcNsName]; exists {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func (g *Graph) gatewayAPIResourceExist(ref gatewayv1.LocalPolicyTargetReference, policyNs string) bool {
+	refNsName := types.NamespacedName{Name: string(ref.Name), Namespace: policyNs}
+
+	switch kind := ref.Kind; kind {
+	case kinds.Gateway:
+		if len(g.Gateways) == 0 {
+			return false
+		}
+
+		return gatewayExists(refNsName, g.Gateways)
+	case kinds.HTTPRoute, kinds.GRPCRoute:
+		_, exists := g.Routes[routeKeyForKind(kind, refNsName)]
+		return exists
+
+	default:
+		return false
+	}
+}
+
+// BuildGraph builds a Graph from a state.
+func BuildGraph(
+	ctx context.Context,
+	state ClusterState,
+	controllerName string,
+	gcName string,
+	clusterDomain string,
+	plusSecrets map[types.NamespacedName][]PlusSecretFile,
+	wafFetcher fetch.Fetcher,
+	plmFetcher *s3fetch.Fetcher,
+	plmSecretNames map[types.NamespacedName][]PLMRole,
+	previousWAFBundles map[WAFBundleKey]*WAFBundleData,
+	validators validation.Validators,
+	logger logr.Logger,
+	featureFlags FeatureFlags,
+	endpointSliceOwnership *resolver.EndpointSliceOwnership,
+) *Graph {
+	processedGwClasses, gcExists := processGatewayClasses(state.GatewayClasses, gcName, controllerName)
+	if gcExists && processedGwClasses.Winner == nil {
+		// configured GatewayClass does not reference this controller
+		return &Graph{}
+	}
+
+	processedGws := processGateways(state.Gateways, gcName)
+	processedNginxProxies := processNginxProxies(
+		state.NginxProxies,
+		validators.GenericValidator,
+		processedGwClasses.Winner,
+		processedGws,
+		featureFlags.Plus,
+	)
+
+	gc := buildGatewayClass(
+		processedGwClasses.Winner,
+		processedNginxProxies,
+		state.CRDMetadata,
+	)
+
+	resourceResolver := newResourceResolver(state)
+	refGrantResolver := newReferenceGrantResolver(state.ReferenceGrants)
+
+	gws := buildGateways(
+		processedGws,
+		resourceResolver,
+		gc,
+		refGrantResolver,
+		processedNginxProxies,
+	)
+
+	listenerSets := buildListenerSets(state.ListenerSets, gws, state.Namespaces)
+
+	attachListenerSetsToGateways(gws, listenerSets)
+
+	processedExternalLoadBalancers := processExternalLoadBalancers(state.ExternalLoadBalancer, gws)
+
+	processedBackendTLSPolicies := processBackendTLSPolicies(
+		state.BackendTLSPolicies,
+		resourceResolver,
+		gws,
+	)
+
+	processedSnippetsFilters := processSnippetsFilters(state.SnippetsFilters)
+
+	processedAuthenticationFilters := processAuthenticationFilters(
+		state.AuthenticationFilters,
+		resourceResolver,
+		validators.AuthFieldsValidator,
+		validators.GenericValidator,
+		featureFlags.Plus,
+	)
+	routes := buildRoutesForGateways(
+		validators.HTTPFieldsValidator,
+		state.HTTPRoutes,
+		state.GRPCRoutes,
+		gws,
+		processedSnippetsFilters,
+		processedAuthenticationFilters,
+		state.InferencePools,
+		featureFlags,
+		listenerSets,
+	)
+
+	referencedInferencePools := buildReferencedInferencePools(
+		routes,
+		gws,
+		state.InferencePools,
+		state.Services,
+		listenerSets,
+	)
+
+	l4routes := buildL4RoutesForGateways(
+		state.TLSRoutes,
+		state.TCPRoutes,
+		state.UDPRoutes,
+		state.Services,
+		processedBackendTLSPolicies,
+		gws,
+		refGrantResolver,
+		listenerSets,
+	)
+
+	addBackendRefsToRouteRules(
+		routes,
+		refGrantResolver,
+		state.Services,
+		referencedInferencePools,
+		processedBackendTLSPolicies,
+	)
+	bindRoutesToListeners(routes, l4routes, gws, state.Namespaces, listenerSets)
+	validateOIDCFilters(routes, gws)
+
+	referencedNamespaces := buildReferencedNamespaces(state.Namespaces, gws)
+
+	referencedServices := buildReferencedServices(routes, l4routes, gws, state.Services, listenerSets)
+
+	var wafInput *WAFProcessingInput
+	if wafFetcher != nil || plmFetcher != nil {
+		plmResolvedSecrets := resolvePLMSecrets(logger, state.Secrets, plmSecretNames)
+		wafInput = &WAFProcessingInput{
+			Fetcher:            wafFetcher,
+			PLMFetcher:         plmFetcher,
+			Secrets:            state.Secrets,
+			PreviousBundles:    previousWAFBundles,
+			APPolicies:         state.APPolicies,
+			APLogConfs:         state.APLogConfs,
+			RefGrantResolver:   refGrantResolver,
+			PLMResolvedSecrets: plmResolvedSecrets,
+		}
+	}
+
+	// policies must be processed last because they rely on the state of the other resources in the graph
+	processedPolicies, wafOutput := processPolicies(
+		ctx,
+		logger,
+		state.NGFPolicies,
+		validators.PolicyValidator,
+		routes,
+		referencedServices,
+		gws,
+		wafInput,
+		refGrantResolver,
+	)
+
+	payloadProcessorOutput := processPayloadProcessorPolicies(
+		processedPolicies,
+		state.Services,
+		state.Secrets,
+		processedBackendTLSPolicies,
+		clusterDomain,
+	)
+
+	// Register PayloadProcessor backend Services (referenced only via a policy, not a Route backend)
+	// into referencedServices with the Gateways their policies attach to, so a BackendTLSPolicy
+	// targeting a Guardrails backend Service picks up those Gateways below.
+	referencedServices = addPayloadProcessorBackendServicesToReferencedServices(
+		processedPolicies,
+		routes,
+		gws,
+		referencedServices,
+		state.Services,
+	)
+
+	// Register InferencePool EndpointPicker backend Services into referencedServices
+	// with the Gateways attached to the InferencePool's HTTPRoutes,
+	// so a BackendTLSPolicy targeting an EPP Service picks up those Gateways below.
+	referencedServices = addInferencePoolEPPServicesToReferencedServices(
+		referencedInferencePools,
+		referencedServices,
+		state.Services,
+	)
+
+	// BackendTLSPolicy gateway attachment must run after referencedServices includes both Route
+	// backends and PayloadProcessor backends and InferencePool EPP backends, so a policy targeting
+	// either kind is attached to the correct Gateways.
+	addGatewaysForBackendTLSPolicies(processedBackendTLSPolicies, referencedServices, controllerName, gws, logger)
+
+	// add status conditions to each targetRef based on the policies that affect them.
+	addPolicyAffectedStatusToTargetRefs(processedPolicies, routes, gws)
+
+	setPlusSecretContent(state.Secrets, plusSecrets)
+
+	// Drop ownership records for Services that are no longer referenced, so the tracker doesn't
+	// grow unbounded over the controller's lifetime as Services come and go. This is a hygiene
+	// step only: endpointSliceIsReferenced always re-verifies a recorded owner is still
+	// referenced before treating an EndpointSlice as relevant.
+	if endpointSliceOwnership != nil {
+		keep := make(map[types.NamespacedName]struct{}, len(referencedServices))
+		for svcNsName := range referencedServices {
+			keep[svcNsName] = struct{}{}
+		}
+		endpointSliceOwnership.Prune(keep)
+	}
+
+	var referencedWAFBundles map[WAFBundleKey]*WAFBundleData
+	var referencedAPPolicies map[types.NamespacedName]*unstructured.Unstructured
+	var referencedAPLogConfs map[types.NamespacedName]*unstructured.Unstructured
+	var referencedWAFAuthSecrets map[types.NamespacedName]*v1.Secret
+	if wafOutput != nil {
+		referencedWAFBundles = wafOutput.Bundles
+		referencedAPPolicies = wafOutput.ReferencedAPPolicies
+		referencedAPLogConfs = wafOutput.ReferencedAPLogConfs
+		referencedWAFAuthSecrets = wafOutput.ReferencedWAFSecrets
+	}
+
+	g := &Graph{
+		GatewayClass:                       gc,
+		Gateways:                           gws,
+		Routes:                             routes,
+		L4Routes:                           l4routes,
+		IgnoredGatewayClasses:              processedGwClasses.Ignored,
+		ReferencedSecrets:                  resourceResolver.GetSecrets(),
+		ReferencedNamespaces:               referencedNamespaces,
+		ReferencedServices:                 referencedServices,
+		ReferencedInferencePools:           referencedInferencePools,
+		ReferencedCaCertConfigMaps:         resourceResolver.GetConfigMaps(),
+		ReferencedNginxProxies:             processedNginxProxies,
+		BackendTLSPolicies:                 processedBackendTLSPolicies,
+		NGFPolicies:                        processedPolicies,
+		SnippetsFilters:                    processedSnippetsFilters,
+		AuthenticationFilters:              processedAuthenticationFilters,
+		ExternalLoadBalancers:              processedExternalLoadBalancers,
+		ListenerSets:                       listenerSets,
+		PlusSecrets:                        plusSecrets,
+		PLMSecrets:                         plmSecretNames,
+		EndpointSliceOwnership:             endpointSliceOwnership,
+		ReferencedWAFBundles:               referencedWAFBundles,
+		ReferencedAPPolicies:               referencedAPPolicies,
+		ReferencedAPLogConfs:               referencedAPLogConfs,
+		ReferencedWAFSecrets:               referencedWAFAuthSecrets,
+		ReferencedPayloadProcessorSecrets:  payloadProcessorOutput.ReferencedPayloadProcessorSecrets,
+		ReferencedPayloadProcessorServices: payloadProcessorOutput.ReferencedPayloadProcessorServices,
+	}
+
+	g.attachPolicies(validators.PolicyValidator, controllerName, logger)
+
+	markClippedAccessPolicies(g.NGFPolicies, g.Routes, g.Gateways)
+
+	resolveEffectivePayloadProcessors(g.Gateways, g.Routes)
+	validateExternalAuthConflicts(routes)
+
+	return g
+}
+
+func gatewayExists(gwNsName types.NamespacedName, gateways map[types.NamespacedName]*Gateway) bool {
+	if len(gateways) == 0 {
+		return false
+	}
+
+	_, exists := gateways[gwNsName]
+	return exists
+}
+
+func newResourceResolver(state ClusterState) resolver.Resolver {
+	resources := make(map[resolver.ResourceKey]client.Object)
+	for nsname, cm := range state.ConfigMaps {
+		key := resolver.ResourceKey{
+			NamespacedName: nsname,
+			ResourceType:   resolver.ResourceTypeConfigMap,
+		}
+		resources[key] = cm
+	}
+	for nsname, s := range state.Secrets {
+		key := resolver.ResourceKey{
+			NamespacedName: nsname,
+			ResourceType:   resolver.ResourceTypeSecret,
+		}
+		resources[key] = s
+	}
+
+	return resolver.NewResourceResolver(resources)
+}
+
+// SecretFileType describes the type of Secret file used for NGINX Plus.
+type SecretFileType int
+
+const (
+	// PlusReportJWTToken is the file for the NGINX Plus JWT Token.
+	PlusReportJWTToken SecretFileType = iota
+	// PlusReportCACertificate is the file for the NGINX Instance Manager CA certificate.
+	PlusReportCACertificate
+	// PlusReportClientSSLCertificate is the file for the NGINX Instance Manager client certificate.
+	PlusReportClientSSLCertificate
+	// PlusReportClientSSLKey is the file for the NGINX Instance Manager client key.
+	PlusReportClientSSLKey
+)
+
+// PlusSecretFile specifies the type and content of an NGINX Plus Secret file.
+// A user provides the names of the various Secrets on startup, and we store this info in a map to cross-reference with
+// the actual Secrets that exist in k8s.
+type PlusSecretFile struct {
+	// FieldName is the field name within the Secret that holds the data for this file.
+	FieldName string
+	// Content is the content of this file.
+	Content []byte
+	// Type is the type of Secret file.
+	Type SecretFileType
+}
+
+// setPlusSecretContent finds the k8s Secret object associated with a PlusSecretFile object, and sets its contents.
+func setPlusSecretContent(
+	clusterSecrets map[types.NamespacedName]*v1.Secret,
+	plusSecrets map[types.NamespacedName][]PlusSecretFile,
+) {
+	for name, plusSecretFiles := range plusSecrets {
+		if secret, ok := clusterSecrets[name]; ok {
+			for idx, file := range plusSecretFiles {
+				content, ok := secret.Data[file.FieldName]
+				if !ok {
+					panic(fmt.Errorf("NGINX Plus Secret did not have expected field %q", file.FieldName))
+				}
+
+				file.Content = content
+				plusSecrets[name][idx] = file
+			}
+		}
+	}
+}

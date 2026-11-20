@@ -1,0 +1,704 @@
+"""Describe project shared pytest fixtures."""
+
+import os
+import subprocess
+import tempfile
+import time
+
+import pytest
+import yaml
+from kubernetes import client, config
+from kubernetes.client import (
+    ApiextensionsV1Api,
+    AppsV1Api,
+    CoordinationV1Api,
+    CoreV1Api,
+    CustomObjectsApi,
+    NetworkingV1Api,
+    RbacAuthorizationV1Api,
+)
+from kubernetes.client.rest import ApiException
+from settings import ALLOWED_DEPLOYMENT_TYPES, ALLOWED_IC_TYPES, ALLOWED_SERVICE_TYPES, CRDS, DEPLOYMENTS, TEST_DATA
+from suite.utils.custom_resources_utils import create_crd_from_yaml, delete_crd
+from suite.utils.kube_config_utils import ensure_context_in_config, get_current_context_name
+from suite.utils.resources_utils import (
+    add_e2e_run_id_to_workload,
+    are_all_pods_in_ready_state,
+    cleanup_rbac,
+    configure_rbac,
+    create_configmap_from_yaml,
+    create_license,
+    create_namespace_with_name_from_yaml,
+    create_ns_and_sa_from_yaml,
+    create_secret_from_yaml,
+    create_service_from_yaml,
+    delete_lease,
+    delete_namespace,
+    delete_testing_namespaces,
+    generate_e2e_run_id,
+    get_e2e_run_selector,
+    get_leases,
+    get_service_node_ports,
+    read_service,
+    replace_configmap_from_yaml,
+    wait_before_test,
+    wait_for_public_ip,
+    wait_until_all_pods_are_ready,
+)
+from suite.utils.yaml_utils import get_name_from_yaml
+
+
+class KubeApis:
+    """
+    Encapsulate all the used kubernetes-client APIs.
+
+    Attributes:
+        v1: CoreV1Api
+        networking_v1: NetworkingV1Api
+        rbac_v1: RbacAuthorizationV1Api
+        api_extensions_v1: ApiextensionsV1Api
+        custom_objects: CustomObjectsApi
+        coordination_v1: CoordinationV1Api
+    """
+
+    def __init__(
+        self,
+        v1: CoreV1Api,
+        networking_v1: NetworkingV1Api,
+        apps_v1_api: AppsV1Api,
+        rbac_v1: RbacAuthorizationV1Api,
+        api_extensions_v1: ApiextensionsV1Api,
+        custom_objects: CustomObjectsApi,
+        coordination_v1: CoordinationV1Api,
+    ):
+        self.v1 = v1
+        self.networking_v1 = networking_v1
+        self.apps_v1_api = apps_v1_api
+        self.rbac_v1 = rbac_v1
+        self.api_extensions_v1 = api_extensions_v1
+        self.custom_objects = custom_objects
+        self.coordination_v1 = coordination_v1
+
+
+class PublicEndpoint:
+    """
+    Encapsulate the Public Endpoint info.
+
+    Attributes:
+        public_ip (str):
+        port (int):
+        port_ssl (int):
+    """
+
+    def __init__(
+        self,
+        public_ip,
+        port=80,
+        port_ssl=443,
+        api_port=8080,
+        metrics_port=9113,
+        tcp_server_port=3333,
+        udp_server_port=3334,
+        service_insight_port=9114,
+        custom_ssl_port=8443,
+        custom_http=8085,
+        custom_https=8445,
+    ):
+        self.public_ip = public_ip
+        self.port = port
+        self.port_ssl = port_ssl
+        self.api_port = api_port
+        self.metrics_port = metrics_port
+        self.tcp_server_port = tcp_server_port
+        self.udp_server_port = udp_server_port
+        self.service_insight_port = service_insight_port
+        self.custom_ssl_port = custom_ssl_port
+        self.custom_http = custom_http
+        self.custom_https = custom_https
+
+
+class IngressControllerPrerequisites:
+    """
+    Encapsulate shared items.
+
+    Attributes:
+        namespace (str): namespace name
+        config_map (str): config_map name
+    """
+
+    def __init__(self, config_map, namespace):
+        self.namespace = namespace
+        self.config_map = config_map
+
+
+@pytest.fixture(autouse=True)
+def print_name(request) -> None:
+    """Print out a current test name."""
+    print(f"\n============================= {request.node.nodeid} =============================")
+
+
+@pytest.fixture(scope="function")
+def e2e_run_id() -> str:
+    """Provide one run ID for all workloads created by a test invocation."""
+    return generate_e2e_run_id()
+
+
+@pytest.fixture(scope="class")
+def test_namespace(kube_apis) -> str:
+    """
+    Create a test namespace.
+
+    :param kube_apis: client apis
+    :return: str
+    """
+    timestamp = round(time.time() * 1000)
+    print("------------------------- Create Test Namespace -----------------------------------")
+    namespace = create_namespace_with_name_from_yaml(
+        kube_apis.v1, f"test-namespace-{str(timestamp)}", f"{TEST_DATA}/common/ns.yaml"
+    )
+    return namespace
+
+
+@pytest.fixture(scope="session", autouse=True)
+def delete_test_namespaces(kube_apis, request) -> None:
+    """
+    Delete all the testing namespaces.
+
+    Testing namespaces are the ones starting with "test-namespace-"
+
+    :param kube_apis: client apis
+    :param request: pytest fixture
+    :return: str
+    """
+
+    def fin():
+        if request.config.getoption("--skip-fixture-teardown") == "no":
+            print("------------------------- Delete All Test Namespaces -----------------------------------")
+            delete_testing_namespaces(kube_apis.v1)
+
+    request.addfinalizer(fin)
+
+
+@pytest.fixture(scope="session")
+def ingress_controller_endpoint(cli_arguments, kube_apis, ingress_controller_prerequisites) -> PublicEndpoint:
+    """
+    Create an entry point for the IC.
+
+    :param cli_arguments: tests context
+    :param kube_apis: client apis
+    :param ingress_controller_prerequisites: common cluster context
+    :return: PublicEndpoint
+    """
+    print("------------------------- Create Public Endpoint  -----------------------------------")
+    namespace = ingress_controller_prerequisites.namespace
+    if cli_arguments["service"] == "nodeport":
+        public_ip = cli_arguments["node-ip"]
+        print(f"The Public IP: {public_ip}")
+        service_name = create_service_from_yaml(
+            kube_apis.v1,
+            namespace,
+            f"{TEST_DATA}/common/service/nodeport-with-additional-ports.yaml",
+        )
+        (
+            port,
+            port_ssl,
+            api_port,
+            metrics_port,
+            tcp_server_port,
+            udp_server_port,
+            service_insight_port,
+            custom_ssl_port,
+            custom_http,
+            custom_https,
+        ) = get_service_node_ports(kube_apis.v1, service_name, namespace)
+        return PublicEndpoint(
+            public_ip,
+            port,
+            port_ssl,
+            api_port,
+            metrics_port,
+            tcp_server_port,
+            udp_server_port,
+            service_insight_port,
+            custom_ssl_port,
+            custom_http,
+            custom_https,
+        )
+    else:
+        create_service_from_yaml(
+            kube_apis.v1,
+            namespace,
+            f"{TEST_DATA}/common/service/loadbalancer-with-additional-ports.yaml",
+        )
+        public_ip = wait_for_public_ip(kube_apis.v1, namespace)
+        print(f"The Public IP: {public_ip}")
+        return PublicEndpoint(public_ip)
+
+
+@pytest.fixture(scope="session")
+def ingress_controller_prerequisites(cli_arguments, kube_apis, request) -> IngressControllerPrerequisites:
+    """
+    Create RBAC, SA, IC namespace and default-secret.
+
+    :param cli_arguments: tests context
+    :param kube_apis: client apis
+    :param request: pytest fixture
+    :return: IngressControllerPrerequisites
+    """
+    print("------------------------- Create IC Prerequisites  -----------------------------------")
+    rbac = configure_rbac(kube_apis.rbac_v1)
+    namespace = create_ns_and_sa_from_yaml(kube_apis.v1, f"{DEPLOYMENTS}/common/ns-and-sa.yaml")
+    print("Create IngressClass resources:")
+    subprocess.run(["kubectl", "apply", "-f", f"{DEPLOYMENTS}/common/ingress-class.yaml"])
+    subprocess.run(
+        [
+            "kubectl",
+            "apply",
+            "-f",
+            f"{TEST_DATA}/ingress-class/resource/custom-ingress-class-res.yaml",
+        ]
+    )
+    config_map_yaml = f"{DEPLOYMENTS}/common/nginx-config.yaml"
+    create_configmap_from_yaml(kube_apis.v1, namespace, config_map_yaml)
+    mgmt_config_map_yaml = f"{DEPLOYMENTS}/common/plus-mgmt-configmap.yaml"
+    with open(config_map_yaml) as f:
+        config_map = yaml.safe_load(f)
+
+    create_secret_from_yaml(kube_apis.v1, namespace, f"{TEST_DATA}/common/default-server-secret.yaml")
+    # setup Plus JWT configuration
+    if cli_arguments["ic-type"] == "nginx-plus-ingress":
+        print("Create Plus JWT License:")
+        license_name = create_license(kube_apis.v1, namespace, cli_arguments["plus-jwt"])
+        print(f"License created: {license_name}")
+        create_configmap_from_yaml(kube_apis.v1, namespace, mgmt_config_map_yaml)
+
+    def fin():
+        if request.config.getoption("--skip-fixture-teardown") == "no":
+            print("Clean up prerequisites")
+            delete_namespace(kube_apis.v1, namespace)
+            print("Delete IngressClass resources:")
+            subprocess.run(["kubectl", "delete", "-f", f"{DEPLOYMENTS}/common/ingress-class.yaml"])
+            subprocess.run(
+                [
+                    "kubectl",
+                    "delete",
+                    "-f",
+                    f"{TEST_DATA}/ingress-class/resource/custom-ingress-class-res.yaml",
+                ]
+            )
+            cleanup_rbac(kube_apis.rbac_v1, rbac)
+
+    request.addfinalizer(fin)
+
+    return IngressControllerPrerequisites(config_map, namespace)
+
+
+@pytest.fixture(scope="session")
+def kube_apis(cli_arguments) -> KubeApis:
+    """
+    Set up kubernetes-client to operate in cluster.
+
+    :param cli_arguments: a set of command-line arguments
+    :return: KubeApis
+    """
+    context_name = cli_arguments["context"]
+    kubeconfig = cli_arguments["kubeconfig"]
+    config.load_kube_config(config_file=kubeconfig, context=context_name, persist_config=False)
+    v1 = client.CoreV1Api()
+    networking_v1 = client.NetworkingV1Api()
+    apps_v1_api = client.AppsV1Api()
+    rbac_v1 = client.RbacAuthorizationV1Api()
+    api_extensions_v1 = client.ApiextensionsV1Api()
+    custom_objects = client.CustomObjectsApi()
+    coordination_v1 = client.CoordinationV1Api()
+    return KubeApis(v1, networking_v1, apps_v1_api, rbac_v1, api_extensions_v1, custom_objects, coordination_v1)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cli_arguments(request) -> {}:
+    """
+    Verify the CLI arguments.
+
+    :param request: pytest fixture
+    :return: {context, image, image-pull-policy, deployment-type, ic-type, service, node-ip, kubeconfig}
+    """
+    result = {"kubeconfig": request.config.getoption("--kubeconfig")}
+    assert result["kubeconfig"] != "", "Empty kubeconfig is not allowed"
+    print(f"\nTests will use this kubeconfig: {result['kubeconfig']}")
+
+    result["context"] = request.config.getoption("--context")
+    if result["context"] != "":
+        ensure_context_in_config(result["kubeconfig"], result["context"])
+        print(f"Tests will run against: {result['context']}")
+    else:
+        result["context"] = get_current_context_name(result["kubeconfig"])
+        print(f"Tests will use a current context: {result['context']}")
+
+    result["image"] = request.config.getoption("--image")
+    assert result["image"] != "", "Empty image is not allowed"
+    print(f"Tests will use the image: {result['image']}")
+
+    result["image-pull-policy"] = request.config.getoption("--image-pull-policy")
+    assert result["image-pull-policy"] != "", "Empty image-pull-policy is not allowed"
+    print(f"Tests will run with the image-pull-policy: {result['image-pull-policy']}")
+
+    result["deployment-type"] = request.config.getoption("--deployment-type")
+    assert (
+        result["deployment-type"] in ALLOWED_DEPLOYMENT_TYPES
+    ), f"Deployment type {result['deployment-type']} is not allowed"
+    print(f"Tests will use the IC deployment of type: {result['deployment-type']}")
+
+    result["ic-type"] = request.config.getoption("--ic-type")
+    assert result["ic-type"] in ALLOWED_IC_TYPES, f"IC type {result['ic-type']} is not allowed"
+    print(f"Tests will run against the IC of type: {result['ic-type']}")
+    if result["ic-type"] == "nginx-plus-ingress":
+        print(f"Tests will use the Plus JWT")
+        result["plus-jwt"] = request.config.getoption("--plus-jwt")
+
+    result["replicas"] = request.config.getoption("--replicas")
+    print(f"Number of pods spun up will be : {result['replicas']}")
+
+    result["service"] = request.config.getoption("--service")
+    assert result["service"] in ALLOWED_SERVICE_TYPES, f"Service {result['service']} is not allowed"
+    print(f"Tests will use Service of this type: {result['service']}")
+    if result["service"] == "nodeport":
+        node_ip = request.config.getoption("--node-ip", None)
+        assert node_ip is not None and node_ip != "", f"Service 'nodeport' requires a node-ip"
+        result["node-ip"] = node_ip
+        print(f"Tests will use the node-ip: {result['node-ip']}")
+    result["skip-fixture-teardown"] = request.config.getoption("--skip-fixture-teardown")
+    assert result["skip-fixture-teardown"] == "yes" or result["skip-fixture-teardown"] == "no"
+    print(
+        f"All test fixtures be available for debugging: {result['skip-fixture-teardown']}, /// ONLY USE THIS OPTION FOR INDIVIDUAL TEST DEBUGGING ///"
+    )
+    return result
+
+
+@pytest.fixture(scope="class")
+def crds(kube_apis, request) -> None:
+    """
+    Create an Ingress Controller with CRD enabled.
+
+    :param kube_apis: client apis
+    :param request: pytest fixture to parametrize this method
+        {type: complete|rbac-without-vs, extra_args: }
+        'type' type of test pre-configuration
+        'extra_args' list of IC cli arguments
+    :return:
+    """
+    vs_crd_name = get_name_from_yaml(f"{CRDS}/k8s.nginx.org_virtualservers.yaml")
+    vsr_crd_name = get_name_from_yaml(f"{CRDS}/k8s.nginx.org_virtualserverroutes.yaml")
+    pol_crd_name = get_name_from_yaml(f"{CRDS}/k8s.nginx.org_policies.yaml")
+    ts_crd_name = get_name_from_yaml(f"{CRDS}/k8s.nginx.org_transportservers.yaml")
+    gc_crd_name = get_name_from_yaml(f"{CRDS}/k8s.nginx.org_globalconfigurations.yaml")
+
+    try:
+        print("------------------------- Register CRDs -----------------------------------")
+        create_crd_from_yaml(
+            kube_apis.api_extensions_v1,
+            vs_crd_name,
+            f"{CRDS}/k8s.nginx.org_virtualservers.yaml",
+        )
+        create_crd_from_yaml(
+            kube_apis.api_extensions_v1,
+            vsr_crd_name,
+            f"{CRDS}/k8s.nginx.org_virtualserverroutes.yaml",
+        )
+        create_crd_from_yaml(
+            kube_apis.api_extensions_v1,
+            pol_crd_name,
+            f"{CRDS}/k8s.nginx.org_policies.yaml",
+        )
+        create_crd_from_yaml(
+            kube_apis.api_extensions_v1,
+            ts_crd_name,
+            f"{CRDS}/k8s.nginx.org_transportservers.yaml",
+        )
+        create_crd_from_yaml(
+            kube_apis.api_extensions_v1,
+            gc_crd_name,
+            f"{CRDS}/k8s.nginx.org_globalconfigurations.yaml",
+        )
+    except ApiException as ex:
+        # Finalizer method doesn't start if fixture creation was incomplete, ensure clean up here
+        print(f"Failed to complete CRD IC fixture: {ex}\nClean up the cluster as much as possible.")
+        delete_crd(kube_apis.api_extensions_v1, vs_crd_name)
+        delete_crd(kube_apis.api_extensions_v1, vsr_crd_name)
+        delete_crd(kube_apis.api_extensions_v1, pol_crd_name)
+        delete_crd(kube_apis.api_extensions_v1, ts_crd_name)
+        delete_crd(kube_apis.api_extensions_v1, gc_crd_name)
+        pytest.fail("IC setup failed")
+
+    def fin():
+        if request.config.getoption("--skip-fixture-teardown") == "no":
+            delete_crd(kube_apis.api_extensions_v1, vs_crd_name)
+            delete_crd(kube_apis.api_extensions_v1, vsr_crd_name)
+            delete_crd(kube_apis.api_extensions_v1, pol_crd_name)
+            delete_crd(kube_apis.api_extensions_v1, ts_crd_name)
+            delete_crd(kube_apis.api_extensions_v1, gc_crd_name)
+
+    request.addfinalizer(fin)
+
+
+@pytest.fixture(scope="function")
+def restore_configmap(request, kube_apis, ingress_controller_prerequisites, test_namespace) -> None:
+    """
+    Return ConfigMap to the initial state after the test.
+
+    :param request: internal pytest fixture
+    :param kube_apis: client apis
+    :param ingress_controller_prerequisites:
+    :param test_namespace: str
+    :return:
+    """
+
+    def fin():
+        if request.config.getoption("--skip-fixture-teardown") == "no":
+            replace_configmap_from_yaml(
+                kube_apis.v1,
+                ingress_controller_prerequisites.config_map["metadata"]["name"],
+                ingress_controller_prerequisites.namespace,
+                f"{DEPLOYMENTS}/common/nginx-config.yaml",
+            )
+
+    request.addfinalizer(fin)
+
+
+@pytest.fixture(scope="module")
+def create_certmanager(request):
+    """
+    Create Cert-manager.
+
+    :param kube_apis: client apis
+    :param request: pytest fixture
+    """
+    cm_yaml = f"{TEST_DATA}/virtual-server-certmanager/certmanager.yaml"
+    kube_apis = request.getfixturevalue("kube_apis")
+    e2e_run_id = generate_e2e_run_id()
+    with open(cm_yaml) as f:
+        cm_yaml_content = yaml.load_all(f, Loader=yaml.SafeLoader)
+        print("------------------------- Deploy CertManager in the cluster -----------------------------------")
+        create_generic_from_yaml(cm_yaml, request, e2e_run_id)
+        for doc in cm_yaml_content:
+            if doc["kind"] == "Deployment":
+                replicas = doc["spec"].get("replicas", 1)
+                ns = doc["metadata"]["namespace"]
+                name = doc["metadata"]["name"]
+                print(f"Wait until Cert-manager deployment {name} in namespace {ns} has {replicas} ready replicas")
+                count = 0
+                while (
+                    not are_all_pods_in_ready_state(
+                        request.getfixturevalue("kube_apis").v1, ns, get_e2e_run_selector(e2e_run_id)
+                    )
+                ) and count < 10:
+                    count += 1
+                    wait_before_test()
+
+    def fin():
+        if request.config.getoption("--skip-fixture-teardown") == "no":
+            print("------------------------- Delete CertManager from the cluster -----------------------------------")
+            leases = get_leases(kube_apis.coordination_v1, "kube-system")
+            for lease in leases.items:
+                if "cert-manager" in lease.metadata.name:
+                    delete_lease(kube_apis.coordination_v1, lease.metadata.name, "kube-system")
+
+    request.addfinalizer(fin)
+
+
+@pytest.fixture(scope="class")
+def create_issuer(request):
+    """
+    Create Cert-manager issuer.
+
+    :param kube_apis: client apis
+    :param issuer_name: the name of the issuer
+    :param request: pytest fixture
+    """
+    issuer_name = request.param.get("issuer_name")
+    issuer_yaml = f"{TEST_DATA}/virtual-server-certmanager/{issuer_name}.yaml"
+    issuer_secret_yaml = f"{TEST_DATA}/virtual-server-certmanager/issuer-secret.yaml"
+
+    print(f"Create issuer {issuer_name}")
+    create_generic_from_yaml(issuer_yaml, request)
+    if issuer_name == "ca-issuer":
+        create_generic_from_yaml(issuer_secret_yaml, request)
+
+
+def create_generic_from_yaml(file_path, request, e2e_run_id=None):
+    """
+    Create an object using a path to the yaml file.
+
+    :param kube_apis: client apis
+    :param request: pytest fixture
+    """
+    try:
+        if e2e_run_id:
+            with open(file_path) as f:
+                docs = list(yaml.safe_load_all(f))
+            for doc in docs:
+                if doc and doc["kind"] in {"Deployment", "DaemonSet", "StatefulSet"}:
+                    add_e2e_run_id_to_workload(doc, e2e_run_id)
+            subprocess.run(
+                ["kubectl", "apply", "-f", "-"],
+                input=yaml.safe_dump_all(docs),
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+        else:
+            subprocess.run(["kubectl", "apply", "-f", file_path], capture_output=True, check=True)
+    except subprocess.CalledProcessError:
+        print("Error occurred while applying a resource definition. See logs for details.")
+        raise
+
+    def fin():
+        if request.config.getoption("--skip-fixture-teardown") == "no":
+            try:
+                subprocess.run(["kubectl", "delete", "-f", f"{file_path}"], capture_output=True, check=True)
+            except subprocess.CalledProcessError:
+                print("Error occurred while cleaning up resources. See logs for details.")
+                raise
+
+    request.addfinalizer(fin)
+
+
+@pytest.fixture(scope="class")
+def create_externaldns(request):
+    """
+    Create externalDNS deployment.
+
+    :param kube_apis: client apis
+    :param request: pytest fixture
+    """
+    ed_yaml = f"{TEST_DATA}/virtual-server-external-dns/external-dns.yaml"
+
+    print("------------------------- Deploy ExternalDNS in the cluster -----------------------------------")
+    create_generic_from_yaml(ed_yaml, request)
+
+
+def _set_cert_manager_solver_nameservers(apps_v1_api: AppsV1Api, nameservers) -> None:
+    """
+    Set or remove the --acme-http01-solver-nameservers arg of the cert-manager controller, then wait for the rollout.
+
+    Idempotent: does nothing if the args already match, so removing an absent arg is a no-op.
+
+    :param apps_v1_api: AppsV1Api
+    :param nameservers: "<ip>:<port>" to set, or None to remove the arg
+    """
+    flag = "--acme-http01-solver-nameservers"
+    dep = apps_v1_api.read_namespaced_deployment("cert-manager", "cert-manager")
+    container = next(c for c in dep.spec.template.spec.containers if c.name == "cert-manager-controller")
+    current = list(container.args or [])
+    args = [a for a in current if not a.startswith(f"{flag}=")]
+    if nameservers:
+        args.append(f"{flag}={nameservers}")
+    if args == current:
+        print(f"cert-manager controller args already as wanted ({flag}={nameservers}), nothing to patch")
+        return
+    # args has no patch merge key, so a strategic merge patch replaces the whole list.
+    body = {"spec": {"template": {"spec": {"containers": [{"name": container.name, "args": args}]}}}}
+    apps_v1_api.patch_namespaced_deployment("cert-manager", "cert-manager", body)
+    subprocess.run(
+        ["kubectl", "rollout", "status", "deployment/cert-manager", "-n", "cert-manager", "--timeout=180s"],
+        check=True,
+    )
+
+
+@pytest.fixture(scope="module")
+def create_pebble(
+    request, kube_apis, ingress_controller_prerequisites, ingress_controller_endpoint, create_certmanager
+) -> None:
+    """
+    Deploy the Pebble ACME test server and a ClusterIssuer "pebble" that uses it.
+
+    challtestsrv answers every DNS A query with the NIC Service ClusterIP. Pebble validates challenges through it,
+    and so does the cert-manager HTTP-01 self-check, via --acme-http01-solver-nameservers.
+
+    :param request: pytest fixture
+    :param kube_apis: client apis
+    :param ingress_controller_prerequisites: common cluster context
+    :param ingress_controller_endpoint: ensures the NIC Service exists
+    :param create_certmanager: cert-manager deployment
+    """
+    print("------------------------- Deploy Pebble in the cluster -----------------------------------")
+    nic_ip = read_service(kube_apis.v1, "nginx-ingress", ingress_controller_prerequisites.namespace).spec.cluster_ip
+    print(f"NIC Service ClusterIP: {nic_ip}")
+    with open(f"{TEST_DATA}/acme-pebble/pebble.yaml") as f:
+        rendered = f.read().replace("__NIC_CLUSTER_IP__", nic_ip)
+    with tempfile.NamedTemporaryFile("w", prefix="pebble-", suffix=".yaml", delete=False) as tmp:
+        tmp.write(rendered)
+    # Registered first, so it runs last: the manifest delete below still needs the file.
+    request.addfinalizer(lambda: os.remove(tmp.name))
+    create_generic_from_yaml(tmp.name, request)
+    for app in ("pebble", "pebble-challtestsrv"):
+        wait_until_all_pods_are_ready(kube_apis.v1, "pebble", f"app={app}", timeout=180)
+
+    challtestsrv_ip = read_service(kube_apis.v1, "pebble-challtestsrv", "pebble").spec.cluster_ip
+
+    def fin():
+        if request.config.getoption("--skip-fixture-teardown") == "no":
+            print("Remove the solver nameservers arg from cert-manager")
+            _set_cert_manager_solver_nameservers(kube_apis.apps_v1_api, None)
+
+    # Registered before patching, so a failed or interrupted patch/rollout is still reverted.
+    request.addfinalizer(fin)
+    print(f"Point the cert-manager HTTP-01 self-check at challtestsrv {challtestsrv_ip}:8053")
+    _set_cert_manager_solver_nameservers(kube_apis.apps_v1_api, f"{challtestsrv_ip}:8053")
+
+    def delete_account_key():
+        # The ACME account lives in Pebble's memory only, so never reuse its key with a new Pebble.
+        if request.config.getoption("--skip-fixture-teardown") == "no":
+            subprocess.run(
+                ["kubectl", "delete", "secret", "pebble-account-key", "-n", "cert-manager", "--ignore-not-found"],
+                capture_output=True,
+            )
+
+    request.addfinalizer(delete_account_key)
+
+    print("Create ClusterIssuer pebble")
+    # The cert-manager webhook can take a few seconds to serve after its pod is Ready.
+    for attempt in range(10):
+        try:
+            create_generic_from_yaml(f"{TEST_DATA}/acme-pebble/cluster-issuer.yaml", request)
+            break
+        except subprocess.CalledProcessError:
+            if attempt == 9:
+                raise
+            wait_before_test(5)
+    wait_for_cluster_issuer_ready(kube_apis, "pebble")
+
+
+def wait_for_cluster_issuer_ready(kube_apis, name, timeout=60) -> None:
+    """
+    Wait for a cert-manager ClusterIssuer to be Ready. On timeout, dump it and fail.
+
+    For an ACME issuer, Ready means cert-manager reached the ACME server over verified TLS and registered an account.
+
+    :param kube_apis: client apis
+    :param name: ClusterIssuer name
+    :param timeout: seconds to wait
+    """
+    condition = None
+    waited = 0
+    while waited < timeout:
+        try:
+            issuer = kube_apis.custom_objects.get_cluster_custom_object("cert-manager.io", "v1", "clusterissuers", name)
+            condition = next(
+                (c for c in issuer.get("status", {}).get("conditions", []) if c["type"] == "Ready"),
+                None,
+            )
+        except ApiException as ex:
+            if ex.status != 404:
+                raise
+        if condition and condition["status"] == "True":
+            print(f"ClusterIssuer {name} is Ready after ~{waited}s")
+            return
+        print(f"ClusterIssuer {name} not Ready yet: {condition}")
+        wait_before_test(2)
+        waited += 2
+    res = subprocess.run(["kubectl", "get", "clusterissuer", name, "-o", "yaml"], capture_output=True, text=True)
+    print(res.stdout or res.stderr)
+    pytest.fail(
+        f"ClusterIssuer {name} not Ready after {timeout}s (check Pebble reachability through the ExternalName "
+        f"Service, the caBundle/TLS SANs, and ACME account registration). Last condition: {condition}"
+    )

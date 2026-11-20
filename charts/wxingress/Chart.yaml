@@ -1,0 +1,19 @@
+apiVersion: v2
+name: wxingress
+version: 2.8.1
+appVersion: 5.7.1-wx5
+kubeVersion: ">= 1.25.0-0"
+type: application
+description: wxingress, the drop-in successor of ingress-nginx, built on NGINX Ingress Controller, with the Gateway API
+home: https://github.com/wx-one/wxingress
+sources:
+  - https://github.com/wx-one/wxingress/tree/main/charts/wxingress
+icon: https://wx-one.github.io/wxingress/assets/logos/wxingress.svg
+maintainers:
+  - name: WizardTales GmbH
+    url: https://wizardtales.com
+annotations:
+  artifacthub.io/license: EUPL-1.2
+keywords:
+  - ingress
+  - ingress-nginx

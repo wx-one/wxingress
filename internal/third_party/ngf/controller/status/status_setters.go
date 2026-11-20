@@ -1,0 +1,742 @@
+package status
+
+import (
+	"slices"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	inference "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPI "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+)
+
+func newNginxGatewayStatusSetter(status ngfAPI.NginxGatewayStatus) Setter {
+	return func(obj client.Object) (wasSet bool) {
+		ng := helpers.MustCastObject[*ngfAPI.NginxGateway](obj)
+
+		if ConditionsEqual(ng.Status.Conditions, status.Conditions) {
+			return false
+		}
+
+		ng.Status = status
+		return true
+	}
+}
+
+func newGatewayStatusSetter(status gatewayv1.GatewayStatus) Setter {
+	return func(obj client.Object) (wasSet bool) {
+		gw := helpers.MustCastObject[*gatewayv1.Gateway](obj)
+
+		if gwStatusEqual(gw.Status, status) {
+			return false
+		}
+
+		gw.Status = status
+		return true
+	}
+}
+
+func gwStatusEqual(prev, cur gatewayv1.GatewayStatus) bool {
+	addressesEqual := slices.EqualFunc(prev.Addresses, cur.Addresses, func(a1, a2 gatewayv1.GatewayStatusAddress) bool {
+		if !helpers.EqualPointers(a1.Type, a2.Type) {
+			return false
+		}
+
+		return a1.Value == a2.Value
+	})
+
+	if !addressesEqual {
+		return false
+	}
+
+	if !ConditionsEqual(prev.Conditions, cur.Conditions) {
+		return false
+	}
+
+	if !helpers.EqualPointers(prev.AttachedListenerSets, cur.AttachedListenerSets) {
+		return false
+	}
+
+	return slices.EqualFunc(prev.Listeners, cur.Listeners, func(s1, s2 gatewayv1.ListenerStatus) bool {
+		if s1.Name != s2.Name {
+			return false
+		}
+
+		if s1.AttachedRoutes != s2.AttachedRoutes {
+			return false
+		}
+
+		if !ConditionsEqual(s1.Conditions, s2.Conditions) {
+			return false
+		}
+
+		return slices.EqualFunc(s1.SupportedKinds, s2.SupportedKinds, func(k1, k2 gatewayv1.RouteGroupKind) bool {
+			if k1.Kind != k2.Kind {
+				return false
+			}
+
+			return helpers.EqualPointers(k1.Group, k2.Group)
+		})
+	})
+}
+
+func newHTTPRouteStatusSetter(status gatewayv1.HTTPRouteStatus, gatewayCtlrName string) Setter {
+	return func(object client.Object) (wasSet bool) {
+		hr := helpers.MustCastObject[*gatewayv1.HTTPRoute](object)
+
+		// keep all the parent statuses that belong to other controllers
+		newParents := make([]gatewayv1.RouteParentStatus, 0, len(status.Parents))
+		newParents = append(newParents, status.Parents...)
+		for _, os := range hr.Status.Parents {
+			if string(os.ControllerName) != gatewayCtlrName {
+				newParents = append(newParents, os)
+			}
+		}
+
+		fullStatus := status
+		fullStatus.Parents = newParents
+
+		if routeStatusEqual(gatewayCtlrName, hr.Status.Parents, fullStatus.Parents) {
+			return false
+		}
+
+		hr.Status = fullStatus
+
+		return true
+	}
+}
+
+func newTLSRouteStatusSetter(status gatewayv1.TLSRouteStatus, gatewayCtlrName string) Setter {
+	return func(object client.Object) (wasSet bool) {
+		tr := helpers.MustCastObject[*gatewayv1.TLSRoute](object)
+
+		// keep all the parent statuses that belong to other controllers
+		newParents := make([]gatewayv1.RouteParentStatus, 0, len(status.Parents))
+		newParents = append(newParents, status.Parents...)
+		for _, os := range tr.Status.Parents {
+			if string(os.ControllerName) != gatewayCtlrName {
+				newParents = append(newParents, os)
+			}
+		}
+
+		fullStatus := status
+		fullStatus.Parents = newParents
+
+		if routeStatusEqual(gatewayCtlrName, tr.Status.Parents, fullStatus.Parents) {
+			return false
+		}
+
+		tr.Status = fullStatus
+
+		return true
+	}
+}
+
+func newGRPCRouteStatusSetter(status gatewayv1.GRPCRouteStatus, gatewayCtlrName string) Setter {
+	return func(object client.Object) (wasSet bool) {
+		gr := helpers.MustCastObject[*gatewayv1.GRPCRoute](object)
+
+		// keep all the parent statuses that belong to other controllers
+		newParents := make([]gatewayv1.RouteParentStatus, 0, len(status.Parents))
+		newParents = append(newParents, status.Parents...)
+		for _, os := range gr.Status.Parents {
+			if string(os.ControllerName) != gatewayCtlrName {
+				newParents = append(newParents, os)
+			}
+		}
+
+		fullStatus := status
+		fullStatus.Parents = newParents
+
+		if routeStatusEqual(gatewayCtlrName, gr.Status.Parents, fullStatus.Parents) {
+			return false
+		}
+
+		gr.Status = fullStatus
+
+		return true
+	}
+}
+
+func newTCPRouteStatusSetter(status gatewayv1.TCPRouteStatus, gatewayCtlrName string) Setter {
+	return func(object client.Object) (wasSet bool) {
+		tr := helpers.MustCastObject[*gatewayv1.TCPRoute](object)
+
+		// keep all the parent statuses that belong to other controllers
+		newParents := make([]gatewayv1.RouteParentStatus, 0, len(status.Parents)+len(tr.Status.Parents))
+		newParents = append(newParents, status.Parents...)
+		for _, os := range tr.Status.Parents {
+			if string(os.ControllerName) != gatewayCtlrName {
+				newParents = append(newParents, os)
+			}
+		}
+
+		fullStatus := status
+		fullStatus.Parents = newParents
+
+		if routeStatusEqual(gatewayCtlrName, tr.Status.Parents, fullStatus.Parents) {
+			return false
+		}
+
+		tr.Status = fullStatus
+
+		return true
+	}
+}
+
+func newUDPRouteStatusSetter(status gatewayv1.UDPRouteStatus, gatewayCtlrName string) Setter {
+	return func(object client.Object) (wasSet bool) {
+		ur := helpers.MustCastObject[*gatewayv1.UDPRoute](object)
+
+		// keep all the parent statuses that belong to other controllers
+		newParents := make([]gatewayv1.RouteParentStatus, 0, len(status.Parents)+len(ur.Status.Parents))
+		newParents = append(newParents, status.Parents...)
+		for _, os := range ur.Status.Parents {
+			if string(os.ControllerName) != gatewayCtlrName {
+				newParents = append(newParents, os)
+			}
+		}
+
+		fullStatus := status
+		fullStatus.Parents = newParents
+
+		if routeStatusEqual(gatewayCtlrName, ur.Status.Parents, fullStatus.Parents) {
+			return false
+		}
+
+		ur.Status = fullStatus
+
+		return true
+	}
+}
+
+func routeStatusEqual(gatewayCtlrName string, prevParents, curParents []gatewayv1.RouteParentStatus) bool {
+	// Since other controllers may update HTTPRoute status we can't assume anything about the order of the statuses,
+	// and we have to ignore statuses written by other controllers when checking for equality.
+	// Therefore, we can't use slices.EqualFunc here because it cares about the order.
+
+	// First, we check if the prev status has any RouteParentStatuses that are no longer present in the cur status.
+	for _, prevParent := range prevParents {
+		if prevParent.ControllerName != gatewayv1.GatewayController(gatewayCtlrName) {
+			continue
+		}
+
+		exists := slices.ContainsFunc(curParents, func(curParent gatewayv1.RouteParentStatus) bool {
+			return routeParentStatusEqual(prevParent, curParent)
+		})
+
+		if !exists {
+			return false
+		}
+	}
+
+	// Then, we check if the cur status has any RouteParentStatuses that are no longer present in the prev status.
+	for _, curParent := range curParents {
+		exists := slices.ContainsFunc(prevParents, func(prevParent gatewayv1.RouteParentStatus) bool {
+			return routeParentStatusEqual(curParent, prevParent)
+		})
+
+		if !exists {
+			return false
+		}
+	}
+
+	return true
+}
+
+func routeParentStatusEqual(p1, p2 gatewayv1.RouteParentStatus) bool {
+	if p1.ControllerName != p2.ControllerName {
+		return false
+	}
+
+	if p1.ParentRef.Name != p2.ParentRef.Name {
+		return false
+	}
+
+	if !helpers.EqualPointers(p1.ParentRef.Namespace, p2.ParentRef.Namespace) {
+		return false
+	}
+
+	if !helpers.EqualPointers(p1.ParentRef.SectionName, p2.ParentRef.SectionName) {
+		return false
+	}
+
+	if !helpers.EqualPointers(p1.ParentRef.Kind, p2.ParentRef.Kind) {
+		return false
+	}
+
+	return ConditionsEqual(p1.Conditions, p2.Conditions)
+}
+
+func newGatewayClassStatusSetter(status gatewayv1.GatewayClassStatus) Setter {
+	return func(obj client.Object) (wasSet bool) {
+		gc := helpers.MustCastObject[*gatewayv1.GatewayClass](obj)
+
+		if gcStatusEqual(gc.Status, status) {
+			return false
+		}
+
+		gc.Status = status
+		return true
+	}
+}
+
+func gcStatusEqual(prev, cur gatewayv1.GatewayClassStatus) bool {
+	if !ConditionsEqual(prev.Conditions, cur.Conditions) {
+		return false
+	}
+
+	return slices.EqualFunc(prev.SupportedFeatures, cur.SupportedFeatures, func(f1, f2 gatewayv1.SupportedFeature) bool {
+		return f1.Name == f2.Name
+	})
+}
+
+func newBackendTLSPolicyStatusSetter(
+	status gatewayv1.PolicyStatus,
+	gatewayCtlrName string,
+) Setter {
+	return func(object client.Object) (wasSet bool) {
+		btp := helpers.MustCastObject[*gatewayv1.BackendTLSPolicy](object)
+
+		// maxAncestors is the max number of ancestor statuses which is the sum of all new ancestor statuses and all old
+		// ancestor statuses.
+		maxAncestors := 1 + len(btp.Status.Ancestors)
+		ancestors := make([]gatewayv1.PolicyAncestorStatus, 0, maxAncestors)
+
+		// keep all the ancestor statuses that belong to other controllers
+		for _, os := range btp.Status.Ancestors {
+			if string(os.ControllerName) != gatewayCtlrName {
+				ancestors = append(ancestors, os)
+			}
+		}
+
+		ancestors = append(ancestors, status.Ancestors...)
+
+		fullStatus := status
+		fullStatus.Ancestors = ancestors
+
+		if policyStatusEqual(gatewayCtlrName, btp.Status, fullStatus) {
+			return false
+		}
+
+		btp.Status = fullStatus
+		return true
+	}
+}
+
+func newNGFPolicyStatusSetter(
+	status gatewayv1.PolicyStatus,
+	gatewayCtlrName string,
+) Setter {
+	return func(object client.Object) (wasSet bool) {
+		policy := helpers.MustCastObject[policies.Policy](object)
+		prevStatus := policy.GetPolicyStatus()
+
+		// maxAncestors is the max number of ancestor statuses which is the sum of all new ancestor statuses and all old
+		// ancestor statuses.
+		maxAncestors := len(status.Ancestors) + len(prevStatus.Ancestors)
+		ancestors := make([]gatewayv1.PolicyAncestorStatus, 0, maxAncestors)
+
+		// keep all the ancestor statuses that belong to other controllers
+		for _, as := range prevStatus.Ancestors {
+			if string(as.ControllerName) != gatewayCtlrName {
+				ancestors = append(ancestors, as)
+			}
+		}
+
+		ancestors = append(ancestors, status.Ancestors...)
+
+		fullStatus := status
+		fullStatus.Ancestors = ancestors
+
+		if policyStatusEqual(gatewayCtlrName, prevStatus, fullStatus) {
+			return false
+		}
+
+		policy.SetPolicyStatus(fullStatus)
+		return true
+	}
+}
+
+func policyStatusEqual(gatewayCtlrName string, prev, cur gatewayv1.PolicyStatus) bool {
+	// Since other controllers may update Policy status we can't assume anything about the order of the
+	// statuses, and we have to ignore statuses written by other controllers when checking for equality.
+	// Therefore, we can't use slices.EqualFunc here because it cares about the order.
+
+	// First, we check if the prev status has any PolicyAncestorStatuses that are no longer present in the cur status.
+	for _, prevAncestor := range prev.Ancestors {
+		if prevAncestor.ControllerName != gatewayv1.GatewayController(gatewayCtlrName) {
+			continue
+		}
+
+		exists := slices.ContainsFunc(cur.Ancestors, func(curAncestor gatewayv1.PolicyAncestorStatus) bool {
+			return ancestorStatusEqual(prevAncestor, curAncestor)
+		})
+
+		if !exists {
+			return false
+		}
+	}
+
+	// Then, we check if the cur status has any PolicyAncestorStatuses that are no longer present in the prev status.
+	for _, curParent := range cur.Ancestors {
+		exists := slices.ContainsFunc(prev.Ancestors, func(prevAncestor gatewayv1.PolicyAncestorStatus) bool {
+			return ancestorStatusEqual(curParent, prevAncestor)
+		})
+
+		if !exists {
+			return false
+		}
+	}
+
+	return true
+}
+
+// groupsEqual returns whether two API group pointers refer to the same API group.
+// Groups are considered equal if EqualPointers would consider them equal, or if they are
+// different representations of the Kubernetes core API group: nil, "", and "core" are all
+// treated as equivalent.
+func groupsEqual[T ~string](g1, g2 *T) bool {
+	normalize := func(g *T) T {
+		if g == nil {
+			return ""
+		}
+		if string(*g) == "core" {
+			return ""
+		}
+
+		return *g
+	}
+
+	return normalize(g1) == normalize(g2)
+}
+
+func ancestorStatusEqual(p1, p2 gatewayv1.PolicyAncestorStatus) bool {
+	if p1.ControllerName != p2.ControllerName {
+		return false
+	}
+
+	if p1.AncestorRef.Name != p2.AncestorRef.Name {
+		return false
+	}
+
+	if !helpers.EqualPointers(p1.AncestorRef.Namespace, p2.AncestorRef.Namespace) {
+		return false
+	}
+
+	if !groupsEqual(p1.AncestorRef.Group, p2.AncestorRef.Group) {
+		return false
+	}
+
+	if !helpers.EqualPointers(p1.AncestorRef.Kind, p2.AncestorRef.Kind) {
+		return false
+	}
+	// we ignore the rest of the AncestorRef fields because we do not set them
+
+	return ConditionsEqual(p1.Conditions, p2.Conditions)
+}
+
+func newSnippetsFilterStatusSetter(
+	snippetsFilterStatus ngfAPI.SnippetsFilterStatus,
+	gatewayCtlrName string,
+) Setter {
+	return func(obj client.Object) (wasSet bool) {
+		sf := helpers.MustCastObject[*ngfAPI.SnippetsFilter](obj)
+
+		// maxControllerStatus is the max number of controller statuses which is the sum of all new controller statuses
+		// and all old controller statuses.
+		maxControllerStatus := 1 + len(sf.Status.Controllers)
+		controllerStatuses := make([]ngfAPI.ControllerStatus, 0, maxControllerStatus)
+
+		for _, status := range sf.Status.Controllers {
+			if string(status.ControllerName) != gatewayCtlrName {
+				controllerStatuses = append(controllerStatuses, status)
+			}
+		}
+
+		controllerStatuses = append(controllerStatuses, snippetsFilterStatus.Controllers...)
+
+		fullStatus := snippetsFilterStatus
+		fullStatus.Controllers = controllerStatuses
+
+		if snippetsFilterStatusEqual(gatewayCtlrName, fullStatus.Controllers, sf.Status.Controllers) {
+			return false
+		}
+
+		sf.Status = fullStatus
+		return true
+	}
+}
+
+func snippetsFilterStatusEqual(gatewayCtlrName string, currStatus, prevStatus []ngfAPI.ControllerStatus) bool {
+	// Since other controllers may update snippetsFilter status we can't assume anything about the order of the statuses,
+	// and we have to ignore statuses written by other controllers when checking for equality.
+	// Therefore, we can't use slices.EqualFunc here because it cares about the order.
+
+	// First, we check if the prevStatus has any ControllerStatuses that are no longer present in the currStatus.
+	for _, prev := range prevStatus {
+		if prev.ControllerName != gatewayv1.GatewayController(gatewayCtlrName) {
+			continue
+		}
+
+		exists := slices.ContainsFunc(currStatus, func(currStatus ngfAPI.ControllerStatus) bool {
+			return snippetsStatusEqual(currStatus, prev)
+		})
+
+		if !exists {
+			return false
+		}
+	}
+
+	// Then, we check if the currStatus has any ControllerStatuses that are no longer present in the prevStatus.
+	for _, curr := range currStatus {
+		exists := slices.ContainsFunc(prevStatus, func(prevStatus ngfAPI.ControllerStatus) bool {
+			return snippetsStatusEqual(curr, prevStatus)
+		})
+
+		if !exists {
+			return false
+		}
+	}
+
+	return true
+}
+
+func snippetsStatusEqual(status1, status2 ngfAPI.ControllerStatus) bool {
+	if status1.ControllerName != status2.ControllerName {
+		return false
+	}
+
+	return ConditionsEqual(status1.Conditions, status2.Conditions)
+}
+
+func newAuthenticationFilterStatusSetter(afStatus ngfAPI.AuthenticationFilterStatus, gatewayCtlrName string) Setter {
+	return func(obj client.Object) (wasSet bool) {
+		af := helpers.MustCastObject[*ngfAPI.AuthenticationFilter](obj)
+
+		maxControllerStatus := 1 + len(af.Status.Controllers)
+		controllerStatuses := make([]ngfAPI.ControllerStatus, 0, maxControllerStatus)
+
+		for _, status := range af.Status.Controllers {
+			if string(status.ControllerName) != gatewayCtlrName {
+				controllerStatuses = append(controllerStatuses, status)
+			}
+		}
+
+		controllerStatuses = append(controllerStatuses, afStatus.Controllers...)
+
+		fullStatus := afStatus
+		fullStatus.Controllers = controllerStatuses
+
+		if authenticationFilterStatusEqual(gatewayCtlrName, fullStatus.Controllers, af.Status.Controllers) {
+			return false
+		}
+
+		af.Status = fullStatus
+		return true
+	}
+}
+
+func authenticationFilterStatusEqual(gatewayCtlrName string, currStatus, prevStatus []ngfAPI.ControllerStatus) bool {
+	for _, prev := range prevStatus {
+		if prev.ControllerName != gatewayv1.GatewayController(gatewayCtlrName) {
+			continue
+		}
+
+		exists := slices.ContainsFunc(currStatus, func(currStatus ngfAPI.ControllerStatus) bool {
+			return authenticationStatusEqual(currStatus, prev)
+		})
+
+		if !exists {
+			return false
+		}
+	}
+
+	for _, curr := range currStatus {
+		exists := slices.ContainsFunc(prevStatus, func(prevStatus ngfAPI.ControllerStatus) bool {
+			return authenticationStatusEqual(curr, prevStatus)
+		})
+
+		if !exists {
+			return false
+		}
+	}
+
+	return true
+}
+
+func authenticationStatusEqual(status1, status2 ngfAPI.ControllerStatus) bool {
+	if status1.ControllerName != status2.ControllerName {
+		return false
+	}
+
+	return ConditionsEqual(status1.Conditions, status2.Conditions)
+}
+
+func newExternalLoadBalancerStatusSetter(
+	elbStatus ngfAPI.ExternalLoadBalancerStatus,
+	gatewayCtlrName string,
+) Setter {
+	return func(obj client.Object) (wasSet bool) {
+		elb := helpers.MustCastObject[*ngfAPI.ExternalLoadBalancer](obj)
+
+		maxControllerStatus := 1 + len(elb.Status.Controllers)
+		controllerStatuses := make([]ngfAPI.ControllerStatus, 0, maxControllerStatus)
+
+		for _, status := range elb.Status.Controllers {
+			if string(status.ControllerName) != gatewayCtlrName {
+				controllerStatuses = append(controllerStatuses, status)
+			}
+		}
+
+		controllerStatuses = append(controllerStatuses, elbStatus.Controllers...)
+
+		fullStatus := elbStatus
+		fullStatus.Controllers = controllerStatuses
+
+		if externalLoadBalancerStatusEqual(gatewayCtlrName, fullStatus.Controllers, elb.Status.Controllers) {
+			return false
+		}
+
+		elb.Status = fullStatus
+		return true
+	}
+}
+
+func externalLoadBalancerStatusEqual(gatewayCtlrName string, currStatus, prevStatus []ngfAPI.ControllerStatus) bool {
+	for _, prev := range prevStatus {
+		if prev.ControllerName != gatewayv1.GatewayController(gatewayCtlrName) {
+			continue
+		}
+
+		exists := slices.ContainsFunc(currStatus, func(currStatus ngfAPI.ControllerStatus) bool {
+			return externalLoadBalancerControllerStatusEqual(currStatus, prev)
+		})
+
+		if !exists {
+			return false
+		}
+	}
+
+	for _, curr := range currStatus {
+		exists := slices.ContainsFunc(prevStatus, func(prevStatus ngfAPI.ControllerStatus) bool {
+			return externalLoadBalancerControllerStatusEqual(curr, prevStatus)
+		})
+
+		if !exists {
+			return false
+		}
+	}
+
+	return true
+}
+
+func externalLoadBalancerControllerStatusEqual(status1, status2 ngfAPI.ControllerStatus) bool {
+	if status1.ControllerName != status2.ControllerName {
+		return false
+	}
+
+	return ConditionsEqual(status1.Conditions, status2.Conditions)
+}
+
+func newListenerSetStatusSetter(lsStatus gatewayv1.ListenerSetStatus) Setter {
+	return func(obj client.Object) (wasSet bool) {
+		ls := helpers.MustCastObject[*gatewayv1.ListenerSet](obj)
+
+		if listenerSetStatusEqual(lsStatus, ls.Status) {
+			return false
+		}
+
+		ls.Status = lsStatus
+		return true
+	}
+}
+
+func listenerSetStatusEqual(status1, status2 gatewayv1.ListenerSetStatus) bool {
+	if !ConditionsEqual(status1.Conditions, status2.Conditions) {
+		return false
+	}
+
+	return slices.EqualFunc(status1.Listeners, status2.Listeners, listenerStatusEqual)
+}
+
+func listenerStatusEqual(listener1, listener2 gatewayv1.ListenerEntryStatus) bool {
+	if listener1.Name != listener2.Name {
+		return false
+	}
+	if listener1.AttachedRoutes != listener2.AttachedRoutes {
+		return false
+	}
+	if !slices.EqualFunc(listener1.SupportedKinds, listener2.SupportedKinds, supportedKindEqual) {
+		return false
+	}
+	return ConditionsEqual(listener1.Conditions, listener2.Conditions)
+}
+
+func supportedKindEqual(kind1, kind2 gatewayv1.RouteGroupKind) bool {
+	return kind1.Kind == kind2.Kind && helpers.EqualPointers(kind1.Group, kind2.Group)
+}
+
+func newInferencePoolStatusSetter(status inference.InferencePoolStatus) Setter {
+	return func(obj client.Object) (wasSet bool) {
+		ip := helpers.MustCastObject[*inference.InferencePool](obj)
+
+		// we build all the parent statuses at once so we can directly
+		// compare the previous and current statuses
+		if inferencePoolStatusEqual(ip.Status.Parents, status.Parents) {
+			return false
+		}
+
+		ip.Status = status
+		return true
+	}
+}
+
+func inferencePoolStatusEqual(prevParents, curParents []inference.ParentStatus) bool {
+	// Compare the previous and current parent statuses, ignoring order
+	// Check if any previous parent status is missing in the current status
+	for _, prevParent := range prevParents {
+		exists := slices.ContainsFunc(curParents, func(curParent inference.ParentStatus) bool {
+			return parentStatusEqual(prevParent, curParent)
+		})
+
+		if !exists {
+			return false
+		}
+	}
+
+	// Check if any current parent status is missing in the previous status
+	for _, curParent := range curParents {
+		exists := slices.ContainsFunc(prevParents, func(prevParent inference.ParentStatus) bool {
+			return parentStatusEqual(curParent, prevParent)
+		})
+
+		if !exists {
+			return false
+		}
+	}
+
+	return true
+}
+
+func parentStatusEqual(p1, p2 inference.ParentStatus) bool {
+	if p1.ParentRef.Name != p2.ParentRef.Name {
+		return false
+	}
+
+	if !helpers.EqualPointers(&p1.ParentRef.Namespace, &p2.ParentRef.Namespace) {
+		return false
+	}
+
+	if !helpers.EqualPointers(&p1.ParentRef.Kind, &p2.ParentRef.Kind) {
+		return false
+	}
+
+	if !groupsEqual(p1.ParentRef.Group, p2.ParentRef.Group) {
+		return false
+	}
+
+	return ConditionsEqual(p1.Conditions, p2.Conditions)
+}

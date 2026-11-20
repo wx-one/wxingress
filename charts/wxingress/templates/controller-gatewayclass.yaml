@@ -1,0 +1,14 @@
+{{- if and .Values.controller.gatewayAPI.enable .Values.controller.gatewayAPI.gatewayClass.create }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {{ .Values.controller.gatewayAPI.gatewayClass.name }}
+  labels:
+    {{- include "nginx-ingress.labels" . | nindent 4 }}
+  annotations:
+    # a hook, so that it comes after the CRDs installCRDs installs with it
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  controllerName: {{ .Values.controller.gatewayAPI.controllerName }}
+{{- end }}

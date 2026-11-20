@@ -1,0 +1,517 @@
+//go:build helmunit
+
+package test
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/gkampitakis/go-snaps/snaps"
+	"sigs.k8s.io/yaml"
+)
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+
+	// After all tests have run `go-snaps` will sort snapshots
+	snaps.Clean(m, snaps.CleanOpts{Sort: true})
+
+	os.Exit(code)
+}
+
+// An example of how to verify the rendered template object of a Helm Chart given various inputs.
+func TestHelmNICTemplate(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		valuesFile    string
+		releaseName   string
+		namespace     string
+		templateFiles []string
+	}{
+		"default values file": {
+			valuesFile:  "",
+			releaseName: "default",
+			namespace:   "default",
+		},
+		"admission-webhooks": {
+			valuesFile:  "testdata/admission-webhooks.yaml",
+			releaseName: "admission-webhooks",
+			namespace:   "default",
+		},
+		"admission-webhooks-cert-manager": {
+			valuesFile:  "testdata/admission-webhooks-cert-manager.yaml",
+			releaseName: "admission-webhooks-cert-manager",
+			namespace:   "default",
+		},
+		"gateway-api": {
+			valuesFile:  "testdata/gateway-api.yaml",
+			releaseName: "gateway-api",
+			namespace:   "default",
+		},
+		"deployment-hpa": {
+			valuesFile:  "testdata/deployment-hpa.yaml",
+			releaseName: "deployment-hpa",
+			namespace:   "default",
+		},
+		"deployment-hpa-no-create": {
+			valuesFile:  "testdata/deployment-hpa-no-create.yaml",
+			releaseName: "deployment-hpa-no-create",
+			namespace:   "default",
+		},
+		"daemonset": {
+			valuesFile:  "testdata/daemonset.yaml",
+			releaseName: "daemonset",
+			namespace:   "default",
+		},
+		"daemonset-readonly": {
+			valuesFile:  "testdata/daemonset-readonly.yaml",
+			releaseName: "daemonset-readonly",
+			namespace:   "default",
+		},
+		"statefulset": {
+			valuesFile:  "testdata/statefulset.yaml",
+			releaseName: "statefulset",
+			namespace:   "default",
+		},
+		"statefulset-readonly": {
+			valuesFile:  "testdata/statefulset-readonly.yaml",
+			releaseName: "statefulset-readonly",
+			namespace:   "default",
+		},
+		"statefulset-config": {
+			valuesFile:  "testdata/statefulset-config.yaml",
+			releaseName: "statefulset-config",
+			namespace:   "default",
+		},
+		"statefulset-no-storageclass": {
+			valuesFile:  "testdata/statefulset-no-storageclass.yaml",
+			releaseName: "statefulset-no-storageclass",
+			namespace:   "default",
+		},
+		"namespace": {
+			valuesFile:  "",
+			releaseName: "namespace",
+			namespace:   "nginx-ingress",
+		},
+		"plus": {
+			valuesFile:  "testdata/plus.yaml",
+			releaseName: "plus",
+			namespace:   "default",
+		},
+		"plus-debug": {
+			valuesFile:  "testdata/plus-debug.yaml",
+			releaseName: "plus-debug",
+			namespace:   "default",
+		},
+		"plus-mgmt": {
+			valuesFile:  "testdata/plus-mgmt.yaml",
+			releaseName: "plus-mgmt",
+			namespace:   "default",
+		},
+		"plus-mgmt-custom-endpoint": {
+			valuesFile:  "testdata/plus-mgmt-custom-endpoint.yaml",
+			releaseName: "plus-mgmt-custom-endpoint",
+			namespace:   "default",
+		},
+		"plus-mgmt-proxy-host": {
+			valuesFile:  "testdata/plus-mgmt-proxy-host.yaml",
+			releaseName: "plus-mgmt-proxy-host",
+			namespace:   "default",
+		},
+		"plus-mgmt-proxy-host-auth": {
+			valuesFile:  "testdata/plus-mgmt-proxy-host-auth.yaml",
+			releaseName: "plus-mgmt-proxy-host-auth",
+			namespace:   "default",
+		},
+		"ingressClass": {
+			valuesFile:  "testdata/ingress-class.yaml",
+			releaseName: "ingress-class",
+			namespace:   "default",
+		},
+		"globalConfig": {
+			valuesFile:  "testdata/global-configuration.yaml",
+			releaseName: "global-configuration",
+			namespace:   "gc",
+		},
+		"globalConfigCustomName": {
+			valuesFile:  "testdata/global-config-custom-name.yaml",
+			releaseName: "global-config-custom-name",
+			namespace:   "default",
+		},
+		"customResources": {
+			valuesFile:  "testdata/custom-resources.yaml",
+			releaseName: "custom-resources",
+			namespace:   "custom-resources",
+		},
+		"appProtectWAF": {
+			valuesFile:  "testdata/app-protect-waf.yaml",
+			releaseName: "appprotect-waf",
+			namespace:   "appprotect-waf",
+		},
+		"appProtectWAFV5": {
+			valuesFile:  "testdata/app-protect-wafv5.yaml",
+			releaseName: "appprotect-wafv5",
+			namespace:   "appprotect-wafv5",
+		},
+		"appProtectWAFV5Resources": {
+			valuesFile:  "testdata/app-protect-wafv5-resources.yaml",
+			releaseName: "appprotect-wafv5-resources",
+			namespace:   "appprotect-wafv5",
+		},
+		"appProtectWAFPLM": {
+			valuesFile:  "testdata/app-protect-waf-plm.yaml",
+			releaseName: "appprotect-waf-plm",
+			namespace:   "appprotect-waf-plm",
+		},
+		"appProtectDOS": {
+			valuesFile:  "testdata/app-protect-dos.yaml",
+			releaseName: "appprotect-dos",
+			namespace:   "appprotect-dos",
+		},
+		"ossAgentV3": {
+			valuesFile:  "testdata/oss-agentv3.yaml",
+			releaseName: "oss-agent",
+			namespace:   "default",
+		},
+		"plusAgentV3": {
+			valuesFile:  "testdata/plus-agentv3.yaml",
+			releaseName: "plus-agent",
+			namespace:   "default",
+		},
+		"plusAgentV3All": {
+			valuesFile:  "testdata/plus-agentv3-all.yaml",
+			releaseName: "plus-agent-all",
+			namespace:   "custom",
+		},
+		"appProtectWAFV5AgentV2": {
+			valuesFile:  "testdata/app-protect-wafv5-agentv2.yaml",
+			releaseName: "app-protect-wafv5-agentv2",
+			namespace:   "default",
+		},
+		"appProtectWAFV5AgentV3": {
+			valuesFile:  "testdata/app-protect-wafv5-agentv3.yaml",
+			releaseName: "app-protect-wafv5-agentv3",
+			namespace:   "default",
+		},
+		"appProtectWAFV4AgentV2": {
+			valuesFile:  "testdata/app-protect-waf-agentv2.yaml",
+			releaseName: "app-protect-waf-agentv2",
+			namespace:   "default",
+		},
+		"appProtectWAFV4AgentV3": {
+			valuesFile:  "testdata/app-protect-waf-agentv3.yaml",
+			releaseName: "app-protect-waf-agentv3",
+			namespace:   "default",
+		},
+		"startupStatusValid": {
+			valuesFile:  "testdata/startupstatus-valid.yaml",
+			releaseName: "startupstatus",
+			namespace:   "default",
+		},
+		"networkPolicyDisabled": {
+			valuesFile:  "testdata/network-policy-disabled.yaml",
+			releaseName: "network-policy-disabled",
+			namespace:   "default",
+		},
+		"networkPolicyIngress": {
+			valuesFile:  "testdata/network-policy-ingress.yaml",
+			releaseName: "network-policy-ingress",
+			namespace:   "default",
+		},
+		"networkPolicyIngressEgress": {
+			valuesFile:  "testdata/network-policy-ingress-egress.yaml",
+			releaseName: "network-policy-ingress-egress",
+			namespace:   "default",
+		},
+		"loadBalancerClass": {
+			valuesFile:  "testdata/service-loadbalancerclass.yaml",
+			releaseName: "loadbalancerclass",
+			namespace:   "default",
+		},
+		"nodePort": {
+			valuesFile:  "testdata/service-nodeport.yaml",
+			releaseName: "nodeport",
+			namespace:   "default",
+		},
+		"nodePortZero": {
+			valuesFile:  "testdata/service-nodeport-zero.yaml",
+			releaseName: "nodeport-zero",
+			namespace:   "default",
+		},
+		"additionalServices": {
+			valuesFile:    "testdata/additional-services.yaml",
+			releaseName:   "additional-services",
+			namespace:     "default",
+			templateFiles: []string{"templates/controller-additional-services.yaml"},
+		},
+		"additionalServicesCommonLabels": {
+			valuesFile:    "testdata/additional-services-common-labels.yaml",
+			releaseName:   "additional-services-common-labels",
+			namespace:     "default",
+			templateFiles: []string{"templates/controller-additional-services.yaml"},
+		},
+		"topologyAwareRouting": {
+			valuesFile:  "testdata/topology-aware-routing.yaml",
+			releaseName: "topology-aware-routing",
+			namespace:   "default",
+		},
+		"listConfigurations": {
+			valuesFile:  "testdata/list-configurations.yaml",
+			releaseName: "list-configs",
+			namespace:   "default",
+		},
+		"allowEmptyIngressHost": {
+			valuesFile:  "testdata/allow-empty-ingress-host.yaml",
+			releaseName: "allow-empty-ingress-host",
+			namespace:   "default",
+		},
+		"latencyMetricsBuckets": {
+			valuesFile:  "testdata/latency-metrics-buckets.yaml",
+			releaseName: "latency-metrics-buckets",
+			namespace:   "default",
+		},
+		"allowEmptyIngressHostWithoutCRs": {
+			valuesFile:  "testdata/allow-empty-ingress-host-no-crs.yaml",
+			releaseName: "allow-empty-ingress-host-no-crs",
+			namespace:   "default",
+		},
+		"defaultListenerPortsWithoutCRs": {
+			valuesFile:  "testdata/default-listener-ports-no-crs.yaml",
+			releaseName: "default-listener-ports-no-crs",
+			namespace:   "default",
+		},
+		"commonLabels": {
+			valuesFile:  "testdata/common-labels.yaml",
+			releaseName: "common-labels",
+			namespace:   "default",
+		},
+	}
+
+	// Path to the helm chart we will test
+	helmChartPath, err := filepath.Abs("../wxingress")
+	if err != nil {
+		t.Fatal("Failed to open helm chart path ../wxingress")
+	}
+
+	for testName, tc := range tests {
+		t.Run(testName, func(t *testing.T) {
+			options := helmOptions{namespace: tc.namespace}
+
+			if tc.valuesFile != "" {
+				options.valuesFiles = []string{tc.valuesFile}
+			}
+
+			var extraArgs []string
+			for _, f := range tc.templateFiles {
+				extraArgs = append(extraArgs, "--show-only", f)
+			}
+
+			output := renderTemplate(t, helmChartPath, tc.releaseName, options, extraArgs...)
+
+			assertNoDuplicateYAMLKeys(t, output)
+
+			snaps.MatchSnapshot(t, output)
+			t.Log(output)
+		})
+	}
+}
+
+// assertNoDuplicateYAMLKeys fails the test if any rendered manifest contains
+// a duplicate mapping key (e.g. a label set by both commonLabels and an
+// extraLabels field). Such manifests are invalid YAML: the duplicate is
+// silently dropped by last-wins parsing instead of being rejected, so a
+// plain string/snapshot comparison would not catch it.
+func assertNoDuplicateYAMLKeys(t *testing.T, output string) {
+	t.Helper()
+
+	for _, doc := range strings.Split(output, "\n---\n") {
+		if strings.TrimSpace(doc) == "" {
+			continue
+		}
+		var out map[string]interface{}
+		if err := yaml.UnmarshalStrict([]byte(doc), &out); err != nil {
+			t.Fatalf("rendered manifest contains invalid YAML (likely a duplicate key): %v\n%s", err, doc)
+		}
+	}
+}
+
+// Test for negative cases where helm template rendering should fail
+func TestHelmNICTemplateNegative(t *testing.T) {
+	t.Parallel()
+
+	negativeTests := map[string]struct {
+		valuesFile        string
+		releaseName       string
+		namespace         string
+		expectedErrorMsgs []string
+	}{
+		"startupStatusInvalid": {
+			valuesFile:        "testdata/startupstatus-invalid.yaml",
+			releaseName:       "startupstatus-invalid",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"missing properties 'port', 'path'"},
+		},
+		"globalConfigInvalidFormat": {
+			valuesFile:        "testdata/global-config-invalid-format.yaml",
+			releaseName:       "global-config-invalid-format",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"globalConfiguration.customName must contain exactly one '/' separator in namespace/name format (e.g., \"my-namespace/my-global-config\")"},
+		},
+		"globalConfigMultipleSlashes": {
+			valuesFile:        "testdata/global-config-multiple-slashes.yaml",
+			releaseName:       "global-config-multiple-slashes",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"globalConfiguration.customName must contain exactly one '/' separator in namespace/name format (e.g., \"my-namespace/my-global-config\")"},
+		},
+		"globalConfigEmptyName": {
+			valuesFile:        "testdata/global-config-empty-name.yaml",
+			releaseName:       "global-config-empty-name",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"globalConfiguration.customName namespace and name parts cannot be empty (e.g., \"my-namespace/my-global-config\")"},
+		},
+		"additionalServiceWithoutPorts": {
+			valuesFile:        "testdata/additional-service-without-ports.yaml",
+			releaseName:       "additional-service-without-ports",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"missing property 'ports'"},
+		},
+		"additionalServiceExternalName": {
+			valuesFile:        "testdata/additional-service-external-name.yaml",
+			releaseName:       "additional-service-external-name",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"value must be one of 'ClusterIP', 'NodePort', 'LoadBalancer'"},
+		},
+		"additionalServiceEmptyPorts": {
+			valuesFile:        "testdata/additional-service-empty-ports.yaml",
+			releaseName:       "additional-service-empty-ports",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"minItems: got 0, want 1"},
+		},
+		"additionalServiceNameCollision": {
+			valuesFile:        "testdata/additional-service-name-collision.yaml",
+			releaseName:       "additional-service-name-collision",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"additional Service name \"duplicate-service\" must not match the primary controller Service name"},
+		},
+		"additionalServiceInvalidName": {
+			valuesFile:        "testdata/additional-service-invalid-name.yaml",
+			releaseName:       "additional-service-invalid-name",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"'Invalid_Name' does not match pattern"},
+		},
+		"additionalServiceReservedLabel": {
+			valuesFile:        "testdata/additional-service-reserved-label.yaml",
+			releaseName:       "additional-service-reserved-label",
+			namespace:         "default",
+			expectedErrorMsgs: []string{`label "app.kubernetes.io/managed-by" is managed by the chart and cannot be overridden`},
+		},
+		"latencyMetricsBucketsInvalid": {
+			valuesFile:        "testdata/latency-metrics-buckets-invalid.yaml",
+			releaseName:       "latency-metrics-buckets-invalid",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"does not match pattern"},
+		},
+		"appProtectWAFPLMWithoutV5": {
+			valuesFile:        "testdata/app-protect-waf-plm-without-v5.yaml",
+			releaseName:       "appprotect-waf-plm-without-v5",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"controller.appprotect.plmStorage.url requires controller.appprotect.v5=true"},
+		},
+		"commonLabelsReserved": {
+			valuesFile:        "testdata/common-labels-reserved.yaml",
+			releaseName:       "common-labels-reserved",
+			namespace:         "default",
+			expectedErrorMsgs: []string{`label "app.kubernetes.io/name" is managed by the chart and cannot be overridden`},
+		},
+		"appProtectWAFPLMWithoutPlus": {
+			valuesFile:        "testdata/app-protect-waf-plm-without-plus.yaml",
+			releaseName:       "appprotect-waf-plm-without-plus",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"controller.appprotect.plmStorage.url requires controller.nginxplus=true"},
+		},
+		"appProtectWAFPLMWithoutAppProtect": {
+			valuesFile:        "testdata/app-protect-waf-plm-without-appprotect.yaml",
+			releaseName:       "appprotect-waf-plm-without-appprotect",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"controller.appprotect.plmStorage.url requires controller.appprotect.enable=true"},
+		},
+		"appProtectWAFPLMWithoutCredentials": {
+			valuesFile:        "testdata/app-protect-waf-plm-without-credentials.yaml",
+			releaseName:       "appprotect-waf-plm-without-credentials",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"controller.appprotect.plmStorage.credentialsSecret must be set when controller.appprotect.plmStorage.url is set"},
+		},
+		"appProtectWAFPLMWithoutURL": {
+			valuesFile:        "testdata/app-protect-waf-plm-without-url.yaml",
+			releaseName:       "appprotect-waf-plm-without-url",
+			namespace:         "default",
+			expectedErrorMsgs: []string{"controller.appprotect.plmStorage auxiliary values require controller.appprotect.plmStorage.url"},
+		},
+	}
+
+	// Path to the helm chart we will test
+	helmChartPath, err := filepath.Abs("../wxingress")
+	if err != nil {
+		t.Fatal("Failed to open helm chart path ../wxingress")
+	}
+
+	for testName, tc := range negativeTests {
+		t.Run(testName, func(t *testing.T) {
+			options := helmOptions{namespace: tc.namespace}
+
+			if tc.valuesFile != "" {
+				options.valuesFiles = []string{tc.valuesFile}
+			}
+			_, err := renderTemplateE(helmChartPath, tc.releaseName, options)
+
+			if err == nil {
+				t.Fatalf("Expected helm template to fail for invalid configuration, but it succeeded")
+			}
+
+			if len(tc.expectedErrorMsgs) > 0 {
+				for _, expectedMsg := range tc.expectedErrorMsgs {
+					if !strings.Contains(err.Error(), expectedMsg) {
+						t.Fatalf("Expected error to contain '%s', but got: %s", expectedMsg, err.Error())
+					}
+				}
+			}
+
+			t.Logf("Expected failure occurred: %s", err.Error())
+		})
+	}
+}
+
+// TestHelmNICNetworkPolicyLegacyValues renders the chart with legacy values
+// that omit controller.networkPolicy, the state a release ends up in on
+// `helm upgrade --reuse-values` from a version that predates the feature.
+func TestHelmNICNetworkPolicyLegacyValues(t *testing.T) {
+	t.Parallel()
+
+	helmChartPath, err := filepath.Abs("../wxingress")
+	if err != nil {
+		t.Fatal("Failed to open helm chart path ../wxingress")
+	}
+
+	options := helmOptions{
+		namespace:   "default",
+		valuesFiles: []string{"testdata/network-policy-legacy-values.yaml"},
+	}
+
+	// The values.schema.json types networkPolicy as "object" and rejects an
+	// explicit null; the real --reuse-values path skips this check because the
+	// key is simply absent.
+	output, err := renderTemplateE(helmChartPath, "network-policy-legacy", options, "--skip-schema-validation")
+	if err != nil {
+		t.Fatalf("helm template must succeed when controller.networkPolicy is absent, got: %v", err)
+	}
+
+	if strings.Contains(output, "kind: NetworkPolicy") {
+		t.Fatalf("expected no NetworkPolicy resource when controller.networkPolicy is absent, rendered output:\n%s", output)
+	}
+	if strings.Contains(output, "controller-networkpolicy.yaml") {
+		t.Fatalf("expected controller-networkpolicy.yaml to render empty, rendered output:\n%s", output)
+	}
+}

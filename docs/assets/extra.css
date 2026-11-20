@@ -1,0 +1,6 @@
+/* the makers' logos: light and dark variants follow the colour scheme */
+.makers { display: flex; flex-wrap: wrap; gap: 2.5rem; align-items: center; margin: 1rem 0 1.5rem; }
+.makers img { height: 90px; width: auto; }
+[data-md-color-scheme="default"] .only-dark { display: none; }
+[data-md-color-scheme="slate"] .only-light { display: none; }
+.hero-numbers td:last-child { font-weight: 700; }

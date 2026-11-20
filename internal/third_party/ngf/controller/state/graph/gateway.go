@@ -1,0 +1,505 @@
+package graph
+
+import (
+	"fmt"
+
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	v1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPIv1alpha1 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/config"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/conditions"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/resolver"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/controller"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+)
+
+// Gateway represents a Gateway resource.
+type Gateway struct {
+	// LatestReloadResult is the result of the last nginx reload attempt.
+	LatestReloadResult NginxReloadResult
+	// AttachedListenerSets contains the ListenerSets that are attached and accepted by this Gateway.
+	AttachedListenerSets map[types.NamespacedName]*ListenerSet
+	// Source is the corresponding Gateway resource.
+	Source *v1.Gateway
+	// NginxProxy is the NginxProxy referenced by this Gateway.
+	NginxProxy *NginxProxy
+	// EffectiveNginxProxy holds the result of merging the NginxProxySpec on this resource with the NginxProxySpec on
+	// the GatewayClass resource. This is the effective set of config that should be applied to the Gateway.
+	// If non-nil, then this config is valid.
+	EffectiveNginxProxy *EffectiveNginxProxy
+	// SecretRef is the namespaced name of the secret referenced by the Gateway for backend TLS.
+	SecretRef *types.NamespacedName
+	// ExternalLoadBalancer is the ExternalLoadBalancer resource attached to this Gateway.
+	ExternalLoadBalancer *ngfAPIv1alpha1.ExternalLoadBalancer
+	// ListenerNamespaces holds the allowed listener namespaces for this Gateway, if specified.
+	ListenerNamespaces *v1.ListenerNamespaces
+	// ListenerFactory is used to create listeners for this Gateway. This is used to validate
+	// listeners when they are created by the Gateway's Listeners, or merged via ListenerSets.
+	ListenerFactory *listenerConfiguratorFactory
+	// DeploymentName is the name of the nginx Deployment associated with this Gateway.
+	DeploymentName types.NamespacedName
+	// Listeners include the listeners of the Gateway.
+	Listeners []*Listener
+	// Conditions holds the conditions for the Gateway.
+	Conditions []conditions.Condition
+	// Policies holds the policies attached to the Gateway.
+	Policies []*Policy
+	// Valid indicates whether the Gateway Spec is valid.
+	Valid bool
+}
+
+// processGateways determines which Gateway resources belong to NGF (determined by the Gateway GatewayClassName field).
+func processGateways(
+	gws map[types.NamespacedName]*v1.Gateway,
+	gcName string,
+) map[types.NamespacedName]*v1.Gateway {
+	referencedGws := make(map[types.NamespacedName]*v1.Gateway)
+
+	for gwNsName, gw := range gws {
+		if string(gw.Spec.GatewayClassName) != gcName {
+			continue
+		}
+
+		referencedGws[gwNsName] = gw
+	}
+
+	if len(referencedGws) == 0 {
+		return nil
+	}
+
+	return referencedGws
+}
+
+func buildGateways(
+	gws map[types.NamespacedName]*v1.Gateway,
+	resourceResolver resolver.Resolver,
+	gc *GatewayClass,
+	refGrantResolver *referenceGrantResolver,
+	nps map[types.NamespacedName]*NginxProxy,
+) map[types.NamespacedName]*Gateway {
+	if len(gws) == 0 {
+		return nil
+	}
+
+	builtGateways := make(map[types.NamespacedName]*Gateway, len(gws))
+
+	for gwNsName, gw := range gws {
+		var np *NginxProxy
+		var npNsName types.NamespacedName
+		var listenerNamespaces *v1.ListenerNamespaces
+		if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
+			npNsName = types.NamespacedName{Namespace: gw.Namespace, Name: gw.Spec.Infrastructure.ParametersRef.Name}
+			np = nps[npNsName]
+		}
+
+		var gcNp *NginxProxy
+		if gc != nil {
+			gcNp = gc.NginxProxy
+		}
+
+		effectiveNginxProxy := buildEffectiveNginxProxy(gcNp, np)
+
+		conds, valid, secretRefNsName := validateGateway(gw, gc, np, resourceResolver, refGrantResolver)
+
+		protectedPorts := buildProtectedPorts(effectiveNginxProxy)
+
+		deploymentName := types.NamespacedName{
+			Namespace: gw.GetNamespace(),
+			Name:      controller.CreateNginxResourceName(gw.GetName(), string(gw.Spec.GatewayClassName)),
+		}
+
+		if gw.Spec.AllowedListeners != nil && gw.Spec.AllowedListeners.Namespaces != nil {
+			listenerNamespaces = gw.Spec.AllowedListeners.Namespaces
+		}
+
+		if !valid {
+			builtGateways[gwNsName] = &Gateway{
+				Source:              gw,
+				Valid:               false,
+				NginxProxy:          np,
+				EffectiveNginxProxy: effectiveNginxProxy,
+				Conditions:          conds,
+				DeploymentName:      deploymentName,
+				SecretRef:           secretRefNsName,
+				ListenerNamespaces:  listenerNamespaces,
+			}
+		} else {
+			gateway := &Gateway{
+				Source:              gw,
+				NginxProxy:          np,
+				EffectiveNginxProxy: effectiveNginxProxy,
+				Valid:               true,
+				Conditions:          conds,
+				DeploymentName:      deploymentName,
+				SecretRef:           secretRefNsName,
+				ListenerNamespaces:  listenerNamespaces,
+				ListenerFactory:     newListenerConfiguratorFactory(gw, resourceResolver, refGrantResolver, protectedPorts),
+			}
+			gateway.Listeners = buildListeners(gateway, gw.Spec.Listeners, gwNsName, types.NamespacedName{})
+			builtGateways[gwNsName] = gateway
+		}
+	}
+
+	return builtGateways
+}
+
+// validateGatewayRefs validates both parametersRef and TLS fields.
+func validateGatewayRefs(
+	gw *v1.Gateway,
+	npCfg *NginxProxy,
+	resourceResolver resolver.Resolver,
+	refGrantResolver *referenceGrantResolver,
+) ([]conditions.Condition, *types.NamespacedName) {
+	if (gw.Spec.Infrastructure == nil || gw.Spec.Infrastructure.ParametersRef == nil) &&
+		(gw.Spec.TLS == nil || gw.Spec.TLS.Backend == nil) {
+		return nil, nil
+	}
+
+	conds, parametersRefErrMsg := validateParametersRef(gw, npCfg)
+	paramsRefValid := len(conds) == 0
+
+	var backendSecretNsName *types.NamespacedName
+	var backendTLSCond conditions.Condition
+
+	if gw.Spec.TLS != nil {
+		path := field.NewPath("spec.tls")
+
+		if gw.Spec.TLS.Backend != nil {
+			backendPath := path.Child("backend")
+			backendTLSCond, backendSecretNsName = validateGatewayTLSBackend(
+				gw,
+				backendPath,
+				resourceResolver,
+				refGrantResolver,
+			)
+		}
+	}
+	tlsValid := backendTLSCond == conditions.Condition{}
+
+	switch {
+	case paramsRefValid && tlsValid:
+		conds = append(conds, conditions.NewGatewayResolvedRefs())
+	case !tlsValid:
+		conds = append(conds, backendTLSCond)
+	default:
+		conds = append(conds, conditions.NewGatewayRefInvalid(parametersRefErrMsg))
+	}
+
+	return conds, backendSecretNsName
+}
+
+// validateParametersRef validates the parametersRef field of the Gateway.
+func validateParametersRef(gw *v1.Gateway, npCfg *NginxProxy) ([]conditions.Condition, string) {
+	var conds []conditions.Condition
+	var parametersRefErrMsg string
+
+	if gw.Spec.Infrastructure != nil && gw.Spec.Infrastructure.ParametersRef != nil {
+		path := field.NewPath("spec.infrastructure.parametersRef")
+		ref := *gw.Spec.Infrastructure.ParametersRef
+		if _, ok := supportedParamKinds[string(ref.Kind)]; !ok {
+			err := field.NotSupported(path.Child("kind"), string(ref.Kind), []string{kinds.NginxProxy})
+			parametersRefErrMsg = helpers.CapitalizeString(err.Error())
+			conds = append(conds, conditions.NewGatewayInvalidParameters(parametersRefErrMsg))
+		} else if npCfg == nil {
+			err := field.NotFound(path.Child("name"), ref.Name)
+			parametersRefErrMsg = helpers.CapitalizeString(err.Error())
+			conds = append(conds, conditions.NewGatewayInvalidParameters(parametersRefErrMsg))
+		} else if !npCfg.Valid {
+			parametersRefErrMsg = helpers.CapitalizeString(npCfg.ErrMsgs.ToAggregate().Error())
+			conds = append(conds, conditions.NewGatewayInvalidParameters(parametersRefErrMsg))
+		}
+	}
+
+	return conds, parametersRefErrMsg
+}
+
+func validateGatewayTLSBackend(
+	gw *v1.Gateway,
+	path *field.Path,
+	resourceResolver resolver.Resolver,
+	refGrantResolver *referenceGrantResolver,
+) (conditions.Condition, *types.NamespacedName) {
+	backend := gw.Spec.TLS.Backend
+	if backend.ClientCertificateRef == nil {
+		return conditions.Condition{}, nil
+	}
+
+	if backend.ClientCertificateRef.Kind != nil &&
+		*backend.ClientCertificateRef.Kind != kinds.Secret {
+		valErr := field.NotSupported(
+			path.Child("clientCertificateRef", "kind"),
+			*backend.ClientCertificateRef.Kind, []string{kinds.Secret},
+		)
+		msg := helpers.CapitalizeString(valErr.Error())
+
+		return conditions.NewGatewaySecretRefInvalid(msg), nil
+	}
+
+	if backend.ClientCertificateRef.Group != nil &&
+		*backend.ClientCertificateRef.Group != "" && *backend.ClientCertificateRef.Group != "core" {
+		valErr := field.NotSupported(
+			path.Child("clientCertificateRef", "group"),
+			*backend.ClientCertificateRef.Group, []string{"core", ""},
+		)
+		msg := helpers.CapitalizeString(valErr.Error())
+
+		return conditions.NewGatewaySecretRefInvalid(msg), nil
+	}
+
+	secretNsName, secretNs := getGatewayCertSecretNsName(gw)
+	if err := resourceResolver.Resolve(resolver.ResourceTypeSecret, *secretNsName); err != nil {
+		valErr := field.Invalid(path.Child("clientCertificateRef"), secretNsName, err.Error())
+		msg := helpers.CapitalizeString(valErr.Error())
+
+		return conditions.NewGatewaySecretRefInvalid(msg), nil
+	} else if secretNs != gw.Namespace {
+		if !refGrantResolver.refAllowed(toSecret(*secretNsName), fromGateway(gw.Namespace)) {
+			msg := fmt.Sprintf("secret ref %s not permitted by any ReferenceGrant", secretNsName)
+
+			return conditions.NewGatewayRefNotPermitted(msg), nil
+		}
+	}
+
+	return conditions.Condition{}, secretNsName
+}
+
+func validateGateway(
+	gw *v1.Gateway,
+	gc *GatewayClass,
+	npCfg *NginxProxy,
+	resourceResolver resolver.Resolver,
+	refGrantResolver *referenceGrantResolver,
+) ([]conditions.Condition, bool, *types.NamespacedName) {
+	var conds []conditions.Condition
+
+	if gc == nil {
+		conds = append(conds, conditions.NewGatewayInvalid("The GatewayClass doesn't exist")...)
+	} else if !gc.Valid {
+		conds = append(conds, conditions.NewGatewayInvalid("The GatewayClass is invalid")...)
+	}
+
+	// Set the unaccepted conditions here, because those make the gateway invalid. We set the unprogrammed conditions
+	// elsewhere, because those do not make the gateway invalid.
+	for _, address := range gw.Spec.Addresses {
+		if address.Type == nil {
+			conds = append(conds, conditions.NewGatewayUnsupportedAddress("The AddressType must be specified"))
+		} else if *address.Type != v1.IPAddressType {
+			conds = append(conds, conditions.NewGatewayUnsupportedAddress("Only AddressType IPAddress is supported"))
+		}
+	}
+
+	// Evaluate validity before validating refs
+	valid := len(conds) == 0
+
+	// Validate unsupported fields - these are warnings, don't affect validity
+	conds = append(conds, validateUnsupportedGatewayFields(gw)...)
+
+	// Validate referenced resources
+	refsConds, secretRefNsName := validateGatewayRefs(gw, npCfg, resourceResolver, refGrantResolver)
+	conds = append(conds, refsConds...)
+
+	return conds, valid, secretRefNsName
+}
+
+// getGatewayCertSecretNsName returns the NamespacedName of the secret referenced by the Gateway for backend TLS.
+func getGatewayCertSecretNsName(gw *v1.Gateway) (*types.NamespacedName, string) {
+	gatewayCert := gw.Spec.TLS.Backend.ClientCertificateRef
+	secretRefNs := gw.Namespace
+	if gatewayCert.Namespace != nil {
+		secretRefNs = string(*gatewayCert.Namespace)
+	}
+	return &types.NamespacedName{
+		Namespace: secretRefNs,
+		Name:      string(gatewayCert.Name),
+	}, secretRefNs
+}
+
+// GetReferencedSnippetsFilters returns all SnippetsFilters that are referenced by routes attached to this Gateway.
+func (g *Gateway) GetReferencedSnippetsFilters(
+	routes map[RouteKey]*L7Route,
+	allSnippetsFilters map[types.NamespacedName]*SnippetsFilter,
+) map[types.NamespacedName]*SnippetsFilter {
+	if len(routes) == 0 || len(allSnippetsFilters) == 0 {
+		return nil
+	}
+
+	gatewayNsName := client.ObjectKeyFromObject(g.Source)
+	referencedSnippetsFilters := make(map[types.NamespacedName]*SnippetsFilter)
+
+	for _, route := range routes {
+		if !route.Valid || !g.isRouteAttachedToGateway(route, gatewayNsName) {
+			continue
+		}
+
+		g.collectSnippetsFiltersFromRoute(route, allSnippetsFilters, referencedSnippetsFilters)
+	}
+
+	if len(referencedSnippetsFilters) == 0 {
+		return nil
+	}
+
+	return referencedSnippetsFilters
+}
+
+// GetReferencedRateLimitPolicies returns all RateLimitPolicies that target routes attached to this Gateway.
+// RateLimitPolicies that target the Gateway directly are excluded.
+func (g *Gateway) GetReferencedRateLimitPolicies(
+	routes map[RouteKey]*L7Route,
+	allPolicies map[PolicyKey]*Policy,
+) map[PolicyKey]*Policy {
+	if len(allPolicies) == 0 {
+		return nil
+	}
+
+	gatewayNsName := client.ObjectKeyFromObject(g.Source)
+	referencedRateLimitPolicies := make(map[PolicyKey]*Policy)
+
+	// Create a lookup map of routes attached to this gateway for efficient checking
+	attachedRoutes := g.buildAttachedRoutes(routes, gatewayNsName)
+
+	// Iterate through all policies and check their target references
+	for policyKey, policy := range allPolicies {
+		// Skip invalid policies or policies invalid for this gateway
+		if _, ok := policy.InvalidForGateways[gatewayNsName]; ok {
+			continue
+		}
+
+		if !policy.Valid || policyKey.GVK.Kind != kinds.RateLimitPolicy {
+			continue
+		}
+
+		// Check all target references in a single loop
+		targetsGateway, targetsAttachedRoute := checkPolicyTargetRefs(policy, gatewayNsName, attachedRoutes)
+
+		// Only include policies that target attached routes but NOT the gateway
+		if targetsAttachedRoute && !targetsGateway {
+			referencedRateLimitPolicies[policyKey] = policy
+		}
+	}
+
+	if len(referencedRateLimitPolicies) == 0 {
+		return nil
+	}
+
+	return referencedRateLimitPolicies
+}
+
+func (g *Gateway) buildAttachedRoutes(
+	routes map[RouteKey]*L7Route,
+	gatewayNsName client.ObjectKey,
+) map[types.NamespacedName]struct{} {
+	attachedRoutes := make(map[types.NamespacedName]struct{})
+	for _, route := range routes {
+		if !route.Valid || !g.isRouteAttachedToGateway(route, gatewayNsName) {
+			continue
+		}
+		routeNsName := client.ObjectKeyFromObject(route.Source)
+		attachedRoutes[routeNsName] = struct{}{}
+	}
+
+	return attachedRoutes
+}
+
+func checkPolicyTargetRefs(
+	policy *Policy,
+	gatewayNsName types.NamespacedName,
+	attachedRoutes map[types.NamespacedName]struct{},
+) (bool, bool) {
+	var targetsGateway, targetsAttachedRoute bool
+
+	for _, targetRef := range policy.TargetRefs {
+		// Check if targeting this gateway directly
+		if targetRef.Kind == kinds.Gateway && targetRef.Nsname == gatewayNsName {
+			targetsGateway = true
+			break // No need to check further if it targets the gateway
+		}
+
+		// Check if targeting a route attached to this gateway
+		if targetRef.Kind == kinds.HTTPRoute || targetRef.Kind == kinds.GRPCRoute {
+			if _, exists := attachedRoutes[targetRef.Nsname]; exists {
+				targetsAttachedRoute = true
+				// Don't break here, we still need to check if any other targetRef targets the gateway
+			}
+		}
+	}
+
+	return targetsGateway, targetsAttachedRoute
+}
+
+// isRouteAttachedToGateway checks if the given route is attached to this gateway.
+// A route is considered attached if it references the gateway directly, or if it
+// references a ListenerSet that is attached to this gateway.
+func (g *Gateway) isRouteAttachedToGateway(route *L7Route, gatewayNsName types.NamespacedName) bool {
+	for _, parentRef := range route.ParentRefs {
+		if parentRef.Kind == kinds.Gateway && parentRef.NamespacedName == gatewayNsName {
+			return true
+		}
+
+		if parentRef.Kind == kinds.ListenerSet {
+			if _, exists := g.AttachedListenerSets[parentRef.NamespacedName]; exists {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// collectSnippetsFiltersFromRoute extracts SnippetsFilters from a single route's rules.
+func (g *Gateway) collectSnippetsFiltersFromRoute(
+	route *L7Route,
+	allSnippetsFilters map[types.NamespacedName]*SnippetsFilter,
+	referencedFilters map[types.NamespacedName]*SnippetsFilter,
+) {
+	for _, rule := range route.Spec.Rules {
+		if !rule.Filters.Valid {
+			continue
+		}
+
+		for _, filter := range rule.Filters.Filters {
+			if filter.FilterType != FilterExtensionRef ||
+				filter.ResolvedExtensionRef == nil ||
+				filter.ResolvedExtensionRef.SnippetsFilter == nil {
+				continue
+			}
+
+			sf := filter.ResolvedExtensionRef.SnippetsFilter
+			nsName := client.ObjectKeyFromObject(sf.Source)
+
+			// Only include if it exists in the cluster-wide map and is valid
+			// Using the cluster-wide version ensures consistency and avoids duplicates
+			if clusterSF, exists := allSnippetsFilters[nsName]; exists && clusterSF.Valid {
+				referencedFilters[nsName] = clusterSF
+			}
+		}
+	}
+}
+
+// buildProtectedPorts creates protected ports from an EffectiveNginxProxy configuration.
+func buildProtectedPorts(effectiveNginxProxy *EffectiveNginxProxy) ProtectedPorts {
+	protectedPorts := make(ProtectedPorts)
+	if port, enabled := MetricsEnabledForNginxProxy(effectiveNginxProxy); enabled {
+		metricsPort := config.DefaultNginxMetricsPort
+		if port != nil {
+			metricsPort = *port
+		}
+		protectedPorts[metricsPort] = "MetricsPort"
+	}
+	return protectedPorts
+}
+
+func validateUnsupportedGatewayFields(gw *v1.Gateway) []conditions.Condition {
+	var conds []conditions.Condition
+
+	if gw.Spec.DefaultScope != "" {
+		conds = append(conds, conditions.NewGatewayAcceptedUnsupportedField(field.Forbidden(
+			field.NewPath("spec", "defaultScope"),
+			"DefaultScope",
+		).Error()))
+	}
+
+	return conds
+}

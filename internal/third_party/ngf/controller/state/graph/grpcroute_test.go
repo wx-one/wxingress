@@ -1,0 +1,2731 @@
+package graph
+
+import (
+	"errors"
+	"fmt"
+	"testing"
+
+	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	v1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPIv1alpha1 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/conditions"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/mirror"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/validation"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/validation/validationfakes"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+)
+
+func createGRPCMethodMatch(
+	serviceName,
+	methodName,
+	methodType string,
+	sp *v1.SessionPersistence,
+	backendRef []v1.GRPCBackendRef,
+) v1.GRPCRouteRule {
+	var mt *v1.GRPCMethodMatchType
+	if methodType != "nilType" {
+		mt = (*v1.GRPCMethodMatchType)(&methodType)
+	}
+	matches := []v1.GRPCRouteMatch{
+		{
+			Method: &v1.GRPCMethodMatch{
+				Type:    mt,
+				Service: &serviceName,
+				Method:  &methodName,
+			},
+		},
+	}
+
+	if sp != nil {
+		return v1.GRPCRouteRule{
+			Matches:            matches,
+			SessionPersistence: sp,
+			BackendRefs:        backendRef,
+		}
+	}
+
+	return v1.GRPCRouteRule{
+		Matches: matches,
+	}
+}
+
+func createGRPCHeadersMatch(headerType, headerName, headerValue string) v1.GRPCRouteRule {
+	matches := []v1.GRPCRouteMatch{
+		{
+			Headers: []v1.GRPCHeaderMatch{
+				{
+					Type:  (*v1.GRPCHeaderMatchType)(&headerType),
+					Name:  v1.GRPCHeaderName(headerName),
+					Value: headerValue,
+				},
+			},
+		},
+	}
+
+	return v1.GRPCRouteRule{
+		Matches: matches,
+	}
+}
+
+func createGRPCRoute(
+	name string,
+	refName string,
+	hostname v1.Hostname,
+	parentRefKind v1.Kind,
+	rules []v1.GRPCRouteRule,
+) *v1.GRPCRoute {
+	return &v1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test",
+			Name:      name,
+		},
+		Spec: v1.GRPCRouteSpec{
+			CommonRouteSpec: v1.CommonRouteSpec{
+				ParentRefs: []v1.ParentReference{
+					{
+						Namespace:   helpers.GetPointer[v1.Namespace]("test"),
+						Name:        v1.ObjectName(refName),
+						SectionName: helpers.GetPointer[v1.SectionName](v1.SectionName(sectionNameOfCreateHTTPRoute)),
+						Kind:        helpers.GetPointer(parentRefKind),
+					},
+				},
+			},
+			Hostnames: []v1.Hostname{hostname},
+			Rules:     rules,
+		},
+	}
+}
+
+func TestBuildGRPCRoutes(t *testing.T) {
+	t.Parallel()
+	gwNsName := types.NamespacedName{Namespace: "test", Name: "gateway"}
+
+	gateways := map[types.NamespacedName]*Gateway{
+		gwNsName: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test",
+					Name:      "gateway",
+				},
+			},
+			Valid: true,
+			EffectiveNginxProxy: &EffectiveNginxProxy{
+				DisableHTTP2: helpers.GetPointer(false),
+			},
+		},
+	}
+
+	listenerSets := map[types.NamespacedName]*ListenerSet{
+		{Namespace: "test", Name: "listener-set"}: {
+			Source: &v1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test",
+					Name:      "listener-set",
+				},
+			},
+			Valid: true,
+		},
+	}
+
+	snippetsFilterRef := v1.GRPCRouteFilter{
+		Type: v1.GRPCRouteFilterExtensionRef,
+		ExtensionRef: &v1.LocalObjectReference{
+			Name:  "sf",
+			Kind:  kinds.SnippetsFilter,
+			Group: ngfAPIv1alpha1.GroupName,
+		},
+	}
+
+	authenticationFilterRef := v1.GRPCRouteFilter{
+		Type: v1.GRPCRouteFilterExtensionRef,
+		ExtensionRef: &v1.LocalObjectReference{
+			Name:  "af",
+			Kind:  kinds.AuthenticationFilter,
+			Group: ngfAPIv1alpha1.GroupName,
+		},
+	}
+
+	requestHeaderFilter := v1.GRPCRouteFilter{
+		Type:                  v1.GRPCRouteFilterRequestHeaderModifier,
+		RequestHeaderModifier: &v1.HTTPHeaderFilter{},
+	}
+
+	unNamedSPConfig := v1.SessionPersistence{
+		AbsoluteTimeout: helpers.GetPointer(v1.Duration("10m")),
+		Type:            helpers.GetPointer(v1.CookieBasedSessionPersistence),
+		CookieConfig: &v1.CookieConfig{
+			LifetimeType: helpers.GetPointer(v1.PermanentCookieLifetimeType),
+		},
+	}
+
+	grpcBackendRef := v1.GRPCBackendRef{
+		BackendRef: v1.BackendRef{
+			BackendObjectReference: v1.BackendObjectReference{
+				Kind:      helpers.GetPointer[v1.Kind]("Service"),
+				Name:      "grpc-service",
+				Namespace: helpers.GetPointer[v1.Namespace]("test"),
+				Port:      helpers.GetPointer[v1.PortNumber](80),
+			},
+		},
+	}
+
+	grRuleWithFiltersAndSessionPersistence := v1.GRPCRouteRule{
+		Filters:            []v1.GRPCRouteFilter{snippetsFilterRef, authenticationFilterRef, requestHeaderFilter},
+		SessionPersistence: &unNamedSPConfig,
+		BackendRefs:        []v1.GRPCBackendRef{grpcBackendRef},
+	}
+
+	gr := createGRPCRoute(
+		"gr-1",
+		gwNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{grRuleWithFiltersAndSessionPersistence},
+	)
+	grLSParentRef := createGRPCRoute(
+		"gr-ls-parent-ref",
+		"listener-set",
+		"example.com",
+		v1.Kind(kinds.ListenerSet),
+		[]v1.GRPCRouteRule{grRuleWithFiltersAndSessionPersistence},
+	)
+
+	grWrongGateway := createGRPCRoute("gr-2", "some-gateway", "example.com", v1.Kind(kinds.Gateway), []v1.GRPCRouteRule{})
+
+	grRoutes := map[types.NamespacedName]*v1.GRPCRoute{
+		client.ObjectKeyFromObject(gr):             gr,
+		client.ObjectKeyFromObject(grWrongGateway): grWrongGateway,
+		client.ObjectKeyFromObject(grLSParentRef):  grLSParentRef,
+	}
+
+	sf := &ngfAPIv1alpha1.SnippetsFilter{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test",
+			Name:      "sf",
+		},
+		Spec: ngfAPIv1alpha1.SnippetsFilterSpec{
+			Snippets: []ngfAPIv1alpha1.Snippet{
+				{
+					Context: ngfAPIv1alpha1.NginxContextHTTP,
+					Value:   "http snippet",
+				},
+			},
+		},
+	}
+
+	af := &ngfAPIv1alpha1.AuthenticationFilter{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test",
+			Name:      "af",
+		},
+		Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+			Basic: &ngfAPIv1alpha1.BasicAuth{
+				SecretRef: ngfAPIv1alpha1.LocalObjectReference{
+					Name: "test-secret",
+				},
+				Realm: "test-realm",
+			},
+		},
+	}
+
+	tests := []struct {
+		expected map[RouteKey]*L7Route
+		gateways map[types.NamespacedName]*Gateway
+		name     string
+	}{
+		{
+			gateways: gateways,
+			expected: map[RouteKey]*L7Route{
+				CreateRouteKey(gr): {
+					RouteType: RouteTypeGRPC,
+					Source:    gr,
+					ParentRefs: []ParentRef{
+						{
+							Idx:                 0,
+							EffectiveNginxProxy: gateways[gwNsName].EffectiveNginxProxy,
+							SectionName:         gr.Spec.ParentRefs[0].SectionName,
+							Kind:                v1.Kind(kinds.Gateway),
+							NamespacedName:      gwNsName,
+							GatewayNsName:       gwNsName,
+						},
+					},
+					Valid:      true,
+					Attachable: true,
+					Spec: L7RouteSpec{
+						Hostnames: gr.Spec.Hostnames,
+						Rules: []RouteRule{
+							{
+								Matches: ConvertGRPCMatches(gr.Spec.Rules[0].Matches),
+								Filters: RouteRuleFilters{
+									Valid: true,
+									Filters: []Filter{
+										{
+											ExtensionRef: snippetsFilterRef.ExtensionRef,
+											ResolvedExtensionRef: &ExtensionRefFilter{
+												SnippetsFilter: &SnippetsFilter{
+													Source: sf,
+													Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+														ngfAPIv1alpha1.NginxContextHTTP: "http snippet",
+													},
+													Valid:      true,
+													Referenced: true,
+												},
+												Valid: true,
+											},
+											RouteType:  RouteTypeGRPC,
+											FilterType: FilterExtensionRef,
+										},
+										{
+											ExtensionRef: authenticationFilterRef.ExtensionRef,
+											ResolvedExtensionRef: &ExtensionRefFilter{
+												AuthenticationFilter: &AuthenticationFilter{
+													Source:     af,
+													Valid:      true,
+													Referenced: true,
+												},
+												Valid: true,
+											},
+											RouteType:  RouteTypeGRPC,
+											FilterType: FilterExtensionRef,
+										},
+										{
+											RequestHeaderModifier: &v1.HTTPHeaderFilter{},
+											RouteType:             RouteTypeGRPC,
+											FilterType:            FilterRequestHeaderModifier,
+										},
+									},
+								},
+								ValidMatches: true,
+								RouteBackendRefs: []RouteBackendRef{
+									{
+										BackendRef: v1.BackendRef{
+											BackendObjectReference: grpcBackendRef.BackendObjectReference,
+										},
+										SessionPersistence: &SessionPersistenceConfig{
+											Valid:       true,
+											Name:        "sp_gr-1_test_0",
+											SessionType: *unNamedSPConfig.Type,
+											Expiry:      "10m",
+											Idx:         "gr-1_test_0",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				CreateRouteKey(grLSParentRef): {
+					RouteType: RouteTypeGRPC,
+					Source:    grLSParentRef,
+					ParentRefs: []ParentRef{
+						{
+							Idx:         0,
+							SectionName: grLSParentRef.Spec.ParentRefs[0].SectionName,
+							Kind:        v1.Kind(kinds.ListenerSet),
+							NamespacedName: types.NamespacedName{
+								Namespace: "test",
+								Name:      "listener-set",
+							},
+						},
+					},
+					Valid:      true,
+					Attachable: true,
+					Spec: L7RouteSpec{
+						Hostnames: grLSParentRef.Spec.Hostnames,
+						Rules: []RouteRule{
+							{
+								Matches: ConvertGRPCMatches(grLSParentRef.Spec.Rules[0].Matches),
+								Filters: RouteRuleFilters{
+									Valid: true,
+									Filters: []Filter{
+										{
+											ExtensionRef: snippetsFilterRef.ExtensionRef,
+											ResolvedExtensionRef: &ExtensionRefFilter{
+												SnippetsFilter: &SnippetsFilter{
+													Source: sf,
+													Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+														ngfAPIv1alpha1.NginxContextHTTP: "http snippet",
+													},
+													Valid:      true,
+													Referenced: true,
+												},
+												Valid: true,
+											},
+											RouteType:  RouteTypeGRPC,
+											FilterType: FilterExtensionRef,
+										},
+										{
+											ExtensionRef: authenticationFilterRef.ExtensionRef,
+											ResolvedExtensionRef: &ExtensionRefFilter{
+												AuthenticationFilter: &AuthenticationFilter{
+													Source:     af,
+													Valid:      true,
+													Referenced: true,
+												},
+												Valid: true,
+											},
+											RouteType:  RouteTypeGRPC,
+											FilterType: FilterExtensionRef,
+										},
+										{
+											RequestHeaderModifier: &v1.HTTPHeaderFilter{},
+											RouteType:             RouteTypeGRPC,
+											FilterType:            FilterRequestHeaderModifier,
+										},
+									},
+								},
+								ValidMatches: true,
+								RouteBackendRefs: []RouteBackendRef{
+									{
+										BackendRef: v1.BackendRef{
+											BackendObjectReference: grpcBackendRef.BackendObjectReference,
+										},
+										SessionPersistence: &SessionPersistenceConfig{
+											Valid:       true,
+											Name:        "sp_gr-ls-parent-ref_test_0",
+											SessionType: *unNamedSPConfig.Type,
+											Expiry:      "10m",
+											Idx:         "gr-ls-parent-ref_test_0",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			name: "normal case",
+		},
+		{
+			gateways: nil,
+			expected: nil,
+			name:     "no gateways",
+		},
+	}
+
+	createAllValidValidator := func() *validationfakes.HTTPFieldsValidatorMock {
+		v := &validationfakes.HTTPFieldsValidatorMock{}
+		v.ValidateDurationFunc = func(string) (string, error) {
+			return "10m", nil
+		}
+		return v
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			snippetsFilters := map[types.NamespacedName]*SnippetsFilter{
+				client.ObjectKeyFromObject(sf): {
+					Source: sf,
+					Valid:  true,
+					Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+						ngfAPIv1alpha1.NginxContextHTTP: "http snippet",
+					},
+				},
+			}
+
+			authenticationFilters := map[types.NamespacedName]*AuthenticationFilter{
+				client.ObjectKeyFromObject(af): {
+					Source: af,
+					Valid:  true,
+				},
+			}
+
+			routes := buildRoutesForGateways(
+				createAllValidValidator(),
+				map[types.NamespacedName]*v1.HTTPRoute{},
+				grRoutes,
+				test.gateways,
+				snippetsFilters,
+				authenticationFilters,
+				nil,
+				FeatureFlags{
+					Plus:         true,
+					Experimental: true,
+				},
+				listenerSets,
+			)
+			g.Expect(helpers.Diff(test.expected, routes)).To(BeEmpty())
+		})
+	}
+}
+
+func TestBuildGRPCRoute(t *testing.T) {
+	t.Parallel()
+
+	gw := &Gateway{
+		Source: &v1.Gateway{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "test",
+				Name:      "gateway",
+			},
+		},
+		Valid: true,
+		EffectiveNginxProxy: &EffectiveNginxProxy{
+			DisableHTTP2: helpers.GetPointer(false),
+		},
+	}
+	gatewayNsName := client.ObjectKeyFromObject(gw.Source)
+
+	listenerSetParentRef := v1.ParentReference{
+		Namespace:   helpers.GetPointer[v1.Namespace]("test"),
+		Name:        "listener-set",
+		SectionName: helpers.GetPointer[v1.SectionName]("ls-l1"),
+		Kind:        helpers.GetPointer[v1.Kind](kinds.ListenerSet),
+	}
+
+	listenerSets := map[types.NamespacedName]*ListenerSet{
+		{Namespace: "test", Name: "listener-set"}: {
+			Source: &v1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test",
+					Name:      "listener-set",
+				},
+			},
+			Valid: true,
+		},
+	}
+	backendRef := v1.BackendRef{
+		BackendObjectReference: v1.BackendObjectReference{
+			Kind:      helpers.GetPointer[v1.Kind]("Service"),
+			Name:      "service1",
+			Namespace: helpers.GetPointer[v1.Namespace]("test"),
+			Port:      helpers.GetPointer[v1.PortNumber](80),
+		},
+	}
+
+	grpcBackendRef := v1.GRPCBackendRef{
+		BackendRef: backendRef,
+	}
+
+	spMethod := &v1.SessionPersistence{
+		SessionName:     helpers.GetPointer("grpc-method-session"),
+		AbsoluteTimeout: helpers.GetPointer(v1.Duration("10h")),
+		Type:            helpers.GetPointer(v1.CookieBasedSessionPersistence),
+		CookieConfig: &v1.CookieConfig{
+			LifetimeType: helpers.GetPointer(v1.PermanentCookieLifetimeType),
+		},
+	}
+
+	methodMatchRule := createGRPCMethodMatch(
+		"myService",
+		"myMethod",
+		"Exact",
+		spMethod,
+		[]v1.GRPCBackendRef{grpcBackendRef},
+	)
+	headersMatchRule := createGRPCHeadersMatch("Exact", "MyHeader", "SomeValue")
+
+	methodMatchEmptyFields := createGRPCMethodMatch("", "", "", nil, nil)
+	methodMatchInvalidFields := createGRPCMethodMatch("service{}", "method{}", "Exact", nil, nil)
+	methodMatchNilType := createGRPCMethodMatch("myService", "myMethod", "nilType", nil, nil)
+	headersMatchInvalid := createGRPCHeadersMatch("", "MyHeader", "SomeValue")
+
+	headersMatchEmptyType := v1.GRPCRouteRule{
+		Matches: []v1.GRPCRouteMatch{
+			{
+				Headers: []v1.GRPCHeaderMatch{
+					{
+						Name:  v1.GRPCHeaderName("MyHeader"),
+						Value: "SomeValue",
+					},
+				},
+			},
+		},
+	}
+
+	grBoth := createGRPCRoute(
+		"gr-1",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{methodMatchRule, headersMatchRule},
+	)
+
+	grEmptyMatch := createGRPCRoute(
+		"gr-1",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{{BackendRefs: []v1.GRPCBackendRef{grpcBackendRef}}},
+	)
+
+	grInvalidHostname := createGRPCRoute(
+		"gr-1",
+		gatewayNsName.Name,
+		"",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{methodMatchRule},
+	)
+	grNotNGF := createGRPCRoute(
+		"gr",
+		"some-gateway",
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{methodMatchRule},
+	)
+
+	grInvalidMatchesEmptyMethodFields := createGRPCRoute(
+		"gr-1",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{methodMatchEmptyFields},
+	)
+	grInvalidMatchesInvalidMethodFields := createGRPCRoute(
+		"gr-1",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{methodMatchInvalidFields},
+	)
+	grInvalidMatchesNilMethodType := createGRPCRoute(
+		"gr-1",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{methodMatchNilType},
+	)
+	grInvalidHeadersInvalidType := createGRPCRoute(
+		"gr-1",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{headersMatchInvalid},
+	)
+
+	grInvalidHeadersEmptyType := createGRPCRoute(
+		"gr-1",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{headersMatchEmptyType},
+	)
+	grOneInvalid := createGRPCRoute(
+		"gr-1",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{methodMatchRule, headersMatchInvalid},
+	)
+
+	grValidWithUnsupportedField := createGRPCRoute(
+		"gr-valid-unsupported",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{
+			{
+				Name: helpers.GetPointer[v1.SectionName]("unsupported-name"),
+				Matches: []v1.GRPCRouteMatch{
+					{
+						Method: &v1.GRPCMethodMatch{
+							Type:    helpers.GetPointer(v1.GRPCMethodMatchExact),
+							Service: helpers.GetPointer("myService"),
+							Method:  helpers.GetPointer("myMethod"),
+						},
+					},
+				},
+			},
+		},
+	)
+
+	grInvalidWithUnsupportedField := createGRPCRoute(
+		"gr-invalid-unsupported",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{
+			{
+				Name: helpers.GetPointer[v1.SectionName]("unsupported-name"),
+				Matches: []v1.GRPCRouteMatch{
+					{
+						Method: &v1.GRPCMethodMatch{
+							Type:    helpers.GetPointer(v1.GRPCMethodMatchExact),
+							Service: helpers.GetPointer(""),
+							Method:  helpers.GetPointer(""),
+						},
+					},
+				},
+			},
+		},
+	)
+
+	grDuplicateSectionName := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{methodMatchRule},
+	)
+	grDuplicateSectionName.Spec.ParentRefs = append(
+		grDuplicateSectionName.Spec.ParentRefs,
+		grDuplicateSectionName.Spec.ParentRefs[0],
+	)
+
+	grInvalidFilterRule := createGRPCMethodMatch("myService", "myMethod", "Exact", nil, nil)
+
+	grInvalidFilterRule.Filters = []v1.GRPCRouteFilter{
+		{
+			Type: "InvalidFilter",
+		},
+	}
+
+	grInvalidFilter := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{grInvalidFilterRule},
+	)
+
+	grValidFilterRule := createGRPCMethodMatch("myService", "myMethod", "Exact", nil, nil)
+	grValidHeaderMatch := createGRPCHeadersMatch("RegularExpression", "MyHeader", "headers-[a-z]+")
+	validSnippetsFilterRef := &v1.LocalObjectReference{
+		Group: ngfAPIv1alpha1.GroupName,
+		Kind:  kinds.SnippetsFilter,
+		Name:  "sf",
+	}
+
+	grpcRouteFilters := []v1.GRPCRouteFilter{
+		{
+			Type: "RequestHeaderModifier",
+			RequestHeaderModifier: &v1.HTTPHeaderFilter{
+				Remove: []string{"header"},
+			},
+		},
+		{
+			Type: "ResponseHeaderModifier",
+			ResponseHeaderModifier: &v1.HTTPHeaderFilter{
+				Add: []v1.HTTPHeader{
+					{Name: "Accept-Encoding", Value: "gzip"},
+				},
+			},
+		},
+		{
+			Type:         v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: validSnippetsFilterRef,
+		},
+	}
+
+	grValidFilterRule.Filters = grpcRouteFilters
+	grValidHeaderMatch.Filters = grpcRouteFilters
+
+	grValidFilter := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{grValidFilterRule, grValidHeaderMatch},
+	)
+
+	// route with invalid snippets filter extension ref
+	grInvalidSnippetsFilterRule := createGRPCMethodMatch("myService", "myMethod", "Exact", nil, nil)
+	grInvalidSnippetsFilterRule.Filters = []v1.GRPCRouteFilter{
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: "wrong",
+				Kind:  kinds.SnippetsFilter,
+				Name:  "sf",
+			},
+		},
+	}
+	grInvalidSnippetsFilter := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{grInvalidSnippetsFilterRule},
+	)
+
+	// route with unresolvable snippets filter extension ref
+	grUnresolvableSnippetsFilterRule := createGRPCMethodMatch("myService", "myMethod", "Exact", nil, nil)
+	grUnresolvableSnippetsFilterRule.Filters = []v1.GRPCRouteFilter{
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: ngfAPIv1alpha1.GroupName,
+				Kind:  kinds.SnippetsFilter,
+				Name:  "does-not-exist",
+			},
+		},
+	}
+	grUnresolvableSnippetsFilter := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{grUnresolvableSnippetsFilterRule},
+	)
+
+	// route with two invalid snippets filter extensions refs: (1) invalid group (2) unresolvable
+	grInvalidAndUnresolvableSnippetsFilterRule := createGRPCMethodMatch("myService", "myMethod", "Exact", nil, nil)
+	grInvalidAndUnresolvableSnippetsFilterRule.Filters = []v1.GRPCRouteFilter{
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: ngfAPIv1alpha1.GroupName,
+				Kind:  kinds.SnippetsFilter,
+				Name:  "does-not-exist",
+			},
+		},
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: "wrong",
+				Kind:  kinds.SnippetsFilter,
+				Name:  "sf",
+			},
+		},
+	}
+	grInvalidAndUnresolvableSnippetsFilter := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{grInvalidAndUnresolvableSnippetsFilterRule},
+	)
+
+	// route with invalid authentication filter extension ref
+	grInvalidAuthenticationFilterRule := createGRPCMethodMatch("myService", "myMethod", "Exact", nil, nil)
+	grInvalidAuthenticationFilterRule.Filters = []v1.GRPCRouteFilter{
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: "wrong",
+				Kind:  kinds.AuthenticationFilter,
+				Name:  "af",
+			},
+		},
+	}
+	grInvalidAuthenticationFilter := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{grInvalidAuthenticationFilterRule},
+	)
+
+	// route with unresolvable authentication filter extension ref
+	grUnresolvableAuthenticationFilterRule := createGRPCMethodMatch("myService", "myMethod", "Exact", nil, nil)
+	grUnresolvableAuthenticationFilterRule.Filters = []v1.GRPCRouteFilter{
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: ngfAPIv1alpha1.GroupName,
+				Kind:  kinds.AuthenticationFilter,
+				Name:  "does-not-exist",
+			},
+		},
+	}
+	grUnresolvableAuthenticationFilter := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{grUnresolvableAuthenticationFilterRule},
+	)
+
+	// route with two invalid authentication filter extensions refs: (1) invalid group (2) unresolvable
+	grInvalidAndUnresolvableAuthenticationFilterRule := createGRPCMethodMatch("myService", "myMethod", "Exact", nil, nil)
+	grInvalidAndUnresolvableAuthenticationFilterRule.Filters = []v1.GRPCRouteFilter{
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: "wrong",
+				Kind:  kinds.AuthenticationFilter,
+				Name:  "af",
+			},
+		},
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: ngfAPIv1alpha1.GroupName,
+				Kind:  kinds.AuthenticationFilter,
+				Name:  "does-not-exist",
+			},
+		},
+	}
+	grInvalidAndUnresolvableAuthenticationFilter := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{grInvalidAndUnresolvableAuthenticationFilterRule},
+	)
+
+	// route with one valid and one invalid authentication filter extensions ref: (1) invalid group (2) valid
+	grInvalidAndValidAuthenticationFilterRule := createGRPCMethodMatch("myService", "myMethod", "Exact", nil, nil)
+	grInvalidAndValidAuthenticationFilterRule.Filters = []v1.GRPCRouteFilter{
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: "wrong",
+				Kind:  kinds.AuthenticationFilter,
+				Name:  "af-wrong-group",
+			},
+		},
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: ngfAPIv1alpha1.GroupName,
+				Kind:  kinds.AuthenticationFilter,
+				Name:  "af",
+			},
+		},
+	}
+	grInvalidAndValidAuthenticationFilter := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{grInvalidAndValidAuthenticationFilterRule},
+	)
+
+	// route with one valid and one unresolved authentication filter extensions ref: (1) unresolved (2) valid
+	grUnresolvedAndValidAuthenticationFilterRule := createGRPCMethodMatch("myService", "myMethod", "Exact", nil, nil)
+	grUnresolvedAndValidAuthenticationFilterRule.Filters = []v1.GRPCRouteFilter{
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: ngfAPIv1alpha1.GroupName,
+				Kind:  kinds.AuthenticationFilter,
+				Name:  "does-not-exist",
+			},
+		},
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: ngfAPIv1alpha1.GroupName,
+				Kind:  kinds.AuthenticationFilter,
+				Name:  "af",
+			},
+		},
+	}
+	grUnresolvedAndValidAuthenticationFilter := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{grUnresolvedAndValidAuthenticationFilterRule},
+	)
+
+	// route with two valid authentication filter extensions refs
+	grTwoValidAuthenticationFilterRule := createGRPCMethodMatch("myService", "myMethod", "Exact", nil, nil)
+	grTwoValidAuthenticationFilterRule.Filters = []v1.GRPCRouteFilter{
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: ngfAPIv1alpha1.GroupName,
+				Kind:  kinds.AuthenticationFilter,
+				Name:  "af",
+			},
+		},
+		{
+			Type: v1.GRPCRouteFilterExtensionRef,
+			ExtensionRef: &v1.LocalObjectReference{
+				Group: ngfAPIv1alpha1.GroupName,
+				Kind:  kinds.AuthenticationFilter,
+				Name:  "af2",
+			},
+		},
+	}
+	grTwoValidAuthenticationFilter := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{grTwoValidAuthenticationFilterRule},
+	)
+
+	// Valid GRPCRoute with ListenerSet parent ref
+	grValidWithListenerSetParentRef := createGRPCRoute(
+		"gr",
+		"listener-set",
+		"example.com",
+		v1.Kind(kinds.ListenerSet),
+		[]v1.GRPCRouteRule{methodMatchRule},
+	)
+	grValidWithListenerSetParentRef.Spec.ParentRefs[0] = listenerSetParentRef
+
+	createAllValidValidator := func() *validationfakes.HTTPFieldsValidatorMock {
+		return &validationfakes.HTTPFieldsValidatorMock{
+			SkipValidationFunc:                 func() bool { return false },
+			ValidatePathInMatchFunc:            func(string) error { return nil },
+			ValidatePathInRegexMatchFunc:       func(string) error { return nil },
+			ValidateHeaderNameInMatchFunc:      func(string) error { return nil },
+			ValidateHeaderValueInMatchFunc:     func(string) error { return nil },
+			ValidateQueryParamNameInMatchFunc:  func(string) error { return nil },
+			ValidateQueryParamValueInMatchFunc: func(string) error { return nil },
+			ValidateMethodInMatchFunc:          func(string) (bool, []string) { return true, nil },
+			ValidateFilterHeaderNameFunc:       func(string) error { return nil },
+			ValidateFilterHeaderValueFunc:      func(string) error { return nil },
+			ValidateHostnameFunc:               func(string) error { return nil },
+			ValidatePathFunc:                   func(string) error { return nil },
+		}
+	}
+
+	createDurationValidator := func(duration *v1.Duration) *validationfakes.HTTPFieldsValidatorMock {
+		v := createAllValidValidator()
+
+		if duration == nil {
+			v.ValidateDurationFunc = func(string) (string, error) {
+				return "", nil
+			}
+		} else {
+			v.ValidateDurationFunc = func(string) (string, error) {
+				return string(*duration), nil
+			}
+		}
+		return v
+	}
+
+	routeFilters := []Filter{
+		{
+			RouteType:  RouteTypeGRPC,
+			FilterType: FilterRequestHeaderModifier,
+			RequestHeaderModifier: &v1.HTTPHeaderFilter{
+				Remove: []string{"header"},
+			},
+		},
+		{
+			RouteType:  RouteTypeGRPC,
+			FilterType: FilterResponseHeaderModifier,
+			ResponseHeaderModifier: &v1.HTTPHeaderFilter{
+				Add: []v1.HTTPHeader{
+					{Name: "Accept-Encoding", Value: "gzip"},
+				},
+			},
+		},
+		{
+			RouteType:    RouteTypeGRPC,
+			FilterType:   FilterExtensionRef,
+			ExtensionRef: validSnippetsFilterRef,
+			ResolvedExtensionRef: &ExtensionRefFilter{
+				SnippetsFilter: &SnippetsFilter{
+					Valid:      true,
+					Referenced: true,
+				},
+				Valid: true,
+			},
+		},
+	}
+
+	durationSP := v1.Duration("10h")
+	tests := []struct {
+		validator          *validationfakes.HTTPFieldsValidatorMock
+		gr                 *v1.GRPCRoute
+		expected           *L7Route
+		name               string
+		plus, experimental bool
+	}{
+		{
+			validator: createDurationValidator(&durationSP),
+			gr:        grBoth,
+			expected: &L7Route{
+				RouteType: RouteTypeGRPC,
+				Source:    grBoth,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grBoth.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Valid:      true,
+				Attachable: true,
+				Spec: L7RouteSpec{
+					Hostnames: grBoth.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches: ConvertGRPCMatches(grBoth.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{
+								{
+									BackendRef: grpcBackendRef.BackendRef,
+									SessionPersistence: &SessionPersistenceConfig{
+										Valid:       true,
+										Name:        "grpc-method-session",
+										SessionType: v1.CookieBasedSessionPersistence,
+										Expiry:      "10h",
+										Idx:         "gr-1_test_0",
+									},
+								},
+							},
+						},
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches:          ConvertGRPCMatches(grBoth.Spec.Rules[1].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			plus:         true,
+			experimental: true,
+			name:         "normal case with both",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grEmptyMatch,
+			expected: &L7Route{
+				RouteType: RouteTypeGRPC,
+				Source:    grEmptyMatch,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grEmptyMatch.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Valid:      true,
+				Attachable: true,
+				Spec: L7RouteSpec{
+					Hostnames: grEmptyMatch.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches:          ConvertGRPCMatches(grEmptyMatch.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{{BackendRef: backendRef}},
+						},
+					},
+				},
+			},
+			name: "valid rule with empty match",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grValidFilter,
+			expected: &L7Route{
+				RouteType: RouteTypeGRPC,
+				Source:    grValidFilter,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grValidFilter.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Valid:      true,
+				Attachable: true,
+				Spec: L7RouteSpec{
+					Hostnames: grValidFilter.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches:     true,
+							Matches:          ConvertGRPCMatches(grValidFilter.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: routeFilters,
+							},
+						},
+						{
+							ValidMatches: true,
+							Matches:      ConvertGRPCMatches(grValidFilter.Spec.Rules[1].Matches),
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: routeFilters,
+							},
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "valid path rule, headers with filters",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grInvalidMatchesEmptyMethodFields,
+			expected: &L7Route{
+				RouteType:  RouteTypeGRPC,
+				Source:     grInvalidMatchesEmptyMethodFields,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidMatchesEmptyMethodFields.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						`All rules are invalid: ` +
+							`[spec.rules[0].matches[0].method.type: Unsupported value: "": supported values: "Exact",` +
+							` spec.rules[0].matches[0].method.service: Required value: service is required,` +
+							` spec.rules[0].matches[0].method.method: Required value: method is required]`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grInvalidMatchesEmptyMethodFields.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: false,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches:          ConvertGRPCMatches(grInvalidMatchesEmptyMethodFields.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "invalid matches with empty method fields",
+		},
+		{
+			validator: func() *validationfakes.HTTPFieldsValidatorMock {
+				validator := createAllValidValidator()
+				validator.ValidatePathInMatchFunc = func(string) error {
+					return errors.New("invalid path value")
+				}
+				return validator
+			}(),
+			gr: grInvalidMatchesInvalidMethodFields,
+			expected: &L7Route{
+				RouteType:  RouteTypeGRPC,
+				Source:     grInvalidMatchesInvalidMethodFields,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidMatchesInvalidMethodFields.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						`All rules are invalid: ` +
+							`[spec.rules[0].matches[0].method.service: Invalid value: "service{}": invalid path value,` +
+							` spec.rules[0].matches[0].method.method: Invalid value: "method{}": invalid path value]`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grInvalidMatchesInvalidMethodFields.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: false,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches:          ConvertGRPCMatches(grInvalidMatchesInvalidMethodFields.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "invalid matches with invalid method fields",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grDuplicateSectionName,
+			expected: &L7Route{
+				RouteType: RouteTypeGRPC,
+				Source:    grDuplicateSectionName,
+			},
+			name: "invalid route with duplicate sectionName",
+		},
+		{
+			validator: createDurationValidator(&durationSP),
+			gr:        grOneInvalid,
+			expected: &L7Route{
+				Source:     grOneInvalid,
+				RouteType:  RouteTypeGRPC,
+				Valid:      true,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grOneInvalid.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRoutePartiallyInvalid(
+						`spec.rules[1].matches[0].headers[0].type: Unsupported value: "": supported values: "Exact", "RegularExpression"`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grOneInvalid.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches: ConvertGRPCMatches(grOneInvalid.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{
+								{
+									BackendRef: grpcBackendRef.BackendRef,
+									SessionPersistence: &SessionPersistenceConfig{
+										Valid:       true,
+										Name:        "grpc-method-session",
+										SessionType: v1.CookieBasedSessionPersistence,
+										Expiry:      "10h",
+										Idx:         "gr-1_test_0",
+									},
+								},
+							},
+						},
+						{
+							ValidMatches: false,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches:          ConvertGRPCMatches(grOneInvalid.Spec.Rules[1].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			plus:         true,
+			experimental: true,
+			name:         "invalid headers and valid method",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grInvalidHeadersInvalidType,
+			expected: &L7Route{
+				Source:     grInvalidHeadersInvalidType,
+				RouteType:  RouteTypeGRPC,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidHeadersInvalidType.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						`All rules are invalid: spec.rules[0].matches[0].headers[0].type: ` +
+							`Unsupported value: "": supported values: "Exact", "RegularExpression"`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grInvalidHeadersInvalidType.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: false,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches:          ConvertGRPCMatches(grInvalidHeadersInvalidType.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "invalid headers with invalid type",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grInvalidHeadersEmptyType,
+			expected: &L7Route{
+				Source:     grInvalidHeadersEmptyType,
+				RouteType:  RouteTypeGRPC,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidHeadersEmptyType.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						`All rules are invalid: spec.rules[0].matches[0].headers[0].type: ` +
+							`Required value: cannot be empty`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grInvalidHeadersEmptyType.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: false,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches:          ConvertGRPCMatches(grInvalidHeadersEmptyType.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "invalid headers with no header type specified",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grInvalidMatchesNilMethodType,
+			expected: &L7Route{
+				Source:     grInvalidMatchesNilMethodType,
+				RouteType:  RouteTypeGRPC,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidMatchesNilMethodType.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						`All rules are invalid: spec.rules[0].matches[0].method.type: Required value: cannot be empty`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grInvalidMatchesNilMethodType.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: false,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches:          ConvertGRPCMatches(grInvalidMatchesNilMethodType.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "invalid method with nil type",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grInvalidFilter,
+			expected: &L7Route{
+				Source:     grInvalidFilter,
+				RouteType:  RouteTypeGRPC,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidFilter.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						`All rules are invalid: spec.rules[0].filters[0].type: Unsupported value: ` +
+							`"InvalidFilter": supported values: "ResponseHeaderModifier", ` +
+							`"RequestHeaderModifier", "RequestMirror", "ExtensionRef"`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grInvalidFilter.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   false,
+								Filters: convertGRPCRouteFilters(grInvalidFilter.Spec.Rules[0].Filters),
+							},
+							Matches:          ConvertGRPCMatches(grInvalidFilter.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "invalid filter",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grNotNGF,
+			expected:  nil,
+			name:      "not NGF route",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grInvalidHostname,
+			expected: &L7Route{
+				Source:     grInvalidHostname,
+				RouteType:  RouteTypeGRPC,
+				Valid:      false,
+				Attachable: false,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidHostname.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						`spec.hostnames[0]: Invalid value: "": cannot be empty string`,
+					),
+				},
+			},
+			name: "invalid hostname",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grInvalidSnippetsFilter,
+			expected: &L7Route{
+				Source:     grInvalidSnippetsFilter,
+				RouteType:  RouteTypeGRPC,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidSnippetsFilter.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						"All rules are invalid: spec.rules[0].filters[0].extensionRef: " +
+							"Unsupported value: \"wrong\": supported values: \"gateway.nginx.org\"",
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grInvalidSnippetsFilter.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   false,
+								Filters: convertGRPCRouteFilters(grInvalidSnippetsFilter.Spec.Rules[0].Filters),
+							},
+							Matches:          ConvertGRPCMatches(grInvalidSnippetsFilter.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "invalid snippet filter extension ref",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grUnresolvableSnippetsFilter,
+			expected: &L7Route{
+				Source:     grUnresolvableSnippetsFilter,
+				RouteType:  RouteTypeGRPC,
+				Valid:      true,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grUnresolvableSnippetsFilter.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteResolvedRefsInvalidFilter(
+						"spec.rules[0].filters[0].extensionRef: Not found: " +
+							`{"group":"gateway.nginx.org","kind":"SnippetsFilter",` +
+							`"name":"does-not-exist"}`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grUnresolvableSnippetsFilter.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   false,
+								Filters: convertGRPCRouteFilters(grUnresolvableSnippetsFilter.Spec.Rules[0].Filters),
+							},
+							Matches:          ConvertGRPCMatches(grUnresolvableSnippetsFilter.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "unresolvable snippet filter extension ref",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grInvalidAndUnresolvableSnippetsFilter,
+			expected: &L7Route{
+				Source:     grInvalidAndUnresolvableSnippetsFilter,
+				RouteType:  RouteTypeGRPC,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidAndUnresolvableSnippetsFilter.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						"All rules are invalid: spec.rules[0].filters[1].extensionRef: " +
+							"Unsupported value: \"wrong\": supported values: \"gateway.nginx.org\"",
+					),
+					conditions.NewRouteResolvedRefsInvalidFilter(
+						"spec.rules[0].filters[0].extensionRef: Not found: " +
+							`{"group":"gateway.nginx.org","kind":"SnippetsFilter",` +
+							`"name":"does-not-exist"}`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grInvalidAndUnresolvableSnippetsFilter.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   false,
+								Filters: convertGRPCRouteFilters(grInvalidAndUnresolvableSnippetsFilter.Spec.Rules[0].Filters),
+							},
+							Matches:          ConvertGRPCMatches(grInvalidAndUnresolvableSnippetsFilter.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "one invalid and one unresolvable snippet filter extension ref",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grInvalidAuthenticationFilter,
+			expected: &L7Route{
+				Source:     grInvalidAuthenticationFilter,
+				RouteType:  RouteTypeGRPC,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidAuthenticationFilter.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						"All rules are invalid: spec.rules[0].filters[0].extensionRef: " +
+							"Unsupported value: \"wrong\": supported values: \"gateway.nginx.org\"",
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grInvalidAuthenticationFilter.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   false,
+								Filters: convertGRPCRouteFilters(grInvalidAuthenticationFilter.Spec.Rules[0].Filters),
+							},
+							Matches:          ConvertGRPCMatches(grInvalidAuthenticationFilter.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "invalid authentication filter extension ref",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grUnresolvableAuthenticationFilter,
+			expected: &L7Route{
+				Source:     grUnresolvableAuthenticationFilter,
+				RouteType:  RouteTypeGRPC,
+				Valid:      true,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grUnresolvableAuthenticationFilter.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteResolvedRefsInvalidFilter(
+						"spec.rules[0].filters[0].extensionRef: Not found: " +
+							`{"group":"gateway.nginx.org","kind":"AuthenticationFilter",` +
+							`"name":"does-not-exist"}`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grUnresolvableAuthenticationFilter.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   false,
+								Filters: convertGRPCRouteFilters(grUnresolvableAuthenticationFilter.Spec.Rules[0].Filters),
+							},
+							Matches:          ConvertGRPCMatches(grUnresolvableAuthenticationFilter.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "unresolvable authentication filter extension ref",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grInvalidAndUnresolvableAuthenticationFilter,
+			expected: &L7Route{
+				Source:     grInvalidAndUnresolvableAuthenticationFilter,
+				RouteType:  RouteTypeGRPC,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidAndUnresolvableAuthenticationFilter.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						`All rules are invalid: [` +
+							`spec.rules[0].filters[0].extensionRef: Unsupported value: "wrong": supported values: "gateway.nginx.org", ` +
+							`spec.rules[0].filters[1].extensionRef: Invalid value: ` +
+							`{"group":"gateway.nginx.org","kind":"AuthenticationFilter","name":"does-not-exist"}: ` +
+							`only one AuthenticationFilter is allowed per Route rule` +
+							`]`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grInvalidAndUnresolvableAuthenticationFilter.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   false,
+								Filters: convertGRPCRouteFilters(grInvalidAndUnresolvableAuthenticationFilter.Spec.Rules[0].Filters),
+							},
+							Matches:          ConvertGRPCMatches(grInvalidAndUnresolvableAuthenticationFilter.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "one invalid and one unresolvable authentication filter extension ref",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grInvalidAndValidAuthenticationFilter,
+			expected: &L7Route{
+				Source:     grInvalidAndValidAuthenticationFilter,
+				RouteType:  RouteTypeGRPC,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidAndValidAuthenticationFilter.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						`All rules are invalid: [` +
+							`spec.rules[0].filters[0].extensionRef: Unsupported value: "wrong": supported values: "gateway.nginx.org", ` +
+							`spec.rules[0].filters[1].extensionRef: Invalid value: ` +
+							`{"group":"gateway.nginx.org","kind":"AuthenticationFilter","name":"af"}: ` +
+							`only one AuthenticationFilter is allowed per Route rule` +
+							`]`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grInvalidAndValidAuthenticationFilter.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   false,
+								Filters: convertGRPCRouteFilters(grInvalidAndValidAuthenticationFilter.Spec.Rules[0].Filters),
+							},
+							Matches:          ConvertGRPCMatches(grInvalidAndValidAuthenticationFilter.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "one invalid and one valid authentication filter extension ref",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grUnresolvedAndValidAuthenticationFilter,
+			expected: &L7Route{
+				Source:     grUnresolvedAndValidAuthenticationFilter,
+				RouteType:  RouteTypeGRPC,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grUnresolvedAndValidAuthenticationFilter.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						`All rules are invalid: ` +
+							`spec.rules[0].filters[1].extensionRef: Invalid value: ` +
+							`{"group":"gateway.nginx.org","kind":"AuthenticationFilter","name":"af"}: ` +
+							`only one AuthenticationFilter is allowed per Route rule`,
+					),
+					conditions.NewRouteResolvedRefsInvalidFilter(
+						`spec.rules[0].filters[0].extensionRef: Not found: ` +
+							`{"group":"gateway.nginx.org","kind":"AuthenticationFilter","name":"does-not-exist"}`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grUnresolvedAndValidAuthenticationFilter.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   false,
+								Filters: convertGRPCRouteFilters(grUnresolvedAndValidAuthenticationFilter.Spec.Rules[0].Filters),
+							},
+							Matches:          ConvertGRPCMatches(grUnresolvedAndValidAuthenticationFilter.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "one unresolved and one valid authentication filter extension ref",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grTwoValidAuthenticationFilter,
+			expected: &L7Route{
+				Source:     grTwoValidAuthenticationFilter,
+				RouteType:  RouteTypeGRPC,
+				Valid:      false,
+				Attachable: true,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grTwoValidAuthenticationFilter.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteUnsupportedValue(
+						`All rules are invalid: ` +
+							`spec.rules[0].filters[1].extensionRef: Invalid value: ` +
+							`{"group":"gateway.nginx.org","kind":"AuthenticationFilter","name":"af2"}: ` +
+							`only one AuthenticationFilter is allowed per Route rule`,
+					),
+				},
+				Spec: L7RouteSpec{
+					Hostnames: grTwoValidAuthenticationFilter.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid: false,
+								Filters: []Filter{
+									{
+										RouteType:    RouteTypeGRPC,
+										FilterType:   FilterExtensionRef,
+										ExtensionRef: grTwoValidAuthenticationFilter.Spec.Rules[0].Filters[0].ExtensionRef,
+										ResolvedExtensionRef: &ExtensionRefFilter{
+											Valid:                true,
+											AuthenticationFilter: &AuthenticationFilter{Valid: true, Referenced: true},
+										},
+									},
+									{
+										RouteType:            RouteTypeGRPC,
+										FilterType:           FilterExtensionRef,
+										ExtensionRef:         grTwoValidAuthenticationFilter.Spec.Rules[0].Filters[1].ExtensionRef,
+										ResolvedExtensionRef: nil,
+									},
+								},
+							},
+							Matches:          ConvertGRPCMatches(grTwoValidAuthenticationFilter.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+			},
+			name: "two valid authentication filter extension refs",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grValidWithUnsupportedField,
+			expected: &L7Route{
+				RouteType: RouteTypeGRPC,
+				Source:    grValidWithUnsupportedField,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grValidWithUnsupportedField.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Valid:      true,
+				Attachable: true,
+				Spec: L7RouteSpec{
+					Hostnames: grValidWithUnsupportedField.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches:          ConvertGRPCMatches(grValidWithUnsupportedField.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteAcceptedUnsupportedField("spec.rules[0].name: Forbidden: Name"),
+				},
+			},
+			name: "valid route with unsupported field",
+		},
+		{
+			validator: createAllValidValidator(),
+			gr:        grInvalidWithUnsupportedField,
+			expected: &L7Route{
+				RouteType: RouteTypeGRPC,
+				Source:    grInvalidWithUnsupportedField,
+				ParentRefs: []ParentRef{
+					{
+						Idx:                 0,
+						EffectiveNginxProxy: gw.EffectiveNginxProxy,
+						SectionName:         grInvalidWithUnsupportedField.Spec.ParentRefs[0].SectionName,
+						Kind:                v1.Kind(kinds.Gateway),
+						NamespacedName:      gatewayNsName,
+						GatewayNsName:       gatewayNsName,
+					},
+				},
+				Valid:      false,
+				Attachable: true,
+				Spec: L7RouteSpec{
+					Hostnames: grInvalidWithUnsupportedField.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: false,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches:          ConvertGRPCMatches(grInvalidWithUnsupportedField.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{},
+						},
+					},
+				},
+				Conditions: []conditions.Condition{
+					conditions.NewRouteAcceptedUnsupportedField("spec.rules[0].name: Forbidden: Name"),
+					conditions.NewRouteUnsupportedValue(
+						"All rules are invalid: [spec.rules[0].matches[0].method.service: Required value: service is required, " +
+							"spec.rules[0].matches[0].method.method: Required value: method is required]",
+					),
+				},
+			},
+			name: "invalid route with unsupported field",
+		},
+		{
+			validator: createDurationValidator(&durationSP),
+			gr:        grValidWithListenerSetParentRef,
+			expected: &L7Route{
+				RouteType: RouteTypeGRPC,
+				Source:    grValidWithListenerSetParentRef,
+				ParentRefs: []ParentRef{
+					{
+						Idx:         0,
+						SectionName: grValidWithListenerSetParentRef.Spec.ParentRefs[0].SectionName,
+						Kind:        v1.Kind(kinds.ListenerSet),
+						NamespacedName: types.NamespacedName{
+							Namespace: "test",
+							Name:      "listener-set",
+						},
+					},
+				},
+				Valid:      true,
+				Attachable: true,
+				Spec: L7RouteSpec{
+					Hostnames: grValidWithListenerSetParentRef.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid:   true,
+								Filters: []Filter{},
+							},
+							Matches: ConvertGRPCMatches(grValidWithListenerSetParentRef.Spec.Rules[0].Matches),
+							RouteBackendRefs: []RouteBackendRef{
+								{
+									BackendRef: grpcBackendRef.BackendRef,
+									SessionPersistence: &SessionPersistenceConfig{
+										Valid:       true,
+										Name:        "grpc-method-session",
+										SessionType: v1.CookieBasedSessionPersistence,
+										Expiry:      "10h",
+										Idx:         "gr_test_0",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			plus:         true,
+			experimental: true,
+			name:         "valid GRPC route with ListenerSet parent ref",
+		},
+	}
+
+	gws := map[types.NamespacedName]*Gateway{
+		gatewayNsName: gw,
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			snippetsFilters := map[types.NamespacedName]*SnippetsFilter{
+				{Namespace: "test", Name: "sf"}: {Valid: true},
+			}
+			authenticationFilters := map[types.NamespacedName]*AuthenticationFilter{
+				{Namespace: "test", Name: "af"}: {Valid: true},
+			}
+			route := buildGRPCRoute(
+				test.validator,
+				test.gr,
+				gws,
+				snippetsFilters,
+				authenticationFilters,
+				FeatureFlags{
+					Plus:         test.plus,
+					Experimental: test.experimental,
+				},
+				listenerSets,
+			)
+			g.Expect(helpers.Diff(test.expected, route)).To(BeEmpty())
+		})
+	}
+}
+
+func TestBuildGRPCRouteWithMirrorRoutes(t *testing.T) {
+	t.Parallel()
+
+	gatewayNsName := types.NamespacedName{Namespace: "test", Name: "gateway"}
+
+	gateways := map[types.NamespacedName]*Gateway{
+		gatewayNsName: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test",
+					Name:      "gateway",
+				},
+			},
+			Valid: true,
+			EffectiveNginxProxy: &EffectiveNginxProxy{
+				DisableHTTP2: helpers.GetPointer(false),
+			},
+		},
+	}
+
+	listenerSets := map[types.NamespacedName]*ListenerSet{
+		{Namespace: "test", Name: "listener-set"}: {
+			Source: &v1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test",
+					Name:      "listener-set",
+				},
+			},
+			Valid: true,
+		},
+	}
+
+	// Create a route with a request mirror filter and another random filter
+	mirrorFilter := v1.GRPCRouteFilter{
+		Type: v1.GRPCRouteFilterRequestMirror,
+		RequestMirror: &v1.HTTPRequestMirrorFilter{
+			BackendRef: v1.BackendObjectReference{
+				Name: "mirror-backend",
+			},
+		},
+	}
+
+	headerFilter := v1.GRPCRouteFilter{
+		Type: v1.GRPCRouteFilterRequestHeaderModifier,
+		RequestHeaderModifier: &v1.HTTPHeaderFilter{
+			Add: []v1.HTTPHeader{
+				{Name: "X-Custom-Header", Value: "some-value"},
+			},
+		},
+	}
+
+	gr := createGRPCRoute(
+		"gr",
+		gatewayNsName.Name,
+		"example.com",
+		v1.Kind(kinds.Gateway),
+		[]v1.GRPCRouteRule{
+			{
+				Matches: []v1.GRPCRouteMatch{
+					{
+						Method: &v1.GRPCMethodMatch{
+							Type:    helpers.GetPointer(v1.GRPCMethodMatchExact),
+							Service: helpers.GetPointer("svc1"),
+							Method:  helpers.GetPointer("method"),
+						},
+					},
+				},
+				Filters: []v1.GRPCRouteFilter{mirrorFilter, headerFilter},
+			},
+		},
+	)
+
+	// Create a route with ListenerSet parent ref
+	grListenerSet := createGRPCRoute(
+		"gr-ls",
+		"listener-set",
+		"example.com",
+		v1.Kind(kinds.ListenerSet),
+		[]v1.GRPCRouteRule{
+			{
+				Matches: []v1.GRPCRouteMatch{
+					{
+						Method: &v1.GRPCMethodMatch{
+							Type:    helpers.GetPointer(v1.GRPCMethodMatchExact),
+							Service: helpers.GetPointer("svc1"),
+							Method:  helpers.GetPointer("method"),
+						},
+					},
+				},
+				Filters: []v1.GRPCRouteFilter{mirrorFilter, headerFilter},
+			},
+		},
+	)
+
+	tests := []struct {
+		name           string
+		gr             *v1.GRPCRoute
+		gateways       map[types.NamespacedName]*Gateway
+		expectedParent ParentRef
+	}{
+		{
+			name:     "Gateway mirror route",
+			gr:       gr,
+			gateways: gateways,
+			expectedParent: ParentRef{
+				Idx:                 0,
+				EffectiveNginxProxy: gateways[gatewayNsName].EffectiveNginxProxy,
+				SectionName:         gr.Spec.ParentRefs[0].SectionName,
+				Kind:                v1.Kind(kinds.Gateway),
+				NamespacedName:      gatewayNsName,
+				GatewayNsName:       gatewayNsName,
+			},
+		},
+		{
+			name:     "ListenerSet mirror route",
+			gr:       grListenerSet,
+			gateways: gateways,
+			expectedParent: ParentRef{
+				Idx:         0,
+				SectionName: grListenerSet.Spec.ParentRefs[0].SectionName,
+				Kind:        v1.Kind(kinds.ListenerSet),
+				NamespacedName: types.NamespacedName{
+					Namespace: "test",
+					Name:      "listener-set",
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Expected mirror route
+			expectedMirrorRoute := &L7Route{
+				RouteType: RouteTypeGRPC,
+				Source: &v1.GRPCRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+						Name:      mirror.RouteName(test.gr.Name, "mirror-backend", "test", 0),
+					},
+					Spec: v1.GRPCRouteSpec{
+						CommonRouteSpec: test.gr.Spec.CommonRouteSpec,
+						Hostnames:       test.gr.Spec.Hostnames,
+						Rules: []v1.GRPCRouteRule{
+							{
+								Matches: []v1.GRPCRouteMatch{
+									{
+										Method: &v1.GRPCMethodMatch{
+											Type:    helpers.GetPointer(v1.GRPCMethodMatchExact),
+											Service: helpers.GetPointer("/_ngf-internal-mirror-mirror-backend-test/" + test.gr.Name + "-0"),
+										},
+									},
+								},
+								Filters: []v1.GRPCRouteFilter{headerFilter},
+								BackendRefs: []v1.GRPCBackendRef{
+									{
+										BackendRef: v1.BackendRef{
+											BackendObjectReference: v1.BackendObjectReference{
+												Name: "mirror-backend",
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				ParentRefs: []ParentRef{test.expectedParent},
+				Valid:      true,
+				Attachable: true,
+				Spec: L7RouteSpec{
+					Hostnames: test.gr.Spec.Hostnames,
+					Rules: []RouteRule{
+						{
+							ValidMatches: true,
+							Filters: RouteRuleFilters{
+								Valid: true,
+								Filters: []Filter{
+									{
+										RouteType:             RouteTypeGRPC,
+										FilterType:            FilterRequestHeaderModifier,
+										RequestHeaderModifier: headerFilter.RequestHeaderModifier,
+									},
+								},
+							},
+							Matches: []v1.HTTPRouteMatch{
+								{
+									Path: &v1.HTTPPathMatch{
+										Type:  helpers.GetPointer(v1.PathMatchExact),
+										Value: helpers.GetPointer("/_ngf-internal-mirror-mirror-backend-test/" + test.gr.Name + "-0"),
+									},
+									Headers: []v1.HTTPHeaderMatch{},
+								},
+							},
+							RouteBackendRefs: []RouteBackendRef{
+								{
+									BackendRef: v1.BackendRef{
+										BackendObjectReference: v1.BackendObjectReference{
+											Name: "mirror-backend",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			validator := &validationfakes.HTTPFieldsValidatorMock{
+				SkipValidationFunc:                 func() bool { return false },
+				ValidateFilterHeaderNameFunc:       func(string) error { return nil },
+				ValidateFilterHeaderValueFunc:      func(string) error { return nil },
+				ValidatePathInMatchFunc:            func(string) error { return nil },
+				ValidatePathInRegexMatchFunc:       func(string) error { return nil },
+				ValidateHeaderNameInMatchFunc:      func(string) error { return nil },
+				ValidateHeaderValueInMatchFunc:     func(string) error { return nil },
+				ValidateQueryParamNameInMatchFunc:  func(string) error { return nil },
+				ValidateQueryParamValueInMatchFunc: func(string) error { return nil },
+				ValidateMethodInMatchFunc:          func(string) (bool, []string) { return true, nil },
+			}
+			snippetsFilters := map[types.NamespacedName]*SnippetsFilter{}
+
+			g := NewWithT(t)
+
+			featureFlags := FeatureFlags{
+				Plus:         false,
+				Experimental: false,
+			}
+
+			routes := map[RouteKey]*L7Route{}
+			l7route := buildGRPCRoute(
+				validator,
+				test.gr,
+				test.gateways,
+				snippetsFilters,
+				nil,
+				featureFlags,
+				listenerSets,
+			)
+			g.Expect(l7route).NotTo(BeNil())
+			buildGRPCMirrorRoutes(routes, l7route, test.gr, test.gateways, snippetsFilters, featureFlags, listenerSets)
+
+			obj, ok := expectedMirrorRoute.Source.(*v1.GRPCRoute)
+			g.Expect(ok).To(BeTrue())
+			mirrorRouteKey := CreateRouteKey(obj)
+			g.Expect(routes).To(HaveKey(mirrorRouteKey))
+			g.Expect(helpers.Diff(expectedMirrorRoute, routes[mirrorRouteKey])).To(BeEmpty())
+		})
+	}
+}
+
+func TestConvertGRPCMatches(t *testing.T) {
+	t.Parallel()
+	methodMatch := createGRPCMethodMatch("myService", "myMethod", "Exact", nil, nil).Matches
+
+	headersMatch := createGRPCHeadersMatch("Exact", "MyHeader", "SomeValue").Matches
+
+	headerMatchRegularExp := createGRPCHeadersMatch("RegularExpression", "HeaderRegex", "headers-[a-z]+").Matches
+
+	expectedHTTPMatches := []v1.HTTPRouteMatch{
+		{
+			Path: &v1.HTTPPathMatch{
+				Type:  helpers.GetPointer(v1.PathMatchExact),
+				Value: helpers.GetPointer("/myService/myMethod"),
+			},
+			Headers: []v1.HTTPHeaderMatch{},
+		},
+	}
+
+	expectedHeadersMatches := []v1.HTTPRouteMatch{
+		{
+			Path: &v1.HTTPPathMatch{
+				Type:  helpers.GetPointer(v1.PathMatchPathPrefix),
+				Value: helpers.GetPointer("/"),
+			},
+			Headers: []v1.HTTPHeaderMatch{
+				{
+					Value: "SomeValue",
+					Name:  v1.HTTPHeaderName("MyHeader"),
+					Type:  helpers.GetPointer(v1.HeaderMatchExact),
+				},
+			},
+		},
+	}
+
+	expectedHeaderMatchesRegularExp := []v1.HTTPRouteMatch{
+		{
+			Path: &v1.HTTPPathMatch{
+				Type:  helpers.GetPointer(v1.PathMatchPathPrefix),
+				Value: helpers.GetPointer("/"),
+			},
+			Headers: []v1.HTTPHeaderMatch{
+				{
+					Value: "headers-[a-z]+",
+					Name:  v1.HTTPHeaderName("HeaderRegex"),
+					Type:  helpers.GetPointer(v1.HeaderMatchRegularExpression),
+				},
+			},
+		},
+	}
+
+	expectedEmptyMatches := []v1.HTTPRouteMatch{
+		{
+			Path: &v1.HTTPPathMatch{
+				Type:  helpers.GetPointer(v1.PathMatchPathPrefix),
+				Value: helpers.GetPointer("/"),
+			},
+		},
+	}
+
+	tests := []struct {
+		name          string
+		methodMatches []v1.GRPCRouteMatch
+		expected      []v1.HTTPRouteMatch
+	}{
+		{
+			name:          "exact match",
+			methodMatches: methodMatch,
+			expected:      expectedHTTPMatches,
+		},
+		{
+			name:          "headers matches exact",
+			methodMatches: headersMatch,
+			expected:      expectedHeadersMatches,
+		},
+		{
+			name:          "headers matches regular expression",
+			methodMatches: headerMatchRegularExp,
+			expected:      expectedHeaderMatchesRegularExp,
+		},
+		{
+			name:          "empty matches",
+			methodMatches: []v1.GRPCRouteMatch{},
+			expected:      expectedEmptyMatches,
+		},
+		{
+			name: "method match followed by headers-only match resets path per iteration",
+			methodMatches: append(
+				methodMatch,
+				headersMatch...,
+			),
+			expected: []v1.HTTPRouteMatch{
+				{
+					Path: &v1.HTTPPathMatch{
+						Type:  helpers.GetPointer(v1.PathMatchExact),
+						Value: helpers.GetPointer("/myService/myMethod"),
+					},
+					Headers: []v1.HTTPHeaderMatch{},
+				},
+				{
+					Path: &v1.HTTPPathMatch{
+						Type:  helpers.GetPointer(v1.PathMatchPathPrefix),
+						Value: helpers.GetPointer("/"),
+					},
+					Headers: []v1.HTTPHeaderMatch{
+						{
+							Value: "SomeValue",
+							Name:  v1.HTTPHeaderName("MyHeader"),
+							Type:  helpers.GetPointer(v1.HeaderMatchExact),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			httpMatches := ConvertGRPCMatches(test.methodMatches)
+			g.Expect(helpers.Diff(test.expected, httpMatches)).To(BeEmpty())
+		})
+	}
+}
+
+func TestConvertGRPCHeaderMatchType(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		input    *v1.GRPCHeaderMatchType
+		expected *v1.HeaderMatchType
+		name     string
+	}{
+		{
+			name:     "exact match type",
+			input:    helpers.GetPointer(v1.GRPCHeaderMatchExact),
+			expected: helpers.GetPointer(v1.HeaderMatchExact),
+		},
+		{
+			name:     "regular expression match type",
+			input:    helpers.GetPointer(v1.GRPCHeaderMatchRegularExpression),
+			expected: helpers.GetPointer(v1.HeaderMatchRegularExpression),
+		},
+		{
+			name:     "unsupported match type",
+			input:    helpers.GetPointer(v1.GRPCHeaderMatchType("unsupported")),
+			expected: nil,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			g.Expect(convertGRPCHeaderMatchType(test.input)).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestProcessGRPCRouteRule_UnsupportedFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		specRule       v1.GRPCRouteRule
+		name           string
+		expectedErrors int
+	}{
+		{
+			name:           "No unsupported fields",
+			specRule:       v1.GRPCRouteRule{}, // Empty rule, no unsupported fields
+			expectedErrors: 0,
+		},
+		{
+			name: "One unsupported field",
+			specRule: v1.GRPCRouteRule{
+				Name: helpers.GetPointer[v1.SectionName]("unsupported-name"),
+			},
+			expectedErrors: 1,
+		},
+		{
+			name: "Multiple unsupported fields",
+			specRule: v1.GRPCRouteRule{
+				Name: helpers.GetPointer[v1.SectionName]("unsupported-name"),
+				SessionPersistence: helpers.GetPointer(
+					v1.SessionPersistence{
+						Type: helpers.GetPointer(v1.SessionPersistenceType("unsupported-session-persistence")),
+					}),
+			},
+			expectedErrors: 2,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			rulePath := field.NewPath("spec").Child("rules")
+			var errors routeRuleErrors
+
+			// Wrap the rule in GRPCRouteRuleWrapper
+			unsupportedFieldsErrors := checkForUnsupportedGRPCFields(
+				test.specRule,
+				rulePath,
+				FeatureFlags{
+					Plus:         false,
+					Experimental: false,
+				},
+			)
+			if len(unsupportedFieldsErrors) > 0 {
+				errors.warn = append(errors.warn, unsupportedFieldsErrors...)
+			}
+
+			g.Expect(errors.warn).To(HaveLen(test.expectedErrors))
+		})
+	}
+}
+
+func TestProcessGRPCRouteRules_UnsupportedFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		specRules     []v1.GRPCRouteRule
+		expectedConds []conditions.Condition
+		expectedWarns int
+		expectedValid bool
+		plusEnabled   bool
+		experimental  bool
+	}{
+		{
+			name:          "No unsupported fields",
+			specRules:     []v1.GRPCRouteRule{{}},
+			expectedValid: true,
+			expectedConds: nil,
+			expectedWarns: 0,
+		},
+		{
+			name: "One unsupported field",
+			specRules: []v1.GRPCRouteRule{
+				{
+					Name: helpers.GetPointer[v1.SectionName]("unsupported-name"),
+				},
+			},
+			expectedValid: true,
+			expectedConds: []conditions.Condition{
+				conditions.NewRouteAcceptedUnsupportedField("spec.rules[0].name: Forbidden: Name"),
+			},
+			expectedWarns: 1,
+		},
+		{
+			name: "Multiple unsupported fields",
+			specRules: []v1.GRPCRouteRule{
+				{
+					Name: helpers.GetPointer[v1.SectionName]("unsupported-name"),
+					SessionPersistence: helpers.GetPointer(v1.SessionPersistence{
+						Type:        helpers.GetPointer(v1.CookieBasedSessionPersistence),
+						SessionName: helpers.GetPointer("session_id"),
+					}),
+				},
+			},
+			expectedValid: true,
+			expectedConds: []conditions.Condition{
+				conditions.NewRouteAcceptedUnsupportedField("spec.rules[0].name: Forbidden: Name"),
+			},
+			experimental:  true,
+			plusEnabled:   false,
+			expectedWarns: 1,
+		},
+		{
+			name: "Session persistence unsupported with experimental disabled",
+			specRules: []v1.GRPCRouteRule{
+				{
+					SessionPersistence: helpers.GetPointer(v1.SessionPersistence{
+						Type:        helpers.GetPointer(v1.CookieBasedSessionPersistence),
+						SessionName: helpers.GetPointer("session_id"),
+					}),
+				},
+			},
+			expectedValid: true,
+			expectedConds: []conditions.Condition{
+				conditions.NewRouteAcceptedUnsupportedField(fmt.Sprintf("spec.rules[0].sessionPersistence: Forbidden: "+
+					"%s", spErrMsg)),
+			},
+			expectedWarns: 1,
+			plusEnabled:   true,
+			experimental:  false,
+		},
+		{
+			name: "Session Persistence supported with experimental enabled",
+			specRules: []v1.GRPCRouteRule{
+				{
+					SessionPersistence: helpers.GetPointer(v1.SessionPersistence{
+						Type:        helpers.GetPointer(v1.CookieBasedSessionPersistence),
+						SessionName: helpers.GetPointer("session_id"),
+					}),
+				},
+			},
+			expectedValid: true,
+			experimental:  true,
+			expectedWarns: 0,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			grpcRouteNsName := types.NamespacedName{
+				Namespace: "test",
+				Name:      "grpc-route",
+			}
+
+			_, valid, conds := processGRPCRouteRules(
+				test.specRules,
+				validation.SkipValidator{},
+				nil,
+				grpcRouteNsName,
+				FeatureFlags{
+					Plus:         test.plusEnabled,
+					Experimental: test.experimental,
+				},
+			)
+
+			g.Expect(valid).To(Equal(test.expectedValid))
+			if test.expectedConds == nil {
+				g.Expect(conds).To(BeEmpty())
+			} else {
+				g.Expect(conds).To(HaveLen(len(test.expectedConds)))
+				for i, expectedCond := range test.expectedConds {
+					g.Expect(conds[i].Message).To(Equal(expectedCond.Message))
+				}
+			}
+		})
+	}
+}
+
+func TestProcessGRPCRouteRule_BackendRefFilters(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	// A GRPCRouteRule whose BackendRef carries a filter must not panic.
+	specRule := v1.GRPCRouteRule{
+		BackendRefs: []v1.GRPCBackendRef{
+			{
+				BackendRef: v1.BackendRef{
+					BackendObjectReference: v1.BackendObjectReference{
+						Name: "backend",
+						Port: helpers.GetPointer[v1.PortNumber](80),
+					},
+				},
+				Filters: []v1.GRPCRouteFilter{
+					{
+						Type: v1.GRPCRouteFilterRequestHeaderModifier,
+						RequestHeaderModifier: &v1.HTTPHeaderFilter{
+							Add: []v1.HTTPHeader{
+								{Name: "X-Test", Value: "value"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	grpcRouteNsName := types.NamespacedName{
+		Namespace: "test",
+		Name:      "grpc-route",
+	}
+
+	rule, ruleErrors := processGRPCRouteRule(
+		specRule,
+		0,
+		validation.SkipValidator{},
+		nil,
+		grpcRouteNsName,
+		FeatureFlags{},
+	)
+
+	g.Expect(ruleErrors.invalid).To(BeEmpty())
+	g.Expect(rule.RouteBackendRefs).To(HaveLen(1))
+	g.Expect(rule.RouteBackendRefs[0].Filters).To(HaveLen(1))
+}

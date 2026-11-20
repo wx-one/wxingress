@@ -1,0 +1,3556 @@
+package status
+
+import (
+	"testing"
+
+	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	inference "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPI "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies/policiesfakes"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+)
+
+func TestNewNginxGatewayStatusSetter(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name              string
+		status, newStatus ngfAPI.NginxGatewayStatus
+		expStatusSet      bool
+	}{
+		{
+			name:         "NginxGateway has no status",
+			expStatusSet: true,
+			newStatus: ngfAPI.NginxGatewayStatus{
+				Conditions: []metav1.Condition{{Message: "some condition"}},
+			},
+			status: ngfAPI.NginxGatewayStatus{},
+		},
+		{
+			name:         "NginxGateway has old status",
+			expStatusSet: true,
+			newStatus: ngfAPI.NginxGatewayStatus{
+				Conditions: []metav1.Condition{{Message: "new condition"}},
+			},
+			status: ngfAPI.NginxGatewayStatus{
+				Conditions: []metav1.Condition{{Message: "old condition"}},
+			},
+		},
+		{
+			name:         "NginxGateway has same status",
+			expStatusSet: false,
+			newStatus: ngfAPI.NginxGatewayStatus{
+				Conditions: []metav1.Condition{{Message: "same condition"}},
+			},
+			status: ngfAPI.NginxGatewayStatus{
+				Conditions: []metav1.Condition{{Message: "same condition"}},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newNginxGatewayStatusSetter(test.newStatus)
+			obj := &ngfAPI.NginxGateway{Status: test.status}
+
+			statusSet := setter(obj)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(obj.Status).To(Equal(test.newStatus))
+		})
+	}
+}
+
+func TestNewGatewayStatusSetter(t *testing.T) {
+	t.Parallel()
+	expAddress := gatewayv1.GatewayStatusAddress{
+		Type:  helpers.GetPointer(gatewayv1.IPAddressType),
+		Value: "10.0.0.0",
+	}
+
+	tests := []struct {
+		status       gatewayv1.GatewayStatus
+		newStatus    gatewayv1.GatewayStatus
+		name         string
+		expStatusSet bool
+	}{
+		{
+			name: "Gateway has no status",
+			newStatus: gatewayv1.GatewayStatus{
+				Conditions: []metav1.Condition{{Message: "new condition"}},
+				Addresses:  []gatewayv1.GatewayStatusAddress{expAddress},
+			},
+			status:       gatewayv1.GatewayStatus{},
+			expStatusSet: true,
+		},
+		{
+			name: "Gateway has old status",
+			newStatus: gatewayv1.GatewayStatus{
+				Conditions: []metav1.Condition{{Message: "new condition"}},
+				Addresses:  []gatewayv1.GatewayStatusAddress{expAddress},
+			},
+			status: gatewayv1.GatewayStatus{
+				Conditions: []metav1.Condition{{Message: "old condition"}},
+				Addresses:  []gatewayv1.GatewayStatusAddress{expAddress},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "Gateway has same status",
+			newStatus: gatewayv1.GatewayStatus{
+				Conditions: []metav1.Condition{{Message: "same condition"}},
+				Addresses:  []gatewayv1.GatewayStatusAddress{expAddress},
+			},
+			status: gatewayv1.GatewayStatus{
+				Conditions: []metav1.Condition{{Message: "same condition"}},
+				Addresses:  []gatewayv1.GatewayStatusAddress{expAddress},
+			},
+			expStatusSet: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newGatewayStatusSetter(test.newStatus)
+			obj := &gatewayv1.Gateway{Status: test.status}
+
+			statusSet := setter(obj)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(obj.Status).To(Equal(test.newStatus))
+		})
+	}
+}
+
+func TestNewHTTPRouteStatusSetter(t *testing.T) {
+	t.Parallel()
+	const (
+		controllerName      = "controller"
+		otherControllerName = "different"
+	)
+
+	tests := []struct {
+		name                         string
+		status, newStatus, expStatus gatewayv1.HTTPRouteStatus
+		expStatusSet                 bool
+	}{
+		{
+			name: "HTTPRoute has no status",
+			newStatus: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "HTTPRoute has old status",
+			newStatus: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "old condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "HTTPRoute has old status, keep other controller statuses",
+			newStatus: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(otherControllerName),
+							Conditions:     []metav1.Condition{{Message: "some condition"}},
+						},
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "old condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(otherControllerName),
+							Conditions:     []metav1.Condition{{Message: "some condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "HTTPRoute has same status",
+			newStatus: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newHTTPRouteStatusSetter(test.newStatus, controllerName)
+			obj := &gatewayv1.HTTPRoute{Status: test.status}
+
+			statusSet := setter(obj)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(obj.Status).To(Equal(test.expStatus))
+		})
+	}
+
+	t.Run("cleanup preserves other controller statuses", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+
+		setter := newHTTPRouteStatusSetter(gatewayv1.HTTPRouteStatus{}, controllerName)
+		obj := &gatewayv1.HTTPRoute{
+			Status: gatewayv1.HTTPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{Parents: []gatewayv1.RouteParentStatus{
+					{
+						ParentRef:      gatewayv1.ParentReference{Name: "other-parent"},
+						ControllerName: gatewayv1.GatewayController(otherControllerName),
+						Conditions:     []metav1.Condition{{Message: "other condition"}},
+					},
+					{
+						ParentRef:      gatewayv1.ParentReference{Name: "ngf-parent"},
+						ControllerName: gatewayv1.GatewayController(controllerName),
+						Conditions:     []metav1.Condition{{Message: "ngf condition"}},
+					},
+				}},
+			},
+		}
+
+		statusSet := setter(obj)
+
+		g.Expect(statusSet).To(BeTrue())
+		g.Expect(obj.Status.Parents).To(Equal([]gatewayv1.RouteParentStatus{
+			{
+				ParentRef:      gatewayv1.ParentReference{Name: "other-parent"},
+				ControllerName: gatewayv1.GatewayController(otherControllerName),
+				Conditions:     []metav1.Condition{{Message: "other condition"}},
+			},
+		}))
+	})
+}
+
+func TestNewGRPCRouteStatusSetter(t *testing.T) {
+	t.Parallel()
+	const (
+		controllerName      = "controller"
+		otherControllerName = "different"
+	)
+
+	tests := []struct {
+		name                         string
+		status, newStatus, expStatus gatewayv1.GRPCRouteStatus
+		expStatusSet                 bool
+	}{
+		{
+			name: "GRPCRoute has no status",
+			newStatus: gatewayv1.GRPCRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.GRPCRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "GRPCRoute has old status",
+			newStatus: gatewayv1.GRPCRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.GRPCRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "old condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.GRPCRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "GRPCRoute has old status, keep other controller statuses",
+			newStatus: gatewayv1.GRPCRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.GRPCRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(otherControllerName),
+							Conditions:     []metav1.Condition{{Message: "some condition"}},
+						},
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "old condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.GRPCRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(otherControllerName),
+							Conditions:     []metav1.Condition{{Message: "some condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "GRPCRoute has same status",
+			newStatus: gatewayv1.GRPCRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.GRPCRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.GRPCRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newGRPCRouteStatusSetter(test.newStatus, controllerName)
+			obj := &gatewayv1.GRPCRoute{Status: test.status}
+
+			statusSet := setter(obj)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(obj.Status).To(Equal(test.expStatus))
+		})
+	}
+}
+
+func TestNewTLSRouteStatusSetter(t *testing.T) {
+	t.Parallel()
+	const (
+		controllerName      = "controller"
+		otherControllerName = "different"
+	)
+
+	tests := []struct {
+		name                         string
+		status, newStatus, expStatus gatewayv1.TLSRouteStatus
+		expStatusSet                 bool
+	}{
+		{
+			name: "TLSRoute has no status",
+			newStatus: gatewayv1.TLSRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.TLSRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "TLSRoute has old status",
+			newStatus: gatewayv1.TLSRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.TLSRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "old condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.TLSRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "TLSRoute has old status, keep other controller statuses",
+			newStatus: gatewayv1.TLSRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.TLSRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(otherControllerName),
+							Conditions:     []metav1.Condition{{Message: "some condition"}},
+						},
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "old condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.TLSRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(otherControllerName),
+							Conditions:     []metav1.Condition{{Message: "some condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "TLSRoute has same status",
+			newStatus: gatewayv1.TLSRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.TLSRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.TLSRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newTLSRouteStatusSetter(test.newStatus, controllerName)
+			obj := &gatewayv1.TLSRoute{Status: test.status}
+
+			statusSet := setter(obj)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(obj.Status).To(Equal(test.expStatus))
+		})
+	}
+}
+
+func TestNewGatewayClassStatusSetter(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name              string
+		status, newStatus gatewayv1.GatewayClassStatus
+		expStatusSet      bool
+	}{
+		{
+			name: "GatewayClass has no status",
+			newStatus: gatewayv1.GatewayClassStatus{
+				Conditions: []metav1.Condition{{Message: "new condition"}},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "GatewayClass has old status",
+			newStatus: gatewayv1.GatewayClassStatus{
+				Conditions: []metav1.Condition{{Message: "new condition"}},
+			},
+			status: gatewayv1.GatewayClassStatus{
+				Conditions: []metav1.Condition{{Message: "old condition"}},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "GatewayClass has same status",
+			newStatus: gatewayv1.GatewayClassStatus{
+				Conditions: []metav1.Condition{{Message: "same condition"}},
+			},
+			status: gatewayv1.GatewayClassStatus{
+				Conditions: []metav1.Condition{{Message: "same condition"}},
+			},
+			expStatusSet: false,
+		},
+		{
+			name: "GatewayClass has same conditions but different SupportedFeatures",
+			newStatus: gatewayv1.GatewayClassStatus{
+				Conditions:        []metav1.Condition{{Message: "same condition"}},
+				SupportedFeatures: []gatewayv1.SupportedFeature{{Name: "Feature1"}},
+			},
+			status: gatewayv1.GatewayClassStatus{
+				Conditions:        []metav1.Condition{{Message: "same condition"}},
+				SupportedFeatures: []gatewayv1.SupportedFeature{{Name: "Feature2"}},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "GatewayClass has same conditions and same SupportedFeatures",
+			newStatus: gatewayv1.GatewayClassStatus{
+				Conditions:        []metav1.Condition{{Message: "same condition"}},
+				SupportedFeatures: []gatewayv1.SupportedFeature{{Name: "Feature1"}},
+			},
+			status: gatewayv1.GatewayClassStatus{
+				Conditions:        []metav1.Condition{{Message: "same condition"}},
+				SupportedFeatures: []gatewayv1.SupportedFeature{{Name: "Feature1"}},
+			},
+			expStatusSet: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newGatewayClassStatusSetter(test.newStatus)
+			obj := &gatewayv1.GatewayClass{Status: test.status}
+
+			statusSet := setter(obj)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(obj.Status).To(Equal(test.newStatus))
+		})
+	}
+}
+
+func TestNewBackendTLSPolicyStatusSetter(t *testing.T) {
+	t.Parallel()
+	const (
+		controllerName      = "controller"
+		otherControllerName = "other-controller"
+	)
+
+	tests := []struct {
+		name                         string
+		status, newStatus, expStatus gatewayv1.PolicyStatus
+		expStatusSet                 bool
+	}{
+		{
+			name: "BackendTLSPolicy has no status",
+			newStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			expStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "BackendTLSPolicy has old status",
+			newStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			status: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "old condition"}},
+					},
+				},
+			},
+			expStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "BackendTLSPolicy has old status and other controller status",
+			newStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			status: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "old condition"}},
+					},
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+				},
+			},
+			expStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "BackendTLSPolicy has same status",
+			newStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+					},
+				},
+			},
+			status: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+					},
+				},
+			},
+			expStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+					},
+				},
+			},
+			expStatusSet: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newBackendTLSPolicyStatusSetter(test.newStatus, controllerName)
+			obj := &gatewayv1.BackendTLSPolicy{Status: test.status}
+
+			statusSet := setter(obj)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(obj.Status).To(Equal(test.expStatus))
+		})
+	}
+
+	t.Run("retry does not duplicate other controller ancestor statuses", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+
+		newStatus := gatewayv1.PolicyStatus{
+			Ancestors: []gatewayv1.PolicyAncestorStatus{
+				{
+					ControllerName: controllerName,
+					Conditions:     []metav1.Condition{{Message: "new condition"}},
+				},
+			},
+		}
+
+		setter := newBackendTLSPolicyStatusSetter(newStatus, controllerName)
+		obj := &gatewayv1.BackendTLSPolicy{
+			Status: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+				},
+			},
+		}
+
+		// Simulate NewRetryUpdateFunc invoking the same Setter closure again after a conflict.
+		res := setter(obj)
+		g.Expect(res).To(BeTrue())
+		res = setter(obj)
+		g.Expect(res).To(BeFalse())
+
+		otherCount := 0
+		for _, a := range obj.Status.Ancestors {
+			if a.ControllerName == otherControllerName {
+				otherCount++
+			}
+		}
+
+		g.Expect(otherCount).To(Equal(1))
+		g.Expect(obj.Status.Ancestors).To(HaveLen(2))
+	})
+}
+
+func TestNewNGFPolicyStatusSetter(t *testing.T) {
+	t.Parallel()
+	const (
+		controllerName      = "controller"
+		otherControllerName = "other-controller"
+	)
+
+	tests := []struct {
+		name                         string
+		status, newStatus, expStatus gatewayv1.PolicyStatus
+		expStatusSet                 bool
+	}{
+		{
+			name: "Policy has no status",
+			newStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			expStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "Policy has old status",
+			newStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			status: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "old condition"}},
+					},
+				},
+			},
+			expStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "Policy has old status and other controller status",
+			newStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			status: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "old condition"}},
+					},
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+				},
+			},
+			expStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "Policy has same status",
+			newStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+					},
+				},
+			},
+			status: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+					},
+				},
+			},
+			expStatus: gatewayv1.PolicyStatus{
+				Ancestors: []gatewayv1.PolicyAncestorStatus{
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+					},
+				},
+			},
+			expStatusSet: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newNGFPolicyStatusSetter(test.newStatus, controllerName)
+			obj := &policiesfakes.PolicyMock{
+				GetPolicyStatusFunc: func() gatewayv1.PolicyStatus {
+					return test.status
+				},
+				SetPolicyStatusFunc: func(gatewayv1.PolicyStatus) {},
+			}
+
+			statusSet := setter(obj)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+
+			if statusSet {
+				g.Expect(obj.SetPolicyStatusCalls()[0].Status).To(Equal(test.expStatus))
+			}
+		})
+	}
+
+	t.Run("retry does not duplicate other controller ancestor statuses", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+
+		newStatus := gatewayv1.PolicyStatus{
+			Ancestors: []gatewayv1.PolicyAncestorStatus{
+				{
+					ControllerName: controllerName,
+					Conditions:     []metav1.Condition{{Message: "new condition"}},
+				},
+			},
+		}
+
+		setter := newNGFPolicyStatusSetter(newStatus, controllerName)
+
+		// currentStatus simulates the object's status as it evolves across retries -
+		// the setter reads the latest status via GetPolicyStatusStub each call.
+		currentStatus := gatewayv1.PolicyStatus{
+			Ancestors: []gatewayv1.PolicyAncestorStatus{
+				{
+					ControllerName: otherControllerName,
+					Conditions:     []metav1.Condition{{Message: "some condition"}},
+				},
+			},
+		}
+
+		obj := &policiesfakes.PolicyMock{
+			GetPolicyStatusFunc: func() gatewayv1.PolicyStatus {
+				return currentStatus
+			},
+			SetPolicyStatusFunc: func(status gatewayv1.PolicyStatus) {
+				currentStatus = status
+			},
+		}
+
+		// Simulate NewRetryUpdateFunc invoking the same Setter closure again after a conflict.
+		_ = setter(obj)
+		_ = setter(obj)
+
+		otherCount := 0
+		for _, a := range currentStatus.Ancestors {
+			if a.ControllerName == otherControllerName {
+				otherCount++
+			}
+		}
+
+		g.Expect(otherCount).To(Equal(1))
+		g.Expect(currentStatus.Ancestors).To(HaveLen(2))
+	})
+}
+
+func TestGWStatusEqual(t *testing.T) {
+	t.Parallel()
+	getDefaultStatus := func() gatewayv1.GatewayStatus {
+		return gatewayv1.GatewayStatus{
+			Addresses: []gatewayv1.GatewayStatusAddress{
+				{
+					Type:  helpers.GetPointer(gatewayv1.IPAddressType),
+					Value: "10.0.0.0",
+				},
+				{
+					Type:  helpers.GetPointer(gatewayv1.IPAddressType),
+					Value: "11.0.0.0",
+				},
+			},
+			Conditions: []metav1.Condition{
+				{
+					Type: "type", /* conditions are covered by another test*/
+				},
+			},
+			Listeners: []gatewayv1.ListenerStatus{
+				{
+					Name: "listener1",
+					SupportedKinds: []gatewayv1.RouteGroupKind{
+						{
+							Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName),
+							Kind:  kinds.HTTPRoute,
+						},
+						{
+							Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName),
+							Kind:  "TCPRoute",
+						},
+					},
+					AttachedRoutes: 1,
+					Conditions: []metav1.Condition{
+						{
+							Type: "type", /* conditions are covered by another test*/
+						},
+					},
+				},
+				{
+					Name: "listener2",
+					SupportedKinds: []gatewayv1.RouteGroupKind{
+						{
+							Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName),
+							Kind:  kinds.HTTPRoute,
+						},
+					},
+					AttachedRoutes: 1,
+					Conditions: []metav1.Condition{
+						{
+							Type: "type", /* conditions are covered by another test*/
+						},
+					},
+				},
+				{
+					Name: "listener3",
+					SupportedKinds: []gatewayv1.RouteGroupKind{
+						{
+							Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName),
+							Kind:  kinds.HTTPRoute,
+						},
+					},
+					AttachedRoutes: 1,
+					Conditions: []metav1.Condition{
+						{
+							Type: "type", /* conditions are covered by another test*/
+						},
+					},
+				},
+			},
+			AttachedListenerSets: helpers.GetPointer(int32(1)),
+		}
+	}
+
+	getModifiedStatus := func(mod func(gatewayv1.GatewayStatus) gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+		return mod(getDefaultStatus())
+	}
+
+	tests := []struct {
+		prevStatus gatewayv1.GatewayStatus
+		curStatus  gatewayv1.GatewayStatus
+		name       string
+		expEqual   bool
+	}{
+		{
+			name:       "different number of addresses",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+				status.Addresses = status.Addresses[:1]
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different address type",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+				status.Addresses[1].Type = helpers.GetPointer(gatewayv1.HostnameAddressType)
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different address value",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+				status.Addresses[0].Value = "12.0.0.0"
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different conditions",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+				status.Conditions[0].Type = "different"
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different number of listener statuses",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+				status.Listeners = status.Listeners[:2]
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different listener status name",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+				status.Listeners[2].Name = "different"
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different listener status attached routes",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+				status.Listeners[1].AttachedRoutes++
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different listener status conditions",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+				status.Listeners[0].Conditions[0].Type = "different"
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different listener status supported kinds (different number)",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+				status.Listeners[0].SupportedKinds = status.Listeners[0].SupportedKinds[:1]
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different listener status supported kinds (different kind)",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+				status.Listeners[1].SupportedKinds[0].Kind = "TCPRoute"
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different listener status supported kinds (different group)",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+				status.Listeners[1].SupportedKinds[0].Group = helpers.GetPointer[gatewayv1.Group]("different")
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different attached listener sets count",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.GatewayStatus) gatewayv1.GatewayStatus {
+				status.AttachedListenerSets = helpers.GetPointer(int32(3))
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "equal",
+			prevStatus: getDefaultStatus(),
+			curStatus:  getDefaultStatus(),
+			expEqual:   true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			equal := gwStatusEqual(test.prevStatus, test.curStatus)
+			g.Expect(equal).To(Equal(test.expEqual))
+		})
+	}
+}
+
+func TestHRStatusEqual(t *testing.T) {
+	t.Parallel()
+	testConds := []metav1.Condition{
+		{
+			Type: "type", /* conditions are covered by another test*/
+		},
+	}
+
+	previousStatus := gatewayv1.HTTPRouteStatus{
+		RouteStatus: gatewayv1.RouteStatus{
+			Parents: []gatewayv1.RouteParentStatus{
+				{
+					ParentRef: gatewayv1.ParentReference{
+						Namespace:   helpers.GetPointer[gatewayv1.Namespace]("test"),
+						Name:        "our-parent",
+						SectionName: helpers.GetPointer[gatewayv1.SectionName]("section1"),
+					},
+					ControllerName: "ours",
+					Conditions:     testConds,
+				},
+				{
+					ParentRef: gatewayv1.ParentReference{
+						Namespace:   helpers.GetPointer[gatewayv1.Namespace]("test"),
+						Name:        "not-our-parent",
+						SectionName: helpers.GetPointer[gatewayv1.SectionName]("section1"),
+					},
+					ControllerName: "not-ours",
+					Conditions:     testConds,
+				},
+				{
+					ParentRef: gatewayv1.ParentReference{
+						Namespace:   helpers.GetPointer[gatewayv1.Namespace]("test"),
+						Name:        "our-parent",
+						SectionName: helpers.GetPointer[gatewayv1.SectionName]("section2"),
+					},
+					ControllerName: "ours",
+					Conditions:     testConds,
+				},
+				{
+					ParentRef: gatewayv1.ParentReference{
+						Namespace:   helpers.GetPointer[gatewayv1.Namespace]("test"),
+						Name:        "not-our-parent",
+						SectionName: helpers.GetPointer[gatewayv1.SectionName]("section2"),
+					},
+					ControllerName: "not-ours",
+					Conditions:     testConds,
+				},
+			},
+		},
+	}
+
+	getDefaultStatus := func() gatewayv1.HTTPRouteStatus {
+		return gatewayv1.HTTPRouteStatus{
+			RouteStatus: gatewayv1.RouteStatus{
+				Parents: []gatewayv1.RouteParentStatus{
+					{
+						ParentRef: gatewayv1.ParentReference{
+							Namespace:   helpers.GetPointer[gatewayv1.Namespace]("test"),
+							Name:        "our-parent",
+							SectionName: helpers.GetPointer[gatewayv1.SectionName]("section1"),
+						},
+						ControllerName: "ours",
+						Conditions:     testConds,
+					},
+					{
+						ParentRef: gatewayv1.ParentReference{
+							Namespace:   helpers.GetPointer[gatewayv1.Namespace]("test"),
+							Name:        "our-parent",
+							SectionName: helpers.GetPointer[gatewayv1.SectionName]("section2"),
+						},
+						ControllerName: "ours",
+						Conditions:     testConds,
+					},
+				},
+			},
+		}
+	}
+
+	newParentStatus := gatewayv1.RouteParentStatus{
+		ParentRef: gatewayv1.ParentReference{
+			Namespace:   helpers.GetPointer[gatewayv1.Namespace]("test"),
+			Name:        "our-parent",
+			SectionName: helpers.GetPointer[gatewayv1.SectionName]("section3"),
+		},
+		ControllerName: "ours",
+		Conditions:     testConds,
+	}
+
+	getModifiedStatus := func(
+		mod func(status gatewayv1.HTTPRouteStatus) gatewayv1.HTTPRouteStatus,
+	) gatewayv1.HTTPRouteStatus {
+		return mod(getDefaultStatus())
+	}
+
+	tests := []struct {
+		name       string
+		prevStatus gatewayv1.HTTPRouteStatus
+		curStatus  gatewayv1.HTTPRouteStatus
+		expEqual   bool
+	}{
+		{
+			name:       "stale status",
+			prevStatus: previousStatus,
+			curStatus: getModifiedStatus(func(status gatewayv1.HTTPRouteStatus) gatewayv1.HTTPRouteStatus {
+				// remove last parent status
+				status.Parents = status.Parents[:1]
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "new status",
+			prevStatus: previousStatus,
+			curStatus: getModifiedStatus(func(status gatewayv1.HTTPRouteStatus) gatewayv1.HTTPRouteStatus {
+				// add another parent status
+				status.Parents = append(status.Parents, newParentStatus)
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "equal",
+			prevStatus: previousStatus,
+			curStatus:  getDefaultStatus(),
+			expEqual:   true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			equal := routeStatusEqual("ours", test.prevStatus.Parents, test.curStatus.Parents)
+			g.Expect(equal).To(Equal(test.expEqual))
+		})
+	}
+}
+
+func TestGroupsEqual(t *testing.T) {
+	t.Parallel()
+
+	empty := gatewayv1.Group("")
+	core := gatewayv1.Group("core")
+	other := gatewayv1.Group("example.com")
+
+	tests := []struct {
+		g1, g2   *gatewayv1.Group
+		name     string
+		expEqual bool
+	}{
+		{
+			name:     "both nil",
+			expEqual: true,
+		},
+		{
+			name:     "nil and empty",
+			g2:       &empty,
+			expEqual: true,
+		},
+		{
+			name:     "nil and core",
+			g2:       &core,
+			expEqual: true,
+		},
+		{
+			name:     "empty and core",
+			g1:       &empty,
+			g2:       &core,
+			expEqual: true,
+		},
+		{
+			name:     "core and core",
+			g1:       &core,
+			g2:       &core,
+			expEqual: true,
+		},
+		{
+			name:     "nil and other",
+			g2:       &other,
+			expEqual: false,
+		},
+		{
+			name:     "core and other",
+			g1:       &core,
+			g2:       &other,
+			expEqual: false,
+		},
+		{
+			name:     "empty and other",
+			g1:       &empty,
+			g2:       &other,
+			expEqual: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(groupsEqual(test.g1, test.g2)).To(Equal(test.expEqual))
+			g.Expect(groupsEqual(test.g2, test.g1)).To(Equal(test.expEqual))
+		})
+	}
+}
+
+func TestRouteParentStatusEqual(t *testing.T) {
+	t.Parallel()
+	getDefaultStatus := func() gatewayv1.RouteParentStatus {
+		return gatewayv1.RouteParentStatus{
+			ParentRef: gatewayv1.ParentReference{
+				Namespace:   helpers.GetPointer[gatewayv1.Namespace]("test"),
+				Name:        "parent",
+				SectionName: helpers.GetPointer[gatewayv1.SectionName]("section"),
+			},
+			ControllerName: "controller",
+			Conditions: []metav1.Condition{
+				{
+					Type: "type", /* conditions are covered by another test*/
+				},
+			},
+		}
+	}
+
+	getModifiedStatus := func(
+		mod func(gatewayv1.RouteParentStatus) gatewayv1.RouteParentStatus,
+	) gatewayv1.RouteParentStatus {
+		return mod(getDefaultStatus())
+	}
+
+	tests := []struct {
+		name     string
+		p1       gatewayv1.RouteParentStatus
+		p2       gatewayv1.RouteParentStatus
+		expEqual bool
+	}{
+		{
+			name: "different controller name",
+			p1:   getDefaultStatus(),
+			p2: getModifiedStatus(func(status gatewayv1.RouteParentStatus) gatewayv1.RouteParentStatus {
+				status.ControllerName = "different"
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name: "different parentRef name",
+			p1:   getDefaultStatus(),
+			p2: getModifiedStatus(func(status gatewayv1.RouteParentStatus) gatewayv1.RouteParentStatus {
+				status.ParentRef.Name = "different"
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name: "different parentRef namespace",
+			p1:   getDefaultStatus(),
+			p2: getModifiedStatus(func(status gatewayv1.RouteParentStatus) gatewayv1.RouteParentStatus {
+				status.ParentRef.Namespace = helpers.GetPointer[gatewayv1.Namespace]("different")
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name: "different parentRef section name",
+			p1:   getDefaultStatus(),
+			p2: getModifiedStatus(func(status gatewayv1.RouteParentStatus) gatewayv1.RouteParentStatus {
+				status.ParentRef.SectionName = helpers.GetPointer[gatewayv1.SectionName]("different")
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name: "different parentRef kind",
+			p1:   getDefaultStatus(),
+			p2: getModifiedStatus(func(status gatewayv1.RouteParentStatus) gatewayv1.RouteParentStatus {
+				status.ParentRef.Kind = helpers.GetPointer[gatewayv1.Kind]("different")
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name: "different conditions",
+			p1:   getDefaultStatus(),
+			p2: getModifiedStatus(func(status gatewayv1.RouteParentStatus) gatewayv1.RouteParentStatus {
+				status.Conditions[0].Type = "different"
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:     "equal",
+			p1:       getDefaultStatus(),
+			p2:       getDefaultStatus(),
+			expEqual: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			equal := routeParentStatusEqual(test.p1, test.p2)
+			g.Expect(equal).To(Equal(test.expEqual))
+		})
+	}
+}
+
+func TestPolicyStatusEqual(t *testing.T) {
+	t.Parallel()
+	getPolicyStatus := func() gatewayv1.PolicyStatus {
+		return gatewayv1.PolicyStatus{
+			Ancestors: []gatewayv1.PolicyAncestorStatus{
+				{
+					AncestorRef: gatewayv1.ParentReference{
+						Namespace: helpers.GetPointer[gatewayv1.Namespace]("ns1"),
+						Name:      "ancestor1",
+						Group:     helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName),
+						Kind:      helpers.GetPointer[gatewayv1.Kind](kinds.Gateway),
+					},
+					ControllerName: "ctlr1",
+					Conditions:     []metav1.Condition{{Type: "otherType", Status: "otherStatus"}},
+				},
+			},
+		}
+	}
+
+	type modFunc func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus
+
+	getModifiedPolicyStatus := func(mod modFunc) gatewayv1.PolicyStatus {
+		return mod(getPolicyStatus())
+	}
+
+	prevMultiple := getPolicyStatus()
+	prevMultiple.Ancestors = append(
+		prevMultiple.Ancestors,
+		getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+			ns := "ns2"
+			s.Ancestors[0].AncestorRef.Name = "ancestor2"
+			s.Ancestors[0].AncestorRef.Namespace = (*gatewayv1.Namespace)(&ns)
+			s.Ancestors[0].ControllerName = "ctlr2"
+			return s
+		}).Ancestors...)
+
+	currMultiple := getPolicyStatus()
+	currMultiple.Ancestors = append(
+		currMultiple.Ancestors,
+		getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+			ns := "ns3"
+			s.Ancestors[0].AncestorRef.Name = "ancestor3"
+			s.Ancestors[0].AncestorRef.Namespace = (*gatewayv1.Namespace)(&ns)
+			s.Ancestors[0].ControllerName = "ctlr3"
+			return s
+		}).Ancestors...)
+
+	tests := []struct {
+		name           string
+		controllerName string
+		previous       gatewayv1.PolicyStatus
+		current        gatewayv1.PolicyStatus
+		expEqual       bool
+	}{
+		{
+			name:           "status equal",
+			previous:       getPolicyStatus(),
+			current:        getPolicyStatus(),
+			controllerName: "ctlr1",
+			expEqual:       true,
+		},
+		{
+			name:     "status not equal, different ancestor name",
+			previous: getPolicyStatus(),
+			current: getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+				s.Ancestors[0].AncestorRef.Name = "diff"
+				return s
+			}),
+			controllerName: "ctlr1",
+			expEqual:       false,
+		},
+		{
+			name:     "status not equal, different ancestor namespace",
+			previous: getPolicyStatus(),
+			current: getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+				ns := "diff"
+				s.Ancestors[0].AncestorRef.Namespace = (*gatewayv1.Namespace)(&ns)
+				return s
+			}),
+			controllerName: "ctlr1",
+			expEqual:       false,
+		},
+		{
+			name:     "status not equal, different ancestor kind",
+			previous: getPolicyStatus(),
+			current: getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+				s.Ancestors[0].AncestorRef.Kind = helpers.GetPointer[gatewayv1.Kind]("diff")
+				return s
+			}),
+			controllerName: "ctlr1",
+			expEqual:       false,
+		},
+		{
+			name:     "status not equal, different ancestor group",
+			previous: getPolicyStatus(),
+			current: getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+				s.Ancestors[0].AncestorRef.Group = helpers.GetPointer[gatewayv1.Group]("diff")
+				return s
+			}),
+			controllerName: "ctlr1",
+			expEqual:       false,
+		},
+		{
+			name: "status equal, ancestor group empty string and core are equivalent",
+			previous: getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+				s.Ancestors[0].AncestorRef.Group = helpers.GetPointer[gatewayv1.Group]("")
+				return s
+			}),
+			current: getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+				s.Ancestors[0].AncestorRef.Group = helpers.GetPointer[gatewayv1.Group]("core")
+				return s
+			}),
+			controllerName: "ctlr1",
+			expEqual:       true,
+		},
+		{
+			name: "status equal, ancestor group nil and core are equivalent",
+			previous: getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+				s.Ancestors[0].AncestorRef.Group = nil
+				return s
+			}),
+			current: getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+				s.Ancestors[0].AncestorRef.Group = helpers.GetPointer[gatewayv1.Group]("core")
+				return s
+			}),
+			controllerName: "ctlr1",
+			expEqual:       true,
+		},
+		{
+			name:     "status not equal, different controller name on current",
+			previous: getPolicyStatus(),
+			current: getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+				s.Ancestors[0].ControllerName = "diff"
+				return s
+			}),
+			controllerName: "ctlr1",
+			expEqual:       false,
+		},
+		{
+			name:     "status not equal, different conds",
+			previous: getPolicyStatus(),
+			current: getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+				s.Ancestors[0].Conditions = nil
+				return s
+			}),
+			controllerName: "ctlr1",
+			expEqual:       false,
+		},
+		{
+			name: "status not equal, different controller name on previous",
+			previous: getModifiedPolicyStatus(func(s gatewayv1.PolicyStatus) gatewayv1.PolicyStatus {
+				s.Ancestors[0].ControllerName = "diff"
+				return s
+			}),
+			current:        getPolicyStatus(),
+			controllerName: "ctlr1",
+			expEqual:       false,
+		},
+		{
+			name:           "status not equal, different controller ancestor changed",
+			previous:       prevMultiple,
+			current:        currMultiple,
+			controllerName: "ctlr1",
+			expEqual:       false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			equal := policyStatusEqual(test.controllerName, test.previous, test.current)
+			g.Expect(equal).To(Equal(test.expEqual))
+		})
+	}
+}
+
+func TestNewSnippetsFilterStatusSetter(t *testing.T) {
+	t.Parallel()
+	const (
+		controllerName      = "controller"
+		otherControllerName = "other-controller"
+	)
+	tests := []struct {
+		name                         string
+		status, expStatus, newStatus ngfAPI.SnippetsFilterStatus
+		expStatusSet                 bool
+	}{
+		{
+			name: "SnippetsFilter has no status",
+			newStatus: ngfAPI.SnippetsFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			expStatusSet: true,
+			expStatus: ngfAPI.SnippetsFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+		},
+		{
+			name: "SnippetsFilter has old status",
+			status: ngfAPI.SnippetsFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "old condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			newStatus: ngfAPI.SnippetsFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			expStatusSet: true,
+			expStatus: ngfAPI.SnippetsFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+		},
+		{
+			name: "SnippetsFilter has old status and other controller status",
+			newStatus: ngfAPI.SnippetsFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			status: ngfAPI.SnippetsFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "old condition"}},
+					},
+				},
+			},
+			expStatus: ngfAPI.SnippetsFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "SnippetsFilter has same status",
+			status: ngfAPI.SnippetsFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			newStatus: ngfAPI.SnippetsFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			expStatusSet: false,
+			expStatus: ngfAPI.SnippetsFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newSnippetsFilterStatusSetter(test.newStatus, controllerName)
+			sf := &ngfAPI.SnippetsFilter{Status: test.status}
+
+			statusSet := setter(sf)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(sf.Status).To(Equal(test.expStatus))
+		})
+	}
+
+	t.Run("retry does not duplicate other controller statuses", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+
+		newStatus := ngfAPI.SnippetsFilterStatus{
+			Controllers: []ngfAPI.ControllerStatus{
+				{
+					Conditions:     []metav1.Condition{{Message: "new condition"}},
+					ControllerName: controllerName,
+				},
+			},
+		}
+
+		setter := newSnippetsFilterStatusSetter(newStatus, controllerName)
+		sf := &ngfAPI.SnippetsFilter{
+			Status: ngfAPI.SnippetsFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+				},
+			},
+		}
+
+		// Simulate NewRetryUpdateFunc invoking the same Setter closure again after a conflict.
+		_ = setter(sf)
+		_ = setter(sf)
+
+		otherCount := 0
+		for _, c := range sf.Status.Controllers {
+			if c.ControllerName == otherControllerName {
+				otherCount++
+			}
+		}
+
+		g.Expect(otherCount).To(Equal(1))
+		g.Expect(sf.Status.Controllers).To(HaveLen(2))
+	})
+}
+
+func TestNewExternalLoadBalancerStatusSetter(t *testing.T) {
+	t.Parallel()
+	const (
+		controllerName      = "controller"
+		otherControllerName = "other-controller"
+	)
+	tests := []struct {
+		name                         string
+		status, expStatus, newStatus ngfAPI.ExternalLoadBalancerStatus
+		expStatusSet                 bool
+	}{
+		{
+			name: "ExternalLoadBalancer has no status",
+			newStatus: ngfAPI.ExternalLoadBalancerStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			expStatusSet: true,
+			expStatus: ngfAPI.ExternalLoadBalancerStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+		},
+		{
+			name: "ExternalLoadBalancer has old status",
+			status: ngfAPI.ExternalLoadBalancerStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "old condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			newStatus: ngfAPI.ExternalLoadBalancerStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			expStatusSet: true,
+			expStatus: ngfAPI.ExternalLoadBalancerStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+		},
+		{
+			name: "ExternalLoadBalancer has old status and other controller status",
+			newStatus: ngfAPI.ExternalLoadBalancerStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			status: ngfAPI.ExternalLoadBalancerStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "old condition"}},
+					},
+				},
+			},
+			expStatus: ngfAPI.ExternalLoadBalancerStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "ExternalLoadBalancer has same status",
+			status: ngfAPI.ExternalLoadBalancerStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			newStatus: ngfAPI.ExternalLoadBalancerStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			expStatusSet: false,
+			expStatus: ngfAPI.ExternalLoadBalancerStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newExternalLoadBalancerStatusSetter(test.newStatus, controllerName)
+			elb := &ngfAPI.ExternalLoadBalancer{Status: test.status}
+
+			statusSet := setter(elb)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(elb.Status).To(Equal(test.expStatus))
+		})
+	}
+
+	t.Run("retry does not duplicate other controller statuses", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+
+		newStatus := ngfAPI.ExternalLoadBalancerStatus{
+			Controllers: []ngfAPI.ControllerStatus{
+				{
+					Conditions:     []metav1.Condition{{Message: "new condition"}},
+					ControllerName: controllerName,
+				},
+			},
+		}
+
+		setter := newExternalLoadBalancerStatusSetter(newStatus, controllerName)
+		elb := &ngfAPI.ExternalLoadBalancer{
+			Status: ngfAPI.ExternalLoadBalancerStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+				},
+			},
+		}
+
+		// Simulate NewRetryUpdateFunc invoking the same Setter closure again after a conflict.
+		_ = setter(elb)
+		_ = setter(elb)
+
+		otherCount := 0
+		for _, c := range elb.Status.Controllers {
+			if c.ControllerName == otherControllerName {
+				otherCount++
+			}
+		}
+
+		g.Expect(otherCount).To(Equal(1))
+		g.Expect(elb.Status.Controllers).To(HaveLen(2))
+	})
+}
+
+func TestNewAuthenticationFilterStatusSetter(t *testing.T) {
+	t.Parallel()
+	const (
+		controllerName      = "controller"
+		otherControllerName = "other-controller"
+	)
+	tests := []struct {
+		name                         string
+		status, expStatus, newStatus ngfAPI.AuthenticationFilterStatus
+		expStatusSet                 bool
+	}{
+		{
+			name: "AuthenticationFilter has no status",
+			newStatus: ngfAPI.AuthenticationFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			expStatusSet: true,
+			expStatus: ngfAPI.AuthenticationFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+		},
+		{
+			name: "AuthenticationFilter has old status",
+			status: ngfAPI.AuthenticationFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "old condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			newStatus: ngfAPI.AuthenticationFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			expStatusSet: true,
+			expStatus: ngfAPI.AuthenticationFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+		},
+		{
+			name: "AuthenticationFilter has old status and other controller status",
+			newStatus: ngfAPI.AuthenticationFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			status: ngfAPI.AuthenticationFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "old condition"}},
+					},
+				},
+			},
+			expStatus: ngfAPI.AuthenticationFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+					{
+						ControllerName: controllerName,
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "AuthenticationFilter has same status",
+			status: ngfAPI.AuthenticationFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			newStatus: ngfAPI.AuthenticationFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+			expStatusSet: false,
+			expStatus: ngfAPI.AuthenticationFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						Conditions:     []metav1.Condition{{Message: "same condition"}},
+						ControllerName: controllerName,
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newAuthenticationFilterStatusSetter(test.newStatus, controllerName)
+			af := &ngfAPI.AuthenticationFilter{Status: test.status}
+
+			statusSet := setter(af)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(af.Status).To(Equal(test.expStatus))
+		})
+	}
+
+	t.Run("retry does not duplicate other controller statuses", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+
+		newStatus := ngfAPI.AuthenticationFilterStatus{
+			Controllers: []ngfAPI.ControllerStatus{
+				{
+					Conditions:     []metav1.Condition{{Message: "new condition"}},
+					ControllerName: controllerName,
+				},
+			},
+		}
+
+		setter := newAuthenticationFilterStatusSetter(newStatus, controllerName)
+		af := &ngfAPI.AuthenticationFilter{
+			Status: ngfAPI.AuthenticationFilterStatus{
+				Controllers: []ngfAPI.ControllerStatus{
+					{
+						ControllerName: otherControllerName,
+						Conditions:     []metav1.Condition{{Message: "some condition"}},
+					},
+				},
+			},
+		}
+
+		// Simulate NewRetryUpdateFunc invoking the same Setter closure again after a conflict.
+		_ = setter(af)
+		_ = setter(af)
+
+		otherCount := 0
+		for _, c := range af.Status.Controllers {
+			if c.ControllerName == otherControllerName {
+				otherCount++
+			}
+		}
+
+		g.Expect(otherCount).To(Equal(1))
+		g.Expect(af.Status.Controllers).To(HaveLen(2))
+	})
+}
+
+func TestInferencePoolStatusSetter(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                         string
+		status, newStatus, expStatus inference.InferencePoolStatus
+		expStatusSet                 bool
+	}{
+		{
+			name: "InferencePool has no status",
+			newStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			expStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "InferencePool updates condition of an existing parent status",
+			status: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "old condition"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			newStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			expStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "InferencePool has new parent statuses along with existing ones",
+			status: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			newStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+					{
+						Conditions: []metav1.Condition{{Message: "gateway2 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway2",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			expStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+					{
+						Conditions: []metav1.Condition{{Message: "gateway2 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway2",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "InferencePool has parent statuses and one is removed",
+			status: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+					{
+						Conditions: []metav1.Condition{{Message: "gateway2 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway2",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			newStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			expStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "InferencePool has existing multiple parent statuses, one gets changed condition",
+			status: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "parent ref gateway1 is valid"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+					{
+						Conditions: []metav1.Condition{{Message: "parent ref gateway2 is valid"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway2",
+							Namespace: "test",
+						},
+					},
+					{
+						Conditions: []metav1.Condition{{Message: "parent ref gateway3 is valid"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway3",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			newStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "parent ref gateway1 is valid"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+					{
+						Conditions: []metav1.Condition{{Message: "parent ref gateway2 is invalid"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway2",
+							Namespace: "test",
+						},
+					},
+					{
+						Conditions: []metav1.Condition{{Message: "parent ref gateway3 is valid"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway3",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			expStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "parent ref gateway1 is valid"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+					{
+						Conditions: []metav1.Condition{{Message: "parent ref gateway2 is invalid"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway2",
+							Namespace: "test",
+						},
+					},
+					{
+						Conditions: []metav1.Condition{{Message: "parent ref gateway3 is valid"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway3",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "InferencePool has same status",
+			status: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			newStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			expStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			expStatusSet: false,
+		},
+		{
+			name: "InferencePool has same status, parent ref group empty string and core are equivalent",
+			status: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+							Group:     helpers.GetPointer(inference.Group("")),
+						},
+					},
+				},
+			},
+			newStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+							Group:     helpers.GetPointer(inference.Group("core")),
+						},
+					},
+				},
+			},
+			expStatus: inference.InferencePoolStatus{
+				Parents: []inference.ParentStatus{
+					{
+						Conditions: []metav1.Condition{{Message: "gateway1 is valid parent ref"}},
+						ParentRef: inference.ParentReference{
+							Name:      "gateway1",
+							Namespace: "test",
+							Group:     helpers.GetPointer(inference.Group("")),
+						},
+					},
+				},
+			},
+			expStatusSet: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newInferencePoolStatusSetter(test.newStatus)
+			obj := &inference.InferencePool{Status: test.status}
+
+			statusSet := setter(obj)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(obj.Status).To(Equal(test.expStatus))
+		})
+	}
+
+	t.Run("cleanup preserves other controller ancestor statuses", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+		const (
+			controllerName      = "controller"
+			otherControllerName = "other-controller"
+		)
+
+		setter := newNGFPolicyStatusSetter(gatewayv1.PolicyStatus{}, controllerName)
+		obj := &ngfAPI.ClientSettingsPolicy{Status: gatewayv1.PolicyStatus{Ancestors: []gatewayv1.PolicyAncestorStatus{
+			{
+				ControllerName: otherControllerName,
+				AncestorRef:    gatewayv1.ParentReference{Name: "other-ancestor"},
+				Conditions:     []metav1.Condition{{Message: "other condition"}},
+			},
+			{
+				ControllerName: controllerName,
+				AncestorRef:    gatewayv1.ParentReference{Name: "ngf-ancestor"},
+				Conditions:     []metav1.Condition{{Message: "ngf condition"}},
+			},
+		}}}
+
+		statusSet := setter(obj)
+
+		g.Expect(statusSet).To(BeTrue())
+		g.Expect(obj.Status.Ancestors).To(Equal([]gatewayv1.PolicyAncestorStatus{
+			{
+				ControllerName: otherControllerName,
+				AncestorRef:    gatewayv1.ParentReference{Name: "other-ancestor"},
+				Conditions:     []metav1.Condition{{Message: "other condition"}},
+			},
+		}))
+	})
+}
+
+func TestNewTCPRouteStatusSetter(t *testing.T) {
+	t.Parallel()
+	const (
+		controllerName      = "controller"
+		otherControllerName = "different"
+	)
+
+	tests := []struct {
+		name                         string
+		status, newStatus, expStatus gatewayv1.TCPRouteStatus
+		expStatusSet                 bool
+	}{
+		{
+			name: "TCPRoute has no status",
+			newStatus: gatewayv1.TCPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.TCPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "TCPRoute has old status",
+			newStatus: gatewayv1.TCPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.TCPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "old condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.TCPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "TCPRoute has old status, keep other controller statuses",
+			newStatus: gatewayv1.TCPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.TCPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "old condition"}},
+						},
+						{
+							ParentRef:      gatewayv1.ParentReference{Name: "other"},
+							ControllerName: gatewayv1.GatewayController(otherControllerName),
+							Conditions:     []metav1.Condition{{Message: "other controller condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.TCPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+						{
+							ParentRef:      gatewayv1.ParentReference{Name: "other"},
+							ControllerName: gatewayv1.GatewayController(otherControllerName),
+							Conditions:     []metav1.Condition{{Message: "other controller condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "TCPRoute has same status",
+			newStatus: gatewayv1.TCPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.TCPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.TCPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newTCPRouteStatusSetter(test.newStatus, controllerName)
+			obj := &gatewayv1.TCPRoute{Status: test.status}
+
+			statusSet := setter(obj)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(obj.Status).To(Equal(test.expStatus))
+		})
+	}
+
+	t.Run("retry does not duplicate other controller statuses", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+
+		newStatus := gatewayv1.TCPRouteStatus{
+			RouteStatus: gatewayv1.RouteStatus{
+				Parents: []gatewayv1.RouteParentStatus{
+					{
+						ParentRef:      gatewayv1.ParentReference{},
+						ControllerName: gatewayv1.GatewayController(controllerName),
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+		}
+
+		setter := newTCPRouteStatusSetter(newStatus, controllerName)
+		obj := &gatewayv1.TCPRoute{
+			Status: gatewayv1.TCPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{Name: "other"},
+							ControllerName: gatewayv1.GatewayController(otherControllerName),
+							Conditions:     []metav1.Condition{{Message: "other controller condition"}},
+						},
+					},
+				},
+			},
+		}
+
+		// Simulate NewRetryUpdateFunc invoking the same Setter closure again after a conflict.
+		_ = setter(obj)
+		_ = setter(obj)
+
+		otherCount := 0
+		for _, p := range obj.Status.Parents {
+			if p.ControllerName == gatewayv1.GatewayController(otherControllerName) {
+				otherCount++
+			}
+		}
+
+		g.Expect(otherCount).To(Equal(1))
+		g.Expect(obj.Status.Parents).To(HaveLen(2))
+	})
+}
+
+func TestNewUDPRouteStatusSetter(t *testing.T) {
+	t.Parallel()
+	const (
+		controllerName      = "controller"
+		otherControllerName = "different"
+	)
+
+	tests := []struct {
+		name                         string
+		status, newStatus, expStatus gatewayv1.UDPRouteStatus
+		expStatusSet                 bool
+	}{
+		{
+			name: "UDPRoute has no status",
+			newStatus: gatewayv1.UDPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.UDPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "UDPRoute has old status",
+			newStatus: gatewayv1.UDPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.UDPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "old condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.UDPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "UDPRoute has old status, keep other controller statuses",
+			newStatus: gatewayv1.UDPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.UDPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "old condition"}},
+						},
+						{
+							ParentRef:      gatewayv1.ParentReference{Name: "other"},
+							ControllerName: gatewayv1.GatewayController(otherControllerName),
+							Conditions:     []metav1.Condition{{Message: "other controller condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.UDPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "new condition"}},
+						},
+						{
+							ParentRef:      gatewayv1.ParentReference{Name: "other"},
+							ControllerName: gatewayv1.GatewayController(otherControllerName),
+							Conditions:     []metav1.Condition{{Message: "other controller condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: true,
+		},
+		{
+			name: "UDPRoute has same status",
+			newStatus: gatewayv1.UDPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			status: gatewayv1.UDPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			expStatus: gatewayv1.UDPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{},
+							ControllerName: gatewayv1.GatewayController(controllerName),
+							Conditions:     []metav1.Condition{{Message: "same condition"}},
+						},
+					},
+				},
+			},
+			expStatusSet: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			setter := newUDPRouteStatusSetter(test.newStatus, controllerName)
+			obj := &gatewayv1.UDPRoute{Status: test.status}
+
+			statusSet := setter(obj)
+
+			g.Expect(statusSet).To(Equal(test.expStatusSet))
+			g.Expect(obj.Status).To(Equal(test.expStatus))
+		})
+	}
+
+	t.Run("retry does not duplicate other controller statuses", func(t *testing.T) {
+		t.Parallel()
+		g := NewWithT(t)
+
+		newStatus := gatewayv1.UDPRouteStatus{
+			RouteStatus: gatewayv1.RouteStatus{
+				Parents: []gatewayv1.RouteParentStatus{
+					{
+						ParentRef:      gatewayv1.ParentReference{},
+						ControllerName: gatewayv1.GatewayController(controllerName),
+						Conditions:     []metav1.Condition{{Message: "new condition"}},
+					},
+				},
+			},
+		}
+
+		setter := newUDPRouteStatusSetter(newStatus, controllerName)
+		obj := &gatewayv1.UDPRoute{
+			Status: gatewayv1.UDPRouteStatus{
+				RouteStatus: gatewayv1.RouteStatus{
+					Parents: []gatewayv1.RouteParentStatus{
+						{
+							ParentRef:      gatewayv1.ParentReference{Name: "other"},
+							ControllerName: gatewayv1.GatewayController(otherControllerName),
+							Conditions:     []metav1.Condition{{Message: "other controller condition"}},
+						},
+					},
+				},
+			},
+		}
+
+		// Simulate NewRetryUpdateFunc invoking the same Setter closure again after a conflict.
+		_ = setter(obj)
+		_ = setter(obj)
+
+		otherCount := 0
+		for _, p := range obj.Status.Parents {
+			if p.ControllerName == gatewayv1.GatewayController(otherControllerName) {
+				otherCount++
+			}
+		}
+
+		g.Expect(otherCount).To(Equal(1))
+		g.Expect(obj.Status.Parents).To(HaveLen(2))
+	})
+}
+
+func TestNewListenerSetStatusSetter(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                         string
+		status, newStatus, expStatus gatewayv1.ListenerSetStatus
+		expStatusSet                 bool
+	}{
+		{
+			name:         "ListenerSet has no status",
+			expStatusSet: true,
+			newStatus: gatewayv1.ListenerSetStatus{
+				Conditions: []metav1.Condition{{Message: "new condition"}},
+				Listeners: []gatewayv1.ListenerEntryStatus{
+					{
+						Name:           "listener-1",
+						AttachedRoutes: 2,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "listener condition"}},
+					},
+				},
+			},
+			expStatus: gatewayv1.ListenerSetStatus{
+				Conditions: []metav1.Condition{{Message: "new condition"}},
+				Listeners: []gatewayv1.ListenerEntryStatus{
+					{
+						Name:           "listener-1",
+						AttachedRoutes: 2,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "listener condition"}},
+					},
+				},
+			},
+			status: gatewayv1.ListenerSetStatus{},
+		},
+		{
+			name:         "ListenerSet has old status",
+			expStatusSet: true,
+			newStatus: gatewayv1.ListenerSetStatus{
+				Conditions: []metav1.Condition{{Message: "new condition"}},
+				Listeners: []gatewayv1.ListenerEntryStatus{
+					{
+						Name:           "listener-1",
+						AttachedRoutes: 2,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "listener condition"}},
+					},
+				},
+			},
+			expStatus: gatewayv1.ListenerSetStatus{
+				Conditions: []metav1.Condition{{Message: "new condition"}},
+				Listeners: []gatewayv1.ListenerEntryStatus{
+					{
+						Name:           "listener-1",
+						AttachedRoutes: 2,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "listener condition"}},
+					},
+				},
+			},
+			status: gatewayv1.ListenerSetStatus{
+				Conditions: []metav1.Condition{{Message: "old condition"}},
+				Listeners: []gatewayv1.ListenerEntryStatus{
+					{
+						Name:           "listener-1",
+						AttachedRoutes: 1,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "old listener condition"}},
+					},
+				},
+			},
+		},
+		{
+			name:         "ListenerSet has multiple listeners, updates some while keeping others",
+			expStatusSet: true,
+			newStatus: gatewayv1.ListenerSetStatus{
+				Conditions: []metav1.Condition{{Message: "updated condition"}},
+				Listeners: []gatewayv1.ListenerEntryStatus{
+					{
+						Name:           "listener-1",
+						AttachedRoutes: 3,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "updated listener-1 condition"}},
+					},
+					{
+						Name:           "listener-2",
+						AttachedRoutes: 1,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "existing listener-2 condition"}},
+					},
+				},
+			},
+			expStatus: gatewayv1.ListenerSetStatus{
+				Conditions: []metav1.Condition{{Message: "updated condition"}},
+				Listeners: []gatewayv1.ListenerEntryStatus{
+					{
+						Name:           "listener-1",
+						AttachedRoutes: 3,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "updated listener-1 condition"}},
+					},
+					{
+						Name:           "listener-2",
+						AttachedRoutes: 1,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "existing listener-2 condition"}},
+					},
+				},
+			},
+			status: gatewayv1.ListenerSetStatus{
+				Conditions: []metav1.Condition{{Message: "old condition"}},
+				Listeners: []gatewayv1.ListenerEntryStatus{
+					{
+						Name:           "listener-1",
+						AttachedRoutes: 1,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "old listener-1 condition"}},
+					},
+					{
+						Name:           "listener-2",
+						AttachedRoutes: 1,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "existing listener-2 condition"}},
+					},
+				},
+			},
+		},
+		{
+			name:         "ListenerSet has same status",
+			expStatusSet: false,
+			newStatus: gatewayv1.ListenerSetStatus{
+				Conditions: []metav1.Condition{{Message: "same condition"}},
+				Listeners: []gatewayv1.ListenerEntryStatus{
+					{
+						Name:           "listener-1",
+						AttachedRoutes: 2,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "listener condition"}},
+					},
+				},
+			},
+			expStatus: gatewayv1.ListenerSetStatus{
+				Conditions: []metav1.Condition{{Message: "same condition"}},
+				Listeners: []gatewayv1.ListenerEntryStatus{
+					{
+						Name:           "listener-1",
+						AttachedRoutes: 2,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "listener condition"}},
+					},
+				},
+			},
+			status: gatewayv1.ListenerSetStatus{
+				Conditions: []metav1.Condition{{Message: "same condition"}},
+				Listeners: []gatewayv1.ListenerEntryStatus{
+					{
+						Name:           "listener-1",
+						AttachedRoutes: 2,
+						SupportedKinds: []gatewayv1.RouteGroupKind{
+							{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						},
+						Conditions: []metav1.Condition{{Message: "listener condition"}},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			ls := &gatewayv1.ListenerSet{
+				Status: test.status,
+			}
+			setter := newListenerSetStatusSetter(test.newStatus)
+			wasSet := setter(ls)
+			g.Expect(wasSet).To(Equal(test.expStatusSet))
+			g.Expect(ls.Status).To(Equal(test.expStatus))
+		})
+	}
+}
+
+func TestListenerSetStatusEqual(t *testing.T) {
+	t.Parallel()
+
+	getDefaultStatus := func() gatewayv1.ListenerSetStatus {
+		return gatewayv1.ListenerSetStatus{
+			Conditions: []metav1.Condition{{Message: "default condition"}},
+			Listeners: []gatewayv1.ListenerEntryStatus{
+				{
+					Name:           "listener-1",
+					AttachedRoutes: 2,
+					SupportedKinds: []gatewayv1.RouteGroupKind{
+						{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+						{Kind: gatewayv1.Kind(kinds.GRPCRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+					},
+					Conditions: []metav1.Condition{{Message: "listener condition"}},
+				},
+				{
+					Name:           "listener-2",
+					AttachedRoutes: 1,
+					SupportedKinds: []gatewayv1.RouteGroupKind{
+						{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+					},
+					Conditions: []metav1.Condition{{Message: "listener2 condition"}},
+				},
+			},
+		}
+	}
+
+	getModifiedStatus := func(mod func(
+		gatewayv1.ListenerSetStatus,
+	) gatewayv1.ListenerSetStatus,
+	) gatewayv1.ListenerSetStatus {
+		return mod(getDefaultStatus())
+	}
+
+	tests := []struct {
+		name       string
+		prevStatus gatewayv1.ListenerSetStatus
+		curStatus  gatewayv1.ListenerSetStatus
+		expEqual   bool
+	}{
+		{
+			name:       "different conditions",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.ListenerSetStatus) gatewayv1.ListenerSetStatus {
+				status.Conditions = []metav1.Condition{{Message: "different condition"}}
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different number of listeners",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.ListenerSetStatus) gatewayv1.ListenerSetStatus {
+				status.Listeners = status.Listeners[:1] // remove one listener
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different listener name",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.ListenerSetStatus) gatewayv1.ListenerSetStatus {
+				status.Listeners[0].Name = "different-name"
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different listener attached routes",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.ListenerSetStatus) gatewayv1.ListenerSetStatus {
+				status.Listeners[0].AttachedRoutes = 5
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different number of supported kinds",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.ListenerSetStatus) gatewayv1.ListenerSetStatus {
+				status.Listeners[0].SupportedKinds = status.Listeners[0].SupportedKinds[:1]
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different supported kind",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.ListenerSetStatus) gatewayv1.ListenerSetStatus {
+				status.Listeners[0].SupportedKinds[0].Kind = gatewayv1.Kind(kinds.TLSRoute)
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different supported kind group",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.ListenerSetStatus) gatewayv1.ListenerSetStatus {
+				status.Listeners[0].SupportedKinds[0].Group = helpers.GetPointer[gatewayv1.Group]("different.group")
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "different listener conditions",
+			prevStatus: getDefaultStatus(),
+			curStatus: getModifiedStatus(func(status gatewayv1.ListenerSetStatus) gatewayv1.ListenerSetStatus {
+				status.Listeners[0].Conditions = []metav1.Condition{{Message: "different listener condition"}}
+				return status
+			}),
+			expEqual: false,
+		},
+		{
+			name:       "equal",
+			prevStatus: getDefaultStatus(),
+			curStatus:  getDefaultStatus(),
+			expEqual:   true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			equal := listenerSetStatusEqual(test.prevStatus, test.curStatus)
+			g.Expect(equal).To(Equal(test.expEqual))
+		})
+	}
+}

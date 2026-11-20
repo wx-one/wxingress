@@ -1,0 +1,946 @@
+package dataplane
+
+import (
+	"fmt"
+	"slices"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	inference "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+
+	ngfAPIv1alpha1 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies/upstreamsettings"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/shared"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/resolver"
+)
+
+// PathType is the type of the path in a PathRule.
+type PathType string
+
+const (
+	// PathTypeExact indicates that the path is exact.
+	PathTypeExact PathType = "exact"
+	// PathTypePrefix indicates that the path is a prefix.
+	PathTypePrefix PathType = "prefix"
+	// PathTypeRegularExpression indicates that the path is a regular expression.
+	PathTypeRegularExpression PathType = "regularExpression"
+)
+
+// Configuration is an intermediate representation of dataplane configuration.
+type Configuration struct {
+	// CertBundles holds all unique Certificate Bundles, including CA certs and CRL files.
+	CertBundles map[CertBundleID]CertBundle
+	// BaseStreamConfig holds the configuration options at the stream context.
+	BaseStreamConfig BaseStreamConfig
+	// SSLKeyPairs holds all unique SSLKeyPairs.
+	SSLKeyPairs map[SSLKeyPairID]SSLKeyPair
+	// AuthSecrets holds all unique secrets for authentication.
+	AuthSecrets map[AuthFileID]AuthFileData
+	// AuxiliarySecrets contains additional secret data, like certificates/keys/tokens that are not related to
+	// Gateway API resources.
+	AuxiliarySecrets map[graph.SecretFileType][]byte
+	// SSLListenerHostnames maps each HTTPS port to its list of raw listener hostnames.
+	// An empty string represents a listener with no hostname (catch-all).
+	// Used to build NGINX maps for misdirected request detection.
+	SSLListenerHostnames map[int32][]string
+	// DeploymentContext contains metadata about NGF and the cluster.
+	DeploymentContext DeploymentContext
+	// Logging defines logging related settings for NGINX.
+	Logging Logging
+	// WorkerProcesses configures the number of NGINX worker processes ("auto" or a positive integer).
+	WorkerProcesses string
+	// WorkerRlimitNofile configures the worker_rlimit_nofile directive in the main context.
+	// When nil, the directive is omitted and NGINX inherits the OS limit.
+	WorkerRlimitNofile *int32
+	// WAF defines the WAF configuration.
+	WAF WAFConfig
+	// NginxPlus specifies NGINX Plus additional settings.
+	NginxPlus NginxPlus
+	// UDPServers holds all UDPServers
+	UDPServers []Layer4VirtualServer
+	// TCPServers holds all TCPServers
+	TCPServers []Layer4VirtualServer
+	// StreamUpstreams holds all unique stream Upstreams (TLS, TCP, UDP)
+	StreamUpstreams []Upstream
+	// SSLServers holds all SSLServers.
+	SSLServers []VirtualServer
+	// Upstreams holds all unique http Upstreams.
+	Upstreams []Upstream
+	// Policies holds the policies attached to the Gateway.
+	Policies []policies.Policy
+	// HTTPServers holds all HTTPServers.
+	HTTPServers []VirtualServer
+	// TLSServers holds all TLS servers (both Passthrough and Terminate mode).
+	TLSServers []Layer4VirtualServer
+	// BackendGroups holds all unique BackendGroups.
+	BackendGroups []BackendGroup
+	// MainSnippets holds all the snippets that apply to the main context.
+	MainSnippets []Snippet
+	// OIDCProviders holds all OIDC provider configurations at the HTTP level.
+	OIDCProviders []OIDCProvider
+	// Telemetry holds the Otel configuration.
+	Telemetry Telemetry
+	// BaseHTTPConfig holds the configuration options at the http context.
+	BaseHTTPConfig BaseHTTPConfig
+	// WorkerConnections specifies the maximum number of simultaneous connections that can be opened by a worker process.
+	WorkerConnections int32
+	// GuardrailsEnabled indicates whether the ai-guardrails NGINX module must be loaded because at least
+	// one location has a Guardrails (PayloadProcessor ExtProcess) configuration.
+	GuardrailsEnabled bool
+}
+
+// Snapshot returns a copy of the configuration for telemetry consumers.
+// It deeply clones upstream data, which is the only mutable portion telemetry reads.
+// Other fields are preserved by value or shared reference because they are not consumed via this path.
+func (c *Configuration) Snapshot() *Configuration {
+	if c == nil {
+		return nil
+	}
+
+	clone := *c
+	// Telemetry only needs upstream endpoint/error data from latest configuration snapshots
+	clone.Upstreams = cloneUpstreams(c.Upstreams)
+
+	return &clone
+}
+
+func cloneUpstreams(src []Upstream) []Upstream {
+	if src == nil {
+		return nil
+	}
+
+	cloned := slices.Clone(src)
+	for i := range cloned {
+		cloned[i].Endpoints = slices.Clone(src[i].Endpoints)
+		cloned[i].Policies = slices.Clone(src[i].Policies)
+	}
+
+	return cloned
+}
+
+// SSLKeyPairID is a unique identifier for a SSLKeyPair.
+// The ID is safe to use as a file name.
+type SSLKeyPairID string
+
+// CertBundleID is a unique identifier for a Certificate bundle.
+// The ID is safe to use as a file name.
+type CertBundleID string
+
+// AuthFileID is a unique identifier for an auth user file.
+// This can be both for basic auth and jwt auth user files.
+// The ID is safe to use as a file name.
+type AuthFileID string
+
+// CertBundle is a Certificate bundle.
+type CertBundle []byte
+
+// AuthFileData is the data for a basic auth user file.
+type AuthFileData []byte
+
+// WAFBundleID is a unique identifier for a WAF bundle.
+// The ID is safe to use as a file name.
+type WAFBundleID string
+
+// WAFBundle is a WAF bundle.
+type WAFBundle []byte
+
+// SSLKeyPair is an SSL private/public key pair.
+type SSLKeyPair struct {
+	// Cert is the certificate.
+	Cert []byte
+	// Key is the private key.
+	Key []byte
+}
+
+// VirtualServer is a virtual server.
+type VirtualServer struct {
+	// SSL holds the SSL configuration for the server.
+	SSL *SSL
+	// Hostname is the hostname of the server.
+	Hostname string
+	// PathRules is a collection of routing rules.
+	PathRules []PathRule
+	// Policies is a list of Policies that apply to the server.
+	Policies []policies.Policy
+	// Port is the port of the server.
+	Port int32
+	// IsDefault indicates whether the server is the default server.
+	IsDefault bool
+}
+
+// Layer4Upstream represents a weighted upstream for Layer 4 traffic.
+type Layer4Upstream struct {
+	// Name is the name of the upstream.
+	Name string
+	// Weight is the weight for load balancing.
+	Weight int32
+}
+
+// Layer4VirtualServer is a virtual server for Layer 4 traffic.
+type Layer4VirtualServer struct {
+	// SSL holds the SSL configuration for TLS Terminate mode.
+	// When nil, the server operates in passthrough mode.
+	SSL *SSL
+	// VerifyTLS holds the backend TLS verification config for TLS terminate upstream proxying.
+	VerifyTLS *VerifyTLS
+	// Hostname is the hostname of the server.
+	Hostname string
+	// Upstreams holds upstreams with weights. For single backend cases, the list contains one entry.
+	Upstreams []Layer4Upstream
+	// Port is the port of the server.
+	Port int32
+	// IsDefault refers to whether this server is created for the default listener hostname.
+	IsDefault bool
+}
+
+// NeedsWeightDistribution returns true if this server needs weight distribution via split_clients.
+func (l4vs Layer4VirtualServer) NeedsWeightDistribution() bool {
+	return len(l4vs.Upstreams) > 1
+}
+
+// Upstream is a pool of endpoints to be load balanced.
+type Upstream struct {
+	// UpstreamSettings holds the processed settings from UpstreamSettingsPolicy for this upstream.
+	UpstreamSettings upstreamsettings.UpstreamSettings
+	// VerifyTLS holds the backend TLS verification settings for active health checks.
+	VerifyTLS *VerifyTLS
+	// SessionPersistence holds the session persistence configuration for the upstream.
+	SessionPersistence SessionPersistenceConfig
+	// Name is the name of the Upstream. Will be unique for each service/port combination.
+	Name string
+	// ErrorMsg contains the error message if the Upstream is invalid.
+	ErrorMsg string
+	// StateFileKey is the key for naming the state file for NGINX Plus upstreams.
+	StateFileKey string
+	// Endpoints are the endpoints of the Upstream.
+	Endpoints []resolver.Endpoint
+	// Policies holds all the valid policies that apply to the Upstream.
+	Policies []policies.Policy
+}
+
+// SessionPersistenceConfig holds the session persistence configuration for an upstream.
+type SessionPersistenceConfig struct {
+	// SessionType is the type of session persistence.
+	SessionType SessionPersistenceType
+	// Name is the name of the session.
+	Name string
+	// Expiry is the expiration time of the session.
+	Expiry string
+	// Path is the path for which session is applied.
+	Path string
+}
+
+// SessionPersistenceType is the type of session persistence.
+type SessionPersistenceType string
+
+const (
+	// CookieBasedSessionPersistence indicates cookie-based session persistence.
+	CookieBasedSessionPersistence SessionPersistenceType = "cookie"
+)
+
+type SSLVerifyClientMode string
+
+const (
+	// SSLVerifyClientOn requires a client certificate that is signed by a trusted CA.
+	// Clients that do not present a certificate, or present one that is not CA-verified, are rejected.
+	SSLVerifyClientOn SSLVerifyClientMode = "on"
+	// SSLVerifyClientOptionalNoCA indicates that client certificates are requested but not required or validated.
+	// Any certificate or none is accepted without CA validation.
+	SSLVerifyClientOptionalNoCA SSLVerifyClientMode = "optional_no_ca"
+)
+
+// SSL is the SSL configuration for a server.
+type SSL struct {
+	// Protocols specifies the SSL/TLS protocols to enable.
+	Protocols string
+	// Ciphers specifies the SSL/TLS ciphers to use.
+	Ciphers string
+	// SessionCache specifies the value for the ssl_session_cache directive. Empty means omit.
+	SessionCache string
+	// SessionTimeout specifies the value for the ssl_session_timeout directive. Empty means omit.
+	SessionTimeout string
+	// EcdhCurve specifies the value for the ssl_ecdh_curve directive. Empty means omit.
+	EcdhCurve string
+	// ClientCertBundleID is the ID of the client certificate bundle for client verification.
+	ClientCertBundleID CertBundleID
+	// VerifyClient specifies the client certificate verification mode.
+	// This can be "on" or "optional_no_ca".
+	VerifyClient SSLVerifyClientMode
+	// KeyPairIDs are the IDs of the corresponding SSLKeyPairs for the server.
+	// Multiple IDs allow nginx to select the appropriate certificate via SNI.
+	KeyPairIDs []SSLKeyPairID
+	// RequireVerifiedCert specifies whether to require a verified client certificate for the server.
+	// When true, NGINX will return 444 and close the connection for clients without a trusted certificate.
+	RequireVerifiedCert bool
+	// PreferServerCiphers specifies whether server ciphers should be preferred over client ciphers.
+	PreferServerCiphers bool
+}
+
+// PathRule represents routing rules that share a common path.
+type PathRule struct {
+	// Path is a path. For example, '/hello'.
+	Path string
+	// PathType is the type of the path.
+	PathType PathType
+	// MatchRules holds routing rules.
+	MatchRules []MatchRule
+	// Policies contains the list of policies that are applied to this PathRule.
+	Policies []policies.Policy
+	// GRPC indicates if this is a gRPC rule
+	GRPC bool
+	// HasInferenceBackends indicates whether the PathRule contains a backend for an inference workload.
+	HasInferenceBackends bool
+}
+
+// InvalidHTTPFilter is a special filter for handling the case when configured filters are invalid.
+type InvalidHTTPFilter struct{}
+
+// HTTPFilters hold the filters for a MatchRule.
+type HTTPFilters struct {
+	// InvalidFilter is a special filter for handling the case when configured filters are invalid.
+	InvalidFilter *InvalidHTTPFilter
+	// RequestRedirect holds an HTTP request redirect filter.
+	RequestRedirect *HTTPRequestRedirectFilter
+	// RequestURLRewrite holds an HTTP URL rewrite filter.
+	RequestURLRewrite *HTTPURLRewriteFilter
+	// RequestHeaderModifiers holds an HTTP header modifier filter for requests.
+	RequestHeaderModifiers *HTTPHeaderFilter
+	// ResponseHeaderModifiers holds an HTTP header modifier filter for responses.
+	ResponseHeaderModifiers *HTTPHeaderFilter
+	// AuthenticationFilter holds the authentication filter configuration.
+	AuthenticationFilter *AuthenticationFilter
+	// CORSFilter holds the CORS filter configuration.
+	CORSFilter *HTTPCORSFilter
+	// ExternalAuthFilter holds external auth filter configuration.
+	ExternalAuthFilter *HTTPExternalAuthFilter
+	// RequestMirrors holds HTTP request mirror filters.
+	RequestMirrors []*HTTPRequestMirrorFilter
+	// SnippetsFilters holds snippets filter configurations.
+	SnippetsFilters []SnippetsFilter
+}
+
+// SnippetsFilter holds the location and server snippets in a SnippetsFilter.
+// The main and http snippets are stored separately in Configuration.MainSnippets and BaseHTTPConfig.Snippets.
+type SnippetsFilter struct {
+	// LocationSnippet holds the snippet for the location context.
+	LocationSnippet *Snippet
+	// ServerSnippet holds the snippet for the server context.
+	ServerSnippet *Snippet
+}
+
+// Snippet is a snippet of configuration.
+type Snippet struct {
+	// Name is the name of the snippet.
+	Name string
+	// Contents is the content of the snippet.
+	Contents string
+}
+
+// HTTPCORSFilter represents HTTP CORS configuration.
+type HTTPCORSFilter struct {
+	// AllowOrigins specifies allowed origins.
+	AllowOrigins []string
+	// AllowMethods specifies allowed HTTP methods.
+	AllowMethods []string
+	// AllowHeaders specifies allowed headers.
+	AllowHeaders []string
+	// ExposeHeaders specifies headers to expose.
+	ExposeHeaders []string
+	// AllowCredentials specifies whether credentials are allowed.
+	AllowCredentials bool
+	// MaxAge specifies preflight request cache duration.
+	MaxAge int32
+}
+
+// HTTPExternalAuthFilter represents configuration for external authorization filter.
+type HTTPExternalAuthFilter struct {
+	// VerifyTLS holds TLS verification config when the auth backend has a BackendTLSPolicy.
+	VerifyTLS *VerifyTLS
+	// UpstreamName is the NGINX upstream name for the auth backend service.
+	UpstreamName string
+	// InternalPath is the NGINX internal location path for the auth subrequest.
+	InternalPath string
+	// PathPrefix is an optional path prefix added to the request path when forwarding to the auth server.
+	PathPrefix string
+	// AllowedRequestHeaders are extra headers to forward from the client request to the auth server,
+	// beyond the mandatory set (Host, Method, Path, Content-Length, Authorization).
+	AllowedRequestHeaders []string
+	// AllowedResponseHeaders are headers from the auth response to copy into the proxied backend request.
+	AllowedResponseHeaders []string
+	// ForwardBody indicates whether the client request body should be forwarded to the auth server.
+	ForwardBody bool
+	// MaxBodySize sets the maximum size of the request body that the client is allowed to send.
+	// It is only applicable when ForwardBody is true. Requests with body larger than the specified size
+	// will be rejected with 413 Payload Too Large error.
+	MaxBodySize uint16
+}
+
+// AuthenticationFilter holds the top level spec for each kind of authentication (e.g. Basic, JWT, etc...).
+type AuthenticationFilter struct {
+	// Basic contains fields related to basic authentication.
+	Basic *AuthBasic
+
+	// OIDC contains fields related to OIDC authentication.
+	OIDC *AuthOIDC
+
+	// JWT contains fields related to JWT authentication.
+	JWT *AuthJWT
+}
+
+// AuthBasic contains fields related to basic authentication.
+// such as the secret data for authentication, and the name/namespace of the secret.
+type AuthBasic struct {
+	// SecretName is the name of the secret containing the basic authentication data.
+	SecretName string
+	// SecretNamespace is the namespace of the secret containing the basic authentication data.
+	SecretNamespace string
+	// Realm is the authentication realm. This is an arbitrary string
+	// displayed to users when prompting for credentials.
+	Realm string
+	// Data contains the user data required for authentication.
+	Data []byte
+}
+
+// OIDCProvider represents an OIDC provider configuration.
+type OIDCProvider struct {
+	// TokenHint specifies whether to include the token hint in the authentication request to the OIDC provider.
+	TokenHint *bool
+	// LogoutURI specifies the logout URI path for the OIDC provider.
+	LogoutURI *string
+	// FrontChannelLogoutURI specifies the front-channel logout URI path for the OIDC provider.
+	FrontChannelLogoutURI *string
+	// Timeout specifies the session timeout for the OIDC provider.
+	Timeout *string
+	// PostLogout URI specifies the post-logout URI for the OIDC provider.
+	PostLogoutURI *string
+	// CookieName specifies the session name for the OIDC provider.
+	CookieName *string
+	// ConfigURL specifies the URL for the OIDC provider's configuration endpoint.
+	ConfigURL *string
+	// PKCE specifies whether to use PKCE for the OIDC provider.
+	PKCE *bool
+	// ClientID is the unique identifier for the OIDC client.
+	ClientID string
+	// Issuer is the issuer URL to discover OIDC configuration from.
+	Issuer string
+	// RedirectURI is the URI used for the OIDC callback.
+	RedirectURI string
+	// ClientSecret is the secret for the OIDC client.
+	// This is used for authentication with the OIDC provider.
+	ClientSecret string
+	// Name is the name of the OIDC provider.
+	Name string
+	// ExtraAuthArgs specifies any extra arguments to include in the authentication request to the OIDC provider.
+	ExtraAuthArgs string
+	// CACertBundleID is the ID of the CA certificate bundle for SSL verification.
+	CACertBundleID CertBundleID
+	// CRLBundleID is the ID of the CRL bundle for SSL verification.
+	CRLBundleID CertBundleID
+	// CRLData is the raw PEM bytes of the CRL.
+	CRLData []byte
+	// CACertData is the raw PEM bytes of the CA certificates.
+	CACertData []byte
+}
+
+// AuthOIDC holds the OIDC authentication configuration, combining the provider
+// configuration with optional claim-based authorization.
+type AuthOIDC struct {
+	// Provider holds the OIDC provider configuration (maps to the oidc_provider directive).
+	Provider *OIDCProvider
+	// AuthRequireVariable is the variable name used by auth_jwt_require for OIDC claim validation.
+	AuthRequireVariable string
+	// AuthZProxySetHeaders are claim-based proxy_set_header directives from authorization config.
+	AuthZProxySetHeaders []HTTPHeader
+}
+
+const (
+	oidcCallBack = "/oidc_callback"
+)
+
+type AuthJWT struct {
+	// KeyCache specifies the time to cache JSON Web Keys.
+	KeyCache *ngfAPIv1alpha1.Duration
+	// Remote holds the configuration for remote JWKS retrieval.
+	Remote *AuthJWTRemote
+	// SecretName is the name of the secret containing the JWT authentication data.
+	SecretName string
+	// SecretNamespace is the namespace of the secret containing the JWT authentication data.
+	SecretNamespace string
+	// Realm is the authentication realm. This is an arbitrary string displayed to users when prompting for credentials.
+	Realm string
+	// Data contains the JWT public key data required for authentication.
+	Data []byte
+	// Leeway specifies the allowable clock skew between the nbf and exp claims.
+	Leeway *ngfAPIv1alpha1.Duration
+	// AuthRequireVariable is the variable name used by auth_jwt_require.
+	AuthRequireVariable string
+	// AuthZProxySetHeaders are claim-based proxy_set_header directives from authorization config.
+	AuthZProxySetHeaders []HTTPHeader
+}
+
+// AuthZConfig holds the complete authorization configuration for JWT claims.
+type AuthZConfig struct {
+	// FilterNsName is the namespaced name of the AuthenticationFilter this config belongs to.
+	FilterNsName string
+	// AuthClaimSets are the auth_jwt_claim_set directives keyed by variable name.
+	AuthClaimSets map[string][]string
+	// RuleMaps are the per-rule maps (http context).
+	RuleMaps []AuthZRuleMap
+	// AuthZMap is the final aggregation map (http context).
+	AuthZMap *AuthZMap
+	// RequireVariable is the variable name used in auth_jwt_require (location context).
+	RequireVariable string
+	// ProxySetHeaders are claim-based proxy_set_header directives (location context).
+	ProxySetHeaders []HTTPHeader
+}
+
+// AuthZRuleMap represents one or more NGINX maps for a single rule.
+type AuthZRuleMap struct {
+	Require ngfAPIv1alpha1.RequireType
+	Maps    []shared.Map
+}
+
+// AuthZMap is the final map combining all rule results.
+type AuthZMap struct {
+	Require ngfAPIv1alpha1.RequireType
+	shared.Map
+}
+
+// ProxySetHeaderClaim maps a claim variable to a proxy_set_header name.
+// Example:
+//
+//	proxy_set_header X-User-Role $claim_roles;
+type ProxySetHeaderClaim struct {
+	HeaderName    string
+	ClaimVariable string
+}
+
+// AuthJWTRemote holds configuration for remote JWKS retrieval.
+type AuthJWTRemote struct {
+	// CACertBundlePath is the path to the CA certificate bundle for verification.
+	CACertBundlePath CertBundleID
+	// URI is the URI for the remote JWKS endpoint.
+	URI string
+	// Path is the internal path used for remote JWKS retrieval.
+	Path string
+}
+
+// HTTPHeader represents an HTTP header.
+type HTTPHeader struct {
+	// Name is the name of the header.
+	Name string
+	// Value is the value of the header.
+	Value string
+}
+
+// HTTPHeaderFilter manipulates HTTP headers.
+type HTTPHeaderFilter struct {
+	// Set adds or replaces headers.
+	Set []HTTPHeader
+	// Add adds headers. It appends to any existing values associated with a header name.
+	Add []HTTPHeader
+	// Remove removes headers.
+	Remove []string
+}
+
+// HTTPRequestRedirectFilter redirects HTTP requests.
+type HTTPRequestRedirectFilter struct {
+	// Scheme is the scheme of the redirect.
+	Scheme *string
+	// Hostname is the hostname of the redirect.
+	Hostname *string
+	// Port is the port of the redirect.
+	Port *int32
+	// StatusCode is the HTTP status code of the redirect.
+	StatusCode *int
+	// Path is the path of the redirect.
+	Path *HTTPPathModifier
+}
+
+// HTTPURLRewriteFilter rewrites HTTP requests.
+type HTTPURLRewriteFilter struct {
+	// Hostname is the hostname of the rewrite.
+	Hostname *string
+	// Path is the path of the rewrite.
+	Path *HTTPPathModifier
+}
+
+// HTTPRequestMirrorFilter mirrors HTTP requests.
+type HTTPRequestMirrorFilter struct {
+	// Name is the service name.
+	Name *string
+	// Namespace is the namespace of the service.
+	Namespace *string
+	// Target is the target of the mirror (path with hostname, service name, and route NamespacedName).
+	Target *string
+	// Percent is the percentage of requests to mirror.
+	Percent *float64
+}
+
+// PathModifierType is the type of the PathModifier in a redirect or rewrite rule.
+type PathModifierType string
+
+const (
+	// ReplaceFullPath indicates that we replace the full path.
+	ReplaceFullPath PathModifierType = "ReplaceFullPath"
+	// ReplacePrefixMatch indicates that we replace a prefix match.
+	ReplacePrefixMatch PathModifierType = "ReplacePrefixMatch"
+)
+
+// MatchType is the type of match in a MatchRule for headers and query parameters.
+type MatchType string
+
+const (
+	// MatchTypeExact indicates that the match type is exact.
+	MatchTypeExact MatchType = "Exact"
+
+	// MatchTypeRegularExpression indicates that the match type is a regular expression.
+	MatchTypeRegularExpression MatchType = "RegularExpression"
+)
+
+// HTTPPathModifier defines configuration for path modifiers.
+type HTTPPathModifier struct {
+	// Replacement specifies the value with which to replace the full path or prefix match of a request during
+	// a rewrite or redirect.
+	Replacement string
+	// Type indicates the type of path modifier.
+	Type PathModifierType
+}
+
+// HTTPHeaderMatch matches an HTTP header.
+type HTTPHeaderMatch struct {
+	// Name is the name of the header to match.
+	Name string
+	// Value is the value of the header to match.
+	Value string
+	// Type specifies the type of match.
+	Type MatchType
+}
+
+// HTTPQueryParamMatch matches an HTTP query parameter.
+type HTTPQueryParamMatch struct {
+	// Name is the name of the query parameter to match.
+	Name string
+	// Value is the value of the query parameter to match.
+	Value string
+	// Type specifies the type of match.
+	Type MatchType
+}
+
+// MatchRule represents a routing rule. It corresponds directly to a Match in the HTTPRoute resource.
+// An HTTPRoute is guaranteed to have at least one rule with one match.
+// If no rule or match is specified by the user, the default rule {{path:{ type: "PathPrefix", value: "/"}}}
+// is set by the schema.
+type MatchRule struct {
+	// Source is the ObjectMeta of the resource that includes the rule.
+	Source *metav1.ObjectMeta
+	// Guardrails holds the ai-guardrails (PayloadProcessor ExtProcess) configuration for the rule, if any.
+	Guardrails *GuardrailsConfig
+	// Filters holds the filters for the MatchRule.
+	Filters HTTPFilters
+	// Match holds the match for the rule.
+	Match Match
+	// BackendGroup is the group of Backends that the rule routes to.
+	BackendGroup BackendGroup
+}
+
+// GuardrailsConfig contains the ai-guardrails / ExtProcess configuration that must be emitted into the
+// generated NGINX location for a match.
+type GuardrailsConfig struct {
+	// VerifyTLS holds the TLS verification settings (CA bundle + hostname) for an HTTPS Guardrails
+	// backend, derived from a BackendTLSPolicy targeting the backend Service. When set, the guardrails
+	// internal location proxies over https with proxy_ssl_verify on.
+	VerifyTLS *VerifyTLS
+	// APIURL is the resolved URL of the external Guardrails service.
+	APIURL string
+	// InternalPath is the NGINX internal location path that the guardrails module issues its
+	// non-blocking inspection subrequest to. That internal location proxies to APIURL.
+	InternalPath string
+	// APITokenAuthFileID identifies the auth token file (in AuthSecrets) holding the bearer token, if any.
+	APITokenAuthFileID AuthFileID
+	// Enabled reports whether the guardrails filter is active for the match.
+	Enabled bool
+}
+
+// Match represents a match for a routing rule which consist of matches against various HTTP request attributes.
+type Match struct {
+	// Method matches against the HTTP method.
+	Method *string
+	// Headers matches against the HTTP headers.
+	Headers []HTTPHeaderMatch
+	// QueryParams matches against the HTTP query parameters.
+	QueryParams []HTTPQueryParamMatch
+}
+
+// BackendGroup represents a group of Backends for a routing rule in an HTTPRoute.
+type BackendGroup struct {
+	// Source is the NamespacedName of the HTTPRoute the group belongs to.
+	Source types.NamespacedName
+	// Backends is a list of Backends in the Group.
+	Backends []Backend
+	// RuleIdx is the index of the corresponding rule in the HTTPRoute.
+	RuleIdx int
+	// PathRuleIdx is the index of the corresponding path rule when attached to a VirtualServer.
+	// BackendGroups attached to a MatchRule that have the same Path match will have the same PathRuleIdx.
+	PathRuleIdx int
+}
+
+// Name returns the name of the backend group.
+// This name must be unique across all HTTPRoutes and all rules within the same HTTPRoute.
+// It is prefixed with `group_` for cases when namespace name starts with a digit. Variable names
+// in nginx configuration cannot start with a digit.
+// The RuleIdx is used to make the name unique across all rules within the same HTTPRoute.
+// The RuleIdx may change for a given rule if an update is made to the HTTPRoute, but it will always match the index
+// of the rule in the stored HTTPRoute.
+func (bg *BackendGroup) Name() string {
+	return fmt.Sprintf("group_%s__%s_rule%d_pathRule%d", bg.Source.Namespace, bg.Source.Name, bg.RuleIdx, bg.PathRuleIdx)
+}
+
+// Backend represents a Backend for a routing rule.
+type Backend struct {
+	// VerifyTLS holds the backend TLS verification configuration.
+	VerifyTLS *VerifyTLS
+	// EndpointPickerConfig holds the configuration for the EndpointPicker for this backend.
+	// This is set if this backend is for an inference workload.
+	EndpointPickerConfig *EndpointPickerConfig
+	// UpstreamName is the name of the upstream for this backend.
+	UpstreamName string
+	// ExternalHostname is the external hostname for ExternalName type services.
+	// This is used to set the Host header when proxying to external services.
+	// Note: The upstream address is also set to this hostname (see resolveUpstreamEndpoints).
+	// Both the Host header and upstream address use the same external hostname to ensure consistency.
+	ExternalHostname string
+	// AppProtocol is the appProtocol of the backing Service port (e.g., "kubernetes.io/h2c").
+	// When set to "kubernetes.io/h2c", NGF will emit proxy_http_version 2 for the corresponding NGINX location.
+	//
+	// Because proxy_http_version is a location-level directive (not per-upstream), NGF applies
+	// an all-or-nothing rule: proxy_http_version 2 is only emitted when every valid backend in
+	// the BackendGroup carries "kubernetes.io/h2c". If even one valid backend does not, NGF falls back
+	// to the NGINX default (1.1) so that all possible upstream targets in a split_clients or
+	// inference-endpoint variable remain reachable.
+	AppProtocol string
+	// Weight is the weight of the BackendRef.
+	// The possible values of weight are 0-1,000,000.
+	// If weight is 0, no traffic should be forwarded for this entry.
+	Weight int32
+	// Valid indicates whether the Backend is valid.
+	Valid bool
+}
+
+// EndpointPickerConfig represents the configuration for the EndpointPicker extension.
+type EndpointPickerConfig struct {
+	// EndpointPickerRef is the reference to the EndpointPicker.
+	EndpointPickerRef *inference.EndpointPickerRef
+	// VerifyTLS holds the backend TLS verification configuration for the EndpointPicker.
+	VerifyTLS *VerifyTLS
+	// NsName is the namespace of the EndpointPicker.
+	NsName string
+}
+
+// VerifyTLS holds the backend TLS verification configuration.
+type VerifyTLS struct {
+	CertBundleID CertBundleID
+	Hostname     string
+	RootCAPath   string
+}
+
+// Telemetry represents global Otel configuration for the dataplane.
+type Telemetry struct {
+	// Endpoint specifies the address of OTLP/gRPC endpoint that will accept telemetry data.
+	Endpoint string
+	// ServiceName is the “service.name” attribute of the OTel resource.
+	ServiceName string
+	// Interval specifies the export interval.
+	Interval string
+	// Ratios is a list of tracing sampling ratios.
+	Ratios []Ratio
+	// SpanAttributes are global custom key/value attributes that are added to each span.
+	SpanAttributes []SpanAttribute
+	// BatchSize specifies the maximum number of spans to be sent in one batch per worker.
+	BatchSize int32
+	// BatchCount specifies the number of pending batches per worker, spans exceeding the limit are dropped.
+	BatchCount int32
+}
+
+// SpanAttribute is a key value pair to be added to a tracing span.
+type SpanAttribute struct {
+	// Key is the key for a span attribute.
+	Key string
+	// Value is the value for a span attribute.
+	Value string
+}
+
+// BaseHTTPConfig holds the configuration options at the http context.
+type BaseHTTPConfig struct {
+	// DNSResolver defines the DNS resolver configuration for NGINX.
+	DNSResolver *DNSResolverConfig
+	// Compression defines the compression settings for NGINX.
+	Compression *CompressionSettings
+	// AuthZConfigs holds the complete authorization configuration for JWT claims.
+	AuthZConfigs []*AuthZConfig
+	// DisableBaseProxySetHeaders specifies which default proxy_set_header entries should be omitted.
+	DisableBaseProxySetHeaders []string
+	// IPFamily specifies the IP family for all servers.
+	IPFamily IPFamilyType
+	// GatewaySecretID is the ID of the secret that contains the gateway backend TLS certificate.
+	GatewaySecretID SSLKeyPairID
+	// NginxReadinessProbePath is the path on which the health check endpoint for NGINX is exposed.
+	NginxReadinessProbePath string
+	// ServerTokens specifies the value for the server_tokens directive in NGINX configuration.
+	ServerTokens string
+	// Policies holds the policies attached to the Gateway for the http context.
+	Policies []policies.Policy
+	// Snippets contain the snippets that apply to the http context.
+	Snippets []Snippet
+	// RewriteClientIPSettings defines configuration for rewriting the client IP to the original client's IP.
+	RewriteClientIPSettings RewriteClientIPSettings
+	// NginxReadinessProbePort is the port on which the health check endpoint for NGINX is exposed.
+	NginxReadinessProbePort int32
+	// HTTP2 specifies whether http2 should be enabled for all servers.
+	HTTP2 bool
+	// DisableSNIHostValidation specifies if the SNI host validation should be disabled.
+	DisableSNIHostValidation bool
+}
+
+// BaseStreamConfig holds the configuration options at the stream context.
+type BaseStreamConfig struct {
+	// DNSResolver specifies the DNS resolver configuration for ExternalName services.
+	DNSResolver *DNSResolverConfig
+}
+
+// RewriteClientIPSettings defines configuration for rewriting the client IP to the original client's IP.
+type RewriteClientIPSettings struct {
+	// Mode specifies the mode for rewriting the client IP.
+	Mode RewriteIPModeType
+	// TrustedAddresses specifies the addresses that are trusted to provide the client IP.
+	TrustedAddresses []string
+	// IPRecursive specifies whether a recursive search is used when selecting the client IP.
+	IPRecursive bool
+}
+
+// DNSResolverConfig defines the DNS resolver configuration for NGINX.
+type DNSResolverConfig struct {
+	// Timeout specifies the timeout for name resolution.
+	Timeout string
+	// Valid specifies how long to cache DNS responses.
+	Valid string
+	// Addresses specifies the list of DNS server addresses.
+	Addresses []string
+	// DisableIPv6 specifies whether to disable DisableIPv6 lookups.
+	DisableIPv6 bool
+}
+
+// CompressionSettings defines the compression configuration for NGINX.
+type CompressionSettings struct {
+	// MinLength is the minimum response length to compress.
+	MinLength *int32
+	// BufferSize is the size of each compression buffer.
+	BufferSize string
+	// HTTPVersion is the minimum HTTP version required for compression.
+	HTTPVersion string
+	// MimeTypes specifies the MIME types to compress.
+	MimeTypes []string
+	// Proxied specifies the proxied request conditions for compression.
+	Proxied []string
+	// Disable specifies User-Agent regex patterns to disable compression.
+	Disable []string
+	// Level is the compression level (1-9).
+	Level int32
+	// BufferNumber is the number of compression buffers.
+	BufferNumber int32
+	// Vary enables the "Vary: Accept-Encoding" response header.
+	Vary bool
+}
+
+// RewriteIPModeType specifies the mode for rewriting the client IP.
+type RewriteIPModeType string
+
+const (
+	// RewriteIPModeProxyProtocol specifies that client IP will be rewrritten using the Proxy-Protocol header.
+	RewriteIPModeProxyProtocol RewriteIPModeType = "proxy_protocol"
+	// RewriteIPModeXForwardedFor specifies that client IP will be rewrritten using the X-Forwarded-For header.
+	RewriteIPModeXForwardedFor RewriteIPModeType = "X-Forwarded-For"
+)
+
+// IPFamilyType specifies the IP family to be used by NGINX.
+type IPFamilyType string
+
+const (
+	// Dual specifies that the server will use both IPv4 and IPv6.
+	Dual IPFamilyType = "dual"
+	// IPv4 specifies that the server will use only IPv4.
+	IPv4 IPFamilyType = "ipv4"
+	// IPv6 specifies that the server will use only IPv6.
+	IPv6 IPFamilyType = "ipv6"
+)
+
+// Ratio represents a tracing sampling ratio used in an nginx config with the otel_module.
+type Ratio struct {
+	// Name is based on the associated ObservabilityPolicy's NamespacedName,
+	// and is used as the nginx variable name for this ratio.
+	Name string
+	// Value is the value of the ratio.
+	Value int32
+}
+
+// Logging defines logging related settings for NGINX.
+type Logging struct {
+	// AccessLog defines the configuration for the NGINX access log.
+	AccessLog *AccessLog
+	// ErrorLevel defines the error log level.
+	ErrorLevel string
+	// ErrorLogFormat defines the error log format.
+	// If not specified, the default NGINX error log format is used.
+	ErrorLogFormat string
+}
+
+// NginxPlus specifies NGINX Plus additional settings.
+type NginxPlus struct {
+	// AllowedAddresses specifies IPAddresses or CIDR blocks to the allow list for accessing the NGINX Plus API.
+	AllowedAddresses []string
+}
+
+// DeploymentContext contains metadata about NGF and the cluster.
+// This is JSON marshaled into a file created by the generator, hence the json tags.
+type DeploymentContext struct {
+	// ClusterID is the ID of the kube-system namespace.
+	ClusterID *string `json:"cluster_id,omitempty"`
+	// InstallationID is the ID of the NGF deployment.
+	InstallationID *string `json:"installation_id,omitempty"`
+	// ClusterNodeCount is the count of nodes in the cluster.
+	ClusterNodeCount *int `json:"cluster_node_count,omitempty"`
+	// Integration is "ngf".
+	Integration string `json:"integration"`
+}
+
+// AccessLog defines the configuration for an NGINX access log.
+type AccessLog struct {
+	// Format specifies the custom log format string.
+	Format string
+	// Escape specifies how to escape characters in variables for access log.
+	Escape string
+	// Path is the destination file path or syslog endpoint.
+	Path string
+	// Disable specifies whether the access log is disabled.
+	Disable bool
+}
+
+var serverTokensKeywords = map[string]struct{}{
+	graph.ServerTokenBuild: {},
+	graph.ServerTokenOff:   {},
+	graph.ServerTokenOn:    {},
+}
+
+// WAFConfig holds the WAF configuration for the dataplane.
+// It is used to determine whether WAF is enabled and to load the WAF module, as well as storing the WAFBundles.
+type WAFConfig struct {
+	// WAFBundles are the WAF Policy Bundles to be stored in the app_protect bundles directory.
+	WAFBundles map[WAFBundleID]WAFBundle
+	// CookieSeed is a stable value used as the app_protect_cookie_seed directive, ensuring WAF session
+	// cookies are consistent across multiple NGINX replicas.
+	CookieSeed string
+	// Enabled indicates whether WAF is enabled.
+	Enabled bool
+}

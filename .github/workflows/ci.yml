@@ -1,0 +1,189 @@
+# Checks and builds wxingress on every push to main and every pull request:
+#
+#   go-test          gofmt check, test certificates (make secrets) and
+#                    make test, with helm for the chart snapshot tests
+#   go-build         the controller binary nginx-ingress (CGO_ENABLED=0)
+#   dataplane-build  the data plane module and an nginx beside it, built with
+#                    dataplane/build.sh inside the meta compiler image
+#   dataplane-test   dataplane/tests/upstream-api.sh against that nginx
+#   helm             helm lint and helm package for charts/wxingress
+#
+# Nothing is pushed or deployed here. release.yml calls this workflow for a
+# tag and builds the image from the binary and module it uploads.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      meta_image:
+        description: meta compiler image to build the data plane with
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      meta_image:
+        description: meta compiler image to build the data plane with
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # the version the chart snapshot tests were recorded with
+  HELM_VERSION: v4.3.0
+  # The meta compiler image (tags are short commits of the meta compiler).
+  # Pinned on purpose: the data plane is checked against a known compiler.
+  # Override with the repository variable META_IMAGE or the workflow_dispatch
+  # input to try another one.
+  META_IMAGE: ${{ inputs.meta_image || vars.META_IMAGE || 'docker.io/wxone/meta:0a3067f' }}
+  # must match NGINX_VERSION in dataplane/build.sh
+  NGINX_OSS_VERSION: 1.31.9
+
+jobs:
+  go-test:
+    name: Go tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: gofmt
+        run: |
+          unformatted=$(git ls-files -z '*.go' | xargs -0 gofmt -l)
+          if [ -n "$unformatted" ]; then
+            echo "::error::files not formatted with gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # the test certificates the tests embed with go:embed
+      - name: Test secrets
+        run: make secrets
+
+      - name: Test
+        run: make test
+
+  go-build:
+    name: Controller binary
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: |
+          IC_VERSION=$(git describe --tags --always --dirty)
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.version=${IC_VERSION}" \
+            -o nginx-ingress ./cmd/nginx-ingress
+          ./nginx-ingress -version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nginx-ingress
+          path: nginx-ingress
+          retention-days: 7
+
+  dataplane-build:
+    name: Data plane build
+    runs-on: ubuntu-24.04
+    container:
+      image: ${{ inputs.meta_image || vars.META_IMAGE || 'docker.io/wxone/meta:0a3067f' }}
+    env:
+      # the image sets META to its directory, build.sh wants the binary
+      META_ROOT: /opt/meta
+      META: /opt/meta/meta
+    steps:
+      - uses: actions/checkout@v4
+
+      # what nginx and the module's static libcurl need to build and the meta
+      # image does not bring along
+      - name: Build dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            curl ca-certificates make libpcre2-dev zlib1g-dev libssl-dev >/dev/null
+
+      - name: Build
+        run: |
+          "$META" --version
+          ./dataplane/build.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dataplane
+          path: |
+            dataplane/build/ngx_http_wxingress_module.so
+            dataplane/build/nginx/sbin/nginx
+            dataplane/build/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  dataplane-test:
+    name: Data plane test
+    needs: dataplane-build
+    runs-on: ubuntu-24.04
+    # the same Debian release the image runs on, so the nginx built in the
+    # meta image finds its libraries
+    container:
+      image: golang:1.27.3-trixie
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dataplane
+          path: dataplane/build
+
+      - name: Upstream API test
+        run: |
+          chmod +x dataplane/build/nginx/sbin/nginx
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          NGINX="$GITHUB_WORKSPACE/dataplane/build/nginx/sbin/nginx" \
+          MODULE="$GITHUB_WORKSPACE/dataplane/build/ngx_http_wxingress_module.so" \
+            ./dataplane/tests/upstream-api.sh
+
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Lint
+        run: helm lint charts/wxingress
+
+      - name: Package
+        run: helm package charts/wxingress -d chart
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chart
+          path: chart/*.tgz
+          retention-days: 7

@@ -1,0 +1,1567 @@
+package v1
+
+import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+)
+
+const (
+	// StateWarning is used when the resource has been validated and accepted but it might work in a degraded state.
+	StateWarning = "Warning"
+	// StateValid is used when the resource has been validated and accepted and is working as expected.
+	StateValid = "Valid"
+	// StateInvalid is used when the resource failed validation or NGINX failed to reload the corresponding config.
+	StateInvalid = "Invalid"
+	// HTTPProtocol defines a constant for the HTTP protocol in GlobalConfinguration.
+	HTTPProtocol = "HTTP"
+	// TLSPassthroughListenerName is the name of a built-in TLS Passthrough listener.
+	TLSPassthroughListenerName = "tls-passthrough"
+	// TLSPassthroughListenerProtocol is the protocol of a built-in TLS Passthrough listener.
+	TLSPassthroughListenerProtocol = "TLS_PASSTHROUGH"
+)
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:validation:Optional
+// +kubebuilder:resource:shortName=vs
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="State",type=string,JSONPath=`.status.state`,description="Current state of the VirtualServer. If the resource has a valid status, it means it has been validated and accepted by the Ingress Controller."
+// +kubebuilder:printcolumn:name="Host",type=string,JSONPath=`.spec.host`
+// +kubebuilder:printcolumn:name="IP",type=string,JSONPath=`.status.externalEndpoints[*].ip`
+// +kubebuilder:printcolumn:name="ExternalHostname",priority=1,type=string,JSONPath=`.status.externalEndpoints[*].hostname`
+// +kubebuilder:printcolumn:name="Ports",type=string,JSONPath=`.status.externalEndpoints[*].ports`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// VirtualServer defines the VirtualServer resource.
+type VirtualServer struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              VirtualServerSpec `json:"spec"`
+	// Status contains the current status of the VirtualServer.
+	Status VirtualServerStatus `json:"status"`
+}
+
+// VirtualServerSpec is the spec of the VirtualServer resource.
+type VirtualServerSpec struct {
+	// Specifies which Ingress Controller must handle the VirtualServerRoute resource. Must be the same as the ingressClassName of the VirtualServer that references this resource.
+	IngressClass string `json:"ingressClassName"`
+	// The host (domain name) of the server. Must be a valid subdomain as defined in RFC 1123, such as my-app or hello.example.com. When using a wildcard domain like *.example.com the domain must be contained in double quotes. The host value needs to be unique among all Ingress and VirtualServer resources.
+	Host string `json:"host"`
+	// Sets a custom HTTP and/or HTTPS listener. Valid fields are listener.http and listener.https. Each field must reference the name of a valid listener defined in a GlobalConfiguration resource
+	Listener *VirtualServerListener `json:"listener"`
+	// The TLS termination configuration.
+	TLS *TLS `json:"tls"`
+	// Enables or disables decompression of gzipped responses for clients. Allowed values “on”/“off”, “true”/“false” or “yes”/“no”. If the gunzip value is not set, it defaults to off.
+	Gunzip bool `json:"gunzip"`
+	// +kubebuilder:validation:Optional
+	// Turns HTTP/2 on or off for this VirtualServer, overriding the http2 ConfigMap key.
+	// Without TLS, HTTP/2 (h2c) on the default listeners (when listener is not set) also requires the http2 ConfigMap key.
+	// When off, HTTP/2 requests for this host get 421 Misdirected Request; HTTP/1.1 is unaffected.
+	HTTP2 *bool `json:"http2,omitempty"`
+	// A list of policies.
+	Policies []PolicyReference `json:"policies"`
+	// A list of upstreams.
+	Upstreams []Upstream `json:"upstreams"`
+	// A list of routes.
+	Routes []Route `json:"routes"`
+	// Sets a custom snippet in the http context.
+	HTTPSnippets string `json:"http-snippets"`
+	// Sets a custom snippet in server context. Overrides the server-snippets ConfigMap key.
+	ServerSnippets string `json:"server-snippets"`
+	// Controls header inheritance behavior at the server level. Allowed values are: on, off, merge. When set to "merge", headers from this context are merged with headers in child contexts. When set to "on", standard NGINX inheritance applies. When set to "off", no headers are inherited from parent contexts.
+	// +kubebuilder:validation:Enum=on;off;merge
+	AddHeaderInherit string `json:"add-header-inherit"`
+	// A reference to a DosProtectedResource, setting this enables DOS protection of the VirtualServer route.
+	Dos string `json:"dos"`
+	// The externalDNS configuration for a VirtualServer.
+	ExternalDNS ExternalDNS `json:"externalDNS"`
+}
+
+// VirtualServerListener references a custom http and/or https listener defined in GlobalConfiguration.
+type VirtualServerListener struct {
+	// The name of an HTTP listener defined in a GlobalConfiguration resource.
+	HTTP string `json:"http"`
+	// The name of an HTTPS listener defined in a GlobalConfiguration resource.
+	HTTPS string `json:"https"`
+}
+
+// ExternalDNS defines externaldns sub-resource of a virtual server.
+type ExternalDNS struct {
+	// Enables ExternalDNS integration for a VirtualServer resource. The default is false.
+	Enable bool `json:"enable"`
+	// The record Type that should be created, e.g. “A”, “AAAA”, “CNAME”. This is automatically computed based on the external endpoints if not defined.
+	RecordType string `json:"recordType,omitempty"`
+	// TTL for the DNS record. This defaults to 0 if not defined.
+	RecordTTL int64 `json:"recordTTL,omitempty"`
+	// Configure labels to be applied to the Endpoint resources that will be consumed by ExternalDNS.
+	// +optional
+	Labels map[string]string `json:"labels,omitempty"`
+	// Configure provider specific properties which holds the name and value of a configuration which is specific to individual DNS providers.
+	// +optional
+	ProviderSpecific ProviderSpecific `json:"providerSpecific,omitempty"`
+}
+
+// ProviderSpecific is a list of properties.
+type ProviderSpecific []ProviderSpecificProperty
+
+// ProviderSpecificProperty defines specific property
+// for using with ExternalDNS sub-resource.
+type ProviderSpecificProperty struct {
+	// Name of the property
+	Name string `json:"name,omitempty"`
+	// Value of the property
+	Value string `json:"value,omitempty"`
+}
+
+// PolicyReference references a policy by name and an optional namespace.
+type PolicyReference struct {
+	// The name of a policy. If the policy doesn’t exist or invalid, NGINX will respond with an error response with the 500 status code.
+	Name string `json:"name"`
+	// The namespace of a policy. If not specified, the namespace of the VirtualServer resource is used.
+	Namespace string `json:"namespace"`
+}
+
+// Upstream defines an upstream.
+type Upstream struct {
+	// The name of the upstream. Must be a valid DNS label as defined in RFC 1035. For example, hello and upstream-123 are valid. The name must be unique among all upstreams of the resource.
+	Name string `json:"name"`
+	// The name of a service. If the Service belongs to a different namespace than the VirtualServer or VirtualServerRoute, you need to include the namespace. For example, tea-namespace/tea. If the service doesn’t exist, NGINX will assume the service has zero endpoints and return a 502 response for requests for this upstream. For NGINX Plus only, services of type ExternalName are also supported in the same namespace.
+	Service string `json:"service"`
+	// Selects the pods within the service using label keys and values. By default, all pods of the service are selected. Note: the specified labels are expected to be present in the pods when they are created. If the pod labels are updated, NGINX Ingress Controller will not see that change until the number of the pods is changed.
+	Subselector map[string]string `json:"subselector"`
+	// The port of the service. If the service doesn’t define that port, NGINX will assume the service has zero endpoints and return a 502 response for requests for this upstream. The port must fall into the range 1..65535.
+	Port uint16 `json:"port"`
+	// The load balancing method. To use the round-robin method, specify round_robin. The default is specified in the lb-method ConfigMap key.
+	LBMethod string `json:"lb-method"`
+	// The time during which the specified number of unsuccessful attempts to communicate with an upstream server should happen to consider the server unavailable. The default is set in the fail-timeout ConfigMap key.
+	FailTimeout string `json:"fail-timeout"`
+	// The number of unsuccessful attempts to communicate with an upstream server that should happen in the duration set by the fail-timeout to consider the server unavailable. The default is set in the max-fails ConfigMap key.
+	MaxFails *int `json:"max-fails"`
+	// The maximum number of simultaneous active connections to an upstream server. By default there is no limit. Note: if keepalive connections are enabled, the total number of active and idle keepalive connections to an upstream server may exceed the max_conns value.
+	MaxConns *int `json:"max-conns"`
+	// Configures the cache for connections to upstream servers. The value 0 disables the cache. The default is set in the keepalive ConfigMap key.
+	Keepalive *int `json:"keepalive"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum="1.0";"1.1";"2"
+	// Sets the HTTP protocol version used for connections to the upstream servers.
+	// Supported values are "1.0", "1.1" and "2". If unset, the appProtocol of the backing
+	// Service port is used ("kubernetes.io/h2c" implies "2"); otherwise NGINX uses HTTP/1.1.
+	// Note: this field is ignored for upstreams with type "grpc", where grpc_pass always
+	// uses HTTP/2, and the values "1.0" and "2" cannot be used with WebSocket, which requires
+	// HTTP/1.1. With "1.0", the "Connection: close" request header is sent to the upstream.
+	ProxyHTTPVersion string `json:"proxy-http-version"`
+	// The timeout for establishing a connection with an upstream server. The default is specified in the proxy-connect-timeout ConfigMap key.
+	ProxyConnectTimeout string `json:"connect-timeout"`
+	// The timeout for reading a response from an upstream server. The default is specified in the proxy-read-timeout ConfigMap key.
+	ProxyReadTimeout string `json:"read-timeout"`
+	// The timeout for transmitting a request to an upstream server. The default is specified in the proxy-send-timeout ConfigMap key.
+	ProxySendTimeout string `json:"send-timeout"`
+	// Specifies in which cases a request should be passed to the next upstream server. The default is error timeout.
+	ProxyNextUpstream string `json:"next-upstream"`
+	// The time during which a request can be passed to the next upstream server. The 0 value turns off the time limit. The default is 0.
+	ProxyNextUpstreamTimeout string `json:"next-upstream-timeout"`
+	// The number of possible tries for passing a request to the next upstream server. The 0 value turns off this limit. The default is 0.
+	ProxyNextUpstreamTries int `json:"next-upstream-tries"`
+	// Enables buffering of responses from the upstream server.  The default is set in the proxy-buffering ConfigMap key.
+	ProxyBuffering *bool `json:"buffering"`
+	// Configures the buffers used for reading a response from the upstream server for a single connection.
+	ProxyBuffers *UpstreamBuffers `json:"buffers"`
+	// Sets the size of the buffer used for reading the first part of a response received from the upstream server. The default is set in the proxy-buffer-size ConfigMap key.
+	ProxyBufferSize string `json:"buffer-size"`
+	// Sets the size of the buffers used for reading a response from the upstream server when the proxy_buffering is enabled. The default is set in the proxy-busy-buffers-size ConfigMap key.'
+	ProxyBusyBuffersSize string `json:"busy-buffers-size"`
+	// Sets the maximum allowed size of the client request body. The default is set in the client-max-body-size ConfigMap key.
+	ClientMaxBodySize string `json:"client-max-body-size"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^\d+[kKmM]?$`
+	// ClientBodyBufferSize sets the size of the buffer used for reading the client request body. Must be specified as a number followed by:
+	// 'k' for kilobytes or 'm' for megabytes.
+	// Examples: "10m" or "512k".
+	ClientBodyBufferSize string `json:"client-body-buffer-size"`
+	// The TLS configuration for the Upstream.
+	TLS UpstreamTLS `json:"tls"`
+	// The health check configuration for the Upstream. Note: this feature is supported only in NGINX Plus.
+	HealthCheck *HealthCheck `json:"healthCheck"`
+	// The slow start allows an upstream server to gradually recover its weight from 0 to its nominal value after it has been recovered or became available or when the server becomes available after a period of time it was considered unavailable. By default, the slow start is disabled. Note: The parameter cannot be used along with the random, hash or ip_hash load balancing methods and will be ignored.
+	SlowStart string `json:"slow-start"`
+	// Configures a queue for an upstream. A client request will be placed into the queue if an upstream server cannot be selected immediately while processing the request. By default, no queue is configured. Note: this feature is supported only in NGINX Plus.
+	Queue *UpstreamQueue `json:"queue"`
+	// The SessionCookie field configures session persistence which allows requests from the same client to be passed to the same upstream server. The information about the designated upstream server is passed in a session cookie generated by NGINX.
+	SessionCookie *SessionCookie `json:"sessionCookie"`
+	// Enables using the Cluster IP and port of the service instead of the default behavior of using the IP and port of the pods. When this field is enabled, the fields that configure NGINX behavior related to multiple upstream servers (like lb-method and next-upstream) will have no effect, as NGINX Ingress Controller will configure NGINX with only one upstream server that will match the service Cluster IP.
+	UseClusterIP bool `json:"use-cluster-ip"`
+	// Allows proxying requests with NTLM Authentication. In order for NTLM authentication to work, it is necessary to enable keepalive connections to upstream servers using the keepalive field. Note: this feature is supported only in NGINX Plus.
+	NTLM bool `json:"ntlm"`
+	// The type of the upstream. Supported values are http and grpc. The default is http. For gRPC, it is necessary to enable HTTP/2, using the VirtualServer http2 field or the http2 ConfigMap key.
+	Type string `json:"type"`
+	// The name of the backup service of type ExternalName. This will be used when the primary servers are unavailable. Note: The parameter cannot be used along with the random, hash or ip_hash load balancing methods.
+	Backup string `json:"backup"`
+	// The port of the backup service. The backup port is required if the backup service name is provided. The port must fall into the range 1..65535.
+	BackupPort *uint16 `json:"backupPort"`
+}
+
+// UpstreamBuffers defines Buffer Configuration for an Upstream.
+type UpstreamBuffers struct {
+	// Configures the number of buffers. The default is set in the proxy-buffers ConfigMap key.
+	Number int `json:"number"`
+	// Configures the size of a buffer. The default is set in the proxy-buffers ConfigMap key.
+	Size string `json:"size"`
+}
+
+// UpstreamTLS defines a TLS configuration for an Upstream.
+type UpstreamTLS struct {
+	// Enables HTTPS for requests to upstream servers. The default is False , meaning that HTTP will be used. Note: by default, NGINX will not verify the upstream server certificate. To enable the verification, configure an EgressMTLS Policy.
+	Enable bool `json:"enable"`
+}
+
+// HealthCheck defines the parameters for active Upstream HealthChecks.
+type HealthCheck struct {
+	// Enables a health check for an upstream server. The default is false.
+	Enable bool `json:"enable"`
+	// The path used for health check requests. The default is /. This is not configurable for gRPC type upstreams.
+	Path string `json:"path"`
+	// The interval between two consecutive health checks. The default is 5s.
+	Interval string `json:"interval"`
+	// The time within which each health check will be randomly delayed. By default, there is no delay.
+	Jitter string `json:"jitter"`
+	// The number of consecutive failed health checks of a particular upstream server after which this server will be considered unhealthy. The default is 1.
+	Fails int `json:"fails"`
+	// The number of consecutive passed health checks of a particular upstream server after which the server will be considered healthy. The default is 1.
+	Passes int `json:"passes"`
+	// The port used for health check requests. By default, the server port is used. Note: in contrast with the port of the upstream, this port is not a service port, but a port of a pod.
+	Port int `json:"port"`
+	// The TLS configuration used for health check requests. By default, the tls field of the upstream is used.
+	TLS *UpstreamTLS `json:"tls"`
+	// The timeout for establishing a connection with an upstream server. By default, the connect-timeout of the upstream is used.
+	ConnectTimeout string `json:"connect-timeout"`
+	// The timeout for reading a response from an upstream server. By default, the read-timeout of the upstream is used.
+	ReadTimeout string `json:"read-timeout"`
+	// The timeout for transmitting a request to an upstream server. By default, the send-timeout of the upstream is used.
+	SendTimeout string `json:"send-timeout"`
+	// The request headers used for health check requests. NGINX Plus always sets the Host, User-Agent and Connection headers for health check requests.
+	Headers []Header `json:"headers"`
+	// The expected response status codes of a health check. By default, the response should have status code 2xx or 3xx. Examples: "200", "! 500", "301-303 307". This not supported for gRPC type upstreams.
+	StatusMatch string `json:"statusMatch"`
+	// The expected gRPC status code of the upstream server response to the Check method. Configure this field only if your gRPC services do not implement the gRPC health checking protocol. For example, configure 12 if the upstream server responds with 12 (UNIMPLEMENTED) status code. Only valid on gRPC type upstreams.
+	GRPCStatus *int `json:"grpcStatus"`
+	// The gRPC service to be monitored on the upstream server. Only valid on gRPC type upstreams.
+	GRPCService string `json:"grpcService"`
+	// Require every newly added server to pass all configured health checks before NGINX Plus sends traffic to it. If this is not specified, or is set to false, the server will be initially considered healthy. When combined with slow-start, it gives a new server more time to connect to databases and “warm up” before being asked to handle their full share of traffic.
+	Mandatory bool `json:"mandatory"`
+	// Set the initial “up” state for a server after reload if the server was considered healthy before reload. Enabling persistent requires that the mandatory parameter is also set to true.
+	Persistent bool `json:"persistent"`
+	// Enables keepalive connections for health checks and specifies the time during which requests can be processed through one keepalive connection. The default is 60s.
+	KeepaliveTime string `json:"keepalive-time"`
+}
+
+// Header defines an HTTP Header.
+type Header struct {
+	// The name of the header.
+	Name string `json:"name"`
+	// The value of the header.
+	Value string `json:"value"`
+}
+
+// SessionCookie defines the parameters for session persistence.
+type SessionCookie struct {
+	// Enables session persistence with a session cookie for an upstream server. The default is false.
+	Enable bool `json:"enable"`
+	// The name of the cookie.
+	Name string `json:"name"`
+	// The path for which the cookie is set.
+	Path string `json:"path"`
+	// The time for which a browser should keep the cookie. Can be set to the special value max, which will cause the cookie to expire on 31 Dec 2037 23:55:55 GMT.
+	Expires string `json:"expires"`
+	// The domain for which the cookie is set.
+	Domain string `json:"domain"`
+	// Adds the HttpOnly attribute to the cookie.
+	HTTPOnly bool `json:"httpOnly"`
+	// Adds the Secure attribute to the cookie.
+	Secure bool `json:"secure"`
+	// Adds the SameSite attribute to the cookie. The allowed values are: strict, lax, none
+	SameSite string `json:"samesite"`
+}
+
+// Route defines a route.
+type Route struct {
+	// The path of the route. NGINX will match it against the URI of a request. Possible values are: a prefix ( / , /path ), a longest prefix match ( ^~/images/ ), an exact match ( =/exact/match ), a case-insensitive regular expression ( ~*^/Bar.*\.jpg ) or a case-sensitive regular expression ( ~^/foo.*\.jpg ). In the case of a prefix match (must start with / ), a longest prefix match (must start with ^~ ) or an exact match (must start with = ), the path must not include any whitespace characters, { , } or ;. In the case of the regex matches, all double quotes " must be escaped and the match can’t end in an unescaped backslash \. The path must be unique among the paths of all routes of the VirtualServer. Check the location directive for more information.
+	Path string `json:"path"`
+	// A list of policies. The policies override the policies of the same type defined in the spec of the VirtualServer.
+	Policies []PolicyReference `json:"policies"`
+	// The name of a VirtualServerRoute resource that defines this route. If the VirtualServerRoute belongs to a different namespace than the VirtualServer, you need to include the namespace. For example, tea-namespace/tea.
+	Route string `json:"route"`
+	// The RouteSelector allows selecting VirtualServerRoute resources using label selectors.
+	RouteSelector *metav1.LabelSelector `json:"routeSelector"`
+	// The default action to perform for a request.
+	Action *Action `json:"action"`
+	// The default splits configuration for traffic splitting. Must include at least 2 splits.
+	Splits []Split `json:"splits"`
+	// The matching rules for advanced content-based routing. Requires the default Action or Splits. Unmatched requests will be handled by the default Action or Splits.
+	Matches []Match `json:"matches"`
+	// The custom responses for error codes. NGINX will use those responses instead of returning the error responses from the upstream servers or the default responses generated by NGINX. A custom response can be a redirect or a canned response. For example, a redirect to another URL if an upstream server responded with a 404 status code.
+	ErrorPages []ErrorPage `json:"errorPages"`
+	// Sets a custom snippet in the location context. Overrides the location-snippets ConfigMap key.
+	LocationSnippets string `json:"location-snippets"`
+	// Controls header inheritance behavior at the location level. Allowed values are: on, off, merge. When set to "merge", headers from this context are merged with headers in child contexts. When set to "on", standard NGINX inheritance applies. When set to "off", no headers are inherited from parent contexts.
+	// +kubebuilder:validation:Enum=on;off;merge
+	AddHeaderInherit string `json:"add-header-inherit"`
+	// A reference to a DosProtectedResource, setting this enables DOS protection of the VirtualServer route.
+	Dos string `json:"dos"`
+}
+
+// Action defines an action.
+type Action struct {
+	// Passes requests to an upstream. The upstream with that name must be defined in the resource.
+	Pass string `json:"pass"`
+	// Redirects requests to a provided URL.
+	Redirect *ActionRedirect `json:"redirect"`
+	// Returns a preconfigured response.
+	Return *ActionReturn `json:"return"`
+	// Passes requests to an upstream with the ability to modify the request/response (for example, rewrite the URI or modify the headers).
+	Proxy *ActionProxy `json:"proxy"`
+}
+
+// ActionRedirect defines a redirect in an Action.
+type ActionRedirect struct {
+	// The URL to redirect the request to. Supported NGINX variables: $scheme, $http_x_forwarded_proto, $request_uri or $host. Variables must be enclosed in curly braces. For example: ${host}${request_uri}.
+	URL string `json:"url"`
+	// The status code of a redirect. The allowed values are: 301, 302, 307 or 308. The default is 301.
+	Code int `json:"code"`
+}
+
+// ActionReturn defines a return in an Action.
+type ActionReturn struct {
+	// The status code of the response. The allowed values are: 2XX, 4XX or 5XX. The default is 200.
+	Code int `json:"code"`
+	// The MIME type of the response. The default is text/plain.
+	Type string `json:"type"`
+	// The body of the response. Supports NGINX variables*. Variables must be enclosed in curly brackets. For example: Request is ${request_uri}\n.
+	Body string `json:"body"`
+	// The custom headers of the response.
+	Headers []Header `json:"headers"`
+}
+
+// ActionProxy defines a proxy in an Action.
+type ActionProxy struct {
+	// The name of the upstream which the requests will be proxied to. The upstream with that name must be defined in the resource.
+	Upstream string `json:"upstream"`
+	// The rewritten URI. If the route path is a regular expression – starts with ~ – the rewritePath can include capture groups with $1-9. For example $1 for the first group, and so on. For more information, check the rewrite example.
+	RewritePath string `json:"rewritePath"`
+	// The request headers modifications.
+	RequestHeaders *ProxyRequestHeaders `json:"requestHeaders"`
+	// The response headers modifications.
+	ResponseHeaders *ProxyResponseHeaders `json:"responseHeaders"`
+}
+
+// ProxyRequestHeaders defines the request headers manipulation in an ActionProxy.
+type ProxyRequestHeaders struct {
+	// Passes the original request headers to the proxied upstream server.  Default is true.
+	Pass *bool `json:"pass"`
+	// Allows redefining or appending fields to present request headers passed to the proxied upstream servers.
+	Set []Header `json:"set"`
+}
+
+// ProxyResponseHeaders defines the response headers manipulation in an ActionProxy.
+type ProxyResponseHeaders struct {
+	// The headers that will not be passed* in the response to the client from a proxied upstream server.
+	Hide []string `json:"hide"`
+	// Allows passing the hidden header fields* to the client from a proxied upstream server.
+	Pass []string `json:"pass"`
+	// Disables processing of certain headers** to the client from a proxied upstream server.
+	Ignore []string `json:"ignore"`
+	// Adds headers to the response to the client.
+	Add []AddHeader `json:"add"`
+}
+
+// AddHeader defines an HTTP Header with an optional Always field to use with the add_header NGINX directive.
+type AddHeader struct {
+	Header `json:",inline"`
+	// If set to true, add the header regardless of the response status code**. Default is false.
+	Always bool `json:"always"`
+}
+
+// Split defines a split.
+type Split struct {
+	// The weight of an action. Must fall into the range 0..100. The sum of the weights of all splits must be equal to 100.
+	Weight int `json:"weight"`
+	// The action to perform for a request.
+	Action *Action `json:"action"`
+}
+
+// Condition defines a condition in a MatchRule.
+type Condition struct {
+	// The name of a header. Must consist of alphanumeric characters or -.
+	Header string `json:"header"`
+	// The name of a cookie. Must consist of alphanumeric characters or _.
+	Cookie string `json:"cookie"`
+	// The name of an argument. Must consist of alphanumeric characters or _.
+	Argument string `json:"argument"`
+	// The name of an NGINX variable. Must start with $.
+	Variable string `json:"variable"`
+	// The value to match the condition against.
+	Value string `json:"value"`
+}
+
+// Match defines a match.
+type Match struct {
+	// A list of conditions. Must include at least 1 condition.
+	Conditions []Condition `json:"conditions"`
+	// The action to perform for a request.
+	Action *Action `json:"action"`
+	// The splits configuration for traffic splitting. Must include at least 2 splits.
+	Splits []Split `json:"splits"`
+}
+
+// ErrorPage defines an ErrorPage in a Route.
+type ErrorPage struct {
+	// A list of error status codes.
+	Codes []int `json:"codes"`
+	// The redirect action for the given status codes.
+	Return *ErrorPageReturn `json:"return"`
+	// The canned response action for the given status codes.
+	Redirect *ErrorPageRedirect `json:"redirect"`
+}
+
+// ErrorPageReturn defines a return for an ErrorPage.
+type ErrorPageReturn struct {
+	ActionReturn `json:",inline"`
+}
+
+// ErrorPageRedirect defines a redirect for an ErrorPage.
+type ErrorPageRedirect struct {
+	ActionRedirect `json:",inline"`
+}
+
+// TLS defines TLS configuration for a VirtualServer.
+type TLS struct {
+	// The name of a secret with a TLS certificate and key. The secret must belong to the same namespace as the VirtualServer. A secret of the type kubernetes.io/tls or Opaque is recommended. The secret is resolved with the TLS role and must store the certificate chain under tls.crt and the matching private key under tls.key. If the secret doesn’t exist or is invalid, NGINX will break any attempt to establish a TLS connection to the host of the VirtualServer. If the secret is not specified but wildcard TLS secret is configured, NGINX will use the wildcard secret for TLS termination.
+	Secret string `json:"secret"`
+	// The redirect configuration of the TLS for a VirtualServer.
+	Redirect *TLSRedirect `json:"redirect"`
+	// The cert-manager configuration of the TLS for a VirtualServer.
+	CertManager *CertManager `json:"cert-manager"`
+}
+
+// TLSRedirect defines a redirect for a TLS.
+type TLSRedirect struct {
+	// Enables a TLS redirect for a VirtualServer. The default is False.
+	Enable bool `json:"enable"`
+	// The status code of a redirect. The allowed values are: 301, 302, 307 or 308. The default is 301.
+	Code *int `json:"code"`
+	// The attribute of a request that NGINX will evaluate to send a redirect. The allowed values are scheme (the scheme of the request) or x-forwarded-proto (the X-Forwarded-Proto header of the request). The default is scheme.
+	BasedOn string `json:"basedOn"`
+}
+
+// CertManager defines a cert manager config for a TLS.
+type CertManager struct {
+	// the name of a ClusterIssuer. A ClusterIssuer is a cert-manager resource which describes the certificate authority capable of signing certificates. It does not matter which namespace your VirtualServer resides, as ClusterIssuers are non-namespaced resources. Please note that one of issuer and cluster-issuer are required, but they are mutually exclusive - one and only one must be defined.
+	ClusterIssuer string `json:"cluster-issuer"`
+	// the name of an Issuer. An Issuer is a cert-manager resource which describes the certificate authority capable of signing certificates. The Issuer must be in the same namespace as the VirtualServer resource. Please note that one of issuer and cluster-issuer are required, but they are mutually exclusive - one and only one must be defined.
+	Issuer string `json:"issuer"`
+	// The kind of the external issuer resource, for example AWSPCAIssuer. This is only necessary for out-of-tree issuers. This cannot be defined if cluster-issuer is also defined.
+	IssuerKind string `json:"issuer-kind"`
+	// The API group of the external issuer controller, for example awspca.cert-manager.io. This is only necessary for out-of-tree issuers. This cannot be defined if cluster-issuer is also defined.
+	IssuerGroup string `json:"issuer-group"`
+	// This field allows you to configure spec.commonName for the Certificate to be generated. This configuration adds a CN to the x509 certificate.
+	CommonName string `json:"common-name"`
+	// This field allows you to configure spec.duration field for the Certificate to be generated. Must be specified using a Go time.Duration string format, which does not allow the d (days) suffix. You must specify these values using s, m, and h suffixes instead.
+	Duration string `json:"duration"`
+	// this annotation allows you to configure spec.renewBefore field for the Certificate to be generated. Must be specified using a Go time.Duration string format, which does not allow the d (days) suffix. You must specify these values using s, m, and h suffixes instead.
+	RenewBefore string `json:"renew-before"`
+	// This field allows you to configure spec.usages field for the Certificate to be generated. Pass a string with comma-separated values i.e. key agreement,digital signature, server auth. An exhaustive list of supported key usages can be found in the the cert-manager api documentation.
+	Usages string `json:"usages"`
+	// When true, ask cert-manager for a temporary self-signed certificate pending the issuance of the Certificate. This allows HTTPS-only servers to use ACME HTTP01 challenges when the TLS secret does not exist yet.
+	IssueTempCert bool `json:"issue-temp-cert"`
+}
+
+// VirtualServerStatus defines the status for the VirtualServer resource.
+type VirtualServerStatus struct {
+	State             string             `json:"state"`
+	Reason            string             `json:"reason"`
+	Message           string             `json:"message"`
+	ExternalEndpoints []ExternalEndpoint `json:"externalEndpoints,omitempty"`
+}
+
+// ExternalEndpoint defines the IP/ Hostname and ports used to connect to this resource.
+type ExternalEndpoint struct {
+	IP       string `json:"ip,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+	Ports    string `json:"ports"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// VirtualServerList is a list of the VirtualServer resources.
+type VirtualServerList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+
+	Items []VirtualServer `json:"items"`
+}
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:validation:Optional
+// +kubebuilder:resource:shortName=vsr
+// +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="State",type=string,JSONPath=`.status.state`,description="Current state of the VirtualServerRoute. If the resource has a valid status, it means it has been validated and accepted by the Ingress Controller."
+// +kubebuilder:printcolumn:name="Host",type=string,JSONPath=`.spec.host`
+// +kubebuilder:printcolumn:name="IP",type=string,JSONPath=`.status.externalEndpoints[*].ip`
+// +kubebuilder:printcolumn:name="ExternalHostname",type=string,priority=1,JSONPath=`.status.externalEndpoints[*].hostname`
+// +kubebuilder:printcolumn:name="Ports",type=string,JSONPath=`.status.externalEndpoints[*].ports`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// VirtualServerRoute defines the VirtualServerRoute resource.
+type VirtualServerRoute struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	Spec   VirtualServerRouteSpec   `json:"spec"`
+	Status VirtualServerRouteStatus `json:"status"`
+}
+
+// VirtualServerRouteSpec is the spec of the VirtualServerRoute resource.
+type VirtualServerRouteSpec struct {
+	// Specifies which Ingress Controller must handle the VirtualServerRoute resource. Must be the same as the ingressClassName of the VirtualServer that references this resource.
+	IngressClass string `json:"ingressClassName"`
+	// The host (domain name) of the server. Must be a valid subdomain as defined in RFC 1123, such as
+	// my-app or hello.example.com. When using a wildcard domain like *.example.com the domain must be
+	// contained in double quotes. When set, must be the same as the host of the VirtualServer that
+	// references this resource. When omitted (hostless mode), the VirtualServerRoute can be referenced
+	// by any VirtualServer regardless of host, enabling the same route configuration to be shared across
+	// multiple VirtualServers.
+	// +kubebuilder:validation:Optional
+	Host string `json:"host,omitempty"`
+	// A list of upstreams.
+	Upstreams []Upstream `json:"upstreams"`
+	// A list of subroutes.
+	Subroutes []Route `json:"subroutes"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// VirtualServerRouteList is a list of VirtualServerRoute
+type VirtualServerRouteList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+
+	Items []VirtualServerRoute `json:"items"`
+}
+
+// UpstreamQueue defines Queue Configuration for an Upstream.
+type UpstreamQueue struct {
+	// The size of the queue.
+	Size int `json:"size"`
+	// The timeout of the queue. A request cannot be queued for a period longer than the timeout. The default is 60s.
+	Timeout string `json:"timeout"`
+}
+
+// VirtualServerRouteStatus defines the status for the VirtualServerRoute resource.
+type VirtualServerRouteStatus struct {
+	// Represents the current state of the resource. There are three possible values: Valid, Invalid and Warning. Valid indicates that the resource has been validated and accepted by the Ingress Controller. Invalid means the resource failed validation or NGINX
+	State string `json:"state"`
+	// The reason of the current state of the resource.
+	Reason string `json:"reason"`
+	// The message of the current state of the resource. It can contain more detailed information about the reason.
+	Message string `json:"message"`
+	// Defines how other resources reference this resource.
+	ReferencedBy string `json:"referencedBy"`
+	// Defines the IPs, hostnames and ports used to connect to this resource.
+	ExternalEndpoints []ExternalEndpoint `json:"externalEndpoints,omitempty"`
+}
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:storageversion
+// +kubebuilder:validation:Optional
+// +kubebuilder:resource:shortName=gc
+
+// GlobalConfiguration defines the GlobalConfiguration resource.
+type GlobalConfiguration struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              GlobalConfigurationSpec `json:"spec"`
+}
+
+// GlobalConfigurationSpec resource defines the global configuration parameters of the Ingress Controller.
+type GlobalConfigurationSpec struct {
+	// Listeners field of the GlobalConfigurationSpec resource
+	Listeners []Listener `json:"listeners"`
+}
+
+// Listener defines a listener.
+type Listener struct {
+	// The name of the listener. The name must be unique across all listeners.
+	Name string `json:"name"`
+	// The protocol of the listener. For example, HTTP.
+	Protocol string `json:"protocol"`
+	// The port on which the listener will accept connections.
+	Port int `json:"port"`
+	// Specifies the IPv4 address to listen on.
+	IPv4 string `json:"ipv4"`
+	// ipv6 addresse that NGINX will listen on.
+	IPv6 string `json:"ipv6"`
+	// Whether the listener will be listening for SSL connections
+	Ssl bool `json:"ssl"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// GlobalConfigurationList is a list of the GlobalConfiguration resources.
+type GlobalConfigurationList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+	// Items field of the GlobalConfigurationList resource
+
+	Items []GlobalConfiguration `json:"items"`
+}
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:validation:Optional
+// +kubebuilder:resource:shortName=ts
+// +kubebuilder:subresource:status
+// +kubebuilder:storageversion
+// +kubebuilder:printcolumn:name="State",type=string,JSONPath=`.status.state`,description="Current state of the TransportServer. If the resource has a valid status, it means it has been validated and accepted by the Ingress Controller."
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.reason`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// TransportServer defines the TransportServer resource.
+type TransportServer struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              TransportServerSpec `json:"spec"`
+	// The status of the TransportServer resource
+	Status TransportServerStatus `json:"status"`
+}
+
+// TransportServerSpec is the spec of the TransportServer resource.
+type TransportServerSpec struct {
+	// Specifies which Ingress Controller must handle the VirtualServer resource.
+	IngressClass string `json:"ingressClassName"`
+	// The TLS termination configuration.
+	TLS *TransportServerTLS `json:"tls"`
+	// Sets a custom HTTP and/or HTTPS listener. Valid fields are listener.http and listener.https. Each field must reference the name of a valid listener defined in a GlobalConfiguration resource
+	Listener TransportServerListener `json:"listener"`
+	// Sets a custom snippet in server context. Overrides the server-snippets ConfigMap key.
+	ServerSnippets string `json:"serverSnippets"`
+	// Sets a custom snippet in the stream context. Overrides the stream-snippets ConfigMap key.
+	StreamSnippets string `json:"streamSnippets"`
+	// The host (domain name) of the server. Must be a valid subdomain as defined in RFC 1123, such as my-app or hello.example.com. When using a wildcard domain like *.example.com the domain must be contained in double quotes. The host value needs to be unique among all Ingress and VirtualServer resources.
+	Host string `json:"host"`
+	// A list of upstreams.
+	Upstreams []TransportServerUpstream `json:"upstreams"`
+	// UpstreamParameters defines parameters for an upstream.
+	UpstreamParameters *UpstreamParameters `json:"upstreamParameters"`
+	// The parameters of the session to be used for the Server context
+	SessionParameters *SessionParameters `json:"sessionParameters"`
+	// The action to perform for a request.
+	Action *TransportServerAction `json:"action"`
+}
+
+// TransportServerTLS defines TransportServerTLS configuration for a TransportServer.
+type TransportServerTLS struct {
+	Secret string `json:"secret"`
+}
+
+// TransportServerListener defines a listener for a TransportServer.
+type TransportServerListener struct {
+	// The name of a listener defined in a GlobalConfiguration resource.
+	Name string `json:"name"`
+	// The protocol of the listener.
+	Protocol string `json:"protocol"`
+}
+
+// TransportServerUpstream defines an upstream.
+type TransportServerUpstream struct {
+	// The name of the upstream. Must be a valid DNS label as defined in RFC 1035. For example, hello and upstream-123 are valid. The name must be unique among all upstreams of the resource.
+	Name string `json:"name"`
+	// The name of a service. The service must belong to the same namespace as the resource. If the service doesn’t exist, NGINX will assume the service has zero endpoints and close client connections/ignore datagrams.
+	Service string `json:"service"`
+	// The port of the service. If the service doesn’t define that port, NGINX will assume the service has zero endpoints and close client connections/ignore datagrams. The port must fall into the range 1..65535.
+	Port int `json:"port"`
+	// Sets the number of unsuccessful attempts to communicate with the server that should happen in the duration set by the failTimeout parameter to consider the server unavailable. The default is 1.
+	FailTimeout string `json:"failTimeout"`
+	// Sets the number of maximum connections to the proxied server. Default value is zero, meaning there is no limit. The default is 0.
+	MaxFails *int `json:"maxFails"`
+	// Sets the time during which the specified number of unsuccessful attempts to communicate with the server should happen to consider the server unavailable and the period of time the server will be considered unavailable. The default is 10s.
+	MaxConns *int `json:"maxConns"`
+	// The health check configuration for the Upstream. Note: this feature is supported only in NGINX Plus.
+	HealthCheck *TransportServerHealthCheck `json:"healthCheck"`
+	// The method used to load balance the upstream servers. By default, connections are distributed between the servers using a weighted round-robin balancing method.
+	LoadBalancingMethod string `json:"loadBalancingMethod"`
+	// The name of the backup service of type ExternalName. This will be used when the primary servers are unavailable. Note: The parameter cannot be used along with the random, hash or ip_hash load balancing methods.
+	Backup string `json:"backup"`
+	// The port of the backup service. The backup port is required if the backup service name is provided. The port must fall into the range 1..65535.
+	BackupPort *uint16 `json:"backupPort"`
+}
+
+// TransportServerHealthCheck defines the parameters for active Upstream HealthChecks.
+type TransportServerHealthCheck struct {
+	// Enables a health check for an upstream server. The default is false.
+	Enabled bool `json:"enable"`
+	// This overrides the timeout set by proxy_timeout which is set in SessionParameters for health checks. The default value is 5s.
+	Timeout string `json:"timeout"`
+	// The time within which each health check will be randomly delayed. By default, there is no delay.
+	Jitter string `json:"jitter"`
+	// The port used for health check requests. By default, the server port is used. Note: in contrast with the port of the upstream, this port is not a service port, but a port of a pod.
+	Port int `json:"port"`
+	// The interval between two consecutive health checks. The default is 5s.
+	Interval string `json:"interval"`
+	// The number of consecutive passed health checks of a particular upstream server after which the server will be considered healthy. The default is 1.
+	Passes int `json:"passes"`
+	// The number of consecutive failed health checks of a particular upstream server after which this server will be considered unhealthy. The default is 1.
+	Fails int `json:"fails"`
+	// Controls the data to send and the response to expect for the healthcheck.
+	Match *TransportServerMatch `json:"match"`
+}
+
+// TransportServerMatch defines the parameters of a custom health check.
+type TransportServerMatch struct {
+	// A string to send to an upstream server.
+	Send string `json:"send"`
+	// A literal string or a regular expression that the data obtained from the server should match. The regular expression is specified with the preceding ~* modifier (for case-insensitive matching), or the ~ modifier (for case-sensitive matching). NGINX Ingress Controller validates a regular expression using the RE2 syntax.
+	Expect string `json:"expect"`
+}
+
+// UpstreamParameters defines parameters for an upstream.
+type UpstreamParameters struct {
+	// The number of datagrams, after receiving which, the next datagram from the same client starts a new session. The default is 0.
+	UDPRequests *int `json:"udpRequests"`
+	// The number of datagrams expected from the proxied server in response to a client datagram.  By default, the number of datagrams is not limited.
+	UDPResponses *int `json:"udpResponses"`
+	// The timeout for establishing a connection with a proxied server.  The default is 60s.
+	ConnectTimeout string `json:"connectTimeout"`
+	// If a connection to the proxied server cannot be established, determines whether a client connection will be passed to the next server. The default is true.
+	NextUpstream bool `json:"nextUpstream"`
+	// The time allowed to pass a connection to the next server. The default is 0.
+	NextUpstreamTimeout string `json:"nextUpstreamTimeout"`
+	// The number of tries for passing a connection to the next server. The default is 0.
+	NextUpstreamTries int `json:"nextUpstreamTries"`
+}
+
+// SessionParameters defines session parameters.
+type SessionParameters struct {
+	// The timeout between two successive read or write operations on client or proxied server connections. The default is 10m.
+	Timeout string `json:"timeout"`
+}
+
+// TransportServerAction defines an action.
+type TransportServerAction struct {
+	// Passes connections/datagrams to an upstream. The upstream with that name must be defined in the resource.
+	Pass string `json:"pass"`
+}
+
+// TransportServerStatus defines the status for the TransportServer resource.
+type TransportServerStatus struct {
+	// Represents the current state of the resource. Possible values: Valid (resource validated and accepted), Invalid (validation failed or config reload failed), or Warning (validated but may work in degraded state).
+	State string `json:"state"`
+	// The reason of the current state of the resource.
+	Reason string `json:"reason"`
+	// The message of the current state of the resource. It can contain more detailed information about the reason.
+	Message string `json:"message"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// TransportServerList is a list of the TransportServer resources.
+type TransportServerList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+	Items           []TransportServer `json:"items"`
+}
+
+// +genclient
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+// +kubebuilder:validation:Optional
+// +kubebuilder:resource:shortName=pol
+// +kubebuilder:subresource:status
+// +kubebuilder:storageversion
+// +kubebuilder:printcolumn:name="State",type=string,JSONPath=`.status.state`,description="Current state of the Policy. If the resource has a valid status, it means it has been validated and accepted by the Ingress Controller."
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+
+// Policy defines a Policy for VirtualServer and VirtualServerRoute resources.
+type Policy struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+	Spec              PolicySpec `json:"spec"`
+	// the status of the Policy resource
+	Status PolicyStatus `json:"status"`
+}
+
+// PolicyStatus is the status of the policy resource
+type PolicyStatus struct {
+	// Represents the current state of the resource. There are three possible values: Valid, Invalid and Warning. Valid indicates that the resource has been validated and accepted by the Ingress Controller. Invalid means the resource failed validation or
+	State string `json:"state"`
+	// The reason of the current state of the resource.
+	Reason string `json:"reason"`
+	// The message of the current state of the resource. It can contain more detailed information about the reason.
+	Message string `json:"message"`
+}
+
+// PolicySpec is the spec of the Policy resource.
+// The spec includes multiple fields, where each field represents a different policy.
+// Only one policy (field) is allowed.
+type PolicySpec struct {
+	// Specifies which instance of NGINX Ingress Controller must handle the Policy resource.
+	IngressClass string `json:"ingressClassName"`
+	// The access control policy based on the client IP address.
+	AccessControl *AccessControl `json:"accessControl"`
+	// The rate limit policy controls the rate of processing requests per a defined key.
+	RateLimit *RateLimit `json:"rateLimit"`
+	// The JWT policy configures NGINX Plus to authenticate client requests using JSON Web Tokens.
+	JWTAuth *JWTAuth `json:"jwt"`
+	// The basic auth policy configures NGINX to authenticate client requests using HTTP Basic authentication credentials.
+	BasicAuth *BasicAuth `json:"basicAuth"`
+	// The IngressMTLS policy configures client certificate verification.
+	IngressMTLS *IngressMTLS `json:"ingressMTLS"`
+	// The EgressMTLS policy configures upstreams authentication and certificate verification.
+	EgressMTLS *EgressMTLS `json:"egressMTLS"`
+	// The OpenID Connect policy configures NGINX to authenticate client requests by validating a JWT token against an OAuth2/OIDC token provider, such as Auth0 or Keycloak.
+	// +kubebuilder:validation:XValidation:rule="(self.sslVerify == true) || (self.sslVerify == false && !has(self.trustedCertSecret))",message="trustedCertSecret can be set only if sslVerify is true"
+	OIDC *OIDC `json:"oidc"`
+	// The OpenID Connect policy configures NGINX to authenticate client requests by validating a JWT token against an OAuth2/OIDC token provider, such as Auth0 or Keycloak. NGINX Plus native.
+	// +kubebuilder:validation:XValidation:rule="(self.sslVerify == true) || (self.sslVerify == false && !has(self.trustedCertSecret))",message="trustedCertSecret can be set only if sslVerify is true"
+	OIDCNative *OIDCNative `json:"oidcNative"`
+	// The WAF policy configures WAF and log configuration policies for NGINX AppProtect
+	WAF *WAF `json:"waf"`
+	// The API Key policy configures NGINX to authorize requests which provide a valid API Key in a specified header or query param.
+	APIKey *APIKey `json:"apiKey"`
+	// The Cache Key defines a cache policy for proxy caching
+	Cache *Cache `json:"cache"`
+	// The CORS policy configures Cross-Origin Resource Sharing headers
+	CORS *CORS `json:"cors"`
+	// The ExternalAuth policy configures NGINX to authenticate client requests using an external authentication server, which can be used for example with the oauth2-proxy or any custom authentication server.
+	ExternalAuth *ExternalAuth `json:"externalAuth"`
+	// The HSTS policy configures HTTP Strict Transport Security headers
+	HSTS *HSTS `json:"hsts"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// PolicyList is a list of the Policy resources.
+type PolicyList struct {
+	metav1.TypeMeta `json:",inline"`
+	metav1.ListMeta `json:"metadata"`
+
+	// Items field of the PolicyList resource
+	Items []Policy `json:"items"`
+}
+
+// AccessControl defines an access policy based on the source IP of a request.
+type AccessControl struct {
+	Allow []string `json:"allow"`
+	Deny  []string `json:"deny"`
+}
+
+// RateLimit defines a rate limit policy.
+type RateLimit struct {
+	// The rate of requests permitted. The rate is specified in requests per second (r/s) or requests per minute (r/m).
+	Rate string `json:"rate"`
+	// The key to which the rate limit is applied. Can contain text, variables, or a combination of them.
+	// Variables must be surrounded by ${}. For example: ${binary_remote_addr}. Accepted variables are
+	// $binary_remote_addr, $request_uri, $request_method, $url, $http_, $args, $arg_, $cookie_,$jwt_claim_ .
+	Key string `json:"key"`
+	// The delay parameter specifies a limit at which excessive requests become delayed. If not set all excessive requests are delayed.
+	Delay *int `json:"delay"`
+	// Disables the delaying of excessive requests while requests are being limited. Overrides delay if both are set.
+	NoDelay *bool `json:"noDelay"`
+	// Excessive requests are delayed until their number exceeds the burst size, in which case the request is terminated with an error.
+	Burst *int `json:"burst"`
+	// Size of the shared memory zone. Only positive values are allowed. Allowed suffixes are k or m, if none are present k is assumed.
+	ZoneSize string `json:"zoneSize"`
+	// Enables the dry run mode. In this mode, the rate limit is not actually applied, but the number of excessive requests is accounted as usual in the shared memory zone.
+	DryRun *bool `json:"dryRun"`
+	// Sets the desired logging level for cases when the server refuses to process requests due to rate exceeding, or delays request processing. Allowed values are info, notice, warn or error. Default is error.
+	LogLevel string `json:"logLevel"`
+	// Sets the status code to return in response to rejected requests. Must fall into the range 400..599. Default is 503.
+	RejectCode *int `json:"rejectCode"`
+	// Enables a constant rate-limit by dividing the configured rate by the number of nginx-ingress pods currently serving traffic. This adjustment ensures that the rate-limit remains consistent, even as the number of nginx-pods fluctuates due to autoscaling. This will not work properly if requests from a client are not evenly distributed across all ingress pods (Such as with sticky sessions, long lived TCP Connections with many requests, and so forth). In such cases using zone-sync instead would give better results. Enabling zone-sync will suppress this setting.
+	Scale bool `json:"scale"`
+	// Add a condition to a rate-limit policy.
+	// +kubebuilder:validation:Optional
+	Condition *RateLimitCondition `json:"condition"`
+}
+
+// RateLimitCondition defines a condition for a rate limit policy.
+type RateLimitCondition struct {
+	// defines a JWT condition to rate limit against.
+	JWT *JWTCondition `json:"jwt"`
+	// defines a Variables condition to rate limit against.
+	// +kubebuilder:validation:MaxItems=1
+	Variables *[]VariableCondition `json:"variables"`
+	// +kubebuilder:validation:Optional
+	// sets the rate limit in this policy to be the default if no conditions are met. In a group of policies with the same condition, only one policy can be the default.
+	Default bool `json:"default"`
+}
+
+// JWTCondition defines a condition for a rate limit by JWT claim.
+type JWTCondition struct {
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^([^$\s"'])*$`
+	// the JWT claim to be rate limit by. Nested claims should be separated by "."
+	Claim string `json:"claim"`
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^([^$\s."'])*$`
+	// the value of the claim to match against.
+	Match string `json:"match"`
+}
+
+// VariableCondition defines a condition to rate limit by a variable.
+type VariableCondition struct {
+	// +kubebuilder:validation:Pattern=`^([^\s"'])*$`
+	// +kubebuilder:validation:Required
+	// the name of the variable to match against.
+	Name string `json:"name"`
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^([^\s"'])*$`
+	// the value of the variable to match against.
+	Match string `json:"match"`
+}
+
+// JWTAuth holds JWT authentication configuration.
+type JWTAuth struct {
+	// The realm of the JWT.
+	Realm string `json:"realm"`
+	// The name of the Kubernetes secret containing the JSON Web Key. It must be in the same namespace as the Policy resource. A secret of the type Opaque is recommended. The secret is resolved with the JWK role and must store the JWK under the jwk key.
+	Secret string `json:"secret"`
+	// The token specifies a variable that contains the JSON Web Token. By default the JWT is passed in the Authorization header as a Bearer Token. JWT may be also passed as a cookie or a part of a query string, for example: $cookie_auth_token. Accepted variables are $http_, $arg_, $cookie_.
+	Token string `json:"token"`
+	// The remote URI where the request will be sent to retrieve JSON Web Key set
+	JwksURI string `json:"jwksURI"`
+	// Enables in-memory caching of JWKS (JSON Web Key Sets) that are obtained from the jwksURI and sets a valid time for expiration.
+	KeyCache string `json:"keyCache"`
+	// Enables SNI (Server Name Indication) for the JWT policy. This is useful when the remote server requires SNI to serve the correct certificate.
+	SNIEnabled bool `json:"sniEnabled"`
+	// The SNI name to use when connecting to the remote server. If not set, the hostname from the ``jwksURI`` will be used.
+	SNIName string `json:"sniName"`
+	// Enables verification of the JWKS server SSL certificate. Default is false.
+	// +kubebuilder:default:=false
+	SSLVerify bool `json:"sslVerify"`
+	// The name of the Kubernetes secret that stores the CA certificate for JWKS server verification. It must be in the same namespace as the Policy resource. A secret of the type Opaque is recommended. The secret is resolved with the CA role and must store the certificate under the ca.crt key.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	TrustedCertSecret string `json:"trustedCertSecret,omitempty"`
+	// Sets the verification depth in the JWKS server certificates chain. The default is 1.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default:=1
+	SSLVerifyDepth *int `json:"sslVerifyDepth"`
+}
+
+// BasicAuth holds HTTP Basic authentication configuration
+type BasicAuth struct {
+	// The realm for the basic authentication.
+	Realm string `json:"realm"`
+	// The name of the Kubernetes secret that stores the Htpasswd configuration. It must be in the same namespace as the Policy resource. A secret of type Opaque is recommended. The secret is resolved with the Htpasswd role and must store the configuration under the htpasswd key.
+	Secret string `json:"secret"`
+}
+
+// The IngressMTLS policy configures client certificate verification.
+type IngressMTLS struct {
+	// The name of the Kubernetes secret that stores the CA certificate. It must be in the same namespace as the Policy resource. A secret of type Opaque is recommended. The secret is resolved with the CA role and must store the certificate under the ca.crt key.
+	ClientCertSecret string `json:"clientCertSecret"`
+	// The file name of the Certificate Revocation List. NGINX Ingress Controller will look for this file in /etc/nginx/secrets
+	CrlFileName string `json:"crlFileName"`
+	// Verification for the client. Possible values are "on", "off", "optional", "optional_no_ca". The default is "on".
+	VerifyClient string `json:"verifyClient"`
+	// Sets the verification depth in the client certificates chain. The default is 1.
+	VerifyDepth *int `json:"verifyDepth"`
+}
+
+// The EgressMTLS policy configures upstreams authentication and certificate verification.
+type EgressMTLS struct {
+	// The name of the Kubernetes secret that stores the TLS certificate and key. It must be in the same namespace as the Policy resource. A secret of the type kubernetes.io/tls or Opaque is recommended. The secret is resolved with the TLS role and must store the certificate chain under tls.crt key and matching private key under the tls.key key.
+	TLSSecret string `json:"tlsSecret"`
+	// Enables verification of the upstream HTTPS server certificate.
+	VerifyServer bool `json:"verifyServer"`
+	// Sets the verification depth in the proxied HTTPS server certificates chain. The default is 1.
+	VerifyDepth *int `json:"verifyDepth"`
+	// Specifies the protocols for requests to an upstream HTTPS server. The default is TLSv1 TLSv1.1 TLSv1.2.
+	Protocols string `json:"protocols"`
+	// Enables reuse of SSL sessions to the upstreams. The default is true.
+	SessionReuse *bool `json:"sessionReuse"`
+	// Specifies the enabled ciphers for requests to an upstream HTTPS server. The default is DEFAULT.
+	Ciphers string `json:"ciphers"`
+	// The name of the Kubernetes secret that stores the CA certificate. It must be in the same namespace as the Policy resource. A secret of the type Opaque is recommended. The secret is resolved with the CA role and must store the certificate under the ca.crt key.
+	TrustedCertSecret string `json:"trustedCertSecret"`
+	// Enables passing of the server name through Server Name Indication extension.
+	ServerName bool `json:"serverName"`
+	// Allows overriding the server name used to verify the certificate of the upstream HTTPS server.
+	SSLName string `json:"sslName"`
+}
+
+// The OIDC policy configures NGINX Plus as a relying party for OpenID Connect authentication.
+type OIDC struct {
+	// wxingress extension: the issuer of the OpenID Connect provider. The ID token's iss must be it, and
+	// the endpoints the policy leaves out come from its discovery document
+	// (<issuer>/.well-known/openid-configuration). Only with the wxingress module (-dynamic-upstreams).
+	// +kubebuilder:validation:Optional
+	Issuer string `json:"issuer,omitempty"`
+	// URL for the authorization endpoint provided by your OpenID Connect provider.
+	AuthEndpoint string `json:"authEndpoint"`
+	// URL for the token endpoint provided by your OpenID Connect provider.
+	TokenEndpoint string `json:"tokenEndpoint"`
+	// URL for the JSON Web Key Set (JWK) document provided by your OpenID Connect provider.
+	JWKSURI string `json:"jwksURI"`
+	// The client ID provided by your OpenID Connect provider.
+	ClientID string `json:"clientID"`
+	// The name of the Kubernetes secret that stores the client secret provided by your OpenID Connect provider. It must be in the same namespace as the Policy resource. A secret of the type Opaque is recommended. The secret is resolved with the OIDC role and must store the client secret under the client-secret key. If PKCE is enabled, this should be not configured.
+	ClientSecret string `json:"clientSecret"`
+	// List of OpenID Connect scopes. The scope openid always needs to be present and others can be added concatenating them with a + sign, for example openid+profile+email, openid+email+userDefinedScope. The default is openid.
+	Scope string `json:"scope"`
+	// Allows overriding the default redirect URI. The default is /_codexch.
+	RedirectURI string `json:"redirectURI"`
+	// URL provided by your OpenID Connect provider to request the end user be logged out.
+	EndSessionEndpoint string `json:"endSessionEndpoint"`
+	// URI to redirect to after the logout has been performed. Requires endSessionEndpoint. The default is /_logout.
+	PostLogoutRedirectURI string `json:"postLogoutRedirectURI"`
+	// Specifies the maximum timeout in milliseconds for synchronizing ID/access tokens and shared values between Ingress Controller pods. The default is 200.
+	ZoneSyncLeeway *int `json:"zoneSyncLeeway"`
+	// A list of extra URL arguments to pass to the authorization endpoint provided by your OpenID Connect provider. Arguments must be URL encoded, multiple arguments may be included in the list, for example [ arg1=value1, arg2=value2 ]
+	AuthExtraArgs []string `json:"authExtraArgs"`
+	// Option of whether Bearer token is used to authorize NGINX to access protected backend.
+	AccessTokenEnable bool `json:"accessTokenEnable"`
+	// Switches Proof Key for Code Exchange on. The OpenID client needs to be in public mode. clientSecret is not used in this mode.
+	PKCEEnable bool `json:"pkceEnable"`
+	// Enables verification of the IDP server SSL certificate. Default is false.
+	// +kubebuilder:default:=false
+	SSLVerify bool `json:"sslVerify"`
+	// The name of the Kubernetes secret that stores the CA certificate for IDP server verification. It must be in the same namespace as the Policy resource. A secret of the type Opaque is recommended. The secret is resolved with the CA role and must store the certificate under the ca.crt key.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	TrustedCertSecret string `json:"trustedCertSecret,omitempty"`
+	// Sets the verification depth in the IDP server certificates chain. The default is 1.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default:=1
+	SSLVerifyDepth *int `json:"sslVerifyDepth"`
+}
+
+// BundleSourceType specifies the remote source backend for a WAF bundle.
+// +kubebuilder:validation:Enum=HTTPS;NIM;N1C
+type BundleSourceType string
+
+const (
+	// BundleSourceTypeHTTPS fetches a pre-compiled .tgz bundle from any HTTPS endpoint.
+	BundleSourceTypeHTTPS BundleSourceType = "HTTPS"
+	// BundleSourceTypeNIM fetches a managed policy bundle from NGINX Instance Manager.
+	BundleSourceTypeNIM BundleSourceType = "NIM"
+	// BundleSourceTypeN1C fetches a managed policy bundle from NGINX One Console.
+	BundleSourceTypeN1C BundleSourceType = "N1C"
+)
+
+// BundleSource configures fetching a pre-compiled WAF bundle from a remote source.
+//
+// Three source types are supported:
+//   - HTTPS (default): fetch a pre-compiled .tgz bundle from any HTTPS server.
+//   - NIM: pull a named managed policy from NGINX Instance Manager via its API.
+//   - N1C: pull a named managed policy from NGINX One Console via its API.
+//
+// Type-specific field requirements (url required; name required for NIM/N1C;
+// namespace required for N1C) are enforced by the controller's Go validation layer.
+//
+// To reference bundles compiled by the F5 WAF Policy Controller (PLM), use the
+// apPolicy and apLogConf fields on the parent WAF resource. NIC resolves those
+// references as PLM bundles when the -plm-storage-url flag is set.
+type BundleSource struct {
+	// Type is the bundle source backend. Defaults to HTTPS.
+	// +kubebuilder:default=HTTPS
+	// +optional
+	Type BundleSourceType `json:"type,omitempty"`
+
+	// URL is the full bundle URL for HTTPS type, or the API base URL for NIM/N1C. Must use https://.
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=2083
+	// +kubebuilder:validation:Pattern=`^https://`
+	URL string `json:"url"`
+
+	// Secret is the name of a Kubernetes Secret in the same namespace as the Policy.
+	// A secret of the type Opaque is recommended.
+	// For HTTPS: TLS role (tls.crt + tls.key keys for client mTLS; optional ca.crt for server CA).
+	// For N1C: WAF Bundle role; secret with a 'token' field containing the API token.
+	// For NIM: WAF Bundle role; secret with a 'token' field (bearer auth) or 'username'+'password' fields (basic auth).
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +optional
+	Secret string `json:"secret,omitempty"`
+
+	// TrustedCertSecret is the name of a Kubernetes Secret with a custom CA certificate
+	// for verifying the remote endpoint TLS certificate. The secret must be in the same
+	// namespace as the Policy. A secret of the type Opaque is recommended. The secret is
+	// resolved with the CA role and must store the certificate under the ca.crt key.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +optional
+	TrustedCertSecret string `json:"trustedCertSecret,omitempty"`
+
+	// Name is the policy name on the management plane. Required for NIM and N1C; forbidden for HTTPS.
+	// +kubebuilder:validation:MaxLength=63
+	// +optional
+	Name string `json:"name,omitempty"`
+
+	// Namespace is the namespace/tenant on the management plane. Required for N1C; forbidden otherwise.
+	// +kubebuilder:validation:MaxLength=63
+	// +optional
+	Namespace string `json:"namespace,omitempty"`
+
+	// EnablePolling enables background polling to automatically detect and fetch
+	// updated bundles at the configured PollInterval. Defaults to false. When
+	// false, the bundle is fetched once on policy creation or update; subsequent
+	// updates require modifying the Policy resource to trigger a new fetch.
+	// +kubebuilder:default:=false
+	// +optional
+	EnablePolling bool `json:"enablePolling,omitempty"`
+
+	// PollInterval is how often to re-fetch the bundle when enablePolling is true.
+	// Minimum 1m. Default 5m. Ignored when enablePolling is false.
+	// +optional
+	PollInterval *metav1.Duration `json:"pollInterval,omitempty"`
+
+	// Timeout is the per-request HTTP timeout. Default 60s.
+	// +optional
+	Timeout *metav1.Duration `json:"timeout,omitempty"`
+
+	// RetryAttempts is the number of retry attempts on transient failure. Range 1–10.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10
+	// +optional
+	RetryAttempts *int `json:"retryAttempts,omitempty"`
+
+	// InsecureSkipVerify disables TLS certificate verification when fetching bundles.
+	// Not recommended for production use.
+	// +optional
+	InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
+
+	// VerifyChecksum enables SHA-256 verification of the downloaded bundle. HTTPS type only.
+	// +optional
+	VerifyChecksum bool `json:"verifyChecksum,omitempty"`
+}
+
+// The OIDCNative policy configures NGINX Plus as a relying party for OpenID Connect authentication using the native ngx_http_oidc_module.
+type OIDCNative struct {
+	// Sets the Issuer Identifier URL of the OpenID Provider; required directive. The URL must exactly match the value of “issuer” in the OpenID Provider metadata and requires the “https” scheme.
+	// +kubebuilder:validation:Pattern=`^https://[^/\s"'\x60$;\\]+(/[^\s"'\x60$;\\]*)?$`
+	// +kubebuilder:validation:Required
+	Issuer string `json:"issuer"`
+	// The client ID provided by your OpenID Connect provider.
+	// +kubebuilder:validation:Required
+	ClientID string `json:"clientID"`
+	// The name of the Kubernetes secret that stores the client secret provided by your OpenID Connect provider. It must be in the same namespace as the Policy resource. A secret of the type Opaque is recommended. The secret is resolved with the OIDC role and must store the client secret under the client-secret key.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	ClientSecret string `json:"clientSecret,omitempty"` //nolint:gosec // G117: references a K8s secret name, not a credential
+	// ConfigURL is the URL of the OpenID Provider Configuration Information. If not set, defaults to <issuer>/.well-known/openid-configuration as per the OpenID Connect Discovery specification.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^https?://[^/\s"'\x60$;\\]+/[^\s"'\x60$;\\]*$`
+	ConfigURL string `json:"configURL,omitempty"`
+	// List of OpenID Connect scopes, space-separated. The scope openid is always required. Example: "openid profile email". Default is "openid".
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:XValidation:rule="self == '' || self.matches('(^|[ +])openid([ +]|$)')",message="scope must contain 'openid' as a token"
+	Scope string `json:"scope,omitempty"`
+	// Allows overriding the default redirect URI. Defaults to /oidc_callback_<providerName>.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^/[^\s{};\\$\x60"']*$`
+	RedirectURI string `json:"redirectURI,omitempty"`
+	// Sets the name of the session cookie. Defaults to NGX_OIDC_<providerName>.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[_A-Za-z0-9]+$`
+	CookieName string `json:"cookieName,omitempty"`
+	// Sets additional query arguments for the authentication request URL, for example "display=page&prompt=login".
+	// +kubebuilder:validation:Optional
+	ExtraAuthArgs string `json:"extraAuthArgs,omitempty"`
+	// Explicitly enables or disables PKCE. By default, PKCE is automatically enabled based on OpenID Provider metadata.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Enum=on;off
+	PKCE string `json:"pkce,omitempty"`
+	// Defines the URI path for initiating session logout. Upon session termination, the user is redirected to the post logout page.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^/[^\s{};\\$\x60"']*$`
+	LogoutURI string `json:"logoutURI,omitempty"`
+	// Defines the path where the user is redirected after logout. Must be a path on the same host — absolute URLs are not supported. When set, NIC also auto-generates an unauthenticated location at this path serving a plain-text confirmation response. If multiple OIDCNative providers on the same host set the same path, only one auto-generated location is rendered; providers whose other generated locations (redirectURI, or the internal IdP proxy location) collide are rejected instead.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^/[^\s{};\\$\x60"']*$`
+	PostLogoutRedirectURI string `json:"postLogoutRedirectURI,omitempty"`
+	// Defines the URI path for triggering OIDC front-channel logout. When set, the IdP calls this URI in a hidden iframe when the user logs out globally, allowing NGINX to terminate the local session.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^/[^\s{};\\$\x60"']*$`
+	FrontChannelLogoutURI string `json:"frontChannelLogoutURI,omitempty"`
+	// Adds the id_token_hint argument to the Provider's Logout Endpoint when redirecting user during logout. Required by some providers.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	LogoutTokenHint bool `json:"logoutTokenHint,omitempty"`
+	// Sets a timeout after which the session is deleted, unless it was refreshed. Default is 8h.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[0-9]{1,8}(s|m|h|d)?$`
+	SessionTimeout string `json:"sessionTimeout,omitempty"`
+	// Enables downloading of the UserInfo data and makes UserInfo claims available via the $oidc_claim_name variables.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	UserInfoEnable bool `json:"userInfoEnable,omitempty"`
+	// The name of the Kubernetes secret that stores the trusted CA certificate for verifying the OpenID Provider's TLS certificate. A secret of the type Opaque is recommended. The secret is resolved with the CA role and must store the certificate under the ca.crt key.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	TrustedCertSecret string `json:"trustedCertSecret,omitempty"`
+	// Enables verification of the OpenID Provider's TLS certificate. Default is true. Set to false to skip verification (dev/test only, insecure).
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=true
+	SSLVerify *bool `json:"sslVerify,omitempty"`
+	// Overrides the TLS SNI name and Host header used when connecting to the OpenID Provider. If omitted, NGINX dynamically resolves SNI and Host header from the endpoint URLs.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	SSLName string `json:"sslName,omitempty"`
+	// Sets the verification depth in the OpenID Provider TLS certificate chain. Default is 1.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=1
+	SSLVerifyDepth *int `json:"sslVerifyDepth,omitempty"`
+	// Buffer size used when proxying requests to the OpenID Provider. Applies to `proxy_buffer_size` and each buffer in `proxy_buffers`. Default is `32k`.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[0-9]{1,8}[kKmM]?$`
+	// +kubebuilder:default="32k"
+	ProxyBufferSize string `json:"proxyBufferSize,omitempty"`
+}
+
+// The WAF policy configures NGINX Plus to secure client requests using App Protect WAF policies.
+// Mutual exclusivity of apPolicy, apBundle, and apBundleSource is enforced by the Go validation layer.
+type WAF struct {
+	// Enables NGINX App Protect WAF.
+	Enable bool `json:"enable"`
+	// The App Protect WAF policy of the WAF. Accepts an optional namespace. Mutually exclusive with apBundle and apBundleSource.
+	ApPolicy string `json:"apPolicy"`
+	// The App Protect WAF policy bundle. Mutually exclusive with apPolicy and apBundleSource.
+	ApBundle string `json:"apBundle"`
+	// ApBundleSource fetches the WAF policy bundle from N1C, NIM, or an HTTPS endpoint.
+	// Mutually exclusive with ApPolicy and ApBundle.
+	// +optional
+	ApBundleSource *BundleSource  `json:"apBundleSource,omitempty"`
+	SecurityLog    *SecurityLog   `json:"securityLog"`
+	SecurityLogs   []*SecurityLog `json:"securityLogs"`
+}
+
+// SecurityLog defines the security log of a WAF policy.
+// Mutual exclusivity of apLogConf, apLogBundle, and apLogBundleSource is enforced by the Go validation layer.
+type SecurityLog struct {
+	// Enables security log.
+	Enable bool `json:"enable"`
+	// The App Protect WAF log conf resource. Accepts an optional namespace. Only works with apPolicy.
+	ApLogConf string `json:"apLogConf"`
+	// The App Protect WAF log bundle resource. Only works with apBundle.
+	ApLogBundle string `json:"apLogBundle"`
+	// ApLogBundleSource fetches the log profile bundle from N1C, NIM, or an HTTPS endpoint.
+	// Mutually exclusive with ApLogConf and ApLogBundle. Requires apBundleSource on the parent WAF.
+	// +optional
+	ApLogBundleSource *BundleSource `json:"apLogBundleSource,omitempty"`
+	// The log destination for the security log. Only accepted variables are syslog:server=<ip-address>; localhost; fqdn>:<port>, stderr, <absolute path to file>.
+	LogDest string `json:"logDest"`
+}
+
+// The APIKey policy configures NGINX to authorize requests which provide a valid API Key in a specified header or query param.
+type APIKey struct {
+	// The location of the API Key. For example, $http_auth, $arg_apikey, $cookie_auth. Accepted variables are $http_, $arg_, $cookie_.
+	SuppliedIn *SuppliedIn `json:"suppliedIn"`
+	// The name of a Kubernetes secret in the Policy namespace. A secret of the type Opaque is recommended. The secret is resolved with the APIKey role; each data key is a client ID and its value is that client API key. Can contain text, variables, or a combination of them. Accepted variables are $http_, $arg_, $cookie_.
+	ClientSecret string `json:"clientSecret"`
+}
+
+// SuppliedIn defines the locations API Key should be supplied in.
+type SuppliedIn struct {
+	// The location of the API Key as a request header. For example, $http_auth. Accepted variables are $http_.
+	Header []string `json:"header"`
+	// The location of the API Key as a query param. For example, $arg_apikey. Accepted variables are $arg_.
+	Query []string `json:"query"`
+}
+
+// CacheManager defines cache manager process parameters for controlling the cache manager process behavior.
+// The cache manager monitors the maximum cache size and removes the least recently used data when the size is exceeded.
+type CacheManager struct {
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	// Files sets the maximum number of files that will be deleted in one iteration by the cache manager.
+	// During one iteration no more than manager_files items are deleted (by default, 100).
+	Files *int `json:"files,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[0-9]+[mu]?s$`
+	// Sleep sets the pause between cache manager iterations.
+	// Between iterations, a pause configured by manager_sleep (by default, 50 milliseconds) is made.
+	Sleep string `json:"sleep,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[0-9]+[mu]?s$`
+	// Threshold sets the maximum duration of one cache manager iteration.
+	// The duration of one iteration is limited by manager_threshold (by default, 200 milliseconds).
+	Threshold string `json:"threshold,omitempty"`
+}
+
+// CacheLock defines cache locking parameters. When enabled, only one request at a time will be allowed to populate a new cache element.
+// Other requests of the same cache element will either wait for a response to appear in the cache or the cache lock for this element to be released.
+// +kubebuilder:validation:XValidation:rule="(!has(self.timeout) && !has(self.age)) || self.enable",message="timeout or age require enable=true"
+type CacheLock struct {
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// Enable sets whether cache locking is enabled (proxy_cache_lock).
+	// When enabled, only one request at a time will be allowed to populate a new cache element according to the proxy_cache_key.
+	Enable bool `json:"enable,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[0-9]+[smhd]$`
+	// Timeout sets a timeout for proxy_cache_lock.
+	// When the time expires, the request will be passed to the proxied server, however, the response will not be cached.
+	Timeout string `json:"timeout,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[0-9]+[smhd]$`
+	// Age sets the maximum time a cache lock can be held (proxy_cache_lock_age).
+	// If the last request passed to the proxied server for populating a new cache element has not completed for the specified time, one more request may be passed.
+	Age string `json:"age,omitempty"`
+}
+
+// CacheConditions defines conditions for cache bypass and no-cache behavior.
+// These use NGINX variables to make dynamic caching decisions based on request characteristics.
+type CacheConditions struct {
+	// +kubebuilder:validation:Optional
+	// NoCache defines conditions under which the response will not be saved to a cache (proxy_no_cache).
+	// If at least one value of the string parameters is not empty and is not equal to "0" then the response will not be saved.
+	NoCache []string `json:"noCache,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Bypass defines conditions under which the response will not be taken from a cache (proxy_cache_bypass).
+	// If at least one value of the string parameters is not empty and is not equal to "0" then the response will not be taken from the cache.
+	Bypass []string `json:"bypass,omitempty"`
+}
+
+// Cache defines a cache policy for proxy caching.
+// +kubebuilder:validation:XValidation:rule="!has(self.allowedCodes) || (has(self.allowedCodes) && has(self.time))",message="time is required when allowedCodes is specified"
+type Cache struct {
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^[a-z][a-zA-Z0-9_]*[a-zA-Z0-9]$|^[a-z]$`
+	// CacheZoneName defines the name of the cache zone. Must start with a lowercase letter,
+	// followed by alphanumeric characters or underscores, and end with an alphanumeric character.
+	// Single lowercase letters are also allowed. Examples: "cache", "my_cache", "cache1".
+	CacheZoneName string `json:"cacheZoneName"`
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^[0-9]+[kmgKMG]$`
+	// CacheZoneSize defines the size of the cache zone. Must be a number followed by a size unit:
+	// 'k' or 'K' for kilobytes, 'm' or 'M' for megabytes, or 'g' or 'G' for gigabytes.
+	// Examples: "10m", "1g", "512k".
+	CacheZoneSize string `json:"cacheZoneSize"`
+	// +kubebuilder:validation:Optional
+	// AllowedCodes defines which HTTP response codes should be cached.
+	// Accepts either:
+	// - The string "any" to cache all response codes (must be the only element)
+	// - A list of HTTP status codes as integers (100-599)
+	// Examples: ["any"], [200, 301, 404], [200].
+	// Invalid: ["any", 200] (cannot mix "any" with specific codes).
+	AllowedCodes []intstr.IntOrString `json:"allowedCodes,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MaxItems=3
+	// +kubebuilder:validation:XValidation:rule="self.all(method, method in ['GET', 'HEAD', 'POST'])",message="allowed methods must be one of: GET, HEAD, POST"
+	// AllowedMethods defines which HTTP methods should be cached.
+	// Only "GET", "HEAD", and "POST" are supported by NGINX proxy_cache_methods directive.
+	// GET and HEAD are always cached by default even if not specified.
+	// Maximum of 3 items allowed. Examples: ["GET"], ["GET", "HEAD", "POST"].
+	// Invalid methods: PUT, DELETE, PATCH, etc.
+	AllowedMethods []string `json:"allowedMethods,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[0-9]+[smhd]$`
+	// Time defines the default cache time. Required when allowedCodes is specified.
+	// Must be a number followed by a time unit:
+	// 's' for seconds, 'm' for minutes, 'h' for hours, 'd' for days.
+	// Examples: "30s", "5m", "1h", "2d".
+	Time string `json:"time,omitempty"`
+	// +kubebuilder:validation:Optional
+	// CachePurgeAllow defines IP addresses or CIDR blocks allowed to purge cache.
+	// This feature is only available in NGINX Plus.
+	// Examples: ["192.168.1.100", "10.0.0.0/8", "::1"].
+	// Invalid in NGINX OSS (will be ignored).
+	CachePurgeAllow []string `json:"cachePurgeAllow,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// OverrideUpstreamCache controls whether to override upstream cache headers
+	// (using proxy_ignore_headers directive). When true, NGINX will ignore
+	// cache-related headers from upstream servers like Cache-Control, Expires, etc.
+	// Default: false.
+	OverrideUpstreamCache bool `json:"overrideUpstreamCache,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[12](?::[12]){0,2}$`
+	// Levels defines the cache directory hierarchy levels for storing cached files.
+	// Must be in format "X:Y" or "X:Y:Z" where X, Y, Z are either 1 or 2.
+	// This controls the number of subdirectory levels and their name lengths.
+	// Examples: "1:2", "2:2", "1:2:2".
+	// Invalid: "3:1", "1:3", "1:2:3".
+	Levels string `json:"levels,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[0-9]+[smhd]$`
+	// Inactive sets the time after which cached data that are not accessed get removed from the cache (inactive parameter).
+	// By default, inactive is set to 10 minutes.
+	Inactive string `json:"inactive,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// UseTempPath controls whether temporary files and the cache are put on different file systems (use_temp_path parameter).
+	// If set to false, temporary files will be put directly in the cache directory (use_temp_path=off).
+	// Default: false (use_temp_path=off, which puts temp files directly in cache directory for better performance).
+	UseTempPath bool `json:"useTempPath,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[0-9]+[kmgKMG]$`
+	// MaxSize sets the maximum cache size (max_size parameter).
+	// When the size is exceeded, the cache manager removes the least recently used data.
+	MaxSize string `json:"maxSize,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[0-9]+[kmgKMG]$`
+	// MinFree sets the minimum amount of free space required on the file system with cache (min_free parameter).
+	// When there is not enough free space, the cache manager removes the least recently used data.
+	MinFree string `json:"minFree,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Manager configures the cache manager process parameters (manager_files, manager_sleep, manager_threshold).
+	Manager *CacheManager `json:"manager,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MaxLength=1024
+	// +kubebuilder:validation:XValidation:rule="!self.contains('$(') && !self.contains('`') && !self.contains(';') && !self.contains('&&') && !self.contains('||')",message="cache key must not contain command execution patterns: $(, `, ;, &&, ||"
+	// CacheKey defines a key for caching (proxy_cache_key).
+	// By default, close to "$scheme$proxy_host$uri$is_args$args".
+	// Must not contain command execution patterns: $(, `, ;, &&, ||
+	CacheKey string `json:"cacheKey,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MaxItems=11
+	// CacheUseStale determines in which cases a stale cached response can be used (proxy_cache_use_stale).
+	// Valid parameters: error, timeout, invalid_header, updating, http_500, http_502, http_503, http_504, http_403, http_404, http_429, off.
+	CacheUseStale []string `json:"cacheUseStale,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// CacheRevalidate enables revalidation of expired cache items using conditional requests (proxy_cache_revalidate).
+	// Uses "If-Modified-Since" and "If-None-Match" header fields.
+	CacheRevalidate bool `json:"cacheRevalidate,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// CacheBackgroundUpdate allows starting a background subrequest to update an expired cache item (proxy_cache_background_update).
+	// A stale cached response is returned to the client while the cache is being updated.
+	CacheBackgroundUpdate bool `json:"cacheBackgroundUpdate,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=1
+	// CacheMinUses sets the number of requests after which the response will be cached (proxy_cache_min_uses).
+	CacheMinUses *int `json:"cacheMinUses,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Lock configures cache locking to prevent multiple identical requests from populating the same cache element simultaneously.
+	Lock *CacheLock `json:"lock,omitempty"`
+	// +kubebuilder:validation:Optional
+	// Conditions defines when responses should not be cached or taken from cache.
+	Conditions *CacheConditions `json:"conditions,omitempty"`
+}
+
+// CORS defines a Cross-Origin Resource Sharing policy for controlling cross-origin requests.
+// +kubebuilder:validation:XValidation:rule="!(self.allowOrigin.exists(origin, origin == '*') && has(self.allowCredentials) && self.allowCredentials == true)",message="cannot use wildcard '*' for allowOrigin when allowCredentials is true for security reasons"
+type CORS struct {
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:XValidation:rule="self.all(origin, origin != '')",message="origin cannot be empty"
+	// AllowOrigin defines the origins that are allowed to make cross-origin requests.
+	// Can be exact domains, single wildcards, or "*" for all origins.
+	// Examples: ["https://example.com", "https://*.mydomain.com", "*"]
+	// Security: When allowCredentials is true, wildcard "*" is not allowed per CORS specification.
+	// The server must specify explicit origins for credentialed requests.
+	AllowOrigin []string `json:"allowOrigin"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:XValidation:rule="self.all(method, method != '')",message="method name cannot be empty"
+	// AllowMethods defines the HTTP methods that are allowed for cross-origin requests.
+	AllowMethods []string `json:"allowMethods,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:XValidation:rule="self.all(header, header != '')",message="header name cannot be empty"
+	// AllowHeaders defines the headers that are allowed in cross-origin requests.
+	// Common safe headers: ["Accept", "Accept-Language", "Content-Language", "Content-Type"]
+	// Custom headers: ["Authorization", "X-Requested-With", "X-Custom-Header"]
+	AllowHeaders []string `json:"allowHeaders,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default=false
+	// AllowCredentials indicates whether the response to the request can be exposed when the credentials flag is true.
+	// When used as part of a response to a preflight request, this indicates whether the actual request can be made using credentials.
+	AllowCredentials *bool `json:"allowCredentials,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:XValidation:rule="self.all(header, header != '')",message="header name cannot be empty"
+	// ExposeHeaders defines the headers that browsers are allowed to access.
+	// Use this field to expose additional custom headers to the browser.
+	// Example: ["X-Total-Count", "X-Page-Size", "X-RateLimit-Remaining"]
+	// Note: Set-Cookie headers cannot be exposed via CORS per official MDN specification.
+	ExposeHeaders []string `json:"exposeHeaders,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=86400
+	// MaxAge defines how long (in seconds) the results of a preflight request can be cached.
+	// Default: 86400 (24 hours). Maximum recommended value is 86400 (24 hours).
+	MaxAge *int `json:"maxAge,omitempty"`
+}
+
+// ExternalAuth defines an external authentication policy for authenticating client requests using an external authentication server, which can be used for example with the oauth2-proxy or any custom authentication server that requires redirection for authentication.
+type ExternalAuth struct {
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^/.*$`
+	// +kubebuilder:default="/"
+	// AuthURI is the URI of the external authentication server to which the request will be sent for authentication. The URI is a relative URI, for example /auth.
+	AuthURI string `json:"authURI"`
+
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?\/)?[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// AuthServiceName is the name of the Kubernetes service to which the request will be sent for authentication.  It can be in the same namespace as the Policy resource or in a different namespace. If the service is in a different namespace, it should be specified in the format <namespace>/<service>. For example, auth-service or auth-namespace/auth-service.
+	AuthServiceName string `json:"authServiceName"`
+
+	// +kubebuilder:validation:Optional
+	// AuthServicePorts are the ports of the Kubernetes service to which requests will be sent for authentication. If not specified, the ports will be looked up from the service definition. This field is only required if the user wants to choose a specific port from the service definition, otherwise the first port will be used by default.
+	AuthServicePorts []int `json:"authServicePorts,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^/.*$`
+	// AuthSigninURI is the URI which requests will be redirected to if the external authentication server determines that the client needs to be authenticated. This is typically used when the external authentication server is an oauth2-proxy or any custom authentication server that requires redirection for authentication. The URI is a relative URI, for example /signin.
+	AuthSigninURI string `json:"authSigninURI,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// AuthSnippets can be used to add custom configuration snippets to the location block of the external authentication configuration. This can be used for example to add additional headers to the request sent to the external authentication server, or to configure additional parameters for the auth_request module. The content of this field will be added as-is to the location block, so it must be a valid NGINX configuration snippet.
+	AuthSnippets string `json:"authSnippets,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^/[a-zA-Z0-9._~:/?#\[\]@!$&'()*+,;=-]*$`
+	// AuthSigninRedirectBasePath is the base path for the NGINX location block that handles sign-in redirect requests from the external authentication server. For example, oauth2-proxy expects /oauth2. If not specified, defaults to /oauth2.
+	AuthSigninRedirectBasePath string `json:"authSigninRedirectBasePath,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default:=false
+	// SSLEnabled enables HTTPS when proxying requests to the external authentication server. Default is false.
+	SSLEnabled bool `json:"sslEnabled"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default:=false
+	// SSLVerify enables verification of the external authentication server's SSL certificate. Default is false.
+	SSLVerify bool `json:"sslVerify"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default:=1
+	// SSLVerifyDepth sets the verification depth in the external authentication server certificates chain. Default is 1.
+	SSLVerifyDepth *int `json:"sslVerifyDepth,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^([a-z0-9]([-a-z0-9]*[a-z0-9])?\/)?[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// TrustedCertSecret is the name of the Kubernetes secret that stores the CA certificate for external authentication server certificate verification. It can be in the same namespace as the Policy resource or in a different namespace specified as <namespace>/<secret>. A secret of the type Opaque is recommended. The secret is resolved with the CA role and must store the certificate under the ca.crt key.
+	TrustedCertSecret string `json:"trustedCertSecret,omitempty"`
+
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([-a-zA-Z0-9]*[a-zA-Z0-9])?)*$`
+	// SNIName sets the server name used for SNI and certificate verification when connecting to the external authentication server over TLS. If not specified, defaults to <service-name>.<namespace>.svc derived from authServiceName.
+	SNIName string `json:"sniName,omitempty"`
+}
+
+// HSTS defines an HTTP Strict Transport Security policy for enforcing secure connections to the server.
+// +kubebuilder:validation:XValidation:rule="!self.preload || self.includeSubDomains",message="preload requires includeSubDomains to be enabled"
+// +kubebuilder:validation:XValidation:rule="!self.preload || (has(self.maxAge) && self.maxAge >= 31536000)",message="preload requires maxAge to be at least 31536000 (one year)"
+type HSTS struct {
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:Minimum=0
+	// MaxAge defines how long (in seconds) the browser should cache and enforce the HSTS policy.
+	MaxAge *int `json:"maxAge"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default:=false
+	// IncludeSubDomains extends the HSTS policy to all subdomains of the host.
+	IncludeSubDomains bool `json:"includeSubDomains,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default:=false
+	// BehindProxy configures NGINX to set the HSTS header based on the X-Forwarded-Proto request header rather than the $https variable.
+	BehindProxy bool `json:"behindProxy,omitempty"`
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default:=false
+	// Preload indicates that the domain should be included in browsers' HSTS preload lists.
+	Preload bool `json:"preload,omitempty"`
+}

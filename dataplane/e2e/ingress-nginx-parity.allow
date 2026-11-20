@@ -1,0 +1,21 @@
+# The differences dataplane/e2e/ingress-nginx-parity.sh allows between
+# ingress-nginx and wxingress, each with the place it is documented.
+# <field regex> | <probe id regex> | <ingress-nginx value regex> | <wxingress value regex> | <why>
+#
+# the default certificate: ingress-nginx's own fake one, wxingress's chart's default
+certificate | unknown host https | . | . | the certificate for a name without one is each controller's default (docs/user-guide/ingress-nginx-compatibility.md, "Not covered")
+#
+# the WebSocket echo answers with the request it got, its X-Request-ID among it: a body of its own every request - so does
+# the canary of the corpus, whose backend it is, on every host whose Ingress has the primary's Service (a canary per upstream)
+body | ws\.annotations\.parity\.test|canary\.annotations\.parity\.test|\ canary$ | . | . | jmalloc/echo-server's body is the request, X-Request-ID included: it differs per request
+#
+# a plain HTTP request to a gRPC backend: ingress-nginx's error page is HTML, wxingress's gRPC's (NGINX Ingress Controller's @grpcerror locations)
+status|body|headers\.content-type | inx-annotations/grpc  | . | . | a request that is no gRPC to a gRPC location gets nginx's HTML error page in ingress-nginx, a gRPC status in wxingress (grpc-status trailer, docs/user-guide/ingress-nginx-compatibility.md, backend-protocol)
+#
+# HSTS on app-root's redirect over https of a host without TLS: ingress-nginx's redirect of app-root is the server's and
+# goes out without its HSTS (set in the locations); wxingress's server adds HSTS to every https answer
+headers\.strict-transport-security | inx-annotations/approot .* https$ | null | max-age | app-root over https: ingress-nginx's redirect has no HSTS, wxingress's has (docs/user-guide/ingress-nginx-compatibility.md, app-root, hsts)
+#
+# a path one character longer than a cert-manager solver's token: ingress-nginx answers 404, wxingress passes it to the
+# solver as the prefix the ImplementationSpecific path is in nginx; no ACME server asks for it
+.* | cm-acme-http-solver.*boundary | . | . | a path that is the solver's token and more: never asked by an ACME server (docs/user-guide/ingress-nginx-compatibility.md, "Several Ingresses of one host")

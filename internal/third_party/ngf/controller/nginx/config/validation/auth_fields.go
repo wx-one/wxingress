@@ -1,0 +1,211 @@
+package validation
+
+import (
+	"errors"
+	"fmt"
+	"regexp"
+
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
+)
+
+// AuthFieldValidator validates fields related to authentication.
+type AuthFieldValidator struct{}
+
+var (
+	oidcHTTPSURLRegexp           = regexp.MustCompile(oidcHTTPSURLFmt)
+	oidcRedirectURIRegexp        = regexp.MustCompile(oidcRedirectURIFmt)
+	oidcPostLogoutURIRegexp      = regexp.MustCompile(oidcPostLogoutURIFmt)
+	oidcPathURIRegexp            = regexp.MustCompile(oidcPathURIFmt)
+	oidcPathWithQueryParamRegexp = regexp.MustCompile(oidcPathWithQueryParamFmt)
+)
+
+//nolint:lll
+const (
+	// oidcHTTPSURLFmt validates HTTPS-only URLs. It is used for the issuer and configURL.
+	// Semicolons and dollar signs are disallowed in the path.
+	oidcHTTPSURLFmt    = `^https:\/\/[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(:[0-9]{1,5})?(\/[a-zA-Z0-9._~:\/?@!&'()*+,=-]*)?$`
+	oidcHTTPSURLErrMsg = "must be a valid HTTPS URL"
+)
+
+func validateHTTPSURL(url string) error {
+	if !oidcHTTPSURLRegexp.MatchString(url) {
+		examples := []string{
+			"https://accounts.example.com",
+			"https://auth.example.com:8080/oidc",
+		}
+		return errors.New(k8svalidation.RegexError(oidcHTTPSURLErrMsg, oidcHTTPSURLFmt, examples...))
+	}
+	return nil
+}
+
+const (
+	// oidcPathURIFmt validates path-only URIs. It is used by the logoutURI and frontChannelLogoutURI fields.
+	// Semicolons and dollar signs are disallowed in the path.
+	oidcPathURIFmt    = `^/[A-Za-z0-9._~!&'()*+,=@/-]*$`
+	oidcPathURIErrMsg = "must be a path-only URI starting with /"
+)
+
+func validatePathURI(uri string) error {
+	if !oidcPathURIRegexp.MatchString(uri) {
+		return errors.New(k8svalidation.RegexError(oidcPathURIErrMsg, oidcPathURIFmt, "/callback"))
+	}
+	return nil
+}
+
+// ValidateOIDCHTTPSURL validates an OIDC issuer or configuration URL. Only HTTPS URLs are accepted.
+func (AuthFieldValidator) ValidateOIDCHTTPSURL(url string) error {
+	return validateHTTPSURL(url)
+}
+
+const (
+	// oidcPathWithQueryParamFmt matches path-only URIs (starting with /) that contain query parameters.
+	oidcPathWithQueryParamFmt    = `^\/[^?]*\?`
+	oidcPathWithQueryParamErrMsg = "query parameters are not allowed in path-only URIs"
+)
+
+//nolint:lll,gosec
+const (
+	// oidcRedirectURIFmt validates redirect URIs. It accepts HTTPS full URIs or path-only URIs starting with /.
+	oidcRedirectURIFmt    = `^(https:\/\/[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(:[0-9]{1,5})?(\/[a-zA-Z0-9._~:\/?@!&'()*+,=-]*)?|\/[a-zA-Z0-9._~:\/?@!&'()*+,=-]*)$`
+	oidcRedirectURIErrMsg = "must be a valid HTTPS URL or a path starting with /"
+)
+
+// ValidateOIDCRedirectURI validates an OIDC redirect URI.
+// Only HTTPS full URIs or path-only URIs starting with / are accepted.
+// Query parameters are not allowed in path-only URIs.
+func (AuthFieldValidator) ValidateOIDCRedirectURI(uri string) error {
+	if !oidcRedirectURIRegexp.MatchString(uri) {
+		return errors.New(k8svalidation.RegexError(
+			oidcRedirectURIErrMsg, oidcRedirectURIFmt, "/callback", "https://example.com/callback",
+		))
+	}
+	if oidcPathWithQueryParamRegexp.MatchString(uri) {
+		return errors.New(oidcPathWithQueryParamErrMsg)
+	}
+	return nil
+}
+
+//nolint:lll
+const (
+	// oidcPostLogoutURIFmt validates post-logout URIs. It accepts HTTP or HTTPS full URIs or path-only URIs starting with /.
+	oidcPostLogoutURIFmt    = `^(https?:\/\/[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(:[0-9]{1,5})?(\/[a-zA-Z0-9._~:\/?@!&'()*+,=-]*)?|\/[a-zA-Z0-9._~:\/?@!&'()*+,=-]*)$`
+	oidcPostLogoutURIErrMsg = "must be a valid HTTP or HTTPS URL or a path starting with /"
+)
+
+// ValidateOIDCPostLogoutURI validates an OIDC post-logout URI.
+// HTTP and HTTPS full URIs and path-only URIs starting with / are accepted.
+// Query parameters are not allowed in path-only URIs.
+func (AuthFieldValidator) ValidateOIDCPostLogoutURI(uri string) error {
+	if !oidcPostLogoutURIRegexp.MatchString(uri) {
+		return errors.New(k8svalidation.RegexError(
+			oidcPostLogoutURIErrMsg, oidcPostLogoutURIFmt, "/logged_out", "https://example.com/logged_out",
+		))
+	}
+	if oidcPathWithQueryParamRegexp.MatchString(uri) {
+		return errors.New(oidcPathWithQueryParamErrMsg)
+	}
+	return nil
+}
+
+// ValidateOIDCPathURI validates an OIDC logout or front-channel logout URI.
+// Only path-only URIs starting with / are accepted.
+func (AuthFieldValidator) ValidateOIDCPathURI(uri string) error {
+	return validatePathURI(uri)
+}
+
+var (
+	authZClaimNameRegexp  = regexp.MustCompile(authZSafeNameFmt)
+	authZClaimValueRegexp = regexp.MustCompile(authZSafeValueFmt)
+)
+
+var (
+	claimNameExamples = []string{
+		"role",
+		"app-1/role",
+		"app_1-role",
+	}
+	claimValueExamples = []string{
+		"admin",
+		"user",
+		"app-1",
+	}
+)
+
+const (
+	// authZSafeNameFmt allows letters, numbers, underscores, dashes, and slashes.
+	// Validates claim names.
+	authZSafeNameFmt = `^[a-zA-Z0-9_/-]+$`
+	authZNameErrMsg  = "must contain only letters, numbers, underscores, dashes, or slashes"
+)
+
+const (
+	// authZSafeValueFmt disallows newlines and special characters.
+	// Validates claim values.
+	authZSafeValueFmt = `^[^\n\r;#\$\{\}\|&><'"]+$`
+	authZValueErrMsg  = "must not contain newlines or special characters like ; # $ { } | & > < ' \""
+)
+
+// ValidateAuthZClaimName validates that an authorization claim name contains only allowed characters.
+func (AuthFieldValidator) ValidateAuthZClaimName(name string) error {
+	if !authZClaimNameRegexp.MatchString(name) {
+		return errors.New(k8svalidation.RegexError(
+			authZNameErrMsg,
+			authZSafeNameFmt,
+			claimNameExamples...))
+	}
+	return nil
+}
+
+// ValidateAuthZClaimValue validates that an authorization claim value does not contain disallowed characters.
+func (AuthFieldValidator) ValidateAuthZClaimValue(value string) error {
+	if !authZClaimValueRegexp.MatchString(value) {
+		return errors.New(k8svalidation.RegexError(
+			authZValueErrMsg,
+			authZSafeValueFmt,
+			claimValueExamples...))
+	}
+	return nil
+}
+
+// ValidateAuthZProxySetHeader validates that a proxy set header name contains only allowed characters.
+func (AuthFieldValidator) ValidateAuthZProxySetHeader(header string) error {
+	return validateHeaderName(header)
+}
+
+const (
+	// extraAuthArgKeyFmt validates OIDC extra auth arg keys.
+	// Keys must contain only alphanumeric characters, hyphens, underscores, or dots.
+	extraAuthArgKeyFmt    = `^[a-zA-Z0-9_.-]+$`
+	extraAuthArgKeyErrMsg = "must contain only alphanumeric characters, hyphens, underscores, or dots"
+)
+
+var extraAuthArgKeyRegexp = regexp.MustCompile(extraAuthArgKeyFmt)
+
+// ValidateOIDCExtraAuthArg validates a single key-value pair from the OIDC extraAuthArgs map.
+// Keys must be valid query parameter names. Values are placed inside a double-quoted NGINX
+// directive, so they are validated with the same escaped-string rules used elsewhere: no
+// unescaped double quotes, no dollar signs (variable expansion is not needed for query
+// parameters), and no trailing backslash.
+func (AuthFieldValidator) ValidateOIDCExtraAuthArg(key, value string) error {
+	if !extraAuthArgKeyRegexp.MatchString(key) {
+		return fmt.Errorf(
+			"invalid key %q: %s",
+			key,
+			k8svalidation.RegexError(extraAuthArgKeyErrMsg, extraAuthArgKeyFmt, "prompt", "acr_values"),
+		)
+	}
+	if err := validateEscapedStringNoVarExpansion(value, []string{"consent", "openid profile"}); err != nil {
+		return fmt.Errorf("invalid value for key %q: %w", key, err)
+	}
+	return nil
+}
+
+// ValidateOIDCEscapedString validates an OIDC field value.
+func (AuthFieldValidator) ValidateOIDCEscapedString(value string) error {
+	return validateEscapedStringNoVarExpansion(value, []string{"my-client-id", "my-session-cookie", "my-secret"})
+}
+
+// ValidateRealm validates a Basic or JWT authentication realm value.
+func (AuthFieldValidator) ValidateRealm(value string) error {
+	return validateEscapedStringNoVarExpansion(value, []string{"Restricted Area", "My Realm"})
+}

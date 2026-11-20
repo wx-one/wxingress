@@ -1,0 +1,23 @@
+{{- /*
+The standard channel CRDs of the Gateway API, from gateway-api-crds.yaml (a
+symlink to deployments/gateway-api/standard-install.yaml, which
+hack/sync-ngf.sh writes). They are kept on uninstall: removing them would
+remove every Gateway and route in the cluster. One the cluster has from
+elsewhere - a release of another name that kept it, kubectl, the
+distribution - is left alone (wxingress.mayRender), else the install would
+fail on it; NOTES.txt names them. To take them over, annotate them with this
+release (meta.helm.sh/release-name, meta.helm.sh/release-namespace).
+*/}}
+{{- if .Values.controller.gatewayAPI.installCRDs }}
+{{- range $doc := regexSplit "(?m)^---[ \t]*$" ($.Files.Get "gateway-api-crds.yaml") -1 }}
+{{- $obj := fromYaml $doc }}
+{{- if and $obj $obj.kind }}
+{{- if include "wxingress.mayRender" (dict "apiVersion" $obj.apiVersion "kind" $obj.kind "namespace" "" "name" $obj.metadata.name "root" $) }}
+{{- $meta := $obj.metadata }}
+{{- $_ := set $meta "annotations" (merge (dict "helm.sh/resource-policy" "keep") ($meta.annotations | default dict)) }}
+---
+{{ toYaml $obj }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,26 @@
+wxingress
+Copyright (c) 2025-2026 WizardTales GmbH and the wxingress contributors
+
+wxingress is licensed under the European Union Public Licence v. 1.2
+(EUPL-1.2), see LICENSE.
+
+wxingress is a fork of NGINX Ingress Controller
+(https://github.com/nginx/kubernetes-ingress), Copyright F5, Inc., licensed
+under the Apache License, Version 2.0. It also contains a copy of parts of
+NGINX Gateway Fabric (https://github.com/nginx/nginx-gateway-fabric),
+Copyright F5, Inc., licensed under the Apache License, Version 2.0, in
+internal/third_party/ngf (see internal/third_party/ngf/LICENSE and VERSION).
+
+The files and portions of files that come from those projects remain
+available under the Apache License, Version 2.0 (LICENSES/Apache-2.0.txt).
+They were modified by WizardTales GmbH and the wxingress contributors; the
+Git history and CHANGELOG.md record the changes. Everything added or changed
+for wxingress is licensed under the EUPL-1.2, and wxingress as a whole is
+distributed under the EUPL-1.2.
+
+The data plane module (dataplane/) is written in meta and compiled with the
+meta compiler (container image docker.io/wxone/meta).
+
+NGINX is a registered trademark of F5, Inc. wxingress is not affiliated with,
+endorsed by or sponsored by F5, Inc. or the Kubernetes ingress-nginx project.
+Kubernetes is a registered trademark of The Linux Foundation.

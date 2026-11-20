@@ -1,0 +1,120 @@
+package policies
+
+import (
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/http"
+)
+
+// Generator defines an interface for a policy to implement its appropriate generator functions.
+//
+//go:generate go tool moq -skip-ensure -pkg policiesfakes -out policiesfakes/fake_generator.go . Generator
+
+type Generator interface {
+	// GenerateForMain generates policy configuration for the main block.
+	GenerateForMain(policies []Policy) GenerateResultFiles
+	// GenerateForHTTP generates policy configuration for the http block.
+	GenerateForHTTP(policies []Policy) GenerateResultFiles
+	// GenerateForServer generates policy configuration for the server block.
+	GenerateForServer(policies []Policy, server http.Server) GenerateResultFiles
+	// GenerateForLocation generates policy configuration for a normal location block.
+	GenerateForLocation(policies []Policy, location http.Location) GenerateResultFiles
+	// GenerateForInternalLocation generates policy configuration for an internal location block.
+	GenerateForInternalLocation(policies []Policy) GenerateResultFiles
+}
+
+// GenerateResultFiles is a list of files generated for inclusion by policy generators.
+type GenerateResultFiles []File
+
+// File is the contents of the generated file.
+type File struct {
+	Name    string
+	Content []byte
+}
+
+// CompositeGenerator contains all policy generators.
+type CompositeGenerator struct {
+	generators []Generator
+}
+
+// NewCompositeGenerator returns a new instance of a CompositeGenerator.
+func NewCompositeGenerator(generators ...Generator) *CompositeGenerator {
+	return &CompositeGenerator{generators: generators}
+}
+
+// GenerateForMain calls all policy generators for the main block.
+func (g *CompositeGenerator) GenerateForMain(policies []Policy) GenerateResultFiles {
+	var compositeResult GenerateResultFiles
+
+	for _, generator := range g.generators {
+		compositeResult = append(compositeResult, generator.GenerateForMain(policies)...)
+	}
+
+	return compositeResult
+}
+
+// GenerateForHTTP calls all policy generators for the http block.
+func (g *CompositeGenerator) GenerateForHTTP(policies []Policy) GenerateResultFiles {
+	var compositeResult GenerateResultFiles
+
+	for _, generator := range g.generators {
+		compositeResult = append(compositeResult, generator.GenerateForHTTP(policies)...)
+	}
+
+	return compositeResult
+}
+
+// GenerateForServer calls all policy generators for the server block.
+func (g *CompositeGenerator) GenerateForServer(policies []Policy, server http.Server) GenerateResultFiles {
+	var compositeResult GenerateResultFiles
+
+	for _, generator := range g.generators {
+		compositeResult = append(compositeResult, generator.GenerateForServer(policies, server)...)
+	}
+
+	return compositeResult
+}
+
+// GenerateForLocation calls all policy generators for a normal location block.
+func (g *CompositeGenerator) GenerateForLocation(policies []Policy, location http.Location) GenerateResultFiles {
+	var compositeResult GenerateResultFiles
+
+	for _, generator := range g.generators {
+		compositeResult = append(compositeResult, generator.GenerateForLocation(policies, location)...)
+	}
+
+	return compositeResult
+}
+
+// GenerateForInternalLocation calls all policy generators for an internal location block.
+func (g *CompositeGenerator) GenerateForInternalLocation(policies []Policy) GenerateResultFiles {
+	var compositeResult GenerateResultFiles
+
+	for _, generator := range g.generators {
+		compositeResult = append(compositeResult, generator.GenerateForInternalLocation(policies)...)
+	}
+
+	return compositeResult
+}
+
+// UnimplementedGenerator can be inherited by any policy generator that may not need to implement all of
+// possible generations, in order to satisfy the Generator interface.
+type UnimplementedGenerator struct{}
+
+func (u UnimplementedGenerator) GenerateForMain(_ []Policy) GenerateResultFiles {
+	return nil
+}
+
+func (u UnimplementedGenerator) GenerateForHTTP(_ []Policy) GenerateResultFiles {
+	return nil
+}
+
+func (u UnimplementedGenerator) GenerateForServer(_ []Policy, _ http.Server) GenerateResultFiles {
+	return nil
+}
+
+func (u UnimplementedGenerator) GenerateForLocation(_ []Policy, _ http.Location) GenerateResultFiles {
+	return nil
+}
+
+func (u UnimplementedGenerator) GenerateForInternalLocation(_ []Policy) GenerateResultFiles {
+	return nil
+}

@@ -1,0 +1,3420 @@
+package graph
+
+import (
+	"testing"
+
+	"github.com/go-logr/logr"
+	. "github.com/onsi/gomega"
+	"github.com/onsi/gomega/format"
+	v1 "k8s.io/api/core/v1"
+	discoveryV1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	inference "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPIv1alpha1 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	ngfAPIv1alpha2 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha2"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies/policiesfakes"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/conditions"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/configmaps"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/secrets"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/resolver"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/validation"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/validation/validationfakes"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/controller"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/controller/index"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+)
+
+var (
+	cert = []byte(`-----BEGIN CERTIFICATE-----
+MIIDLjCCAhYCCQDAOF9tLsaXWjANBgkqhkiG9w0BAQsFADBaMQswCQYDVQQGEwJV
+UzELMAkGA1UECAwCQ0ExITAfBgNVBAoMGEludGVybmV0IFdpZGdpdHMgUHR5IEx0
+ZDEbMBkGA1UEAwwSY2FmZS5leGFtcGxlLmNvbSAgMB4XDTE4MDkxMjE2MTUzNVoX
+DTIzMDkxMTE2MTUzNVowWDELMAkGA1UEBhMCVVMxCzAJBgNVBAgMAkNBMSEwHwYD
+VQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQxGTAXBgNVBAMMEGNhZmUuZXhh
+bXBsZS5jb20wggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCp6Kn7sy81
+p0juJ/cyk+vCAmlsfjtFM2muZNK0KtecqG2fjWQb55xQ1YFA2XOSwHAYvSdwI2jZ
+ruW8qXXCL2rb4CZCFxwpVECrcxdjm3teViRXVsYImmJHPPSyQgpiobs9x7DlLc6I
+BA0ZjUOyl0PqG9SJexMV73WIIa5rDVSF2r4kSkbAj4Dcj7LXeFlVXH2I5XwXCptC
+n67JCg42f+k8wgzcRVp8XZkZWZVjwq9RUKDXmFB2YyN1XEWdZ0ewRuKYUJlsm692
+skOrKQj0vkoPn41EE/+TaVEpqLTRoUY3rzg7DkdzfdBizFO2dsPNFx2CW0jXkNLv
+Ko25CZrOhXAHAgMBAAEwDQYJKoZIhvcNAQELBQADggEBAKHFCcyOjZvoHswUBMdL
+RdHIb383pWFynZq/LuUovsVA58B0Cg7BEfy5vWVVrq5RIkv4lZ81N29x21d1JH6r
+jSnQx+DXCO/TJEV5lSCUpIGzEUYaUPgRyjsM/NUdCJ8uHVhZJ+S6FA+CnOD9rn2i
+ZBePCI5rHwEXwnnl8ywij3vvQ5zHIuyBglWr/Qyui9fjPpwWUvUm4nv5SMG9zCV7
+PpuwvuatqjO1208BjfE/cZHIg8Hw9mvW9x9C+IQMIMDE7b/g6OcK7LGTLwlFxvA8
+7WjEequnayIphMhKRXVf1N349eN98Ez38fOTHTPbdJjFA/PcC+Gyme+iGt5OQdFh
+yRE=
+-----END CERTIFICATE-----`)
+	key = []byte(`-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAqeip+7MvNadI7if3MpPrwgJpbH47RTNprmTStCrXnKhtn41k
+G+ecUNWBQNlzksBwGL0ncCNo2a7lvKl1wi9q2+AmQhccKVRAq3MXY5t7XlYkV1bG
+CJpiRzz0skIKYqG7Pcew5S3OiAQNGY1DspdD6hvUiXsTFe91iCGuaw1Uhdq+JEpG
+wI+A3I+y13hZVVx9iOV8FwqbQp+uyQoONn/pPMIM3EVafF2ZGVmVY8KvUVCg15hQ
+dmMjdVxFnWdHsEbimFCZbJuvdrJDqykI9L5KD5+NRBP/k2lRKai00aFGN684Ow5H
+c33QYsxTtnbDzRcdgltI15DS7yqNuQmazoVwBwIDAQABAoIBAQCPSdSYnQtSPyql
+FfVFpTOsoOYRhf8sI+ibFxIOuRauWehhJxdm5RORpAzmCLyL5VhjtJme223gLrw2
+N99EjUKb/VOmZuDsBc6oCF6QNR58dz8cnORTewcotsJR1pn1hhlnR5HqJJBJask1
+ZEnUQfcXZrL94lo9JH3E+Uqjo1FFs8xxE8woPBqjZsV7pRUZgC3LhxnwLSExyFo4
+cxb9SOG5OmAJozStFoQ2GJOes8rJ5qfdvytgg9xbLaQL/x0kpQ62BoFMBDdqOePW
+KfP5zZ6/07/vpj48yA1Q32PzobubsBLd3Kcn32jfm1E7prtWl+JeOFiOznBQFJbN
+4qPVRz5hAoGBANtWyxhNCSLu4P+XgKyckljJ6F5668fNj5CzgFRqJ09zn0TlsNro
+FTLZcxDqnR3HPYM42JERh2J/qDFZynRQo3cg3oeivUdBVGY8+FI1W0qdub/L9+yu
+edOZTQ5XmGGp6r6jexymcJim/OsB3ZnYOpOrlD7SPmBvzNLk4MF6gxbXAoGBAMZO
+0p6HbBmcP0tjFXfcKE77ImLm0sAG4uHoUx0ePj/2qrnTnOBBNE4MvgDuTJzy+caU
+k8RqmdHCbHzTe6fzYq/9it8sZ77KVN1qkbIcuc+RTxA9nNh1TjsRne74Z0j1FCLk
+hHcqH0ri7PYSKHTE8FvFCxZYdbuB84CmZihvxbpRAoGAIbjqaMYPTYuklCda5S79
+YSFJ1JzZe1Kja//tDw1zFcgVCKa31jAwciz0f/lSRq3HS1GGGmezhPVTiqLfeZqc
+R0iKbhgbOcVVkJJ3K0yAyKwPTumxKHZ6zImZS0c0am+RY9YGq5T7YrzpzcfvpiOU
+ffe3RyFT7cfCmfoOhDCtzukCgYB30oLC1RLFOrqn43vCS51zc5zoY44uBzspwwYN
+TwvP/ExWMf3VJrDjBCH+T/6sysePbJEImlzM+IwytFpANfiIXEt/48Xf60Nx8gWM
+uHyxZZx/NKtDw0V8vX1POnq2A5eiKa+8jRARYKJLYNdfDuwolxvG6bZhkPi/4EtT
+3Y18sQKBgHtKbk+7lNJVeswXE5cUG6EDUsDe/2Ua7fXp7FcjqBEoap1LSw+6TXp0
+ZgrmKE8ARzM47+EJHUviiq/nupE15g0kJW3syhpU9zZLO7ltB0KIkO9ZRcmUjo8Q
+cpLlHMAqbLJ8WYGJCkhiWxyal6hYTyWY4cVkC0xtTl/hUE9IeNKo
+-----END RSA PRIVATE KEY-----`)
+
+	invalidCert = []byte(`-----BEGIN CERTIFICATE-----
+-----END CERTIFICATE-----`)
+	invalidKey = []byte(`-----BEGIN RSA PRIVATE KEY-----
+-----END RSA PRIVATE KEY-----`)
+)
+
+const (
+	caBlock = `-----BEGIN CERTIFICATE-----
+MIIDSDCCAjACCQDKWvrpwiIyCDANBgkqhkiG9w0BAQsFADBmMQswCQYDVQQGEwJV
+UzELMAkGA1UECAwCQ0ExFjAUBgNVBAcMDVNhbiBGcmFuc2lzY28xDjAMBgNVBAoM
+BU5HSU5YMQwwCgYDVQQLDANLSUMxFDASBgNVBAMMC2V4YW1wbGUuY29tMB4XDTIw
+MTExMjIxMjg0MloXDTMwMTExMDIxMjg0MlowZjELMAkGA1UEBhMCVVMxCzAJBgNV
+BAgMAkNBMRYwFAYDVQQHDA1TYW4gRnJhbnNpc2NvMQ4wDAYDVQQKDAVOR0lOWDEM
+MAoGA1UECwwDS0lDMRQwEgYDVQQDDAtleGFtcGxlLmNvbTCCASIwDQYJKoZIhvcN
+AQEBBQADggEPADCCAQoCggEBAMrlKMqrHfMR4mgaL2zZG2DYYfKCFVmINjlYuOeC
+FDTcRgQKtu2YcCxZYBADwHZxEf6NIKtVsMWLhSNS/Nc0BmtiQM/IExhlCiDC6Sl8
+ONrI3w7qJzN6IUERB6tVlQt07rgM0V26UTYu0Ikv1Y8trfLYPZckzBkorQjpcium
+qoP2BJf4yyc9LqpxtlWKxelkunVL5ijMEzpj9gEE26TEHbsdEbhoR8g0OeHZqH7e
+mXCnSIBR0A/o/s6noGNX+F19lY7Tgw77jOuQQ5Ysi+7nhN2lKvcC819RX7oMpgvt
+V5B3nI0mF6BaznjeTs4yQcr1Sm3UTVBwX9ZuvL7RbIXkUm8CAwEAATANBgkqhkiG
+9w0BAQsFAAOCAQEAgm04w6OIWGj6tka9ccccnblF0oZzeEAIywjvR5sDcPdvLIeM
+eesJy6rFH4DBmMygpcIxJGrSOzZlF3LMvw7zK4stqNtm1HiprF8bzxfTffVYncg6
+hVKErHtZ2FZRj/2TMJ01aRDZSuVbL6UJiokpU6xxT7yy0dFZkKrjUR349gKxRqJw
+Am2as0bhi51EqK1GEx3m4c0un2vNh5qP2hv6e/Qze6P96vefNaSk9QMFfuB1kSAk
+fGpkiL7bjmjnhKwAmf8jDWDZltB6S56Qy2QjPR8JoOusbYxar4c6EcIwVHv6mdgP
+yZxWqQsgtSfFx+Pwon9IPKuq0jQYgeZPSxRMLA==
+-----END CERTIFICATE-----
+`
+)
+
+func TestBuildGraph(t *testing.T) {
+	const (
+		gcName                  = "my-class"
+		controllerName          = "my.controller"
+		experimentalFeaturesOff = false
+	)
+
+	cm := &v1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "configmap",
+			Namespace: "service",
+		},
+		Data: map[string]string{
+			secrets.CAKey: caBlock,
+		},
+	}
+
+	btpAcceptedConds := []conditions.Condition{
+		conditions.NewBackendTLSPolicyResolvedRefs(),
+		conditions.NewPolicyAccepted(),
+		conditions.NewPolicyAccepted(),
+		conditions.NewPolicyAccepted(),
+	}
+
+	btp := BackendTLSPolicy{
+		Source: &gatewayv1.BackendTLSPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "btp",
+				Namespace: "service",
+			},
+			Spec: gatewayv1.BackendTLSPolicySpec{
+				TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+					{
+						LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+							Group: "",
+							Kind:  "Service",
+							Name:  "foo",
+						},
+					},
+				},
+				Validation: gatewayv1.BackendTLSPolicyValidation{
+					Hostname: "foo.example.com",
+					CACertificateRefs: []gatewayv1.LocalObjectReference{
+						{
+							Kind:  "ConfigMap",
+							Name:  "configmap",
+							Group: "",
+						},
+					},
+				},
+			},
+		},
+		Valid:        true,
+		IsReferenced: true,
+		Gateways:     []types.NamespacedName{{Namespace: testNs, Name: "gateway-1"}},
+		Conditions:   btpAcceptedConds,
+		CaCertRef:    types.NamespacedName{Namespace: "service", Name: "configmap"},
+	}
+
+	commonGWBackendRef := gatewayv1.BackendRef{
+		BackendObjectReference: gatewayv1.BackendObjectReference{
+			Kind:      (*gatewayv1.Kind)(helpers.GetPointer("Service")),
+			Name:      "foo",
+			Namespace: (*gatewayv1.Namespace)(helpers.GetPointer("service")),
+			Port:      helpers.GetPointer[gatewayv1.PortNumber](80),
+		},
+	}
+
+	commonTLSBackendRef := gatewayv1.BackendRef{
+		BackendObjectReference: gatewayv1.BackendObjectReference{
+			Kind:      (*gatewayv1.Kind)(helpers.GetPointer("Service")),
+			Name:      "foo2",
+			Namespace: (*gatewayv1.Namespace)(helpers.GetPointer("test")),
+			Port:      helpers.GetPointer[gatewayv1.PortNumber](80),
+		},
+	}
+
+	refSnippetsFilterExtensionRef := &gatewayv1.LocalObjectReference{
+		Group: ngfAPIv1alpha1.GroupName,
+		Kind:  kinds.SnippetsFilter,
+		Name:  "ref-snippets-filter",
+	}
+
+	unreferencedSnippetsFilter := &ngfAPIv1alpha1.SnippetsFilter{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "unref-snippets-filter",
+			Namespace: testNs,
+		},
+		Spec: ngfAPIv1alpha1.SnippetsFilterSpec{
+			Snippets: []ngfAPIv1alpha1.Snippet{
+				{
+					Context: ngfAPIv1alpha1.NginxContextMain,
+					Value:   "main snippet",
+				},
+			},
+		},
+	}
+
+	referencedSnippetsFilter := &ngfAPIv1alpha1.SnippetsFilter{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ref-snippets-filter",
+			Namespace: testNs,
+		},
+		Spec: ngfAPIv1alpha1.SnippetsFilterSpec{
+			Snippets: []ngfAPIv1alpha1.Snippet{
+				{
+					Context: ngfAPIv1alpha1.NginxContextHTTPServer,
+					Value:   "server snippet",
+				},
+			},
+		},
+	}
+
+	processedUnrefSnippetsFilter := &SnippetsFilter{
+		Source:     unreferencedSnippetsFilter,
+		Valid:      true,
+		Referenced: false,
+		Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+			ngfAPIv1alpha1.NginxContextMain: "main snippet",
+		},
+	}
+
+	processedRefSnippetsFilter := &SnippetsFilter{
+		Source:     referencedSnippetsFilter,
+		Valid:      true,
+		Referenced: true,
+		Snippets: map[ngfAPIv1alpha1.NginxContext]string{
+			ngfAPIv1alpha1.NginxContextHTTPServer: "server snippet",
+		},
+	}
+
+	elbGW1 := &ngfAPIv1alpha1.ExternalLoadBalancer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "elb-gateway-1",
+			Namespace: testNs,
+		},
+		Spec: ngfAPIv1alpha1.ExternalLoadBalancerSpec{
+			TargetRefs: []gatewayv1.LocalPolicyTargetReference{
+				{
+					Group: gatewayv1.GroupName,
+					Kind:  kinds.Gateway,
+					Name:  "gateway-1",
+				},
+			},
+			GatewayLink: &ngfAPIv1alpha1.GatewayLinkConfig{
+				VirtualServerAddress: helpers.GetPointer("10.10.10.10"),
+			},
+		},
+	}
+
+	// AuthenticationFilter to be used in tests
+	refAuthenticationFilterExtensionRef := &gatewayv1.LocalObjectReference{
+		Group: ngfAPIv1alpha1.GroupName,
+		Kind:  kinds.AuthenticationFilter,
+		Name:  "ref-authentication-filter",
+	}
+
+	basicAuthSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "basic-auth-secret",
+		},
+		Type: v1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			secrets.AuthKey: []byte("user:pass"),
+		},
+	}
+
+	unreferencedAuthenticationFilter := &ngfAPIv1alpha1.AuthenticationFilter{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "unref-authentication-filter",
+			Namespace: testNs,
+		},
+		Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+			Type: ngfAPIv1alpha1.AuthTypeBasic,
+			Basic: &ngfAPIv1alpha1.BasicAuth{
+				SecretRef: ngfAPIv1alpha1.LocalObjectReference{
+					Name: "basic-auth-secret",
+				},
+			},
+		},
+	}
+
+	referencedAuthenticationFilter := &ngfAPIv1alpha1.AuthenticationFilter{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ref-authentication-filter",
+			Namespace: testNs,
+		},
+		Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+			Type: ngfAPIv1alpha1.AuthTypeBasic,
+			Basic: &ngfAPIv1alpha1.BasicAuth{
+				SecretRef: ngfAPIv1alpha1.LocalObjectReference{
+					Name: "basic-auth-secret",
+				},
+			},
+		},
+	}
+
+	processedUnrefAuthenticationFilter := &AuthenticationFilter{
+		Source:     unreferencedAuthenticationFilter,
+		Valid:      true,
+		Referenced: false,
+	}
+
+	oidcClientSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "oidc-client-secret",
+		},
+		Type: v1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			secrets.ClientSecretKey: []byte("oidc-client-secret-value"),
+		},
+	}
+
+	oidcCACertSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "oidc-ca-cert",
+		},
+		Type: v1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			secrets.CAKey: []byte(caBlock),
+		},
+	}
+
+	referencedOIDCAuthenticationFilter := &ngfAPIv1alpha1.AuthenticationFilter{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "ref-oidc-authentication-filter",
+			Namespace: testNs,
+		},
+		Spec: ngfAPIv1alpha1.AuthenticationFilterSpec{
+			Type: ngfAPIv1alpha1.AuthTypeOIDC,
+			OIDC: &ngfAPIv1alpha1.OIDCAuth{
+				Issuer:   "https://example.com/auth",
+				ClientID: "my-client-id",
+				ClientSecretRef: ngfAPIv1alpha1.LocalObjectReference{
+					Name: "oidc-client-secret",
+				},
+				CACertificateRefs: []ngfAPIv1alpha1.LocalObjectReference{
+					{
+						Name: "oidc-ca-cert",
+					},
+				},
+			},
+		},
+	}
+
+	processedRefOIDCAuthenticationFilter := &AuthenticationFilter{
+		Source:     referencedOIDCAuthenticationFilter,
+		Valid:      true,
+		Referenced: true,
+	}
+
+	processedRefAuthenticationFilter := &AuthenticationFilter{
+		Source:     referencedAuthenticationFilter,
+		Valid:      true,
+		Referenced: true,
+	}
+
+	createValidRuleWithBackendRefs := func(
+		matches []gatewayv1.HTTPRouteMatch,
+		sessionPersistence *SessionPersistenceConfig,
+	) RouteRule {
+		refs := []BackendRef{
+			{
+				SvcNsName:          types.NamespacedName{Namespace: "service", Name: "foo"},
+				ServicePort:        v1.ServicePort{Port: 80},
+				Valid:              true,
+				Weight:             1,
+				BackendTLSPolicy:   &btp,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				SessionPersistence: sessionPersistence,
+			},
+		}
+		rbrs := []RouteBackendRef{
+			{
+				BackendRef:         commonGWBackendRef,
+				SessionPersistence: sessionPersistence,
+			},
+		}
+		return RouteRule{
+			ValidMatches: true,
+			Filters: RouteRuleFilters{
+				Filters: []Filter{},
+				Valid:   true,
+			},
+			BackendRefs:      refs,
+			Matches:          matches,
+			RouteBackendRefs: rbrs,
+		}
+	}
+
+	createValidRuleWithBackendRefsAndFilters := func(
+		matches []gatewayv1.HTTPRouteMatch,
+		routeType RouteType,
+		sessionPersistence *SessionPersistenceConfig,
+	) RouteRule {
+		rule := createValidRuleWithBackendRefs(matches, sessionPersistence)
+		rule.Filters = RouteRuleFilters{
+			Filters: []Filter{
+				{
+					RouteType:    routeType,
+					FilterType:   FilterExtensionRef,
+					ExtensionRef: refSnippetsFilterExtensionRef,
+					ResolvedExtensionRef: &ExtensionRefFilter{
+						SnippetsFilter: processedRefSnippetsFilter,
+						Valid:          true,
+					},
+				},
+				{
+					RouteType:    routeType,
+					FilterType:   FilterExtensionRef,
+					ExtensionRef: refAuthenticationFilterExtensionRef,
+					ResolvedExtensionRef: &ExtensionRefFilter{
+						AuthenticationFilter: processedRefAuthenticationFilter,
+						Valid:                true,
+					},
+				},
+			},
+			Valid: true,
+		}
+
+		return rule
+	}
+
+	createValidRuleWithInferencePoolBackendRef := func(matches []gatewayv1.HTTPRouteMatch) RouteRule {
+		refs := []BackendRef{
+			{
+				SvcNsName: types.NamespacedName{
+					Namespace: testNs,
+					Name:      controller.CreateInferencePoolServiceName("ipool"),
+				},
+				ServicePort:        v1.ServicePort{Port: 80},
+				Valid:              true,
+				Weight:             1,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				IsInferencePool:    true,
+				EndpointPickerConfig: EndpointPickerConfig{
+					NsName: testNs,
+					EndpointPickerRef: &inference.EndpointPickerRef{
+						Kind: kinds.Service,
+						Name: inference.ObjectName(controller.CreateInferencePoolServiceName("ipool")),
+						Port: helpers.GetPointer(inference.Port{Number: 80}),
+					},
+				},
+			},
+		}
+		rbrs := []RouteBackendRef{
+			{
+				IsInferencePool:   true,
+				InferencePoolName: "ipool",
+				BackendRef: gatewayv1.BackendRef{
+					BackendObjectReference: gatewayv1.BackendObjectReference{
+						Group:     helpers.GetPointer[gatewayv1.Group](""),
+						Kind:      helpers.GetPointer[gatewayv1.Kind](kinds.Service),
+						Name:      gatewayv1.ObjectName(controller.CreateInferencePoolServiceName("ipool")),
+						Namespace: helpers.GetPointer(gatewayv1.Namespace(testNs)),
+					},
+				},
+			},
+		}
+		return RouteRule{
+			ValidMatches: true,
+			Filters: RouteRuleFilters{
+				Filters: []Filter{},
+				Valid:   true,
+			},
+			BackendRefs:      refs,
+			Matches:          matches,
+			RouteBackendRefs: rbrs,
+		}
+	}
+
+	routeMatches := []gatewayv1.HTTPRouteMatch{
+		{
+			Path: &gatewayv1.HTTPPathMatch{
+				Type:  helpers.GetPointer(gatewayv1.PathMatchPathPrefix),
+				Value: helpers.GetPointer("/"),
+			},
+		},
+	}
+
+	createRoute := func(name string, gatewayName string, listenerName string) *gatewayv1.HTTPRoute {
+		return &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: testNs,
+				Name:      name,
+			},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{
+							Namespace:   (*gatewayv1.Namespace)(helpers.GetPointer(testNs)),
+							Name:        gatewayv1.ObjectName(gatewayName),
+							SectionName: (*gatewayv1.SectionName)(helpers.GetPointer(listenerName)),
+						},
+					},
+				},
+				Hostnames: []gatewayv1.Hostname{
+					"foo.example.com",
+				},
+				Rules: []gatewayv1.HTTPRouteRule{
+					{
+						Matches: routeMatches,
+						BackendRefs: []gatewayv1.HTTPBackendRef{
+							{
+								BackendRef: commonGWBackendRef,
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	createRouteTLS := func(name string, gatewayName string) *gatewayv1.TLSRoute {
+		return &gatewayv1.TLSRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: testNs,
+				Name:      name,
+			},
+			Spec: gatewayv1.TLSRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{
+							Namespace: (*gatewayv1.Namespace)(helpers.GetPointer(testNs)),
+							Name:      gatewayv1.ObjectName(gatewayName),
+						},
+					},
+				},
+				Hostnames: []gatewayv1.Hostname{
+					"fizz.example.org",
+				},
+				Rules: []gatewayv1.TLSRouteRule{
+					{
+						BackendRefs: []gatewayv1.BackendRef{
+							commonTLSBackendRef,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	spConfig := &gatewayv1.SessionPersistence{
+		SessionName:     helpers.GetPointer("session-persistence-httproute"),
+		Type:            helpers.GetPointer(gatewayv1.CookieBasedSessionPersistence),
+		AbsoluteTimeout: helpers.GetPointer(gatewayv1.Duration("30m")),
+		CookieConfig: &gatewayv1.CookieConfig{
+			LifetimeType: helpers.GetPointer(gatewayv1.PermanentCookieLifetimeType),
+		},
+	}
+	hr1 := createRoute("hr-1", "gateway-1", "listener-80-1")
+	addElementsToPath(
+		hr1,
+		"/",
+		gatewayv1.HTTPRouteFilter{
+			Type:         gatewayv1.HTTPRouteFilterExtensionRef,
+			ExtensionRef: refSnippetsFilterExtensionRef,
+		},
+		spConfig,
+	)
+	addElementsToPath(
+		hr1,
+		"/",
+		gatewayv1.HTTPRouteFilter{
+			Type:         gatewayv1.HTTPRouteFilterExtensionRef,
+			ExtensionRef: refAuthenticationFilterExtensionRef,
+		},
+		spConfig,
+	)
+
+	hr2 := createRoute("hr-2", "wrong-gateway", "listener-80-1")
+	hr3 := createRoute("hr-3", "gateway-1", "listener-443-1") // https listener; should not conflict with hr1
+
+	refOIDCAuthenticationFilterExtensionRef := &gatewayv1.LocalObjectReference{
+		Group: ngfAPIv1alpha1.GroupName,
+		Kind:  kinds.AuthenticationFilter,
+		Name:  "ref-oidc-authentication-filter",
+	}
+	addElementsToPath(
+		hr3,
+		"/",
+		gatewayv1.HTTPRouteFilter{
+			Type:         gatewayv1.HTTPRouteFilterExtensionRef,
+			ExtensionRef: refOIDCAuthenticationFilterExtensionRef,
+		},
+		nil,
+	)
+
+	// These TLS Routes do not specify section names so that they attempt to attach to all listeners.
+	tr := createRouteTLS("tr", "gateway-1")
+	tr2 := createRouteTLS("tr2", "gateway-1")
+
+	createRouteTCP := func(name string, gatewayName string) *gatewayv1.TCPRoute {
+		return &gatewayv1.TCPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: testNs,
+				Name:      name,
+			},
+			Spec: gatewayv1.TCPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{
+							Namespace: (*gatewayv1.Namespace)(helpers.GetPointer(testNs)),
+							Name:      gatewayv1.ObjectName(gatewayName),
+						},
+					},
+				},
+				Rules: []gatewayv1.TCPRouteRule{
+					{
+						BackendRefs: []gatewayv1.BackendRef{
+							commonTLSBackendRef,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	createRouteUDP := func(name string, gatewayName string) *gatewayv1.UDPRoute {
+		return &gatewayv1.UDPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: testNs,
+				Name:      name,
+			},
+			Spec: gatewayv1.UDPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{
+						{
+							Namespace: (*gatewayv1.Namespace)(helpers.GetPointer(testNs)),
+							Name:      gatewayv1.ObjectName(gatewayName),
+						},
+					},
+				},
+				Rules: []gatewayv1.UDPRouteRule{
+					{
+						BackendRefs: []gatewayv1.BackendRef{
+							commonTLSBackendRef,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	tcpr := createRouteTCP("tcpr", "gateway-1")
+	udpr := createRouteUDP("udpr", "gateway-1")
+
+	gr := &gatewayv1.GRPCRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "gr",
+		},
+		Spec: gatewayv1.GRPCRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Namespace:   (*gatewayv1.Namespace)(helpers.GetPointer(testNs)),
+						Name:        gatewayv1.ObjectName("gateway-1"),
+						SectionName: (*gatewayv1.SectionName)(helpers.GetPointer("listener-80-1")),
+					},
+				},
+			},
+			Hostnames: []gatewayv1.Hostname{
+				"bar.example.com",
+			},
+			Rules: []gatewayv1.GRPCRouteRule{
+				{
+					BackendRefs: []gatewayv1.GRPCBackendRef{
+						{
+							BackendRef: commonGWBackendRef,
+						},
+					},
+					Filters: []gatewayv1.GRPCRouteFilter{
+						{
+							Type:         gatewayv1.GRPCRouteFilterExtensionRef,
+							ExtensionRef: refSnippetsFilterExtensionRef,
+						},
+						{
+							Type:         gatewayv1.GRPCRouteFilterExtensionRef,
+							ExtensionRef: refAuthenticationFilterExtensionRef,
+						},
+					},
+					SessionPersistence: &gatewayv1.SessionPersistence{
+						SessionName:     helpers.GetPointer("session-persistence-grpcroute"),
+						Type:            helpers.GetPointer(gatewayv1.CookieBasedSessionPersistence),
+						AbsoluteTimeout: helpers.GetPointer(gatewayv1.Duration("30m")),
+						CookieConfig: &gatewayv1.CookieConfig{
+							LifetimeType: helpers.GetPointer(gatewayv1.PermanentCookieLifetimeType),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	inferencePool := &inference.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "ipool",
+		},
+		Spec: inference.InferencePoolSpec{
+			TargetPorts: []inference.Port{
+				{Number: 80},
+			},
+			EndpointPickerRef: &inference.EndpointPickerRef{
+				Kind: kinds.Service,
+				Name: inference.ObjectName(controller.CreateInferencePoolServiceName("ipool")),
+			},
+		},
+	}
+
+	// ListenerSet test objects
+	validListenerSet := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "valid-listenerset",
+		},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Name: "gateway-1",
+			},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "http-8080",
+					Port:     8080,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+				{
+					Name:     "https-9443",
+					Port:     9443,
+					Protocol: gatewayv1.HTTPSProtocolType,
+					TLS: &gatewayv1.ListenerTLSConfig{
+						Mode: helpers.GetPointer(gatewayv1.TLSModeTerminate),
+						CertificateRefs: []gatewayv1.SecretObjectReference{
+							{
+								Name: gatewayv1.ObjectName("secret"),
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	nonexistentParentRefListenerSet := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "invalid-listenerset",
+		},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Name: "nonexistent-gateway",
+			},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "http-9090",
+					Port:     9090,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	// ListenerSet that will be rejected due to AllowedListeners policy (different namespace)
+	notAllowedListenerSet := &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "other-ns",
+			Name:      "not-allowed-listenerset",
+		},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Namespace: helpers.GetPointer(gatewayv1.Namespace(testNs)),
+				Name:      "gateway-2",
+			},
+			Listeners: []gatewayv1.ListenerEntry{
+				{
+					Name:     "http-7070",
+					Port:     7070,
+					Protocol: gatewayv1.HTTPProtocolType,
+				},
+			},
+		},
+	}
+
+	ir := createRoute("ir", "gateway-1", "listener-80-1")
+	ir.Spec.Hostnames = []gatewayv1.Hostname{"inference.example.com"}
+	// Update the backend ref to point to the InferencePool instead of a Service
+	ir.Spec.Rules[0].BackendRefs[0] = gatewayv1.HTTPBackendRef{
+		BackendRef: gatewayv1.BackendRef{
+			BackendObjectReference: gatewayv1.BackendObjectReference{
+				Kind:      helpers.GetPointer[gatewayv1.Kind](kinds.InferencePool),
+				Group:     helpers.GetPointer[gatewayv1.Group](inferenceAPIGroup),
+				Name:      gatewayv1.ObjectName(inferencePool.Name),
+				Namespace: helpers.GetPointer(gatewayv1.Namespace(inferencePool.Namespace)),
+			},
+		},
+	}
+
+	// HTTPRoute that references ListenerSet
+	hrLS := &gatewayv1.HTTPRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "hr-ls",
+		},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{
+				ParentRefs: []gatewayv1.ParentReference{
+					{
+						Kind:        helpers.GetPointer[gatewayv1.Kind](kinds.ListenerSet),
+						Namespace:   (*gatewayv1.Namespace)(helpers.GetPointer(testNs)),
+						Name:        gatewayv1.ObjectName("valid-listenerset"),
+						SectionName: helpers.GetPointer[gatewayv1.SectionName]("http-8080"),
+					},
+				},
+			},
+			Hostnames: []gatewayv1.Hostname{"listenerest.example.com"},
+			Rules: []gatewayv1.HTTPRouteRule{
+				{
+					Matches: routeMatches,
+					BackendRefs: []gatewayv1.HTTPBackendRef{
+						{
+							BackendRef: gatewayv1.BackendRef{
+								BackendObjectReference: gatewayv1.BackendObjectReference{
+									Kind:      (*gatewayv1.Kind)(helpers.GetPointer("Service")),
+									Name:      "ls-backend",
+									Namespace: (*gatewayv1.Namespace)(helpers.GetPointer(testNs)),
+									Port:      helpers.GetPointer[gatewayv1.PortNumber](80),
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	secret := &v1.Secret{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Secret",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "secret",
+		},
+		Data: map[string][]byte{
+			v1.TLSCertKey:       cert,
+			v1.TLSPrivateKeyKey: key,
+		},
+		Type: v1.SecretTypeTLS,
+	}
+
+	plusSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ngf",
+			Name:      "plus-secret",
+		},
+		Data: map[string][]byte{
+			secrets.LicenseJWTKey: []byte("license"),
+		},
+	}
+
+	gatewaySecret := &v1.Secret{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "Secret",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "gateway-secret",
+		},
+		Data: map[string][]byte{
+			v1.TLSCertKey:       cert,
+			v1.TLSPrivateKeyKey: key,
+		},
+		Type: v1.SecretTypeTLS,
+	}
+
+	ns := &v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: testNs,
+			Labels: map[string]string{
+				"app": "allowed",
+			},
+		},
+	}
+
+	createGateway := func(name, nginxProxyName string) *Gateway {
+		return &Gateway{
+			Source: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: testNs,
+					Name:      name,
+				},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: gcName,
+					Infrastructure: &gatewayv1.GatewayInfrastructure{
+						ParametersRef: &gatewayv1.LocalParametersReference{
+							Group: ngfAPIv1alpha2.GroupName,
+							Kind:  kinds.NginxProxy,
+							Name:  nginxProxyName,
+						},
+					},
+					AllowedListeners: &gatewayv1.AllowedListeners{
+						Namespaces: &gatewayv1.ListenerNamespaces{
+							From: helpers.GetPointer(gatewayv1.NamespacesFromSame),
+						},
+					},
+					Listeners: []gatewayv1.Listener{
+						{
+							Name:     "listener-80-1",
+							Hostname: nil,
+							Port:     80,
+							Protocol: gatewayv1.HTTPProtocolType,
+							AllowedRoutes: &gatewayv1.AllowedRoutes{
+								Namespaces: &gatewayv1.RouteNamespaces{
+									From: helpers.GetPointer(gatewayv1.NamespacesFromSelector),
+									Selector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{
+											"app": "allowed",
+										},
+									},
+								},
+							},
+						},
+
+						{
+							Name:     "listener-443-1",
+							Hostname: (*gatewayv1.Hostname)(helpers.GetPointer("*.example.com")),
+							Port:     443,
+							TLS: &gatewayv1.ListenerTLSConfig{
+								Mode: helpers.GetPointer(gatewayv1.TLSModeTerminate),
+								CertificateRefs: []gatewayv1.SecretObjectReference{
+									{
+										Kind:      helpers.GetPointer[gatewayv1.Kind]("Secret"),
+										Name:      gatewayv1.ObjectName(secret.Name),
+										Namespace: helpers.GetPointer(gatewayv1.Namespace(secret.Namespace)),
+									},
+								},
+							},
+							Protocol: gatewayv1.HTTPSProtocolType,
+						},
+						{
+							Name:     "listener-443-2",
+							Hostname: (*gatewayv1.Hostname)(helpers.GetPointer("*.example.org")),
+							Port:     443,
+							Protocol: gatewayv1.TLSProtocolType,
+							TLS:      &gatewayv1.ListenerTLSConfig{Mode: helpers.GetPointer(gatewayv1.TLSModePassthrough)},
+							AllowedRoutes: &gatewayv1.AllowedRoutes{
+								Kinds: []gatewayv1.RouteGroupKind{
+									{Kind: kinds.TLSRoute, Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+								},
+							},
+						},
+						{
+							Name:     "listener-8443",
+							Hostname: (*gatewayv1.Hostname)(helpers.GetPointer("*.example.org")),
+							Port:     8443,
+							Protocol: gatewayv1.TLSProtocolType,
+							TLS:      &gatewayv1.ListenerTLSConfig{Mode: helpers.GetPointer(gatewayv1.TLSModePassthrough)},
+						},
+					},
+					TLS: &gatewayv1.GatewayTLSConfig{
+						Backend: &gatewayv1.GatewayBackendTLS{
+							ClientCertificateRef: &gatewayv1.SecretObjectReference{
+								Kind:      helpers.GetPointer[gatewayv1.Kind]("Secret"),
+								Name:      gatewayv1.ObjectName(gatewaySecret.Name),
+								Namespace: helpers.GetPointer(gatewayv1.Namespace(gatewaySecret.Namespace)),
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	gw1 := createGateway("gateway-1", "np-1")
+	gw2 := createGateway("gateway-2", "np-2")
+
+	// np1 is referenced by gw1 and sets the nginx error log to error.
+	np1 := &ngfAPIv1alpha2.NginxProxy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "np-1",
+			Namespace: testNs,
+		},
+		Spec: ngfAPIv1alpha2.NginxProxySpec{
+			Logging: &ngfAPIv1alpha2.NginxLogging{
+				ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelError),
+			},
+		},
+	}
+
+	// np2 is referenced by gw2 and sets the IPFamily to IPv6.
+	np2 := &ngfAPIv1alpha2.NginxProxy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "np-2",
+			Namespace: testNs,
+		},
+		Spec: ngfAPIv1alpha2.NginxProxySpec{
+			IPFamily: helpers.GetPointer(ngfAPIv1alpha2.IPv6),
+		},
+	}
+
+	svc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "service", Name: "foo",
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Port: 80,
+				},
+			},
+		},
+	}
+
+	svc1 := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs, Name: "foo2",
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Port: 80,
+				},
+			},
+		},
+	}
+
+	inferenceSvc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs, Name: controller.CreateInferencePoolServiceName(inferencePool.Name),
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Port: 80,
+				},
+			},
+		},
+	}
+
+	lsBackendSvc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "ls-backend",
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Port: 80,
+				},
+			},
+		},
+	}
+
+	rgSecret := &gatewayv1.ReferenceGrant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rg-secret",
+			Namespace: "certificate",
+		},
+		Spec: gatewayv1.ReferenceGrantSpec{
+			From: []gatewayv1.ReferenceGrantFrom{
+				{
+					Group:     gatewayv1.GroupName,
+					Kind:      kinds.Gateway,
+					Namespace: gatewayv1.Namespace(testNs),
+				},
+			},
+			To: []gatewayv1.ReferenceGrantTo{
+				{
+					Kind: "Secret",
+				},
+			},
+		},
+	}
+
+	hrToServiceNsRefGrant := &gatewayv1.ReferenceGrant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hr-to-service",
+			Namespace: "service",
+		},
+		Spec: gatewayv1.ReferenceGrantSpec{
+			From: []gatewayv1.ReferenceGrantFrom{
+				{
+					Group:     gatewayv1.GroupName,
+					Kind:      kinds.HTTPRoute,
+					Namespace: gatewayv1.Namespace(testNs),
+				},
+			},
+			To: []gatewayv1.ReferenceGrantTo{
+				{
+					Kind: "Service",
+				},
+			},
+		},
+	}
+
+	grToServiceNsRefGrant := &gatewayv1.ReferenceGrant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gr-to-service",
+			Namespace: "service",
+		},
+		Spec: gatewayv1.ReferenceGrantSpec{
+			From: []gatewayv1.ReferenceGrantFrom{
+				{
+					Group:     gatewayv1.GroupName,
+					Kind:      kinds.GRPCRoute,
+					Namespace: gatewayv1.Namespace(testNs),
+				},
+			},
+			To: []gatewayv1.ReferenceGrantTo{
+				{
+					Kind: "Service",
+				},
+			},
+		},
+	}
+
+	// npGlobal is referenced by the gateway class, and we expect it to be configured and merged with np1.
+	npGlobal := &ngfAPIv1alpha2.NginxProxy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "np-global",
+			Namespace: testNs,
+		},
+		Spec: ngfAPIv1alpha2.NginxProxySpec{
+			Telemetry: &ngfAPIv1alpha2.Telemetry{
+				Exporter: &ngfAPIv1alpha2.TelemetryExporter{
+					Endpoint:   helpers.GetPointer("1.2.3.4:123"),
+					Interval:   helpers.GetPointer(ngfAPIv1alpha1.Duration("5s")),
+					BatchSize:  helpers.GetPointer(int32(512)),
+					BatchCount: helpers.GetPointer(int32(4)),
+				},
+				ServiceName: helpers.GetPointer("my-svc"),
+				SpanAttributes: []ngfAPIv1alpha1.SpanAttribute{
+					{Key: "key", Value: "value"},
+				},
+			},
+		},
+	}
+
+	// np1Effective is the combined NginxProxy of npGlobal and np1
+	np1Effective := &EffectiveNginxProxy{
+		Telemetry: &ngfAPIv1alpha2.Telemetry{
+			Exporter: &ngfAPIv1alpha2.TelemetryExporter{
+				Endpoint:   helpers.GetPointer("1.2.3.4:123"),
+				Interval:   helpers.GetPointer(ngfAPIv1alpha1.Duration("5s")),
+				BatchSize:  helpers.GetPointer(int32(512)),
+				BatchCount: helpers.GetPointer(int32(4)),
+			},
+			ServiceName: helpers.GetPointer("my-svc"),
+			SpanAttributes: []ngfAPIv1alpha1.SpanAttribute{
+				{Key: "key", Value: "value"},
+			},
+		},
+		Logging: &ngfAPIv1alpha2.NginxLogging{
+			ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelError),
+		},
+	}
+
+	// NGF Policies
+	//
+	// We have to use real policies here instead of a mocks because the Diff function we use in the test fails when
+	// using a mock because the mock has unexported fields.
+	// Testing one type of policy per attachment point should suffice.
+	polGVK := schema.GroupVersionKind{Kind: kinds.ClientSettingsPolicy}
+	hrPolicyKey := PolicyKey{GVK: polGVK, NsName: types.NamespacedName{Namespace: testNs, Name: "hrPolicy"}}
+	hrPolicy := &ngfAPIv1alpha1.ClientSettingsPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "hrPolicy",
+			Namespace: testNs,
+		},
+		TypeMeta: metav1.TypeMeta{Kind: kinds.ClientSettingsPolicy},
+		Spec: ngfAPIv1alpha1.ClientSettingsPolicySpec{
+			TargetRef: createTestRef(kinds.HTTPRoute, gatewayv1.GroupName, "hr-1"),
+		},
+	}
+	processedRoutePolicy := &Policy{
+		Source: hrPolicy,
+		Ancestors: []PolicyAncestor{
+			{
+				Ancestor: gatewayv1.ParentReference{
+					Group:     helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName),
+					Kind:      helpers.GetPointer[gatewayv1.Kind](kinds.HTTPRoute),
+					Namespace: (*gatewayv1.Namespace)(&testNs),
+					Name:      "hr-1",
+				},
+			},
+		},
+		TargetRefs: []PolicyTargetRef{
+			{
+				Kind:   kinds.HTTPRoute,
+				Group:  gatewayv1.GroupName,
+				Nsname: types.NamespacedName{Namespace: testNs, Name: "hr-1"},
+			},
+		},
+		InvalidForGateways: map[types.NamespacedName]struct{}{},
+		Valid:              true,
+	}
+
+	gwPolicyKey := PolicyKey{GVK: polGVK, NsName: types.NamespacedName{Namespace: testNs, Name: "gwPolicy"}}
+	gwPolicy := &ngfAPIv1alpha1.ClientSettingsPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "gwPolicy",
+			Namespace: testNs,
+		},
+		TypeMeta: metav1.TypeMeta{Kind: kinds.ClientSettingsPolicy},
+		Spec: ngfAPIv1alpha1.ClientSettingsPolicySpec{
+			TargetRef: createTestRef(kinds.Gateway, gatewayv1.GroupName, "gateway-1"),
+		},
+	}
+	processedGwPolicy := &Policy{
+		Source: gwPolicy,
+		Ancestors: []PolicyAncestor{
+			{
+				Ancestor: gatewayv1.ParentReference{
+					Group:     helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName),
+					Kind:      helpers.GetPointer[gatewayv1.Kind](kinds.Gateway),
+					Namespace: (*gatewayv1.Namespace)(&testNs),
+					Name:      "gateway-1",
+				},
+			},
+		},
+		TargetRefs: []PolicyTargetRef{
+			{
+				Kind:   kinds.Gateway,
+				Group:  gatewayv1.GroupName,
+				Nsname: types.NamespacedName{Namespace: testNs, Name: "gateway-1"},
+			},
+		},
+		InvalidForGateways: map[types.NamespacedName]struct{}{},
+		Valid:              true,
+	}
+
+	createStateWithGatewayClass := func(gc *gatewayv1.GatewayClass) ClusterState {
+		return ClusterState{
+			GatewayClasses: map[types.NamespacedName]*gatewayv1.GatewayClass{
+				client.ObjectKeyFromObject(gc): gc,
+			},
+			Gateways: map[types.NamespacedName]*gatewayv1.Gateway{
+				client.ObjectKeyFromObject(gw1.Source): gw1.Source,
+				client.ObjectKeyFromObject(gw2.Source): gw2.Source,
+			},
+			HTTPRoutes: map[types.NamespacedName]*gatewayv1.HTTPRoute{
+				client.ObjectKeyFromObject(hr1):  hr1,
+				client.ObjectKeyFromObject(hr2):  hr2,
+				client.ObjectKeyFromObject(hr3):  hr3,
+				client.ObjectKeyFromObject(ir):   ir,
+				client.ObjectKeyFromObject(hrLS): hrLS,
+			},
+			TLSRoutes: map[types.NamespacedName]*gatewayv1.TLSRoute{
+				client.ObjectKeyFromObject(tr):  tr,
+				client.ObjectKeyFromObject(tr2): tr2,
+			},
+			TCPRoutes: map[types.NamespacedName]*gatewayv1.TCPRoute{
+				client.ObjectKeyFromObject(tcpr): tcpr,
+			},
+			UDPRoutes: map[types.NamespacedName]*gatewayv1.UDPRoute{
+				client.ObjectKeyFromObject(udpr): udpr,
+			},
+			GRPCRoutes: map[types.NamespacedName]*gatewayv1.GRPCRoute{
+				client.ObjectKeyFromObject(gr): gr,
+			},
+			Services: map[types.NamespacedName]*v1.Service{
+				client.ObjectKeyFromObject(svc):          svc,
+				client.ObjectKeyFromObject(svc1):         svc1,
+				client.ObjectKeyFromObject(inferenceSvc): inferenceSvc,
+				client.ObjectKeyFromObject(lsBackendSvc): lsBackendSvc,
+			},
+			InferencePools: map[types.NamespacedName]*inference.InferencePool{
+				client.ObjectKeyFromObject(inferencePool): inferencePool,
+			},
+			Namespaces: map[types.NamespacedName]*v1.Namespace{
+				client.ObjectKeyFromObject(ns): ns,
+			},
+			ReferenceGrants: map[types.NamespacedName]*gatewayv1.ReferenceGrant{
+				client.ObjectKeyFromObject(rgSecret):              rgSecret,
+				client.ObjectKeyFromObject(hrToServiceNsRefGrant): hrToServiceNsRefGrant,
+				client.ObjectKeyFromObject(grToServiceNsRefGrant): grToServiceNsRefGrant,
+			},
+			Secrets: map[types.NamespacedName]*v1.Secret{
+				client.ObjectKeyFromObject(secret):           secret,
+				client.ObjectKeyFromObject(plusSecret):       plusSecret,
+				client.ObjectKeyFromObject(gatewaySecret):    gatewaySecret,
+				client.ObjectKeyFromObject(basicAuthSecret):  basicAuthSecret,
+				client.ObjectKeyFromObject(oidcClientSecret): oidcClientSecret,
+				client.ObjectKeyFromObject(oidcCACertSecret): oidcCACertSecret,
+			},
+			BackendTLSPolicies: map[types.NamespacedName]*gatewayv1.BackendTLSPolicy{
+				client.ObjectKeyFromObject(btp.Source): btp.Source,
+			},
+			ConfigMaps: map[types.NamespacedName]*v1.ConfigMap{
+				client.ObjectKeyFromObject(cm): cm,
+			},
+			NginxProxies: map[types.NamespacedName]*ngfAPIv1alpha2.NginxProxy{
+				client.ObjectKeyFromObject(npGlobal): npGlobal,
+				client.ObjectKeyFromObject(np1):      np1,
+				client.ObjectKeyFromObject(np2):      np2,
+			},
+			NGFPolicies: map[PolicyKey]policies.Policy{
+				hrPolicyKey: hrPolicy,
+				gwPolicyKey: gwPolicy,
+			},
+			SnippetsFilters: map[types.NamespacedName]*ngfAPIv1alpha1.SnippetsFilter{
+				client.ObjectKeyFromObject(unreferencedSnippetsFilter): unreferencedSnippetsFilter,
+				client.ObjectKeyFromObject(referencedSnippetsFilter):   referencedSnippetsFilter,
+			},
+			ExternalLoadBalancer: map[types.NamespacedName]*ngfAPIv1alpha1.ExternalLoadBalancer{
+				client.ObjectKeyFromObject(elbGW1): elbGW1,
+			},
+			AuthenticationFilters: map[types.NamespacedName]*ngfAPIv1alpha1.AuthenticationFilter{
+				client.ObjectKeyFromObject(unreferencedAuthenticationFilter):   unreferencedAuthenticationFilter,
+				client.ObjectKeyFromObject(referencedAuthenticationFilter):     referencedAuthenticationFilter,
+				client.ObjectKeyFromObject(referencedOIDCAuthenticationFilter): referencedOIDCAuthenticationFilter,
+			},
+			ListenerSets: map[types.NamespacedName]*gatewayv1.ListenerSet{
+				client.ObjectKeyFromObject(validListenerSet):                validListenerSet,
+				client.ObjectKeyFromObject(nonexistentParentRefListenerSet): nonexistentParentRefListenerSet,
+				client.ObjectKeyFromObject(notAllowedListenerSet):           notAllowedListenerSet,
+			},
+		}
+	}
+
+	getExpectedSPConfig := &SessionPersistenceConfig{
+		Name:        "session-persistence-httproute",
+		SessionType: gatewayv1.CookieBasedSessionPersistence,
+		Expiry:      "30m",
+		Valid:       true,
+		Path:        "/",
+		Idx:         "hr-1_test_0",
+	}
+
+	routeHR1 := &L7Route{
+		RouteType:  RouteTypeHTTP,
+		Valid:      true,
+		Attachable: true,
+		Source:     hr1,
+		ParentRefs: []ParentRef{
+			{
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				Idx:                 0,
+				EffectiveNginxProxy: np1Effective,
+				SectionName:         hr1.Spec.ParentRefs[0].SectionName,
+				Attachment: &ParentRefAttachmentStatus{
+					Attached: true,
+					Listeners: []ListenerAttachmentStatus{{
+						Key: CreateParentRefListenerKey(
+							client.ObjectKeyFromObject(gw1.Source),
+							"listener-80-1",
+						),
+						AcceptedHostnames: []string{"foo.example.com"},
+						Port:              80,
+					}},
+				},
+			},
+		},
+		Spec: L7RouteSpec{
+			Hostnames: hr1.Spec.Hostnames,
+			Rules:     []RouteRule{createValidRuleWithBackendRefsAndFilters(routeMatches, RouteTypeHTTP, getExpectedSPConfig)},
+		},
+		Policies: []*Policy{processedRoutePolicy},
+		Conditions: []conditions.Condition{
+			conditions.NewClientSettingsPolicyAffected(),
+		},
+	}
+
+	routeHRLS := &L7Route{
+		RouteType:  RouteTypeHTTP,
+		Valid:      true,
+		Attachable: true,
+		Source:     hrLS,
+		ParentRefs: []ParentRef{
+			{
+				Kind:                kinds.ListenerSet,
+				NamespacedName:      types.NamespacedName{Namespace: testNs, Name: "valid-listenerset"},
+				GatewayNsName:       types.NamespacedName{Namespace: testNs, Name: "gateway-1"},
+				EffectiveNginxProxy: np1Effective,
+				Idx:                 0,
+				SectionName:         hrLS.Spec.ParentRefs[0].SectionName,
+				Attachment: &ParentRefAttachmentStatus{
+					Attached: true,
+					Listeners: []ListenerAttachmentStatus{{
+						Key: CreateParentRefListenerKey(
+							types.NamespacedName{Namespace: testNs, Name: "valid-listenerset"},
+							"http-8080",
+						),
+						AcceptedHostnames: []string{"listenerest.example.com"},
+						Port:              8080,
+					}},
+				},
+			},
+		},
+		Spec: L7RouteSpec{
+			Hostnames: hrLS.Spec.Hostnames,
+			Rules: []RouteRule{
+				{
+					ValidMatches: true,
+					Matches:      routeMatches,
+					RouteBackendRefs: []RouteBackendRef{
+						{
+							BackendRef: hrLS.Spec.Rules[0].BackendRefs[0].BackendRef,
+						},
+					},
+					BackendRefs: []BackendRef{
+						{
+							SvcNsName: types.NamespacedName{
+								Namespace: testNs,
+								Name:      "ls-backend",
+							},
+							ServicePort: v1.ServicePort{
+								Port: 80,
+							},
+							Valid:              true,
+							InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+							Weight:             1,
+						},
+					},
+					Filters: RouteRuleFilters{
+						Filters: []Filter{},
+						Valid:   true,
+					},
+				},
+			},
+		},
+	}
+
+	routeTR := &L4Route{
+		Valid:      true,
+		Attachable: true,
+		Source:     tr,
+		RouteType:  RouteTypeTLS,
+		ParentRefs: []ParentRef{
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[0].Name,
+			},
+			{
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				Idx:                 0,
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[1].Name,
+			},
+			{
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				Idx:                 0,
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Attached: true,
+					Listeners: []ListenerAttachmentStatus{{
+						Key: CreateParentRefListenerKey(
+							client.ObjectKeyFromObject(gw1.Source),
+							"listener-443-2",
+						),
+						AcceptedHostnames: []string{"fizz.example.org"},
+						Port:              443,
+					}},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[2].Name,
+			},
+			{
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				Idx:                 0,
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Attached: true,
+					Listeners: []ListenerAttachmentStatus{{
+						Key: CreateParentRefListenerKey(
+							client.ObjectKeyFromObject(gw1.Source),
+							"listener-8443",
+						),
+						AcceptedHostnames: []string{"fizz.example.org"},
+						Port:              8443,
+					}},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[3].Name,
+			},
+			{
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				Idx:                 0,
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
+				},
+				SectionName: helpers.GetPointer[gatewayv1.SectionName]("http-8080"),
+			},
+			{
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				Idx:                 0,
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
+				},
+				SectionName: helpers.GetPointer[gatewayv1.SectionName]("https-9443"),
+			},
+		},
+		Spec: L4RouteSpec{
+			Hostnames: tr.Spec.Hostnames,
+			BackendRef: BackendRef{
+				SvcNsName: types.NamespacedName{
+					Namespace: "test",
+					Name:      "foo2",
+				},
+				ServicePort: v1.ServicePort{
+					Port: 80,
+				},
+				Valid:              true,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+			},
+		},
+	}
+
+	routeTR2 := &L4Route{
+		Valid:      true,
+		Attachable: true,
+		Source:     tr2,
+		RouteType:  RouteTypeTLS,
+		ParentRefs: []ParentRef{
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Attached:         false,
+					Listeners:        []ListenerAttachmentStatus{},
+					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[0].Name,
+			},
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[1].Name,
+			},
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Attached:         false,
+					Listeners:        []ListenerAttachmentStatus{},
+					FailedConditions: []conditions.Condition{conditions.NewRouteHostnameConflict()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[2].Name,
+			},
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Attached:         false,
+					Listeners:        []ListenerAttachmentStatus{},
+					FailedConditions: []conditions.Condition{conditions.NewRouteHostnameConflict()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[3].Name,
+			},
+			{
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				Idx:                 0,
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
+				},
+				SectionName: helpers.GetPointer[gatewayv1.SectionName]("http-8080"),
+			},
+			{
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				Idx:                 0,
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
+				},
+				SectionName: helpers.GetPointer[gatewayv1.SectionName]("https-9443"),
+			},
+		},
+		Spec: L4RouteSpec{
+			Hostnames: tr.Spec.Hostnames,
+			BackendRef: BackendRef{
+				SvcNsName: types.NamespacedName{
+					Namespace: "test",
+					Name:      "foo2",
+				},
+				ServicePort: v1.ServicePort{
+					Port: 80,
+				},
+				Valid:              true,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+			},
+		},
+	}
+
+	routeTCP := &L4Route{
+		Valid:      true,
+		Attachable: true,
+		Source:     tcpr,
+		RouteType:  RouteTypeTCP,
+		ParentRefs: []ParentRef{
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[0].Name,
+			},
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[1].Name,
+			},
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[2].Name,
+			},
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[3].Name,
+			},
+			{
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				Idx:                 0,
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
+				},
+				SectionName: helpers.GetPointer[gatewayv1.SectionName]("http-8080"),
+			},
+			{
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				Idx:                 0,
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
+				},
+				SectionName: helpers.GetPointer[gatewayv1.SectionName]("https-9443"),
+			},
+		},
+		Spec: L4RouteSpec{
+			BackendRefs: []BackendRef{
+				{
+					SvcNsName: types.NamespacedName{
+						Namespace: "test",
+						Name:      "foo2",
+					},
+					ServicePort: v1.ServicePort{
+						Port: 80,
+					},
+					Valid:              true,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+		},
+	}
+
+	routeUDP := &L4Route{
+		Valid:      true,
+		Attachable: true,
+		Source:     udpr,
+		RouteType:  RouteTypeUDP,
+		ParentRefs: []ParentRef{
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[0].Name,
+			},
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[1].Name,
+			},
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[2].Name,
+			},
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
+				},
+				SectionName: &gw1.Source.Spec.Listeners[3].Name,
+			},
+			{
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				Idx:                 0,
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
+				},
+				SectionName: helpers.GetPointer[gatewayv1.SectionName]("http-8080"),
+			},
+			{
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				Idx:                 0,
+				EffectiveNginxProxy: np1Effective,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners:        []ListenerAttachmentStatus{},
+					Attached:         false,
+					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
+				},
+				SectionName: helpers.GetPointer[gatewayv1.SectionName]("https-9443"),
+			},
+		},
+		Spec: L4RouteSpec{
+			BackendRefs: []BackendRef{
+				{
+					SvcNsName: types.NamespacedName{
+						Namespace: "test",
+						Name:      "foo2",
+					},
+					ServicePort: v1.ServicePort{
+						Port: 80,
+					},
+					Valid:              true,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+		},
+	}
+
+	expectedSPgr := &SessionPersistenceConfig{
+		Name:        "session-persistence-grpcroute",
+		SessionType: gatewayv1.CookieBasedSessionPersistence,
+		Expiry:      "30m",
+		Valid:       true,
+		Idx:         "gr_test_0",
+	}
+	routeGR := &L7Route{
+		RouteType:  RouteTypeGRPC,
+		Valid:      true,
+		Attachable: true,
+		Source:     gr,
+		ParentRefs: []ParentRef{
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				SectionName:         gr.Spec.ParentRefs[0].SectionName,
+				Attachment: &ParentRefAttachmentStatus{
+					Attached: true,
+					Listeners: []ListenerAttachmentStatus{{
+						Key: CreateParentRefListenerKey(
+							client.ObjectKeyFromObject(gw1.Source),
+							"listener-80-1",
+						),
+						AcceptedHostnames: []string{"bar.example.com"},
+						Port:              80,
+					}},
+				},
+			},
+		},
+		Spec: L7RouteSpec{
+			Hostnames: gr.Spec.Hostnames,
+			Rules: []RouteRule{
+				createValidRuleWithBackendRefsAndFilters(routeMatches, RouteTypeGRPC, expectedSPgr),
+			},
+		},
+	}
+
+	routeHR3 := &L7Route{
+		RouteType:  RouteTypeHTTP,
+		Valid:      true,
+		Attachable: true,
+		Source:     hr3,
+		ParentRefs: []ParentRef{
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				SectionName:         hr3.Spec.ParentRefs[0].SectionName,
+				Attachment: &ParentRefAttachmentStatus{
+					Attached: true,
+					Listeners: []ListenerAttachmentStatus{{
+						Key: CreateParentRefListenerKey(
+							client.ObjectKeyFromObject(gw1.Source),
+							"listener-443-1",
+						),
+						AcceptedHostnames: []string{"foo.example.com"},
+						Port:              443,
+					}},
+				},
+			},
+		},
+		Spec: L7RouteSpec{
+			Hostnames: hr3.Spec.Hostnames,
+			Rules: []RouteRule{
+				{
+					ValidMatches: true,
+					Matches:      routeMatches,
+					BackendRefs:  []BackendRef{createValidRuleWithBackendRefs(routeMatches, nil).BackendRefs[0]},
+					RouteBackendRefs: []RouteBackendRef{
+						{
+							BackendRef: commonGWBackendRef,
+						},
+					},
+					Filters: RouteRuleFilters{
+						Filters: []Filter{
+							{
+								RouteType:    RouteTypeHTTP,
+								FilterType:   FilterExtensionRef,
+								ExtensionRef: refOIDCAuthenticationFilterExtensionRef,
+								ResolvedExtensionRef: &ExtensionRefFilter{
+									AuthenticationFilter: processedRefOIDCAuthenticationFilter,
+									Valid:                true,
+								},
+							},
+						},
+						Valid: true,
+					},
+				},
+			},
+		},
+	}
+
+	inferenceRoute := &L7Route{
+		RouteType:  RouteTypeHTTP,
+		Valid:      true,
+		Attachable: true,
+		Source:     ir,
+		Conditions: []conditions.Condition{
+			conditions.NewRouteEndpointPickerTLSVerificationSkipped(),
+		},
+		ParentRefs: []ParentRef{
+			{
+				Idx:                 0,
+				Kind:                kinds.Gateway,
+				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
+				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
+				EffectiveNginxProxy: np1Effective,
+				SectionName:         ir.Spec.ParentRefs[0].SectionName,
+				Attachment: &ParentRefAttachmentStatus{
+					Attached: true,
+					Listeners: []ListenerAttachmentStatus{{
+						Key: CreateParentRefListenerKey(
+							client.ObjectKeyFromObject(gw1.Source),
+							"listener-80-1",
+						),
+						AcceptedHostnames: []string{"inference.example.com"},
+						Port:              80,
+					}},
+				},
+			},
+		},
+		Spec: L7RouteSpec{
+			Hostnames: ir.Spec.Hostnames,
+			Rules:     []RouteRule{createValidRuleWithInferencePoolBackendRef(routeMatches)},
+		},
+	}
+
+	supportedKindsForListeners := []gatewayv1.RouteGroupKind{
+		{Kind: gatewayv1.Kind(kinds.HTTPRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+		{Kind: gatewayv1.Kind(kinds.GRPCRoute), Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+	}
+
+	createExpectedGraphWithGatewayClass := func(gc *gatewayv1.GatewayClass) *Graph {
+		return &Graph{
+			GatewayClass: &GatewayClass{
+				Source:     gc,
+				Valid:      true,
+				Conditions: []conditions.Condition{conditions.NewGatewayClassResolvedRefs()},
+				NginxProxy: &NginxProxy{
+					Source: npGlobal,
+					Valid:  true,
+				},
+			},
+			Gateways: map[types.NamespacedName]*Gateway{
+				{Namespace: testNs, Name: "gateway-1"}: {
+					Source: gw1.Source,
+					Listeners: []*Listener{
+						{
+							Name:        "listener-80-1",
+							GatewayName: types.NamespacedName{Namespace: testNs, Name: "gateway-1"},
+							Source:      gw1.Source.Spec.Listeners[0],
+							Valid:       true,
+							Attachable:  true,
+							Routes: map[RouteKey]*L7Route{
+								CreateRouteKey(hr1): routeHR1,
+								CreateRouteKey(gr):  routeGR,
+								CreateRouteKey(ir):  inferenceRoute,
+							},
+							SupportedKinds:            supportedKindsForListeners,
+							L4Routes:                  map[L4RouteKey]*L4Route{},
+							AllowedRouteLabelSelector: labels.SelectorFromSet(map[string]string{"app": "allowed"}),
+						},
+						{
+							Name:            "listener-443-1",
+							GatewayName:     types.NamespacedName{Namespace: testNs, Name: "gateway-1"},
+							Source:          gw1.Source.Spec.Listeners[1],
+							Valid:           true,
+							Attachable:      true,
+							Routes:          map[RouteKey]*L7Route{CreateRouteKey(hr3): routeHR3},
+							L4Routes:        map[L4RouteKey]*L4Route{},
+							ResolvedSecrets: []types.NamespacedName{client.ObjectKeyFromObject(secret)},
+							SupportedKinds:  supportedKindsForListeners,
+						},
+						{
+							Name:        "listener-443-2",
+							GatewayName: types.NamespacedName{Namespace: testNs, Name: "gateway-1"},
+							Source:      gw1.Source.Spec.Listeners[2],
+							Valid:       true,
+							Attachable:  true,
+							L4Routes:    map[L4RouteKey]*L4Route{CreateRouteKeyL4(tr): routeTR},
+							Routes:      map[RouteKey]*L7Route{},
+							SupportedKinds: []gatewayv1.RouteGroupKind{
+								{Kind: kinds.TLSRoute, Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+							},
+						},
+						{
+							Name:        "listener-8443",
+							GatewayName: types.NamespacedName{Namespace: testNs, Name: "gateway-1"},
+							Source:      gw1.Source.Spec.Listeners[3],
+							Valid:       true,
+							Attachable:  true,
+							L4Routes:    map[L4RouteKey]*L4Route{CreateRouteKeyL4(tr): routeTR},
+							Routes:      map[RouteKey]*L7Route{},
+							SupportedKinds: []gatewayv1.RouteGroupKind{
+								{Kind: kinds.TLSRoute, Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+							},
+						},
+						{
+							Name:            "http-8080",
+							GatewayName:     types.NamespacedName{Namespace: testNs, Name: "gateway-1"},
+							ListenerSetName: types.NamespacedName{Namespace: testNs, Name: "valid-listenerset"},
+							Source: gatewayv1.Listener{
+								Name:     "http-8080",
+								Port:     8080,
+								Protocol: "HTTP",
+							},
+							Routes:         map[RouteKey]*L7Route{CreateRouteKey(hrLS): routeHRLS},
+							L4Routes:       map[L4RouteKey]*L4Route{},
+							SupportedKinds: supportedKindsForListeners,
+							Valid:          true,
+							Attachable:     true,
+						},
+						{
+							Name:            "https-9443",
+							GatewayName:     types.NamespacedName{Namespace: testNs, Name: "gateway-1"},
+							ListenerSetName: types.NamespacedName{Namespace: testNs, Name: "valid-listenerset"},
+							Source: gatewayv1.Listener{
+								Name:     "https-9443",
+								Port:     9443,
+								Protocol: "HTTPS",
+								TLS: &gatewayv1.ListenerTLSConfig{
+									Mode: helpers.GetPointer(gatewayv1.TLSModeTerminate),
+									CertificateRefs: []gatewayv1.SecretObjectReference{
+										{
+											Name: gatewayv1.ObjectName("secret"),
+										},
+									},
+								},
+							},
+							Routes:          map[RouteKey]*L7Route{},
+							L4Routes:        map[L4RouteKey]*L4Route{},
+							ResolvedSecrets: []types.NamespacedName{client.ObjectKeyFromObject(secret)},
+							SupportedKinds:  supportedKindsForListeners,
+							Valid:           true,
+							Attachable:      true,
+						},
+					},
+					Valid:                true,
+					Policies:             []*Policy{processedGwPolicy},
+					ExternalLoadBalancer: elbGW1,
+					AttachedListenerSets: map[types.NamespacedName]*ListenerSet{
+						client.ObjectKeyFromObject(validListenerSet): {
+							Source:  validListenerSet,
+							Gateway: gw1.Source,
+							Valid:   true,
+							Listeners: []*Listener{
+								{
+									Name:            "http-8080",
+									GatewayName:     types.NamespacedName{Namespace: testNs, Name: "gateway-1"},
+									ListenerSetName: types.NamespacedName{Namespace: testNs, Name: "valid-listenerset"},
+									Source: gatewayv1.Listener{
+										Name:     "http-8080",
+										Port:     8080,
+										Protocol: "HTTP",
+									},
+									Routes:         map[RouteKey]*L7Route{CreateRouteKey(hrLS): routeHRLS},
+									L4Routes:       map[L4RouteKey]*L4Route{},
+									SupportedKinds: supportedKindsForListeners,
+									Valid:          true,
+									Attachable:     true,
+								},
+								{
+									Name:            "https-9443",
+									GatewayName:     types.NamespacedName{Namespace: testNs, Name: "gateway-1"},
+									ListenerSetName: types.NamespacedName{Namespace: testNs, Name: "valid-listenerset"},
+									Source: gatewayv1.Listener{
+										Name:     "https-9443",
+										Port:     9443,
+										Protocol: "HTTPS",
+										TLS: &gatewayv1.ListenerTLSConfig{
+											Mode: helpers.GetPointer(gatewayv1.TLSModeTerminate),
+											CertificateRefs: []gatewayv1.SecretObjectReference{
+												{
+													Name: gatewayv1.ObjectName("secret"),
+												},
+											},
+										},
+									},
+									Routes:          map[RouteKey]*L7Route{},
+									L4Routes:        map[L4RouteKey]*L4Route{},
+									ResolvedSecrets: []types.NamespacedName{client.ObjectKeyFromObject(secret)},
+									SupportedKinds:  supportedKindsForListeners,
+									Valid:           true,
+									Attachable:      true,
+								},
+							},
+							Conditions: []conditions.Condition{
+								conditions.NewListenerSetAccepted(),
+							},
+						},
+					},
+					NginxProxy: &NginxProxy{
+						Source: np1,
+						Valid:  true,
+					},
+					ListenerNamespaces: &gatewayv1.ListenerNamespaces{
+						From: helpers.GetPointer(gatewayv1.NamespacesFromSame),
+					},
+					EffectiveNginxProxy: &EffectiveNginxProxy{
+						Telemetry: &ngfAPIv1alpha2.Telemetry{
+							Exporter: &ngfAPIv1alpha2.TelemetryExporter{
+								Endpoint:   helpers.GetPointer("1.2.3.4:123"),
+								Interval:   helpers.GetPointer(ngfAPIv1alpha1.Duration("5s")),
+								BatchSize:  helpers.GetPointer(int32(512)),
+								BatchCount: helpers.GetPointer(int32(4)),
+							},
+							ServiceName: helpers.GetPointer("my-svc"),
+							SpanAttributes: []ngfAPIv1alpha1.SpanAttribute{
+								{Key: "key", Value: "value"},
+							},
+						},
+						Logging: &ngfAPIv1alpha2.NginxLogging{
+							ErrorLevel: helpers.GetPointer(ngfAPIv1alpha2.NginxLogLevelError),
+						},
+					},
+					Conditions: []conditions.Condition{
+						conditions.NewGatewayResolvedRefs(),
+						conditions.NewClientSettingsPolicyAffected(),
+					},
+					DeploymentName: types.NamespacedName{
+						Namespace: "test",
+						Name:      "gateway-1-my-class",
+					},
+					SecretRef: helpers.GetPointer(client.ObjectKeyFromObject(gatewaySecret)),
+				},
+				{Namespace: testNs, Name: "gateway-2"}: {
+					Source: gw2.Source,
+					Listeners: []*Listener{
+						{
+							Name:                      "listener-80-1",
+							GatewayName:               types.NamespacedName{Namespace: testNs, Name: "gateway-2"},
+							Source:                    gw2.Source.Spec.Listeners[0],
+							Valid:                     true,
+							Attachable:                true,
+							Routes:                    map[RouteKey]*L7Route{},
+							SupportedKinds:            supportedKindsForListeners,
+							L4Routes:                  map[L4RouteKey]*L4Route{},
+							AllowedRouteLabelSelector: labels.SelectorFromSet(map[string]string{"app": "allowed"}),
+						},
+						{
+							Name:            "listener-443-1",
+							GatewayName:     types.NamespacedName{Namespace: testNs, Name: "gateway-2"},
+							Source:          gw2.Source.Spec.Listeners[1],
+							Valid:           true,
+							Attachable:      true,
+							Routes:          map[RouteKey]*L7Route{},
+							L4Routes:        map[L4RouteKey]*L4Route{},
+							ResolvedSecrets: []types.NamespacedName{client.ObjectKeyFromObject(secret)},
+							SupportedKinds:  supportedKindsForListeners,
+						},
+						{
+							Name:        "listener-443-2",
+							GatewayName: types.NamespacedName{Namespace: testNs, Name: "gateway-2"},
+							Source:      gw2.Source.Spec.Listeners[2],
+							Valid:       true,
+							Attachable:  true,
+							L4Routes:    map[L4RouteKey]*L4Route{},
+							Routes:      map[RouteKey]*L7Route{},
+							SupportedKinds: []gatewayv1.RouteGroupKind{
+								{Kind: kinds.TLSRoute, Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+							},
+						},
+						{
+							Name:        "listener-8443",
+							GatewayName: types.NamespacedName{Namespace: testNs, Name: "gateway-2"},
+							Source:      gw2.Source.Spec.Listeners[3],
+							Valid:       true,
+							Attachable:  true,
+							L4Routes:    map[L4RouteKey]*L4Route{},
+							Routes:      map[RouteKey]*L7Route{},
+							SupportedKinds: []gatewayv1.RouteGroupKind{
+								{Kind: kinds.TLSRoute, Group: helpers.GetPointer[gatewayv1.Group](gatewayv1.GroupName)},
+							},
+						},
+					},
+					Valid: true,
+					NginxProxy: &NginxProxy{
+						Source: np2,
+						Valid:  true,
+					},
+					ListenerNamespaces: &gatewayv1.ListenerNamespaces{
+						From: helpers.GetPointer(gatewayv1.NamespacesFromSame),
+					},
+					EffectiveNginxProxy: &EffectiveNginxProxy{
+						Telemetry: &ngfAPIv1alpha2.Telemetry{
+							Exporter: &ngfAPIv1alpha2.TelemetryExporter{
+								Endpoint:   helpers.GetPointer("1.2.3.4:123"),
+								Interval:   helpers.GetPointer(ngfAPIv1alpha1.Duration("5s")),
+								BatchSize:  helpers.GetPointer(int32(512)),
+								BatchCount: helpers.GetPointer(int32(4)),
+							},
+							ServiceName: helpers.GetPointer("my-svc"),
+							SpanAttributes: []ngfAPIv1alpha1.SpanAttribute{
+								{Key: "key", Value: "value"},
+							},
+						},
+						IPFamily: helpers.GetPointer(ngfAPIv1alpha2.IPv6),
+					},
+					Conditions: []conditions.Condition{conditions.NewGatewayResolvedRefs()},
+					DeploymentName: types.NamespacedName{
+						Namespace: "test",
+						Name:      "gateway-2-my-class",
+					},
+					SecretRef: helpers.GetPointer(client.ObjectKeyFromObject(gatewaySecret)),
+				},
+			},
+			Routes: map[RouteKey]*L7Route{
+				CreateRouteKey(hr1):  routeHR1,
+				CreateRouteKey(hr3):  routeHR3,
+				CreateRouteKey(gr):   routeGR,
+				CreateRouteKey(ir):   inferenceRoute,
+				CreateRouteKey(hrLS): routeHRLS,
+			},
+			L4Routes: map[L4RouteKey]*L4Route{
+				CreateRouteKeyL4(tr):   routeTR,
+				CreateRouteKeyL4(tr2):  routeTR2,
+				CreateRouteKeyL4(tcpr): routeTCP,
+				CreateRouteKeyL4(udpr): routeUDP,
+			},
+			ReferencedSecrets: map[types.NamespacedName]*secrets.Secret{
+				client.ObjectKeyFromObject(secret): {
+					Source: secret,
+					CertBundle: secrets.NewCertificateBundle(
+						client.ObjectKeyFromObject(secret),
+						"Secret",
+						&secrets.Certificate{
+							TLSCert:       cert,
+							TLSPrivateKey: key,
+						}),
+				},
+				client.ObjectKeyFromObject(gatewaySecret): {
+					Source: gatewaySecret,
+					CertBundle: secrets.NewCertificateBundle(
+						client.ObjectKeyFromObject(gatewaySecret),
+						"Secret",
+						&secrets.Certificate{
+							TLSCert:       cert,
+							TLSPrivateKey: key,
+						}),
+				},
+				client.ObjectKeyFromObject(basicAuthSecret): {
+					Source: basicAuthSecret,
+				},
+				client.ObjectKeyFromObject(oidcClientSecret): {
+					Source: oidcClientSecret,
+				},
+				client.ObjectKeyFromObject(oidcCACertSecret): {
+					Source: oidcCACertSecret,
+					CertBundle: secrets.NewCertificateBundle(
+						client.ObjectKeyFromObject(oidcCACertSecret),
+						"Secret",
+						&secrets.Certificate{
+							CACert: []byte(caBlock),
+						}),
+				},
+			},
+			ReferencedNamespaces: map[types.NamespacedName]*v1.Namespace{
+				client.ObjectKeyFromObject(ns): ns,
+			},
+			ReferencedServices: map[types.NamespacedName]*ReferencedService{
+				client.ObjectKeyFromObject(svc): {
+					GatewayNsNames: map[types.NamespacedName]struct{}{{Namespace: testNs, Name: "gateway-1"}: {}},
+				},
+				client.ObjectKeyFromObject(svc1): {
+					GatewayNsNames: map[types.NamespacedName]struct{}{{Namespace: testNs, Name: "gateway-1"}: {}},
+				},
+				client.ObjectKeyFromObject(inferenceSvc): {
+					GatewayNsNames: map[types.NamespacedName]struct{}{{Namespace: testNs, Name: "gateway-1"}: {}},
+				},
+				client.ObjectKeyFromObject(lsBackendSvc): {
+					GatewayNsNames: map[types.NamespacedName]struct{}{{Namespace: testNs, Name: "gateway-1"}: {}},
+				},
+			},
+			ReferencedInferencePools: map[types.NamespacedName]*ReferencedInferencePool{
+				client.ObjectKeyFromObject(inferencePool): {
+					Source: inferencePool,
+					Gateways: []*gatewayv1.Gateway{
+						gw1.Source,
+					},
+					HTTPRoutes: []*L7Route{
+						inferenceRoute,
+					},
+					Conditions: []conditions.Condition{},
+					Valid:      true,
+				},
+			},
+			ReferencedCaCertConfigMaps: map[types.NamespacedName]*configmaps.CaCertConfigMap{
+				client.ObjectKeyFromObject(cm): {
+					Source: cm,
+					CertBundle: secrets.NewCertificateBundle(
+						client.ObjectKeyFromObject(cm),
+						"ConfigMap",
+						&secrets.Certificate{
+							CACert: []byte(caBlock),
+						}),
+				},
+			},
+			BackendTLSPolicies: map[types.NamespacedName]*BackendTLSPolicy{
+				client.ObjectKeyFromObject(btp.Source): &btp,
+			},
+			ReferencedNginxProxies: map[types.NamespacedName]*NginxProxy{
+				client.ObjectKeyFromObject(npGlobal): {
+					Source: npGlobal,
+					Valid:  true,
+				},
+				client.ObjectKeyFromObject(np1): {
+					Source: np1,
+					Valid:  true,
+				},
+				client.ObjectKeyFromObject(np2): {
+					Source: np2,
+					Valid:  true,
+				},
+			},
+			NGFPolicies: map[PolicyKey]*Policy{
+				hrPolicyKey: processedRoutePolicy,
+				gwPolicyKey: processedGwPolicy,
+			},
+			SnippetsFilters: map[types.NamespacedName]*SnippetsFilter{
+				client.ObjectKeyFromObject(unreferencedSnippetsFilter): processedUnrefSnippetsFilter,
+				client.ObjectKeyFromObject(referencedSnippetsFilter):   processedRefSnippetsFilter,
+			},
+			AuthenticationFilters: map[types.NamespacedName]*AuthenticationFilter{
+				client.ObjectKeyFromObject(unreferencedAuthenticationFilter):   processedUnrefAuthenticationFilter,
+				client.ObjectKeyFromObject(referencedAuthenticationFilter):     processedRefAuthenticationFilter,
+				client.ObjectKeyFromObject(referencedOIDCAuthenticationFilter): processedRefOIDCAuthenticationFilter,
+			},
+			ExternalLoadBalancers: map[types.NamespacedName]*ExternalLoadBalancer{
+				client.ObjectKeyFromObject(elbGW1): {
+					Source:     elbGW1,
+					Valid:      true,
+					Conditions: []conditions.Condition{conditions.NewExternalLoadBalancerAccepted()},
+				},
+			},
+			ListenerSets: map[types.NamespacedName]*ListenerSet{
+				client.ObjectKeyFromObject(validListenerSet): {
+					Source:  validListenerSet,
+					Gateway: gw1.Source,
+					Valid:   true,
+					Listeners: []*Listener{
+						{
+							Name:            "http-8080",
+							GatewayName:     types.NamespacedName{Namespace: "test", Name: "gateway-1"},
+							ListenerSetName: types.NamespacedName{Namespace: "test", Name: "valid-listenerset"},
+							Source: gatewayv1.Listener{
+								Name:     "http-8080",
+								Port:     8080,
+								Protocol: "HTTP",
+							},
+							Routes:         map[RouteKey]*L7Route{CreateRouteKey(hrLS): routeHRLS},
+							L4Routes:       map[L4RouteKey]*L4Route{},
+							SupportedKinds: supportedKindsForListeners,
+							Valid:          true,
+							Attachable:     true,
+						},
+						{
+							Name:            "https-9443",
+							GatewayName:     types.NamespacedName{Namespace: "test", Name: "gateway-1"},
+							ListenerSetName: types.NamespacedName{Namespace: "test", Name: "valid-listenerset"},
+							Source: gatewayv1.Listener{
+								Name:     "https-9443",
+								Port:     9443,
+								Protocol: "HTTPS",
+								TLS: &gatewayv1.ListenerTLSConfig{
+									Mode: helpers.GetPointer(gatewayv1.TLSModeTerminate),
+									CertificateRefs: []gatewayv1.SecretObjectReference{
+										{
+											Name: gatewayv1.ObjectName("secret"),
+										},
+									},
+								},
+							},
+							Routes:          map[RouteKey]*L7Route{},
+							L4Routes:        map[L4RouteKey]*L4Route{},
+							ResolvedSecrets: []types.NamespacedName{client.ObjectKeyFromObject(secret)},
+							SupportedKinds:  supportedKindsForListeners,
+							Valid:           true,
+							Attachable:      true,
+						},
+					},
+					Conditions: []conditions.Condition{
+						conditions.NewListenerSetAccepted(),
+					},
+				},
+				client.ObjectKeyFromObject(notAllowedListenerSet): {
+					Source:  notAllowedListenerSet,
+					Gateway: gw2.Source,
+					Valid:   false,
+					Conditions: []conditions.Condition{
+						conditions.NewListenerSetNotAllowed("ListenerSet is not allowed by parent Gateway" +
+							" test/gateway-2 AllowedListeners configuration"),
+					},
+				},
+			},
+			PlusSecrets: map[types.NamespacedName][]PlusSecretFile{
+				client.ObjectKeyFromObject(plusSecret): {
+					{
+						Type:      PlusReportJWTToken,
+						Content:   []byte("license"),
+						FieldName: secrets.LicenseJWTKey,
+					},
+				},
+			},
+		}
+	}
+
+	normalGC := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: gcName,
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: controllerName,
+			ParametersRef: &gatewayv1.ParametersReference{
+				Group:     gatewayv1.Group("gateway.nginx.org"),
+				Kind:      gatewayv1.Kind(kinds.NginxProxy),
+				Name:      "np-global",
+				Namespace: helpers.GetPointer(gatewayv1.Namespace(testNs)),
+			},
+		},
+	}
+	differentControllerGC := &gatewayv1.GatewayClass{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: gcName,
+		},
+		Spec: gatewayv1.GatewayClassSpec{
+			ControllerName: "different-controller",
+		},
+	}
+
+	// referencedSvcEndpointSlice and staleEndpointSlice are used below to verify that BuildGraph
+	// prunes the EndpointSliceOwnership tracker down to only the Services still referenced by the
+	// resulting graph. svc ("service/foo") is referenced by the normal-case graph, so its owner
+	// record must survive; "service/stale-svc" is not referenced by anything, so its owner record
+	// must be pruned.
+	referencedSvcEndpointSlice := types.NamespacedName{Namespace: "service", Name: "foo-abc123"}
+	staleEndpointSlice := types.NamespacedName{Namespace: "service", Name: "stale-svc-abc123"}
+
+	endpointSliceOwnershipForPruning := resolver.NewEndpointSliceOwnership()
+	endpointSliceOwnershipForPruning.Replace(client.ObjectKeyFromObject(svc), []discoveryV1.EndpointSlice{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: referencedSvcEndpointSlice.Namespace,
+				Name:      referencedSvcEndpointSlice.Name,
+			},
+		},
+	})
+	endpointSliceOwnershipForPruning.Replace(
+		types.NamespacedName{Namespace: "service", Name: "stale-svc"},
+		[]discoveryV1.EndpointSlice{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: staleEndpointSlice.Namespace,
+					Name:      staleEndpointSlice.Name,
+				},
+			},
+		},
+	)
+
+	tests := []struct {
+		store                     ClusterState
+		expected                  *Graph
+		endpointSliceOwnership    *resolver.EndpointSliceOwnership
+		name                      string
+		plus, experimentalEnabled bool
+	}{
+		{
+			store:               createStateWithGatewayClass(normalGC),
+			expected:            createExpectedGraphWithGatewayClass(normalGC),
+			experimentalEnabled: true,
+			plus:                true,
+			name:                "normal case",
+		},
+		{
+			store:    createStateWithGatewayClass(differentControllerGC),
+			expected: &Graph{},
+			name:     "gatewayclass belongs to a different controller",
+		},
+		{
+			store:                  createStateWithGatewayClass(normalGC),
+			expected:               createExpectedGraphWithGatewayClass(normalGC),
+			experimentalEnabled:    true,
+			plus:                   true,
+			name:                   "normal case prunes EndpointSliceOwnership to referenced Services",
+			endpointSliceOwnership: endpointSliceOwnershipForPruning,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			// The diffs get very large so the format max length will make sure the output doesn't get truncated.
+			format.MaxLength = 10000000
+
+			fakePolicyValidator := &validationfakes.PolicyValidatorMock{
+				ValidateFunc: func(policies.Policy) []conditions.Condition { return nil },
+				ValidateGlobalSettingsFunc: func(policies.Policy, *policies.GlobalSettings) []conditions.Condition {
+					return nil
+				},
+				ConflictsFunc: func(policies.Policy, policies.Policy) bool { return false },
+			}
+
+			createAllValidValidator := func() *validationfakes.HTTPFieldsValidatorMock {
+				return &validationfakes.HTTPFieldsValidatorMock{
+					SkipValidationFunc:                 func() bool { return false },
+					ValidatePathInMatchFunc:            func(string) error { return nil },
+					ValidatePathInRegexMatchFunc:       func(string) error { return nil },
+					ValidateHeaderNameInMatchFunc:      func(string) error { return nil },
+					ValidateHeaderValueInMatchFunc:     func(string) error { return nil },
+					ValidateQueryParamNameInMatchFunc:  func(string) error { return nil },
+					ValidateQueryParamValueInMatchFunc: func(string) error { return nil },
+					ValidateMethodInMatchFunc:          func(string) (bool, []string) { return true, nil },
+					ValidateRedirectSchemeFunc:         func(string) (bool, []string) { return true, nil },
+					ValidateRedirectPortFunc:           func(int32) error { return nil },
+					ValidateHostnameFunc:               func(string) error { return nil },
+					ValidateFilterHeaderNameFunc:       func(string) error { return nil },
+					ValidateFilterHeaderValueFunc:      func(string) error { return nil },
+					ValidatePathFunc:                   func(string) error { return nil },
+					ValidateDurationFunc:               func(string) (string, error) { return "30m", nil },
+				}
+			}
+
+			authValidator := &validationfakes.AuthFieldsValidatorMock{
+				ValidateAuthZClaimNameFunc:      func(string) error { return nil },
+				ValidateAuthZClaimValueFunc:     func(string) error { return nil },
+				ValidateAuthZProxySetHeaderFunc: func(string) error { return nil },
+				ValidateOIDCEscapedStringFunc:   func(string) error { return nil },
+				ValidateOIDCExtraAuthArgFunc:    func(string, string) error { return nil },
+				ValidateOIDCHTTPSURLFunc:        func(string) error { return nil },
+				ValidateOIDCPathURIFunc:         func(string) error { return nil },
+				ValidateOIDCPostLogoutURIFunc:   func(string) error { return nil },
+				ValidateOIDCRedirectURIFunc:     func(string) error { return nil },
+				ValidateRealmFunc:               func(string) error { return nil },
+			}
+
+			genericValidator := &validationfakes.GenericValidatorMock{
+				ValidateAccessLogFormatStringFunc:       func(string) error { return nil },
+				ValidateEndpointFunc:                    func(string) error { return nil },
+				ValidateEscapedStringNoVarExpansionFunc: func(string) error { return nil },
+				ValidateNginxDurationFunc:               func(string) error { return nil },
+				ValidateNginxSizeFunc:                   func(string) error { return nil },
+				ValidateNginxVariableNameFunc:           func(string) error { return nil },
+				ValidateServerTokensValueFunc:           func(string) error { return nil },
+				ValidateServiceNameFunc:                 func(string) error { return nil },
+			}
+
+			result := BuildGraph(
+				t.Context(),
+				test.store,
+				controllerName,
+				gcName,
+				"cluster.local",
+				map[types.NamespacedName][]PlusSecretFile{
+					client.ObjectKeyFromObject(plusSecret): {
+						{
+							Type:      PlusReportJWTToken,
+							FieldName: secrets.LicenseJWTKey,
+						},
+					},
+				},
+				nil, // wafFetcher
+				nil, // plmFetcher
+				nil, // plmSecretNames
+				nil, // previousWAFBundles
+				validation.Validators{
+					HTTPFieldsValidator: createAllValidValidator(),
+					GenericValidator:    genericValidator,
+					AuthFieldsValidator: authValidator,
+					PolicyValidator:     fakePolicyValidator,
+				},
+				logr.Discard(),
+				FeatureFlags{
+					Experimental: test.experimentalEnabled,
+					Plus:         test.plus,
+				},
+				test.endpointSliceOwnership,
+			)
+
+			// Handle ListenerFactory separately due to complex internal structure
+			for gwNsName, expectedGW := range test.expected.Gateways {
+				if actualGW := result.Gateways[gwNsName]; actualGW != nil {
+					if expectedGW.Valid {
+						g.Expect(actualGW.ListenerFactory).ToNot(BeNil())
+					} else {
+						g.Expect(actualGW.ListenerFactory).To(BeNil())
+					}
+
+					// Set both to nil for graph comparison to avoid complex factory structure diffs
+					actualGW.ListenerFactory = nil
+				}
+			}
+
+			// EndpointSliceOwnership carries unexported fields (a map and a sync.RWMutex) that cmp
+			// cannot traverse, so it's excluded from the general diff and its pruning behavior is
+			// verified separately below.
+			result.EndpointSliceOwnership = nil
+			test.expected.EndpointSliceOwnership = nil
+
+			g.Expect(helpers.Diff(test.expected, result)).To(BeEmpty())
+
+			if test.endpointSliceOwnership != nil {
+				_, keptExists := test.endpointSliceOwnership.Owner(referencedSvcEndpointSlice)
+				g.Expect(keptExists).To(BeTrue(),
+					"owner record for a still-referenced Service must be kept after BuildGraph")
+
+				_, prunedExists := test.endpointSliceOwnership.Owner(staleEndpointSlice)
+				g.Expect(prunedExists).To(BeFalse(),
+					"owner record for a no-longer-referenced Service must be pruned after BuildGraph")
+			}
+		})
+	}
+}
+
+func TestIsReferenced(t *testing.T) {
+	baseSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "secret",
+		},
+	}
+	sameNamespaceDifferentNameSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "secret-different-name",
+		},
+	}
+	differentNamespaceSameNameSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-different-namespace",
+			Name:      "secret",
+		},
+	}
+	plusSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "ngf",
+			Name:      "plus-secret",
+		},
+	}
+
+	nsInGraph := &v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: testNs,
+			Labels: map[string]string{
+				"app": "allowed",
+			},
+		},
+	}
+	nsNotInGraph := &v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "different-name",
+			Labels: map[string]string{
+				"app": "allowed",
+			},
+		},
+	}
+
+	serviceInGraph := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "serviceInGraph",
+		},
+	}
+	serviceNotInGraph := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "serviceNotInGraph",
+		},
+	}
+	serviceNotInGraphSameNameDifferentNS := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "not-default",
+			Name:      "serviceInGraph",
+		},
+	}
+	payloadProcessorServiceInGraph := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "payloadProcessorServiceInGraph",
+		},
+	}
+	emptyService := &v1.Service{}
+
+	inferenceInGraph := &inference.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "inferenceInGraph",
+		},
+	}
+	inferenceNotInGraph := &inference.InferencePool{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "inferenceNotInGraph",
+		},
+	}
+	emptyInferencePool := &inference.InferencePool{}
+
+	createEndpointSlice := func(name string, svcName string) *discoveryV1.EndpointSlice {
+		return &discoveryV1.EndpointSlice{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
+				Name:      name,
+				Labels:    map[string]string{index.KubernetesServiceNameLabel: svcName},
+			},
+		}
+	}
+	endpointSliceInGraph := createEndpointSlice("endpointSliceInGraph", "serviceInGraph")
+	endpointSliceNotInGraph := createEndpointSlice("endpointSliceNotInGraph", "serviceNotInGraph")
+	emptyEndpointSlice := &discoveryV1.EndpointSlice{}
+
+	// The following simulate the delete path, where the EndpointSlice reconciler can only deliver
+	// a delete event with the registered prototype object (no labels), so the owning Service can
+	// only be recovered via EndpointSliceOwnershipTracker.
+	deletedEndpointSliceKnownOwnerReferenced := &discoveryV1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "deleted-known-owner-referenced"},
+	}
+	deletedEndpointSliceKnownOwnerNotReferenced := &discoveryV1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "deleted-known-owner-not-referenced"},
+	}
+	deletedEndpointSliceUnknownOwner := &discoveryV1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "deleted-unknown-owner"},
+	}
+
+	endpointSliceOwnership := resolver.NewEndpointSliceOwnership()
+	endpointSliceOwnership.Replace(
+		client.ObjectKeyFromObject(serviceInGraph),
+		[]discoveryV1.EndpointSlice{*deletedEndpointSliceKnownOwnerReferenced},
+	)
+	endpointSliceOwnership.Replace(
+		client.ObjectKeyFromObject(serviceNotInGraph),
+		[]discoveryV1.EndpointSlice{*deletedEndpointSliceKnownOwnerNotReferenced},
+	)
+	// deletedEndpointSliceUnknownOwner is intentionally never recorded.
+
+	gw := map[types.NamespacedName]*Gateway{
+		{}: {
+			Listeners: []*Listener{
+				{
+					Name:                      "listener-1",
+					Valid:                     true,
+					AllowedRouteLabelSelector: labels.SelectorFromSet(map[string]string{"apples": "oranges"}),
+				},
+			},
+			Valid: true,
+		},
+	}
+
+	nsNotInGraphButInGateway := &v1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "notInGraphButInGateway",
+			Labels: map[string]string{
+				"apples": "oranges",
+			},
+		},
+	}
+
+	baseConfigMap := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "configmap",
+		},
+	}
+	sameNamespaceDifferentNameConfigMap := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNs,
+			Name:      "configmap-different-name",
+		},
+	}
+	differentNamespaceSameNameConfigMap := &v1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "test-different-namespace",
+			Name:      "configmap",
+		},
+	}
+
+	npNotReferenced := &ngfAPIv1alpha2.NginxProxy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "nginx-proxy-not-ref",
+		},
+	}
+
+	npReferenced := &ngfAPIv1alpha2.NginxProxy{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "nginx-proxy-ref",
+		},
+	}
+
+	apPolicyReferenced := &unstructured.Unstructured{}
+	apPolicyReferenced.SetGroupVersionKind(kinds.APPolicyGVK)
+	apPolicyReferenced.SetNamespace(testNs)
+	apPolicyReferenced.SetName("ap-policy")
+
+	apPolicyNotReferenced := &unstructured.Unstructured{}
+	apPolicyNotReferenced.SetGroupVersionKind(kinds.APPolicyGVK)
+	apPolicyNotReferenced.SetNamespace(testNs)
+	apPolicyNotReferenced.SetName("ap-policy-other")
+
+	apLogConfReferenced := &unstructured.Unstructured{}
+	apLogConfReferenced.SetGroupVersionKind(kinds.APLogConfGVK)
+	apLogConfReferenced.SetNamespace(testNs)
+	apLogConfReferenced.SetName("ap-logconf")
+
+	apLogConfNotReferenced := &unstructured.Unstructured{}
+	apLogConfNotReferenced.SetGroupVersionKind(kinds.APLogConfGVK)
+	apLogConfNotReferenced.SetNamespace(testNs)
+	apLogConfNotReferenced.SetName("ap-logconf-other")
+
+	graph := &Graph{
+		Gateways: gw,
+		ReferencedSecrets: map[types.NamespacedName]*secrets.Secret{
+			client.ObjectKeyFromObject(baseSecret): {
+				Source: baseSecret,
+			},
+		},
+		ReferencedNamespaces: map[types.NamespacedName]*v1.Namespace{
+			client.ObjectKeyFromObject(nsInGraph): nsInGraph,
+		},
+		ReferencedServices: map[types.NamespacedName]*ReferencedService{
+			client.ObjectKeyFromObject(serviceInGraph): {},
+		},
+		ReferencedPayloadProcessorServices: map[types.NamespacedName]struct{}{
+			client.ObjectKeyFromObject(payloadProcessorServiceInGraph): {},
+		},
+		ReferencedInferencePools: map[types.NamespacedName]*ReferencedInferencePool{
+			client.ObjectKeyFromObject(inferenceInGraph): {},
+		},
+		ReferencedCaCertConfigMaps: map[types.NamespacedName]*configmaps.CaCertConfigMap{
+			client.ObjectKeyFromObject(baseConfigMap): {
+				Source: baseConfigMap,
+				CertBundle: secrets.NewCertificateBundle(
+					client.ObjectKeyFromObject(baseConfigMap),
+					"ConfigMap",
+					&secrets.Certificate{
+						CACert: []byte(caBlock),
+					}),
+			},
+		},
+		ReferencedNginxProxies: map[types.NamespacedName]*NginxProxy{
+			client.ObjectKeyFromObject(npReferenced): {
+				Source: npReferenced,
+			},
+		},
+		ReferencedAPPolicies: map[types.NamespacedName]*unstructured.Unstructured{
+			client.ObjectKeyFromObject(apPolicyReferenced): apPolicyReferenced,
+		},
+		ReferencedAPLogConfs: map[types.NamespacedName]*unstructured.Unstructured{
+			client.ObjectKeyFromObject(apLogConfReferenced): apLogConfReferenced,
+		},
+		EndpointSliceOwnership: endpointSliceOwnership,
+	}
+
+	tests := []struct {
+		graph    *Graph
+		gc       *GatewayClass
+		resource client.Object
+		name     string
+		expected bool
+	}{
+		// Namespace tests
+		{
+			name:     "Namespace in graph's ReferencedNamespaces is referenced",
+			resource: nsInGraph,
+			graph:    graph,
+			expected: true,
+		},
+		{
+			name:     "Namespace with a different name but same labels is not referenced",
+			resource: nsNotInGraph,
+			graph:    graph,
+			expected: false,
+		},
+		{
+			name: "Namespace not in ReferencedNamespaces but in Gateway Listener's AllowedRouteLabelSelector" +
+				" is referenced",
+			resource: nsNotInGraphButInGateway,
+			graph:    graph,
+			expected: true,
+		},
+
+		// Secret tests
+		{
+			name:     "Secret in graph's ReferencedSecrets is referenced",
+			resource: baseSecret,
+			graph:    graph,
+			expected: true,
+		},
+		{
+			name:     "NGINX Plus JWT Secret",
+			resource: plusSecret,
+			graph: &Graph{
+				PlusSecrets: map[types.NamespacedName][]PlusSecretFile{
+					client.ObjectKeyFromObject(plusSecret): {
+						{Type: PlusReportJWTToken},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name:     "Secret in graph's ReferencedPayloadProcessorSecrets is referenced",
+			resource: sameNamespaceDifferentNameSecret,
+			graph: &Graph{
+				ReferencedPayloadProcessorSecrets: map[types.NamespacedName]*v1.Secret{
+					client.ObjectKeyFromObject(sameNamespaceDifferentNameSecret): sameNamespaceDifferentNameSecret,
+				},
+			},
+			expected: true,
+		},
+		{
+			name:     "Secret tracked with nil value in ReferencedPayloadProcessorSecrets is referenced",
+			resource: sameNamespaceDifferentNameSecret,
+			graph: &Graph{
+				ReferencedPayloadProcessorSecrets: map[types.NamespacedName]*v1.Secret{
+					client.ObjectKeyFromObject(sameNamespaceDifferentNameSecret): nil,
+				},
+			},
+			expected: true,
+		},
+		{
+			name:     "Secret not in ReferencedSecrets with same Namespace and different Name is not referenced",
+			resource: sameNamespaceDifferentNameSecret,
+			graph:    graph,
+			expected: false,
+		},
+		{
+			name:     "Secret not in ReferencedSecrets with different Namespace and same Name is not referenced",
+			resource: differentNamespaceSameNameSecret,
+			graph:    graph,
+			expected: false,
+		},
+
+		// Service tests
+		{
+			name:     "Service is referenced",
+			resource: serviceInGraph,
+			graph:    graph,
+			expected: true,
+		},
+		{
+			name:     "Service is not referenced",
+			resource: serviceNotInGraph,
+			graph:    graph,
+			expected: false,
+		},
+		{
+			name:     "Service with same name but different namespace is not referenced",
+			resource: serviceNotInGraphSameNameDifferentNS,
+			graph:    graph,
+			expected: false,
+		},
+		{
+			name:     "Service referenced only by a PayloadProcessor policy is referenced",
+			resource: payloadProcessorServiceInGraph,
+			graph:    graph,
+			expected: true,
+		},
+		{
+			name:     "Empty Service",
+			resource: emptyService,
+			graph:    graph,
+			expected: false,
+		},
+
+		// InferencePool tests
+		{
+			name:     "InferencePool is referenced",
+			resource: inferenceInGraph,
+			graph:    graph,
+			expected: true,
+		},
+		{
+			name:     "InferencePool is not referenced",
+			resource: inferenceNotInGraph,
+			graph:    graph,
+			expected: false,
+		},
+		{
+			name:     "Empty InferencePool",
+			resource: emptyInferencePool,
+			graph:    graph,
+			expected: false,
+		},
+
+		// EndpointSlice tests
+		{
+			name:     "EndpointSlice with Service owner in graph's ReferencedServices is referenced",
+			resource: endpointSliceInGraph,
+			graph:    graph,
+			expected: true,
+		},
+		{
+			name:     "EndpointSlice with Service owner not in graph's ReferencedServices is not referenced",
+			resource: endpointSliceNotInGraph,
+			graph:    graph,
+			expected: false,
+		},
+		{
+			name:     "Empty EndpointSlice",
+			resource: emptyEndpointSlice,
+			graph:    graph,
+			expected: false,
+		},
+		{
+			name: "Deleted EndpointSlice (no labels) with a known owner that is still referenced " +
+				"is referenced",
+			resource: deletedEndpointSliceKnownOwnerReferenced,
+			graph:    graph,
+			expected: true,
+		},
+		{
+			name: "Deleted EndpointSlice (no labels) with a known owner that is no longer referenced " +
+				"is not referenced",
+			resource: deletedEndpointSliceKnownOwnerNotReferenced,
+			graph:    graph,
+			expected: false,
+		},
+		{
+			name:     "Deleted EndpointSlice (no labels) with an unknown owner is not referenced",
+			resource: deletedEndpointSliceUnknownOwner,
+			graph:    graph,
+			expected: false,
+		},
+		{
+			name:     "Deleted EndpointSlice (no labels) with a nil EndpointSliceOwnership is not referenced",
+			resource: deletedEndpointSliceKnownOwnerReferenced,
+			graph: &Graph{
+				ReferencedServices: map[types.NamespacedName]*ReferencedService{
+					client.ObjectKeyFromObject(serviceInGraph): {},
+				},
+			},
+			expected: false,
+		},
+
+		// ConfigMap tests
+		{
+			name:     "ConfigMap in graph's ReferencedConfigMaps is referenced",
+			resource: baseConfigMap,
+			graph:    graph,
+			expected: true,
+		},
+		{
+			name:     "ConfigMap not in ReferencedConfigMaps with same Namespace and different Name is not referenced",
+			resource: sameNamespaceDifferentNameConfigMap,
+			graph:    graph,
+			expected: false,
+		},
+		{
+			name:     "ConfigMap not in ReferencedConfigMaps with different Namespace and same Name is not referenced",
+			resource: differentNamespaceSameNameConfigMap,
+			graph:    graph,
+			expected: false,
+		},
+
+		// NginxProxy tests
+		{
+			name:     "NginxProxy is referenced",
+			resource: npReferenced,
+			graph:    graph,
+			expected: true,
+		},
+		{
+			name:     "NginxProxy is not referenced",
+			resource: npNotReferenced,
+			graph:    graph,
+			expected: false,
+		},
+		{
+			name:     "APPolicy is referenced",
+			resource: apPolicyReferenced,
+			graph:    graph,
+			expected: true,
+		},
+		{
+			name:     "APPolicy is not referenced",
+			resource: apPolicyNotReferenced,
+			graph:    graph,
+			expected: false,
+		},
+		{
+			name:     "APLogConf is referenced",
+			resource: apLogConfReferenced,
+			graph:    graph,
+			expected: true,
+		},
+		{
+			name:     "APLogConf is not referenced",
+			resource: apLogConfNotReferenced,
+			graph:    graph,
+			expected: false,
+		},
+
+		// Edge cases
+		{
+			name:     "Resource is not supported by IsReferenced",
+			resource: &gatewayv1.HTTPRoute{},
+			graph:    graph,
+			expected: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			test.graph.GatewayClass = test.gc
+			result := test.graph.IsReferenced(test.resource, client.ObjectKeyFromObject(test.resource))
+			g.Expect(result).To(Equal(test.expected))
+		})
+	}
+}
+
+func TestIsNGFPolicyRelevant(t *testing.T) {
+	t.Parallel()
+	policyGVK := schema.GroupVersionKind{Kind: "MyKind"}
+	existingPolicyNsName := types.NamespacedName{Namespace: "test", Name: "pol"}
+
+	hrKey := RouteKey{RouteType: RouteTypeHTTP, NamespacedName: types.NamespacedName{Namespace: "test", Name: "hr"}}
+	grKey := RouteKey{RouteType: RouteTypeGRPC, NamespacedName: types.NamespacedName{Namespace: "test", Name: "gr"}}
+
+	getGraph := func() *Graph {
+		return &Graph{
+			Gateways: map[types.NamespacedName]*Gateway{
+				{Namespace: "test", Name: "gw"}: {
+					Source: &gatewayv1.Gateway{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "gw",
+							Namespace: "test",
+						},
+					},
+				},
+			},
+			Routes: map[RouteKey]*L7Route{
+				hrKey: {},
+				grKey: {},
+			},
+			NGFPolicies: map[PolicyKey]*Policy{
+				{GVK: policyGVK, NsName: existingPolicyNsName}: {
+					Source: &policiesfakes.PolicyMock{},
+				},
+			},
+			ReferencedServices: nil,
+		}
+	}
+
+	type modFunc func(g *Graph) *Graph
+
+	getModifiedGraph := func(mod modFunc) *Graph {
+		return mod(getGraph())
+	}
+
+	getPolicy := func(ref gatewayv1.LocalPolicyTargetReference) policies.Policy {
+		return &policiesfakes.PolicyMock{
+			GetNamespaceFunc: func() string {
+				return testNs
+			},
+			GetTargetRefsFunc: func() []gatewayv1.LocalPolicyTargetReference {
+				return []gatewayv1.LocalPolicyTargetReference{ref}
+			},
+		}
+	}
+
+	tests := []struct {
+		name        string
+		graph       *Graph
+		policy      policies.Policy
+		nsname      types.NamespacedName
+		expRelevant bool
+	}{
+		{
+			name:  "relevant; policy exists in graph",
+			graph: getGraph(),
+			policy: &policiesfakes.PolicyMock{
+				GetTargetRefsFunc: func() []gatewayv1.LocalPolicyTargetReference { return nil },
+			},
+			nsname:      existingPolicyNsName,
+			expRelevant: true,
+		},
+		{
+			name:  "irrelevant; policy does not exist in graph and is empty (delete event)",
+			graph: getGraph(),
+			policy: &policiesfakes.PolicyMock{
+				GetTargetRefsFunc: func() []gatewayv1.LocalPolicyTargetReference { return nil },
+			},
+			nsname:      types.NamespacedName{Namespace: "diff", Name: "diff"},
+			expRelevant: false,
+		},
+		{
+			name:        "relevant; policy references the winning gateway",
+			graph:       getGraph(),
+			policy:      getPolicy(createTestRef(kinds.Gateway, gatewayv1.GroupName, "gw")),
+			nsname:      types.NamespacedName{Namespace: "test", Name: "ref-gw"},
+			expRelevant: true,
+		},
+		{
+			name:        "relevant; policy references an httproute in the graph",
+			graph:       getGraph(),
+			policy:      getPolicy(createTestRef(kinds.HTTPRoute, gatewayv1.GroupName, "hr")),
+			nsname:      types.NamespacedName{Namespace: "test", Name: "ref-hr"},
+			expRelevant: true,
+		},
+		{
+			name:        "relevant; policy references a grpcroute in the graph",
+			graph:       getGraph(),
+			policy:      getPolicy(createTestRef(kinds.GRPCRoute, gatewayv1.GroupName, "gr")),
+			nsname:      types.NamespacedName{Namespace: "test", Name: "ref-gr"},
+			expRelevant: true,
+		},
+		{
+			name:        "irrelevant; policy does not reference a relevant gw or route in the graph",
+			graph:       getGraph(),
+			policy:      getPolicy(createTestRef(kinds.Gateway, gatewayv1.GroupName, "diff")),
+			nsname:      types.NamespacedName{Namespace: "test", Name: "not-relevant"},
+			expRelevant: false,
+		},
+		{
+			name:        "irrelevant; policy references an unsupported kind in the Gateway group",
+			graph:       getGraph(),
+			policy:      getPolicy(createTestRef("GatewayClass", gatewayv1.GroupName, "diff")),
+			nsname:      types.NamespacedName{Namespace: "test", Name: "unsupported-kind"},
+			expRelevant: false,
+		},
+		{
+			name:        "irrelevant; policy references an unsupported group",
+			graph:       getGraph(),
+			policy:      getPolicy(createTestRef(kinds.Gateway, "SomeGroup", "diff")),
+			nsname:      types.NamespacedName{Namespace: "test", Name: "unsupported-group"},
+			expRelevant: false,
+		},
+		{
+			name: "irrelevant; policy references a Gateway, but the graph's Gateway is nil",
+			graph: getModifiedGraph(func(g *Graph) *Graph {
+				g.Gateways = nil
+				return g
+			}),
+			policy:      getPolicy(createTestRef(kinds.Gateway, gatewayv1.GroupName, "diff")),
+			nsname:      types.NamespacedName{Namespace: "test", Name: "nil-gw"},
+			expRelevant: false,
+		},
+		{
+			name: "irrelevant; policy references a Gateway, but the graph's Gateway.Source is nil",
+			graph: getModifiedGraph(func(g *Graph) *Graph {
+				gw := g.Gateways[types.NamespacedName{Namespace: "test", Name: "gw"}]
+				gw.Source = nil
+				return g
+			}),
+			policy:      getPolicy(createTestRef(kinds.Gateway, gatewayv1.GroupName, "diff")),
+			nsname:      types.NamespacedName{Namespace: "test", Name: "nil-gw-source"},
+			expRelevant: false,
+		},
+		{
+			name: "relevant; policy references a Service that is referenced by a route, group core is inferred",
+			graph: getModifiedGraph(func(g *Graph) *Graph {
+				g.ReferencedServices = map[types.NamespacedName]*ReferencedService{
+					{Namespace: "test", Name: "ref-service"}: {},
+				}
+
+				return g
+			}),
+			policy:      getPolicy(createTestRef(kinds.Service, "", "ref-service")),
+			nsname:      types.NamespacedName{Namespace: "test", Name: "policy-for-svc"},
+			expRelevant: true,
+		},
+		{
+			name: "relevant; policy references a Service that is referenced by a route, group core is explicit",
+			graph: getModifiedGraph(func(g *Graph) *Graph {
+				g.ReferencedServices = map[types.NamespacedName]*ReferencedService{
+					{Namespace: "test", Name: "ref-service"}: {},
+				}
+
+				return g
+			}),
+			policy:      getPolicy(createTestRef(kinds.Service, "core", "ref-service")),
+			nsname:      types.NamespacedName{Namespace: "test", Name: "policy-for-svc"},
+			expRelevant: true,
+		},
+		{
+			name:        "irrelevant; policy references a Service that is not referenced by a route, group core is inferred",
+			graph:       getGraph(),
+			policy:      getPolicy(createTestRef(kinds.Service, "", "not-ref-service")),
+			nsname:      types.NamespacedName{Namespace: "test", Name: "policy-for-not-ref-svc"},
+			expRelevant: false,
+		},
+		{
+			name:        "irrelevant; policy references a Service that is not referenced by a route, group core is explicit",
+			graph:       getGraph(),
+			policy:      getPolicy(createTestRef(kinds.Service, "core", "not-ref-service")),
+			nsname:      types.NamespacedName{Namespace: "test", Name: "policy-for-not-ref-svc"},
+			expRelevant: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			relevant := test.graph.IsNGFPolicyRelevant(test.policy, policyGVK, test.nsname)
+			g.Expect(relevant).To(Equal(test.expRelevant))
+		})
+	}
+}
+
+func TestIsNGFPolicyRelevantPanics(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+	graph := &Graph{}
+	nsname := types.NamespacedName{Namespace: "test", Name: "pol"}
+	gvk := schema.GroupVersionKind{Kind: "MyKind"}
+
+	isRelevant := func() {
+		_ = graph.IsNGFPolicyRelevant(nil, gvk, nsname)
+	}
+
+	g.Expect(isRelevant).To(Panic())
+}
+
+func TestGatewayExists(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	tests := []struct {
+		gateways       map[types.NamespacedName]*Gateway
+		gwNsName       types.NamespacedName
+		name           string
+		expectedResult bool
+	}{
+		{
+			name:     "gateway exists",
+			gwNsName: types.NamespacedName{Namespace: "test", Name: "gw"},
+			gateways: map[types.NamespacedName]*Gateway{
+				{Namespace: "test", Name: "gw"}:  {},
+				{Namespace: "test", Name: "gw2"}: {},
+			},
+			expectedResult: true,
+		},
+		{
+			name:           "gateway does not exist",
+			gwNsName:       types.NamespacedName{Namespace: "test", Name: "gw"},
+			gateways:       nil,
+			expectedResult: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g.Expect(gatewayExists(test.gwNsName, test.gateways)).To(Equal(test.expectedResult))
+		})
+	}
+}

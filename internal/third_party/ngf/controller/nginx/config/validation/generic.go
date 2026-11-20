@@ -1,0 +1,164 @@
+package validation
+
+import (
+	"errors"
+	"regexp"
+	"strings"
+
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
+)
+
+// GenericValidator validates values for generic cases in the nginx conf.
+type GenericValidator struct{}
+
+// ValidateEscapedStringNoVarExpansion ensures that no invalid characters are included in the string value that
+// could lead to unwanted nginx behavior.
+func (GenericValidator) ValidateEscapedStringNoVarExpansion(value string) error {
+	return validateEscapedStringNoVarExpansion(value, nil)
+}
+
+// ErrInvalidIPAddress is the error detail used when an address is not a valid IPv4/IPv6 address or CIDR range.
+const ErrInvalidIPAddress = "must be a valid IPv4/IPv6 address or CIDR range (e.g. 10.0.0.0/8)"
+
+// ValidateDNSSubdomainName validates a name that follows DNS subdomain naming conventions.
+func (GenericValidator) ValidateDNSSubdomainName(name string) error {
+	if msgs := k8svalidation.IsDNS1123Subdomain(name); len(msgs) > 0 {
+		return errors.New(strings.Join(msgs, "; "))
+	}
+
+	return nil
+}
+
+const (
+	alphaNumericStringFmt    = `[a-zA-Z0-9_-]+`
+	alphaNumericStringErrMsg = "must contain only alphanumeric characters or '-' or '_'"
+)
+
+var alphaNumericStringFmtRegexp = regexp.MustCompile("^" + alphaNumericStringFmt + "$")
+
+// ValidateServiceName validates a service name that can only use alphanumeric characters.
+func (GenericValidator) ValidateServiceName(name string) error {
+	if !alphaNumericStringFmtRegexp.MatchString(name) {
+		examples := []string{
+			"svc1",
+			"svc-1",
+			"svc_1",
+		}
+
+		return errors.New(k8svalidation.RegexError(alphaNumericStringErrMsg, alphaNumericStringFmt, examples...))
+	}
+
+	return nil
+}
+
+const (
+	durationStringFmt    = `^[0-9]{1,4}(ms|s|m|h)?`
+	durationStringErrMsg = "must contain an, at most, four digit number followed by 'ms', 's', 'm', or 'h'"
+)
+
+var durationStringFmtRegexp = regexp.MustCompile("^" + durationStringFmt + "$")
+
+// ValidateNginxDuration validates a duration string that nginx can understand.
+func (GenericValidator) ValidateNginxDuration(duration string) error {
+	if !durationStringFmtRegexp.MatchString(duration) {
+		examples := []string{
+			"5ms",
+			"10s",
+			"500m",
+			"1000h",
+		}
+
+		return errors.New(k8svalidation.RegexError(durationStringErrMsg, durationStringFmt, examples...))
+	}
+
+	return nil
+}
+
+const (
+	sizeStringFmt    = `^\d{1,4}(k|m|g)?$`
+	sizeStringErrMsg = "must contain a number. May be followed by 'k', 'm', or 'g', otherwise bytes are assumed"
+)
+
+var sizeStringFmtRegexp = regexp.MustCompile("^" + sizeStringFmt + "$")
+
+// ValidateNginxSize validates a size string that nginx can understand.
+func (GenericValidator) ValidateNginxSize(size string) error {
+	if !sizeStringFmtRegexp.MatchString(size) {
+		examples := []string{
+			"1024",
+			"8k",
+			"20m",
+			"1g",
+		}
+
+		return errors.New(k8svalidation.RegexError(sizeStringErrMsg, sizeStringFmt, examples...))
+	}
+
+	return nil
+}
+
+const (
+	//nolint:lll
+	endpointStringFmt    = `(?:http?:\/\/)?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*(?::\d{1,5})?`
+	endpointStringErrMsg = "must be an alphanumeric hostname with optional http scheme and optional port"
+)
+
+var endpointStringFmtRegexp = regexp.MustCompile("^" + endpointStringFmt + "$")
+
+// ValidateEndpoint validates an alphanumeric endpoint, with optional http scheme and port.
+func (GenericValidator) ValidateEndpoint(endpoint string) error {
+	if !endpointStringFmtRegexp.MatchString(endpoint) {
+		examples := []string{
+			"my-endpoint",
+			"my.endpoint:5678",
+			"http://my-endpoint",
+		}
+
+		return errors.New(k8svalidation.RegexError(endpointStringErrMsg, endpointStringFmt, examples...))
+	}
+
+	return nil
+}
+
+const (
+	variableNameFmt    = `\$(\{[a-z][a-z0-9_]*\}|[a-z][a-z0-9_]*)`
+	variableNameErrMsg = "must be a valid NGINX variable of the form $name or ${name}, " +
+		"where name starts with a lowercase letter followed by lowercase letters, digits, or underscores"
+)
+
+var variableNameRegexp = regexp.MustCompile("^" + variableNameFmt + "$")
+
+// ValidateNginxVariableName validates an NGINX variable name in the form $name or ${name}.
+func (GenericValidator) ValidateNginxVariableName(name string) error {
+	if !variableNameRegexp.MatchString(name) {
+		examples := []string{
+			"$remote_addr",
+			"$http_x_forwarded_for",
+			"${remote_addr}",
+		}
+
+		return errors.New(k8svalidation.RegexError(variableNameErrMsg, variableNameFmt, examples...))
+	}
+
+	return nil
+}
+
+// ValidateServerTokensValue validates a custom server_tokens value that will be placed inside
+// double quotes in the NGINX configuration. It ensures no unescaped double quotes or
+// trailing backslashes that could break the NGINX config.
+func (GenericValidator) ValidateServerTokensValue(value string) error {
+	return validateEscapedString(value, []string{"my-server", "nginx"})
+}
+
+// ValidateAccessLogFormatString validates a custom access log format string that will
+// be placed inside single quotes in the NGINX configuration. Single quotes must be
+// rejected since they cannot be escaped in NGINX single-quoted strings.
+func (GenericValidator) ValidateAccessLogFormatString(value string) error {
+	return validateSingleQuotedString(
+		value,
+		[]string{
+			`$remote_addr - $remote_user [$time_local] "$request" $status`,
+			`{"remote_addr": "$remote_addr", "status": "$status"}`,
+		},
+	)
+}

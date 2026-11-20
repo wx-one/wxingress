@@ -1,0 +1,412 @@
+{{- /*gotype: github.com/wx-one/wxingress/internal/configs/version1.MainConfig*/ -}}
+worker_processes  {{.WorkerProcesses}};
+{{- if .WorkerRlimitNofile}}
+worker_rlimit_nofile {{.WorkerRlimitNofile}};{{end}}
+{{- if .WorkerCPUAffinity}}
+worker_cpu_affinity {{.WorkerCPUAffinity}};{{end}}
+{{- if .WorkerShutdownTimeout}}
+worker_shutdown_timeout {{.WorkerShutdownTimeout}};{{end}}
+
+daemon off;
+
+error_log  stderr {{.ErrorLogLevel}};
+pid        /var/lib/nginx/nginx.pid;
+
+{{- if .MainOtelLoadModule}}
+load_module modules/ngx_otel_module.so;
+{{- end}}
+{{- if .AppProtectLoadModule}}
+load_module modules/ngx_http_app_protect_module.so;
+{{- end}}
+{{- if .AppProtectDosLoadModule}}
+load_module modules/ngx_http_app_protect_dos_module.so;
+{{- end}}
+load_module modules/ngx_fips_check_module.so;
+{{- range $value := .MainSnippets}}
+{{$value}}{{- end}}
+
+load_module modules/ngx_http_js_module.so;
+
+events {
+    worker_connections  {{.WorkerConnections}};
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+    map_hash_max_size {{.MapHashMaxSize}};
+    map_hash_bucket_size {{.MapHashBucketSize}};
+
+    {{- if .ClientBodyBufferSize }}
+    client_body_buffer_size {{.ClientBodyBufferSize}};
+    {{- end }}
+
+    js_import /etc/nginx/njs/apikey_auth.js;
+    js_set $apikey_auth_hash apikey_auth.hash;
+
+    # variables of ingress-nginx for its annotations
+    js_import /etc/nginx/njs/ingress_nginx.js;
+    js_set $escaped_request_uri ingress_nginx.escapedRequestURI;
+    map $http_x_request_id $ingress_nginx_req_id {
+        default $http_x_request_id;
+        "" $request_id;
+    }
+    # SameSite=None, but not for the browsers that reject it (session-cookie-conditional-samesite-none of ingress-nginx)
+    map $http_user_agent $ingress_nginx_samesite_none {
+        "~Chrome/[4-6]" "";
+        "~CPU iPhone OS 12" "";
+        "~iPad; CPU OS 12" "";
+        "~Chrome" none;
+        "~^(?=.*Macintosh)(?=.*Intel Mac OS X 10_14)(?=.*Safari)" "";
+        default none;
+    }
+
+    {{- range $value := .HTTPSnippets}}
+    {{$value}}{{- end}}
+
+    {{- range $h := .AddHeaders}}
+    add_header {{$h.Name}} {{ printf "%q" $h.Value }}{{if $h.Always}} always{{end}};
+    {{- end}}
+
+    {{if .LogFormat -}}
+    log_format  main {{if .LogFormatEscaping}}escape={{ .LogFormatEscaping }} {{end}}
+                     {{range $i, $value := .LogFormat -}}
+                     {{with $value}}'{{if $i}} {{end}}{{$value}}'
+                     {{end}}{{end}};
+    {{- else -}}
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent" "$http_x_forwarded_for"';
+    {{- end}}
+
+    map $upstream_trailer_grpc_status $grpc_status {
+        default $upstream_trailer_grpc_status;
+        '' $sent_http_grpc_status;
+    }
+
+    {{- if .DynamicSSLReloadEnabled }}
+    map $nginx_version $secret_dir_path {
+        default "{{ .StaticSSLPath }}";
+    }
+    {{- end }}
+
+    {{- if .AppProtectDosLoadModule}}
+    {{- if .AppProtectDosLogFormat}}
+    log_format  log_dos {{if .AppProtectDosLogFormatEscaping}}escape={{ .AppProtectDosLogFormatEscaping }} {{end}}
+                    {{range $i, $value := .AppProtectDosLogFormat -}}
+                    {{with $value}}'{{if $i}} {{end}}{{$value}}'
+                    {{end}}{{end}};
+    {{- else }}
+    log_format  log_dos ', vs_name_al=$app_protect_dos_vs_name, ip=$remote_addr, tls_fp=$app_protect_dos_tls_fp, '
+                        'outcome=$app_protect_dos_outcome, reason=$app_protect_dos_outcome_reason, '
+                        'ip_tls=$remote_addr:$app_protect_dos_tls_fp, ';
+
+    {{- end}}
+    {{- if .AppProtectDosArbFqdn}}
+    app_protect_dos_arb_fqdn {{.AppProtectDosArbFqdn}};
+    {{- end}}
+    {{- end}}
+
+    {{- if .AppProtectV5LoadModule}}
+    app_protect_enforcer_address {{ .AppProtectV5EnforcerAddr }};
+    {{- end}}
+
+    access_log {{.AccessLog}};
+
+    {{- if .AddHeaderInherit}}
+    add_header_inherit {{.AddHeaderInherit}};
+    {{- end}}
+
+    {{- if .LatencyMetrics}}
+    log_format response_time '{"upstreamAddress":"$upstream_addr", "upstreamResponseTime":"$upstream_response_time", "proxyHost":"$proxy_host", "upstreamStatus": "$upstream_status"}';
+    access_log syslog:server=unix:/var/lib/nginx/nginx-syslog.sock,nohostname,tag=nginx response_time;
+    {{- end}}
+
+    {{- if .AppProtectLoadModule}}
+    {{if .AppProtectFailureModeAction}}app_protect_failure_mode_action {{.AppProtectFailureModeAction}};{{end}}
+    {{if .AppProtectCompressedRequestsAction}}app_protect_compressed_requests_action {{.AppProtectCompressedRequestsAction}};{{end}}
+    {{if .AppProtectCookieSeed}}app_protect_cookie_seed {{.AppProtectCookieSeed}};{{end}}
+    {{if .AppProtectCPUThresholds}}app_protect_cpu_thresholds {{.AppProtectCPUThresholds}};{{end}}
+    {{if .AppProtectPhysicalMemoryThresholds}}app_protect_physical_memory_util_thresholds {{.AppProtectPhysicalMemoryThresholds}};{{end}}
+    {{if .AppProtectReconnectPeriod}}app_protect_reconnect_period_seconds {{.AppProtectReconnectPeriod}};{{end}}
+    include /etc/nginx/waf/nac-usersigs/index.conf;
+    {{- end}}
+
+    sendfile        on;
+    #tcp_nopush     on;
+
+    keepalive_timeout {{.KeepaliveTimeout}};
+    keepalive_requests {{.KeepaliveRequests}};
+
+    {{- if .HTTP2}}
+    http2 on;
+    {{- end}}
+
+    #gzip  on;
+
+    server_names_hash_max_size {{.ServerNamesHashMaxSize}};
+    {{if .ServerNamesHashBucketSize}}server_names_hash_bucket_size {{.ServerNamesHashBucketSize}};{{end}}
+
+    variables_hash_bucket_size {{.VariablesHashBucketSize}};
+    variables_hash_max_size {{.VariablesHashMaxSize}};
+
+    map $request_uri $request_uri_no_args {
+        "~^(?P<path>[^?]*)(\?.*)?$" $path;
+    }
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+    # a "$" in a header value of ingress-nginx's custom-headers, as ingress-nginx has it (geo values are no variables)
+    geo $literal_dollar {
+        default "$";
+    }
+    # ingress-nginx's redirect to https: the Host header without its port, the URI without a trailing slash
+    map $http_host $ingress_nginx_redirect_host {
+        "~^(?<ingress_nginx_h>[^:]+)" $ingress_nginx_h;
+        default                     $host;
+    }
+    map $request_uri $ingress_nginx_redirect_uri {
+        "~^(?<ingress_nginx_u>.*)/$" $ingress_nginx_u;
+        default                     $request_uri;
+    }
+    # ingress-nginx's Connection to an upstream with keepalive: upgrade for WebSocket, else kept alive
+    map $http_upgrade $ingress_nginx_connection_upgrade {
+        default upgrade;
+        ''      '';
+    }
+    map $http_upgrade $default_connection_header {
+        default "";
+    }
+    map $http_host $resource_type {
+        default "";
+    }
+    map $http_host $resource_name {
+        default "";
+    }
+    map $http_host $resource_namespace {
+        default "";
+    }
+    map $http_host $service {
+        default "";
+    }
+    map $http_upgrade $vs_connection_header {
+        default upgrade;
+        ''      $default_connection_header;
+    }
+    {{- if .UseForwardedHeaders }}
+    map $http_x_forwarded_host $forwarded_host {
+        default $host;
+        "~^[ \t]*([^, \t]+)" $1;
+    }
+    map $http_x_forwarded_port $forwarded_port {
+        default $server_port;
+        "~^[ \t]*([^, \t]+)" $1;
+    }
+    map $http_x_forwarded_proto $forwarded_proto {
+        default $scheme;
+        "~^[ \t]*([^, \t]+)" $1;
+    }
+    {{- end }}
+    {{- if .SSLProtocols}}
+    ssl_protocols {{.SSLProtocols}};
+    {{- end}}
+    {{- if .SSLCiphers}}
+    ssl_ciphers {{ printf "%q" .SSLCiphers }};
+    {{- end}}
+    {{- if .SSLPreferServerCiphers}}
+    ssl_prefer_server_ciphers on;
+    {{- end}}
+    {{- if .SSLDHParam}}
+    ssl_dhparam {{.SSLDHParam}};
+    {{- end}}
+
+    {{- if .MainOtelLoadModule }}
+    otel_exporter {
+        endpoint {{ .MainOtelExporterEndpoint }};
+        {{- if and .MainOtelExporterHeaderName .MainOtelExporterHeaderValue }}
+        header {{ .MainOtelExporterHeaderName }} "{{ .MainOtelExporterHeaderValue }}";
+        {{- end }}
+    }
+
+    {{ if .MainOtelServiceName}}
+    otel_service_name {{ printf "%q" .MainOtelServiceName }};
+    {{- end }}
+    {{ if .MainOtelGlobalTraceEnabled }}
+    otel_trace on;
+    {{- end}}
+    {{- if .MainOtelTraceContext}}
+    otel_trace_context {{ .MainOtelTraceContext }};
+    {{- end}}
+    {{- end}}
+
+    {{ $resolverIPV6HTTPBool := boolToPointerBool .ResolverIPV6 -}}
+    {{ makeResolver .ResolverAddresses .ResolverValid $resolverIPV6HTTPBool }}
+    {{if .ResolverTimeout}}resolver_timeout {{.ResolverTimeout}};{{end}}
+
+    {{- if .OIDC.Enable}}
+    keyval_zone zone=oidc_pkce:{{.OIDC.PKCEZoneSize}} timeout={{.OIDC.PKCETimeout}} sync;
+    keyval_zone zone=oidc_id_tokens:{{.OIDC.IDTokenZoneSize}} timeout={{.OIDC.IDTokenTimeout}} sync;
+    keyval_zone zone=oidc_access_tokens:{{.OIDC.AccessZoneSize}} timeout={{.OIDC.AccessTimeout}} sync;
+    keyval_zone zone=refresh_tokens:{{.OIDC.RefreshZoneSize}} timeout={{.OIDC.RefreshTimeout}} sync;
+    keyval_zone zone=oidc_sids:{{.OIDC.SIDSZoneSize}} timeout={{.OIDC.SIDSTimeout}} sync;
+    include oidc/oidc_common.conf;
+    {{- end}}
+    {{- if .NginxStatus}}
+    # NGINX Plus APIs
+    server {
+        listen {{.NginxStatusPort}};
+        {{if not .DisableIPV6}}listen [::]:{{.NginxStatusPort}};{{end}}
+
+        root /usr/share/nginx/html;
+
+        access_log off;
+
+        location  = /dashboard.html {
+        }
+        {{if .AppProtectDosLoadModule}}
+        location = /dashboard-dos.html {
+        }
+        {{end}}
+        {{range $value := .NginxStatusAllowCIDRs}}
+        allow {{$value}};{{end}}
+
+        deny all;
+        location /api {
+            {{if .AppProtectDosLoadModule}}
+            app_protect_dos_api on;
+            {{end}}
+            api write=off;
+        }
+    }
+    {{- end}}
+
+    # NGINX Plus API over unix socket
+    server {
+        listen unix:/var/lib/nginx/nginx-plus-api.sock;
+        access_log off;
+
+        # $config_version_mismatch is defined in /etc/nginx/config-version.conf
+        location /configVersionCheck {
+            if ($config_version_mismatch) {
+                return 503;
+            }
+            return 200;
+        }
+
+        location /api {
+            api write=on;
+        }
+    }
+
+    include /etc/nginx/config-version.conf;
+    include /etc/nginx/conf.d/*.conf;
+
+    server {
+        listen unix:/var/lib/nginx/nginx-418-server.sock;
+        access_log off;
+
+        return 418;
+    }
+}
+
+stream {
+    {{if .StreamLogFormat -}}
+    log_format  stream-main {{if .StreamLogFormatEscaping}}escape={{ .StreamLogFormatEscaping }} {{end}}
+                            {{range $i, $value := .StreamLogFormat -}}
+                            {{with $value}}'{{if $i}} {{end}}{{$value}}'
+                            {{end}}{{end}};
+    {{- else -}}
+    log_format  stream-main  '$remote_addr [$time_local] '
+                      '$protocol $status $bytes_sent $bytes_received '
+                      '$session_time "$ssl_preread_server_name"';
+    {{- end}}
+
+    access_log  /dev/stdout  stream-main;
+
+    {{- range $value := .StreamSnippets}}
+    {{$value}}{{end}}
+    {{ $resolverIPV6StreamBool := boolToPointerBool .ResolverIPV6 -}}
+    {{ makeResolver .ResolverAddresses .ResolverValid $resolverIPV6StreamBool }}
+    {{if .ResolverTimeout}}resolver_timeout {{.ResolverTimeout}};{{end}}
+
+    map_hash_max_size {{.MapHashMaxSize}};
+    {{if .MapHashBucketSize}}map_hash_bucket_size {{.MapHashBucketSize}};{{end}}
+
+    {{- if .DynamicSSLReloadEnabled }}
+    map $nginx_version $secret_dir_path {
+        default "{{ .StaticSSLPath }}";
+    }
+    {{- end }}
+
+    {{- if .TLSPassthrough}}
+    map $ssl_preread_server_name $dest_internal_passthrough  {
+        default unix:/var/lib/nginx/passthrough-https.sock;
+        include /etc/nginx/tls-passthrough-hosts.conf;
+    }
+
+    server {
+        listen {{.TLSPassthroughPort}}{{if .ProxyProtocol}} proxy_protocol{{end}};
+        {{if not .DisableIPV6}}listen [::]:{{.TLSPassthroughPort}}{{if .ProxyProtocol}} proxy_protocol{{end}};{{end}}
+
+        {{if .ProxyProtocol}}
+        {{range $setRealIPFrom := .SetRealIPFrom}}
+        set_real_ip_from {{$setRealIPFrom}};{{end}}
+        {{end}}
+
+        ssl_preread on;
+
+        proxy_protocol on;
+        proxy_pass $dest_internal_passthrough;
+    }
+    {{end}}
+
+    {{- if .ZoneSyncConfig.Enable }}
+    server {
+        listen {{ .ZoneSyncConfig.Port }};
+        {{- if not .DisableIPV6 }}
+        listen [::]:{{ .ZoneSyncConfig.Port }};
+        {{- end }}
+        {{ makeResolver .ZoneSyncConfig.ResolverAddresses .ZoneSyncConfig.ResolverValid .ZoneSyncConfig.ResolverIPV6 }}
+        zone_sync;
+        zone_sync_server {{ .ZoneSyncConfig.Domain }}:{{ .ZoneSyncConfig.Port }} resolve;
+    }
+    {{- end }}
+    include /etc/nginx/stream-conf.d/*.conf;
+}
+
+mgmt {
+    {{- if or (ne .MGMTConfig.Endpoint "") (ne .MGMTConfig.Interval "") }}
+    usage_report
+    {{- if ne .MGMTConfig.Endpoint "" }} endpoint={{ .MGMTConfig.Endpoint }} {{- end }} {{- if ne .MGMTConfig.Interval "" }} interval={{ .MGMTConfig.Interval }} {{- end }};
+    {{- end }}
+    {{- if ne .MGMTConfig.ProxyHost "" }}
+    proxy {{ .MGMTConfig.ProxyHost }};
+    {{- end }}
+    {{- if ne .MGMTConfig.ProxyUser "" }}
+    proxy_username {{ printf "%q" .MGMTConfig.ProxyUser }};
+    {{- end }}
+    {{- if ne .MGMTConfig.ProxyPass "" }}
+    proxy_password {{ printf "%q" .MGMTConfig.ProxyPass }};
+    {{- end }}
+    license_token {{ printf "%s/license.jwt" .StaticSSLPath }};
+    enforce_initial_report {{ makeOnOffFromBool .MGMTConfig.EnforceInitialReport}};
+    {{ if .MGMTConfig.SSLVerify -}}
+    ssl_verify {{ makeOnOffFromBool .MGMTConfig.SSLVerify }};
+    {{ end -}}
+    {{ if .MGMTConfig.ResolverAddresses -}}
+    {{ makeResolver .MGMTConfig.ResolverAddresses .MGMTConfig.ResolverValid .MGMTConfig.ResolverIPV6 }}
+    {{ end -}}
+    {{ if .MGMTConfig.TrustedCert -}}
+    ssl_trusted_certificate {{ printf "%s/mgmt/ca.crt" .StaticSSLPath }};
+    {{ end -}}
+    {{ if .MGMTConfig.TrustedCRL -}}
+    ssl_crl {{ printf "%s/mgmt/ca.crl" .StaticSSLPath }};
+    {{ end -}}
+    {{ if .MGMTConfig.ClientAuth -}}
+    ssl_certificate {{ printf "%s/mgmt/client" .StaticSSLPath }};
+    ssl_certificate_key {{ printf "%s/mgmt/client" .StaticSSLPath }};
+    {{ end -}}
+    deployment_context /etc/nginx/reporting/tracking.info;
+}

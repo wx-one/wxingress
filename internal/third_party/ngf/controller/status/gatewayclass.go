@@ -1,0 +1,80 @@
+package status
+
+import (
+	"sort"
+
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	"sigs.k8s.io/gateway-api/pkg/features"
+)
+
+// supportedFeatures returns the list of features supported by NGINX Gateway Fabric.
+// The list must be sorted in ascending alphabetical order.
+func supportedFeatures() []gatewayv1.SupportedFeature {
+	featureNames := []features.FeatureName{
+		// Core features
+		features.SupportGateway,
+		features.SupportGRPCRoute,
+		features.SupportHTTPRoute,
+		features.SupportReferenceGrant,
+
+		// BackendTLSPolicy
+		features.SupportBackendTLSPolicy,
+
+		// TLSRoute
+		features.SupportTLSRoute,
+		features.SupportTLSRouteModeTerminate,
+		features.SupportTLSRouteModeMixed,
+
+		// Gateway extended
+		features.SupportGatewayAddressEmpty,
+		features.SupportGatewayHTTPListenerIsolation,
+		features.SupportGatewayInfrastructure,
+		features.SupportGatewayPort8080,
+		features.SupportGatewayStaticAddresses,
+		features.SupportGatewayBackendClientCertificate,
+		features.SupportGatewayHTTPSListenerDetectMisdirectedRequests,
+		features.SupportGatewayFrontendClientCertificateValidation,
+		features.SupportGatewayFrontendClientCertificateValidationInsecureFallback,
+		features.SupportListenerSet,
+
+		// HTTPRoute extended
+		features.SupportHTTPRouteBackendProtocolWebSocket,
+		features.SupportHTTPRouteBackendProtocolH2C,
+		features.SupportHTTPRouteDestinationPortMatching,
+		features.SupportHTTPRouteHostRewrite,
+		features.SupportHTTPRouteMethodMatching,
+		features.SupportHTTPRouteParentRefPort,
+		features.SupportHTTPRoutePathRedirect,
+		features.SupportHTTPRoutePathRewrite,
+		features.SupportHTTPRoutePortRedirect,
+		features.SupportHTTPRouteQueryParamMatching,
+		features.SupportHTTPRouteRequestMirror,
+		features.SupportHTTPRouteRequestMultipleMirrors,
+		features.SupportHTTPRouteRequestPercentageMirror,
+		features.SupportHTTPRouteResponseHeaderModification,
+		features.SupportHTTPRouteSchemeRedirect,
+		features.SupportHTTPRoute303RedirectStatusCode,
+		features.SupportHTTPRoute307RedirectStatusCode,
+		features.SupportHTTPRoute308RedirectStatusCode,
+		features.SupportHTTPRouteCORS,
+
+		// TCPRoute
+		features.SupportTCPRoute,
+
+		// UDPRoute
+		features.SupportUDPRoute,
+	}
+
+	// Sort alphabetically by feature name
+	sort.Slice(featureNames, func(i, j int) bool {
+		return string(featureNames[i]) < string(featureNames[j])
+	})
+
+	// Convert to SupportedFeature slice
+	result := make([]gatewayv1.SupportedFeature, 0, len(featureNames))
+	for _, name := range featureNames {
+		result = append(result, gatewayv1.SupportedFeature{Name: gatewayv1.FeatureName(name)})
+	}
+
+	return result
+}

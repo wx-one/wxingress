@@ -1,0 +1,103 @@
+package validation
+
+import (
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/conditions"
+)
+
+// Validators include validators for API resources from the perspective of a data-plane.
+// It is used for fields that propagate into the data plane configuration. For example, the path in a routing rule.
+// However, not all such fields are validated: NGF will not validate a field using Validators if it is confident that
+// the field is valid.
+type Validators struct {
+	HTTPFieldsValidator HTTPFieldsValidator
+	GenericValidator    GenericValidator
+	AuthFieldsValidator AuthFieldsValidator
+	PolicyValidator     PolicyValidator
+}
+
+// HTTPFieldsValidator validates the HTTP-related fields of Gateway API resources from the perspective of
+// a data-plane. Data-plane implementations must implement this interface.
+//
+//go:generate go tool moq -skip-ensure -pkg validationfakes -out validationfakes/fake_httpfields_validator.go . HTTPFieldsValidator
+type HTTPFieldsValidator interface {
+	SkipValidation() bool
+	ValidatePathInMatch(path string) error
+	ValidatePathInRegexMatch(path string) error
+	ValidateHeaderNameInMatch(name string) error
+	ValidateHeaderValueInMatch(value string) error
+	ValidateQueryParamNameInMatch(name string) error
+	ValidateQueryParamValueInMatch(name string) error
+	ValidateMethodInMatch(method string) (valid bool, supportedValues []string)
+	ValidateRedirectScheme(scheme string) (valid bool, supportedValues []string)
+	ValidateRedirectPort(port int32) error
+	ValidateHostname(hostname string) error
+	ValidateFilterHeaderName(name string) error
+	ValidateFilterHeaderValue(value string) error
+	ValidatePath(path string) error
+	ValidateDuration(duration string) (string, error)
+}
+
+// GenericValidator validates any generic values from NGF API resources from the perspective of a data-plane.
+// These could be values that we want to re-validate in case of any CRD schema manipulation.
+//
+//go:generate go tool moq -skip-ensure -pkg validationfakes -out validationfakes/fake_generic_validator.go . GenericValidator
+type GenericValidator interface {
+	ValidateEscapedStringNoVarExpansion(value string) error
+	ValidateDNSSubdomainName(name string) error
+	ValidateServiceName(name string) error
+	ValidateNginxDuration(duration string) error
+	ValidateNginxSize(size string) error
+	ValidateEndpoint(endpoint string) error
+	ValidateNginxVariableName(name string) error
+	ValidateServerTokensValue(value string) error
+	ValidateAccessLogFormatString(value string) error
+}
+
+// AuthFieldsValidator validates authentication-related fields from NGF API resources.
+//
+//go:generate go tool moq -skip-ensure -pkg validationfakes -out validationfakes/fake_auth_fields_validator.go . AuthFieldsValidator
+type AuthFieldsValidator interface {
+	ValidateOIDCHTTPSURL(url string) error
+	ValidateOIDCRedirectURI(uri string) error
+	ValidateOIDCPathURI(uri string) error
+	ValidateOIDCPostLogoutURI(uri string) error
+	ValidateAuthZClaimName(name string) error
+	ValidateAuthZClaimValue(value string) error
+	ValidateAuthZProxySetHeader(header string) error
+	ValidateOIDCExtraAuthArg(key, value string) error
+	ValidateOIDCEscapedString(value string) error
+	ValidateRealm(value string) error
+}
+
+// PolicyValidator validates an NGF Policy.
+//
+//go:generate go tool moq -skip-ensure -pkg validationfakes -out validationfakes/fake_policy_validator.go . PolicyValidator
+type PolicyValidator interface {
+	// Validate validates an NGF Policy.
+	Validate(policy policies.Policy) []conditions.Condition
+	// ValidateGlobalSettings validates an NGF Policy with the NginxProxy settings.
+	ValidateGlobalSettings(policy policies.Policy, globalSettings *policies.GlobalSettings) []conditions.Condition
+	// Conflicts returns true if the two Policies conflict.
+	Conflicts(a, b policies.Policy) bool
+}
+
+// SkipValidator is used to skip validation on internally-created routes for request mirroring.
+type SkipValidator struct{}
+
+func (SkipValidator) SkipValidation() bool { return true }
+
+func (SkipValidator) ValidatePathInMatch(string) error               { return nil }
+func (SkipValidator) ValidatePathInRegexMatch(string) error          { return nil }
+func (SkipValidator) ValidateHeaderNameInMatch(string) error         { return nil }
+func (SkipValidator) ValidateHeaderValueInMatch(string) error        { return nil }
+func (SkipValidator) ValidateQueryParamNameInMatch(string) error     { return nil }
+func (SkipValidator) ValidateQueryParamValueInMatch(string) error    { return nil }
+func (SkipValidator) ValidateMethodInMatch(string) (bool, []string)  { return true, nil }
+func (SkipValidator) ValidateRedirectScheme(string) (bool, []string) { return true, nil }
+func (SkipValidator) ValidateRedirectPort(int32) error               { return nil }
+func (SkipValidator) ValidateHostname(string) error                  { return nil }
+func (SkipValidator) ValidateFilterHeaderName(string) error          { return nil }
+func (SkipValidator) ValidateFilterHeaderValue(string) error         { return nil }
+func (SkipValidator) ValidatePath(string) error                      { return nil }
+func (SkipValidator) ValidateDuration(string) (string, error)        { return "", nil }

@@ -1,0 +1,111 @@
+site_name: wxingress
+site_description: The drop-in successor of ingress-nginx, built on NGINX Ingress Controller, with the Gateway API.
+site_url: https://wx-one.github.io/wxingress/
+repo_url: https://github.com/wx-one/wxingress
+repo_name: wxone/wxingress
+edit_uri: edit/main/docs/
+copyright: >-
+  Copyright &copy; 2025-2026 WizardTales GmbH and the wxingress contributors &middot;
+  <a href="https://github.com/wx-one/wxingress/blob/main/LICENSE">EUPL-1.2</a> &middot;
+  NGINX is a registered trademark of F5, Inc.
+
+theme:
+  name: material
+  logo: assets/logos/wxingress.svg
+  favicon: assets/logos/wxingress.svg
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: deep purple
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: deep purple
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/wx-one/wxingress
+    - icon: fontawesome/brands/docker
+      link: https://hub.docker.com/r/wxone/wxingress
+    - icon: fontawesome/solid/heart
+      link: https://github.com/sponsors/wx-one
+      name: Sponsor wxingress
+
+extra_css:
+  - assets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+
+# pages the site does not link (left over from the upstream repository, or
+# generated for other tools)
+exclude_docs: |
+  developer/github-comments-guide.md
+  developer/image-matrices.md
+  developer/parallel-e2e-plan.md
+  developer/opaque-secrets-high-level-design.md
+  developer/telemetry-schema-generation.md
+  developer/README.md
+
+not_in_nav: |
+  crd/*.md
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/installation.md
+      - First Ingress: getting-started/first-ingress.md
+  - Migration:
+      - From ingress-nginx: migration/ingress-nginx.md
+      - Lua to njs: migration/lua-to-njs.md
+      - RKE2 node by node: migration/rke2.md
+      - Testing and benchmarks: migration/testing.md
+  - User guide:
+      - ingress-nginx compatibility: user-guide/ingress-nginx-compatibility.md
+      - Gateway API: user-guide/gateway-api.md
+  - Reference:
+      - Annotations: reference/annotations.md
+      - ConfigMap: reference/configmap.md
+      - Command-line flags: reference/cli-flags.md
+      - Helm values: reference/helm-values.md
+  - Development:
+      - Building: developer/building.md
+      - Architecture: developer/architecture.md
+      - Debugging: developer/debugging.md
+      - Upstream: developer/upstream.md
+  - About:
+      - Licence: about/license.md
+      - Support: about/support.md
+      - Sponsors: about/sponsors.md

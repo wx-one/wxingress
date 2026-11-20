@@ -1,0 +1,101 @@
+# The wxingress image as CI builds it (.github/workflows/release.yml).
+#
+# It is what `make debian-image-wxingress TARGET=local` builds, the stages
+# debian -> debian-wxingress -> common -> local of build/Dockerfile: nginx and
+# its modules from nginx.org's packages, the data plane module from
+# dataplane/build.sh and the controller binary built before.
+#
+# A file of its own because it must build without `RUN --mount`, which
+# build/Dockerfile uses for keys, helper scripts and the source tree; here they
+# are COPY and ADD. A change of one of those stages belongs here as well.
+#
+# Expected in the build context beforehand (CI puts both there):
+#
+#   nginx-ingress                                    the controller binary
+#   dataplane/build/ngx_http_wxingress_module.so     the data plane module
+
+FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+
+ARG OSS_PACKAGE_REPO=packages.nginx.org
+ARG NGINX_OSS_VERSION=1.31.9
+ARG AGENT_V3_VERSION=3
+ARG IC_VERSION
+ARG BUILD_OS=debian-wxingress
+
+ENV BUILD_OS=${BUILD_OS}
+
+ADD https://cs.nginx.com/static/keys/nginx_signing.key /tmp/nginx_signing.key
+COPY build/scripts/agent.sh /usr/local/bin/agent.sh
+
+# the stage debian of build/Dockerfile, then patch-os.sh (apt-get upgrade) -
+# before nginx.org's sources are added, else the upgrade lifts nginx past the
+# version the module is built against, and load_module refuses it
+RUN apt-get update \
+	&& apt-get install --no-install-recommends --no-install-suggests -y \
+	gpg libcap2-bin ca-certificates lsb-release debian-archive-keyring \
+	&& groupadd --system --gid 101 nginx \
+	&& useradd --system --gid nginx --no-create-home --home-dir /nonexistent --comment "nginx user" --shell /bin/false --uid 101 nginx \
+	&& gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg /tmp/nginx_signing.key \
+	&& echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
+	https://${OSS_PACKAGE_REPO}/nginx/mainline/debian `lsb_release -cs` nginx" > /etc/apt/sources.list.d/nginx.list \
+	&& echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
+	https://${OSS_PACKAGE_REPO}/nginx-agent/debian `lsb_release -cs` agent" >> /etc/apt/sources.list.d/nginx.list \
+	&& printf "%s" "Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n" > /etc/apt/preferences.d/99nginx \
+	&& apt-get update \
+	&& apt-get install --no-install-recommends --no-install-suggests -y \
+	nginx=${NGINX_OSS_VERSION}* \
+	nginx-module-njs=${NGINX_OSS_VERSION}* \
+	nginx-module-otel=${NGINX_OSS_VERSION}* \
+	nginx-module-xslt=${NGINX_OSS_VERSION}* \
+	nginx-module-geoip=${NGINX_OSS_VERSION}* \
+	nginx-module-acme=${NGINX_OSS_VERSION}* \
+	nginx-module-image-filter=${NGINX_OSS_VERSION}* \
+	nginx-agent=${AGENT_V3_VERSION}* \
+	&& apt-get purge --auto-remove -y gpg \
+	&& rm -rf /var/lib/apt/lists/* /etc/apt/preferences.d/99nginx /etc/apt/sources.list.d/nginx.list \
+		/tmp/nginx_signing.key \
+	&& apt-get update \
+	&& apt-get upgrade -y \
+	&& rm -rf /var/lib/apt/lists/* \
+	&& agent.sh \
+	&& rm /usr/local/bin/agent.sh
+
+# the stage debian-wxingress
+COPY dataplane/build/ngx_http_wxingress_module.so /usr/lib/nginx/modules/ngx_http_wxingress_module.so
+
+# nginx takes the module only if it is built against exactly its version
+# (NGINX_VERSION in dataplane/build.sh); better fail here than in the pod
+RUN printf 'load_module modules/ngx_http_wxingress_module.so;\nevents {}\nhttp {}\n' > /tmp/module.conf \
+	&& nginx -t -q -c /tmp/module.conf \
+	&& rm /tmp/module.conf
+
+# the stage common: what build/scripts/common.sh does without Plus
+COPY internal/configs/njs/ /etc/nginx/njs/
+COPY internal/configs/version1/nginx.ingress.tmpl \
+	internal/configs/version1/nginx.tmpl \
+	internal/configs/version2/nginx.virtualserver.tmpl \
+	internal/configs/version2/nginx.transportserver.tmpl \
+	/
+RUN mkdir -p /var/lib/nginx /etc/nginx/secrets /etc/nginx/stream-conf.d \
+	&& setcap 'cap_net_bind_service=+eip' /usr/sbin/nginx 'cap_net_bind_service=+eip' /usr/sbin/nginx-debug \
+	&& setcap -v 'cap_net_bind_service=+eip' /usr/sbin/nginx 'cap_net_bind_service=+eip' /usr/sbin/nginx-debug \
+	&& chown -R 101:0 /etc/nginx /var/cache/nginx /var/lib/nginx /var/log/nginx /*.tmpl \
+	&& chmod -R g=u /etc/nginx /var/cache/nginx /var/lib/nginx /var/log/nginx /*.tmpl \
+	&& rm -f /etc/nginx/conf.d/* \
+	&& ln -sf /dev/stdout /var/log/nginx/access.log \
+	&& ln -sf /dev/stderr /var/log/nginx/error.log
+
+# the stage local: the binary from outside
+COPY --chown=101:0 nginx-ingress /nginx-ingress
+RUN setcap 'cap_net_bind_service=+ep' /nginx-ingress && setcap -v 'cap_net_bind_service=+ep' /nginx-ingress
+
+EXPOSE 80 443
+
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/nginx-ingress"]
+# 101 is nginx
+USER 101
+
+LABEL org.opencontainers.image.title="wxingress" \
+	org.opencontainers.image.version="${IC_VERSION}" \
+	org.opencontainers.image.source="https://github.com/wx-one/wxingress"

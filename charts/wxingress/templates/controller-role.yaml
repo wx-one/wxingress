@@ -1,0 +1,73 @@
+{{- if .Values.rbac.create }}
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: {{ include "nginx-ingress.fullname" . }}
+  labels:
+    {{- include "nginx-ingress.labels" . | nindent 4 }}
+  namespace: {{ .Release.Namespace }}
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - pods
+  - secrets
+  - services
+  verbs:
+  - get
+  - list
+  - watch
+{{- if and .Values.controller.enableOIDC (or .Values.controller.dynamicUpstreams .Values.controller.ingressNginxCompat) }}
+# the revocations of oidc sessions: each replica writes the logouts its module took
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  resourceNames:
+  - {{ include "nginx-ingress.controller.fullname" . }}-oidc-revocations
+  verbs:
+  - update
+{{- end }}
+- apiGroups:
+    - ""
+  resources:
+    - namespaces
+  verbs:
+    - get
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+  - list
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  resourceNames:
+  - {{ include "nginx-ingress.leaderElectionName" . }}
+  verbs:
+  - get
+  - update
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+{{- end }}

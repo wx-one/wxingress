@@ -1,0 +1,584 @@
+package graph
+
+import (
+	"testing"
+
+	. "github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/types"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+)
+
+func TestReferenceGrantResolver(t *testing.T) {
+	t.Parallel()
+	gwNs := "gw-ns"
+	secretNsName := types.NamespacedName{Namespace: "test", Name: "certificate"}
+
+	refGrants := map[types.NamespacedName]*gatewayv1.ReferenceGrant{
+		{Namespace: "test", Name: "valid"}: {
+			Spec: gatewayv1.ReferenceGrantSpec{
+				From: []gatewayv1.ReferenceGrantFrom{
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.Gateway,
+						Namespace: gatewayv1.Namespace(gwNs),
+					},
+				},
+				To: []gatewayv1.ReferenceGrantTo{
+					{
+						Kind: "Secret",
+						Name: helpers.GetPointer(gatewayv1.ObjectName("wrong-name1")),
+					},
+					{
+						Kind: "Secret",
+						Name: helpers.GetPointer(gatewayv1.ObjectName("wrong-name2")),
+					},
+					{
+						Kind: "Secret",
+						Name: helpers.GetPointer(gatewayv1.ObjectName(secretNsName.Name)), // matches
+					},
+				},
+			},
+		},
+		{Namespace: "explicit-core-group", Name: "valid"}: {
+			Spec: gatewayv1.ReferenceGrantSpec{
+				From: []gatewayv1.ReferenceGrantFrom{
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.Gateway,
+						Namespace: gatewayv1.Namespace(gwNs),
+					},
+				},
+				To: []gatewayv1.ReferenceGrantTo{
+					{
+						Group: "core",
+						Kind:  "Secret",
+						Name:  helpers.GetPointer(gatewayv1.ObjectName(secretNsName.Name)),
+					},
+				},
+			},
+		},
+		{Namespace: "all-in-namespace", Name: "valid"}: {
+			Spec: gatewayv1.ReferenceGrantSpec{
+				To: []gatewayv1.ReferenceGrantTo{
+					{
+						Kind: "Secret",
+					},
+				},
+				From: []gatewayv1.ReferenceGrantFrom{
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.Gateway,
+						Namespace: "wrong-ns1",
+					},
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.Gateway,
+						Namespace: "wrong-ns2",
+					},
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.Gateway,
+						Namespace: gatewayv1.Namespace(gwNs),
+					},
+				},
+			},
+		},
+	}
+
+	normalTo := toResource{kind: "Secret", name: secretNsName.Name, namespace: secretNsName.Namespace}
+	normalFrom := fromResource{group: gatewayv1.GroupName, kind: kinds.Gateway, namespace: gwNs}
+
+	tests := []struct {
+		to      toResource
+		from    fromResource
+		msg     string
+		allowed bool
+	}{
+		{
+			msg:     "wrong 'to' kind",
+			to:      toResource{kind: "WrongKind", name: secretNsName.Name, namespace: secretNsName.Namespace},
+			from:    normalFrom,
+			allowed: false,
+		},
+		{
+			msg: "wrong 'to' group",
+			to: toResource{
+				group:     "wrong.group",
+				kind:      "Secret",
+				name:      secretNsName.Name,
+				namespace: secretNsName.Namespace,
+			},
+			from:    normalFrom,
+			allowed: false,
+		},
+		{
+			msg:     "wrong 'to' name",
+			to:      toResource{kind: "Secret", name: "wrong-name", namespace: secretNsName.Namespace},
+			from:    normalFrom,
+			allowed: false,
+		},
+		{
+			msg:     "wrong 'from' kind",
+			to:      normalTo,
+			from:    fromResource{group: gatewayv1.GroupName, kind: "WrongKind", namespace: gwNs},
+			allowed: false,
+		},
+		{
+			msg:     "wrong 'from' group",
+			to:      normalTo,
+			from:    fromResource{group: "wrong.group", kind: kinds.Gateway, namespace: gwNs},
+			allowed: false,
+		},
+		{
+			msg:     "wrong 'from' namespace",
+			to:      normalTo,
+			from:    fromResource{group: gatewayv1.GroupName, kind: kinds.Gateway, namespace: "wrong-ns"},
+			allowed: false,
+		},
+		{
+			msg:     "allowed; matches specific reference grant",
+			to:      normalTo,
+			from:    normalFrom,
+			allowed: true,
+		},
+		{
+			msg:     "allowed; matches all-in-namespace reference grant",
+			to:      toResource{kind: "Secret", name: secretNsName.Name, namespace: "all-in-namespace"},
+			from:    normalFrom,
+			allowed: true,
+		},
+		{
+			msg:     "allowed; matches specific reference grant with explicit 'core' group name",
+			to:      toResource{kind: "Secret", name: secretNsName.Name, namespace: "explicit-core-group"},
+			from:    normalFrom,
+			allowed: true,
+		},
+	}
+
+	resolver := newReferenceGrantResolver(refGrants)
+
+	for _, test := range tests {
+		t.Run(test.msg, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(resolver.refAllowed(test.to, test.from)).To(Equal(test.allowed))
+		})
+	}
+}
+
+func TestToSecret(t *testing.T) {
+	t.Parallel()
+	ref := toSecret(types.NamespacedName{Namespace: "ns", Name: "secret"})
+
+	exp := toResource{
+		kind:      "Secret",
+		namespace: "ns",
+		name:      "secret",
+	}
+
+	g := NewWithT(t)
+	g.Expect(ref).To(Equal(exp))
+}
+
+func TestToConfigMap(t *testing.T) {
+	t.Parallel()
+	ref := toConfigMap(types.NamespacedName{Namespace: "ns", Name: "config-map"})
+
+	exp := toResource{
+		kind:      "ConfigMap",
+		namespace: "ns",
+		name:      "config-map",
+	}
+
+	g := NewWithT(t)
+	g.Expect(ref).To(Equal(exp))
+}
+
+func TestToService(t *testing.T) {
+	t.Parallel()
+	ref := toService(types.NamespacedName{Namespace: "ns", Name: "service"})
+
+	exp := toResource{
+		kind:      kinds.Service,
+		namespace: "ns",
+		name:      "service",
+	}
+
+	g := NewWithT(t)
+	g.Expect(ref).To(Equal(exp))
+}
+
+func TestToInferencePool(t *testing.T) {
+	t.Parallel()
+	ref := toInferencePool(types.NamespacedName{Namespace: "ns", Name: "inference-pool"})
+
+	exp := toResource{
+		group:     inferenceAPIGroup,
+		kind:      kinds.InferencePool,
+		namespace: "ns",
+		name:      "inference-pool",
+	}
+
+	g := NewWithT(t)
+	g.Expect(ref).To(Equal(exp))
+}
+
+func TestFromGateway(t *testing.T) {
+	t.Parallel()
+	ref := fromGateway("ns")
+
+	exp := fromResource{
+		group:     gatewayv1.GroupName,
+		kind:      kinds.Gateway,
+		namespace: "ns",
+	}
+
+	g := NewWithT(t)
+	g.Expect(ref).To(Equal(exp))
+}
+
+func TestFromHTTPRoute(t *testing.T) {
+	t.Parallel()
+	ref := fromHTTPRoute("ns")
+
+	exp := fromResource{
+		group:     gatewayv1.GroupName,
+		kind:      kinds.HTTPRoute,
+		namespace: "ns",
+	}
+
+	g := NewWithT(t)
+	g.Expect(ref).To(Equal(exp))
+}
+
+func TestFromGRPCRoute(t *testing.T) {
+	t.Parallel()
+
+	ref := fromGRPCRoute("ns")
+
+	exp := fromResource{
+		group:     gatewayv1.GroupName,
+		kind:      kinds.GRPCRoute,
+		namespace: "ns",
+	}
+
+	g := NewWithT(t)
+	g.Expect(ref).To(Equal(exp))
+}
+
+func TestFromTLSRoute(t *testing.T) {
+	t.Parallel()
+
+	ref := fromTLSRoute("ns")
+
+	exp := fromResource{
+		group:     gatewayv1.GroupName,
+		kind:      kinds.TLSRoute,
+		namespace: "ns",
+	}
+
+	g := NewWithT(t)
+	g.Expect(ref).To(Equal(exp))
+}
+
+func TestFromListenerSet(t *testing.T) {
+	t.Parallel()
+
+	ref := fromListenerSet("ns")
+
+	exp := fromResource{
+		group:     gatewayv1.GroupName,
+		kind:      kinds.ListenerSet,
+		namespace: "ns",
+	}
+
+	g := NewWithT(t)
+	g.Expect(ref).To(Equal(exp))
+}
+
+func TestRefAllowedFrom(t *testing.T) {
+	t.Parallel()
+
+	gwNs := "gw-ns"
+	hrNs := "hr-ns"
+	grNs := "gr-ns"
+	trNs := "tr-ns"
+	tcrNs := "tcr-ns"
+	urNs := "ur-ns"
+	lsNs := "ls-ns"
+
+	allowedHTTPRouteNs := "hr-allowed-ns"
+	allowedHTTPRouteNsName := types.NamespacedName{Namespace: allowedHTTPRouteNs, Name: "all-allowed-in-ns"}
+
+	allowedGRPCRouteNs := "gr-allowed-ns"
+	allowedGRPCRouteNsName := types.NamespacedName{Namespace: allowedGRPCRouteNs, Name: "all-allowed-in-ns"}
+
+	allowedTLSRouteNs := "tr-allowed-ns"
+	allowedTLSRouteNsName := types.NamespacedName{Namespace: allowedTLSRouteNs, Name: "all-allowed-in-ns"}
+
+	allowedTCPRouteNs := "tcr-allowed-ns"
+	allowedTCPRouteNsName := types.NamespacedName{Namespace: allowedTCPRouteNs, Name: "all-allowed-in-ns"}
+
+	allowedUDPRouteNs := "ur-allowed-ns"
+	allowedUDPRouteNsName := types.NamespacedName{Namespace: allowedUDPRouteNs, Name: "all-allowed-in-ns"}
+
+	allowedGatewayNs := "gw-allowed-ns"
+	allowedGatewayNsName := types.NamespacedName{Namespace: allowedGatewayNs, Name: "all-allowed-in-ns"}
+
+	allowedListenerSetNs := "ls-allowed-ns"
+	allowedListenerSetNsName := types.NamespacedName{Namespace: allowedListenerSetNs, Name: "all-allowed-in-ns"}
+
+	notAllowedNsName := types.NamespacedName{Namespace: "not-allowed-ns", Name: "not-allowed-in-ns"}
+
+	refGrants := map[types.NamespacedName]*gatewayv1.ReferenceGrant{
+		{Namespace: allowedGatewayNs, Name: "gw-2-secret"}: {
+			Spec: gatewayv1.ReferenceGrantSpec{
+				From: []gatewayv1.ReferenceGrantFrom{
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.Gateway,
+						Namespace: gatewayv1.Namespace(gwNs),
+					},
+				},
+				To: []gatewayv1.ReferenceGrantTo{
+					{
+						Kind: "Secret",
+					},
+				},
+			},
+		},
+		{Namespace: allowedListenerSetNs, Name: "ls-2-secret"}: {
+			Spec: gatewayv1.ReferenceGrantSpec{
+				From: []gatewayv1.ReferenceGrantFrom{
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.ListenerSet,
+						Namespace: gatewayv1.Namespace(lsNs),
+					},
+				},
+				To: []gatewayv1.ReferenceGrantTo{
+					{
+						Kind: "Secret",
+					},
+				},
+			},
+		},
+		{Namespace: allowedHTTPRouteNs, Name: "hr-2-svc"}: {
+			Spec: gatewayv1.ReferenceGrantSpec{
+				From: []gatewayv1.ReferenceGrantFrom{
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.HTTPRoute,
+						Namespace: gatewayv1.Namespace(hrNs),
+					},
+				},
+				To: []gatewayv1.ReferenceGrantTo{
+					{
+						Kind: kinds.Service,
+					},
+				},
+			},
+		},
+		{Namespace: allowedHTTPRouteNs, Name: "hr-2-ipool"}: {
+			Spec: gatewayv1.ReferenceGrantSpec{
+				From: []gatewayv1.ReferenceGrantFrom{
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.HTTPRoute,
+						Namespace: gatewayv1.Namespace(hrNs),
+					},
+				},
+				To: []gatewayv1.ReferenceGrantTo{
+					{
+						Group: inferenceAPIGroup,
+						Kind:  kinds.InferencePool,
+					},
+				},
+			},
+		},
+		{Namespace: allowedGRPCRouteNs, Name: "gr-2-svc"}: {
+			Spec: gatewayv1.ReferenceGrantSpec{
+				From: []gatewayv1.ReferenceGrantFrom{
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.GRPCRoute,
+						Namespace: gatewayv1.Namespace(grNs),
+					},
+				},
+				To: []gatewayv1.ReferenceGrantTo{
+					{
+						Kind: kinds.Service,
+					},
+				},
+			},
+		},
+		{Namespace: allowedTLSRouteNs, Name: "tr-2-svc"}: {
+			Spec: gatewayv1.ReferenceGrantSpec{
+				From: []gatewayv1.ReferenceGrantFrom{
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.TLSRoute,
+						Namespace: gatewayv1.Namespace(trNs),
+					},
+				},
+				To: []gatewayv1.ReferenceGrantTo{
+					{
+						Kind: kinds.Service,
+					},
+				},
+			},
+		},
+		{Namespace: allowedTCPRouteNs, Name: "tcr-2-svc"}: {
+			Spec: gatewayv1.ReferenceGrantSpec{
+				From: []gatewayv1.ReferenceGrantFrom{
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.TCPRoute,
+						Namespace: gatewayv1.Namespace(tcrNs),
+					},
+				},
+				To: []gatewayv1.ReferenceGrantTo{
+					{
+						Kind: kinds.Service,
+					},
+				},
+			},
+		},
+		{Namespace: allowedUDPRouteNs, Name: "ur-2-svc"}: {
+			Spec: gatewayv1.ReferenceGrantSpec{
+				From: []gatewayv1.ReferenceGrantFrom{
+					{
+						Group:     gatewayv1.GroupName,
+						Kind:      kinds.UDPRoute,
+						Namespace: gatewayv1.Namespace(urNs),
+					},
+				},
+				To: []gatewayv1.ReferenceGrantTo{
+					{
+						Kind: kinds.Service,
+					},
+				},
+			},
+		},
+	}
+
+	tests := []struct {
+		name           string
+		refAllowedFrom fromResource
+		toResource     toResource
+		expAllowed     bool
+	}{
+		{
+			name:           "ref allowed from gateway to secret",
+			refAllowedFrom: fromGateway(gwNs),
+			toResource:     toSecret(allowedGatewayNsName),
+			expAllowed:     true,
+		},
+		{
+			name:           "ref not allowed from gateway to secret",
+			refAllowedFrom: fromGateway(gwNs),
+			toResource:     toSecret(notAllowedNsName),
+			expAllowed:     false,
+		},
+		{
+			name:           "ref allowed from listener set to secret",
+			refAllowedFrom: fromListenerSet(lsNs),
+			toResource:     toSecret(allowedListenerSetNsName),
+			expAllowed:     true,
+		},
+		{
+			name:           "ref not allowed from listener set to secret",
+			refAllowedFrom: fromListenerSet(lsNs),
+			toResource:     toSecret(notAllowedNsName),
+			expAllowed:     false,
+		},
+		{
+			name:           "ref allowed from httproute to service",
+			refAllowedFrom: fromHTTPRoute(hrNs),
+			toResource:     toService(allowedHTTPRouteNsName),
+			expAllowed:     true,
+		},
+		{
+			name:           "ref not allowed from httproute to service",
+			refAllowedFrom: fromHTTPRoute(hrNs),
+			toResource:     toService(notAllowedNsName),
+			expAllowed:     false,
+		},
+		{
+			name:           "ref allowed from httproute to inferencepool",
+			refAllowedFrom: fromHTTPRoute(hrNs),
+			toResource:     toInferencePool(allowedHTTPRouteNsName),
+			expAllowed:     true,
+		},
+		{
+			name:           "ref not allowed from httproute to inferencepool",
+			refAllowedFrom: fromHTTPRoute(hrNs),
+			toResource:     toInferencePool(notAllowedNsName),
+			expAllowed:     false,
+		},
+		{
+			name:           "ref allowed from grpcroute to service",
+			refAllowedFrom: fromGRPCRoute(grNs),
+			toResource:     toService(allowedGRPCRouteNsName),
+			expAllowed:     true,
+		},
+		{
+			name:           "ref not allowed from grpcroute to service",
+			refAllowedFrom: fromGRPCRoute(grNs),
+			toResource:     toService(notAllowedNsName),
+			expAllowed:     false,
+		},
+		{
+			name:           "ref allowed from tlsroute to service",
+			refAllowedFrom: fromTLSRoute(trNs),
+			toResource:     toService(allowedTLSRouteNsName),
+			expAllowed:     true,
+		},
+		{
+			name:           "ref not allowed from tlsroute to service",
+			refAllowedFrom: fromTLSRoute(trNs),
+			toResource:     toService(notAllowedNsName),
+			expAllowed:     false,
+		},
+		{
+			name:           "ref allowed from tcproute to service",
+			refAllowedFrom: fromTCPRoute(tcrNs),
+			toResource:     toService(allowedTCPRouteNsName),
+			expAllowed:     true,
+		},
+		{
+			name:           "ref not allowed from tcproute to service",
+			refAllowedFrom: fromTCPRoute(tcrNs),
+			toResource:     toService(notAllowedNsName),
+			expAllowed:     false,
+		},
+		{
+			name:           "ref allowed from udproute to service",
+			refAllowedFrom: fromUDPRoute(urNs),
+			toResource:     toService(allowedUDPRouteNsName),
+			expAllowed:     true,
+		},
+		{
+			name:           "ref not allowed from udproute to service",
+			refAllowedFrom: fromUDPRoute(urNs),
+			toResource:     toService(notAllowedNsName),
+			expAllowed:     false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			resolver := newReferenceGrantResolver(refGrants)
+			refAllowed := resolver.refAllowedFrom(test.refAllowedFrom)
+
+			g := NewWithT(t)
+			g.Expect(refAllowed(test.toResource)).To(Equal(test.expAllowed))
+		})
+	}
+}

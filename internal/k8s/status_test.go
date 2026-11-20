@@ -1,0 +1,1249 @@
+package k8s
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/google/go-cmp/cmp"
+	nic_glog "github.com/wx-one/wxingress/internal/logger/glog"
+	"github.com/wx-one/wxingress/internal/logger/levels"
+	conf_v1 "github.com/wx-one/wxingress/pkg/apis/configuration/v1"
+	fake_v1 "github.com/wx-one/wxingress/pkg/client/clientset/versioned/fake"
+	v1 "k8s.io/api/core/v1"
+	networking "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
+)
+
+func TestUpdateTransportServerStatus(t *testing.T) {
+	t.Parallel()
+	ts := &conf_v1.TransportServer{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:      "ts-1",
+			Namespace: "default",
+			UID:       "ts-uid-1",
+		},
+		Status: conf_v1.TransportServerStatus{
+			State:   "before status",
+			Reason:  "before reason",
+			Message: "before message",
+		},
+	}
+
+	fakeClient := fake_v1.NewClientset(
+		&conf_v1.TransportServerList{
+			Items: []conf_v1.TransportServer{
+				*ts,
+			},
+		},
+	)
+
+	tsLister := cache.NewStore(cache.DeletionHandlingMetaNamespaceKeyFunc)
+
+	err := tsLister.Add(ts)
+	if err != nil {
+		t.Errorf("Error adding TransportServer to the transportserver lister: %v", err)
+	}
+	nsi := make(map[string]*namespacedInformer)
+	nsi["default"] = &namespacedInformer{transportServerLister: tsLister}
+	su := statusUpdater{
+		namespacedInformers: registryFrom(nsi),
+		confClient:          fakeClient,
+		keyFunc:             cache.DeletionHandlingMetaNamespaceKeyFunc,
+		logger:              slog.New(nic_glog.New(io.Discard, &nic_glog.Options{Level: levels.LevelInfo})),
+	}
+
+	err = su.UpdateTransportServerStatus(ts, "after status", "after reason", "after message")
+	if err != nil {
+		t.Errorf("error updating transportserver status: %v", err)
+	}
+	updatedTs, _ := fakeClient.K8sV1().TransportServers(ts.Namespace).Get(context.TODO(), ts.Name, meta_v1.GetOptions{})
+
+	expectedStatus := conf_v1.TransportServerStatus{
+		State:   "after status",
+		Reason:  "after reason",
+		Message: "after message",
+	}
+
+	if diff := cmp.Diff(expectedStatus, updatedTs.Status); diff != "" {
+		t.Errorf("Unexpected status (-want +got):\n%s", diff)
+	}
+}
+
+func TestUpdateTransportServerStatusIgnoreNoChange(t *testing.T) {
+	t.Parallel()
+	ts := &conf_v1.TransportServer{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:      "ts-1",
+			Namespace: "default",
+		},
+		Status: conf_v1.TransportServerStatus{
+			State:   "same status",
+			Reason:  "same reason",
+			Message: "same message",
+		},
+	}
+
+	fakeClient := fake_v1.NewClientset(
+		&conf_v1.TransportServerList{
+			Items: []conf_v1.TransportServer{
+				*ts,
+			},
+		},
+	)
+
+	tsLister, _ := cache.NewInformerWithOptions(
+		cache.InformerOptions{
+			ListerWatcher: cache.NewListWatchFromClient(
+				fakeClient.K8sV1().RESTClient(),
+				"transportservers",
+				"nginx-ingress",
+				fields.Everything(),
+			),
+			ObjectType:   &conf_v1.TransportServer{},
+			ResyncPeriod: 2 * time.Second,
+			Handler:      nil,
+		},
+	)
+
+	err := tsLister.Add(ts)
+	if err != nil {
+		t.Errorf("Error adding TransportServer to the transportserver lister: %v", err)
+	}
+	nsi := make(map[string]*namespacedInformer)
+	nsi["default"] = &namespacedInformer{transportServerLister: tsLister}
+	l := slog.New(nic_glog.New(io.Discard, &nic_glog.Options{Level: levels.LevelInfo}))
+	su := statusUpdater{
+		namespacedInformers: registryFrom(nsi),
+		confClient:          fakeClient,
+		keyFunc:             cache.DeletionHandlingMetaNamespaceKeyFunc,
+		logger:              l,
+	}
+
+	err = su.UpdateTransportServerStatus(ts, "same status", "same reason", "same message")
+	if err != nil {
+		t.Errorf("error updating transportserver status: %v", err)
+	}
+	updatedTs, _ := fakeClient.K8sV1().TransportServers(ts.Namespace).Get(context.TODO(), ts.Name, meta_v1.GetOptions{})
+
+	if updatedTs.Status.State != "same status" {
+		t.Errorf("expected: %v actual: %v", "same status", updatedTs.Status.State)
+	}
+	if updatedTs.Status.Message != "same message" {
+		t.Errorf("expected: %v actual: %v", "same message", updatedTs.Status.Message)
+	}
+	if updatedTs.Status.Reason != "same reason" {
+		t.Errorf("expected: %v actual: %v", "same reason", updatedTs.Status.Reason)
+	}
+}
+
+func TestUpdateTransportServerStatusMissingTransportServer(t *testing.T) {
+	t.Parallel()
+	ts := &conf_v1.TransportServer{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:      "ts-1",
+			Namespace: "default",
+		},
+		Status: conf_v1.TransportServerStatus{
+			State:   "before status",
+			Reason:  "before reason",
+			Message: "before message",
+		},
+	}
+
+	fakeClient := fake_v1.NewClientset(
+		&conf_v1.TransportServerList{
+			Items: []conf_v1.TransportServer{},
+		},
+	)
+
+	tsLister, _ := cache.NewInformerWithOptions(
+		cache.InformerOptions{
+			ListerWatcher: cache.NewListWatchFromClient(
+				fakeClient.K8sV1().RESTClient(),
+				"transportservers",
+				"nginx-ingress",
+				fields.Everything(),
+			),
+			ObjectType:   &conf_v1.TransportServer{},
+			ResyncPeriod: 2 * time.Second,
+			Handler:      nil,
+		},
+	)
+
+	nsi := make(map[string]*namespacedInformer)
+	nsi[""] = &namespacedInformer{transportServerLister: tsLister}
+
+	l := slog.New(nic_glog.New(io.Discard, &nic_glog.Options{Level: levels.LevelInfo}))
+	su := statusUpdater{
+		namespacedInformers: registryFrom(nsi),
+		confClient:          fakeClient,
+		keyFunc:             cache.DeletionHandlingMetaNamespaceKeyFunc,
+		externalEndpoints: []conf_v1.ExternalEndpoint{
+			{
+				IP:    "123.123.123.123",
+				Ports: "1234",
+			},
+		},
+		logger: l,
+	}
+
+	err := su.UpdateTransportServerStatus(ts, "after status", "after reason", "after message")
+	if err != nil {
+		t.Fatalf("unexpected error: %v, result should be empty as no matching TransportServer is present", err)
+	}
+
+	_, err = fakeClient.K8sV1().TransportServers(ts.Namespace).Get(context.TODO(), ts.Name, meta_v1.GetOptions{})
+	if err == nil {
+		t.Fatalf("expected TransportServer Store would be empty as provided TransportServer was not found.")
+	}
+}
+
+// The following tests guard against a nil pointer dereference panic (see
+// getNamespacedInformer) when a status update is requested for a resource whose
+// namespace is no longer watched (e.g. its watch-namespace-label was removed).
+
+func newTestStatusUpdater() statusUpdater {
+	return statusUpdater{
+		namespacedInformers: registryFrom(map[string]*namespacedInformer{}),
+		keyFunc:             cache.DeletionHandlingMetaNamespaceKeyFunc,
+		logger:              slog.New(nic_glog.New(io.Discard, &nic_glog.Options{Level: levels.LevelInfo})),
+	}
+}
+
+func TestUpdateIngressWithStatusNamespaceNotWatched(t *testing.T) {
+	t.Parallel()
+	su := newTestStatusUpdater()
+
+	ing := networking.Ingress{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "ing-1", Namespace: "not-watched"},
+	}
+	if err := su.updateIngressWithStatus(ing, nil); err != nil {
+		t.Errorf("updateIngressWithStatus() returned unexpected error: %v", err)
+	}
+}
+
+func TestUpdateTransportServerStatusNamespaceNotWatched(t *testing.T) {
+	t.Parallel()
+	su := newTestStatusUpdater()
+
+	ts := &conf_v1.TransportServer{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "ts-1", Namespace: "not-watched"},
+	}
+	if err := su.UpdateTransportServerStatus(ts, "state", "reason", "message"); err != nil {
+		t.Errorf("UpdateTransportServerStatus() returned unexpected error: %v", err)
+	}
+}
+
+func TestUpdateVirtualServerStatusNamespaceNotWatched(t *testing.T) {
+	t.Parallel()
+	su := newTestStatusUpdater()
+
+	vs := &conf_v1.VirtualServer{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "vs-1", Namespace: "not-watched"},
+	}
+	if err := su.UpdateVirtualServerStatus(vs, "state", "reason", "message"); err != nil {
+		t.Errorf("UpdateVirtualServerStatus() returned unexpected error: %v", err)
+	}
+}
+
+func TestUpdateVirtualServerRouteStatusWithReferencedByNamespaceNotWatched(t *testing.T) {
+	t.Parallel()
+	su := newTestStatusUpdater()
+
+	vsr := &conf_v1.VirtualServerRoute{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "vsr-1", Namespace: "not-watched"},
+	}
+	if err := su.UpdateVirtualServerRouteStatusWithReferencedBy(vsr, "state", "reason", "message", nil); err != nil {
+		t.Errorf("UpdateVirtualServerRouteStatusWithReferencedBy() returned unexpected error: %v", err)
+	}
+}
+
+func TestUpdateVirtualServerRouteReferencedByNamespaceNotWatched(t *testing.T) {
+	t.Parallel()
+	su := newTestStatusUpdater()
+
+	vsr := &conf_v1.VirtualServerRoute{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "vsr-1", Namespace: "not-watched"},
+	}
+	if err := su.UpdateVirtualServerRouteReferencedBy(vsr, nil); err != nil {
+		t.Errorf("UpdateVirtualServerRouteReferencedBy() returned unexpected error: %v", err)
+	}
+}
+
+// TestUpdateVirtualServerRouteReferencedByConflictRetainsNewerStatus: a conflict retry must not overwrite a newer state/reason with the stale cached copy.
+func TestUpdateVirtualServerRouteReferencedByConflictRetainsNewerStatus(t *testing.T) {
+	t.Parallel()
+
+	newer := &conf_v1.VirtualServerRoute{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "vsr-1", Namespace: "default", ResourceVersion: "2"},
+		Status: conf_v1.VirtualServerRouteStatus{
+			State: conf_v1.StateWarning, Reason: "AddedOrUpdatedWithWarning", Message: "warning message",
+		},
+	}
+	fakeClient := fake_v1.NewSimpleClientset(newer)
+
+	conflicted := false
+	fakeClient.PrependReactor("update", "virtualserverroutes", func(_ k8stesting.Action) (bool, runtime.Object, error) {
+		if conflicted {
+			return false, nil, nil
+		}
+		conflicted = true
+		return true, nil, apierrors.NewConflict(schema.GroupResource{Group: "k8s.nginx.org", Resource: "virtualserverroutes"}, "vsr-1", errors.New("stale resourceVersion"))
+	})
+
+	stale := &conf_v1.VirtualServerRoute{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "vsr-1", Namespace: "default", ResourceVersion: "1"},
+		Status:     conf_v1.VirtualServerRouteStatus{State: conf_v1.StateValid, Reason: "AddedOrUpdated"},
+	}
+	store := cache.NewStore(cache.MetaNamespaceKeyFunc)
+	_ = store.Add(stale)
+
+	su := newTestStatusUpdater()
+	su.confClient = fakeClient
+	su.namespacedInformers = registryFrom(map[string]*namespacedInformer{
+		"default": {virtualServerRouteLister: store},
+	})
+
+	vs := &conf_v1.VirtualServer{ObjectMeta: meta_v1.ObjectMeta{Name: "vs-a", Namespace: "default"}}
+	if err := su.UpdateVirtualServerRouteReferencedBy(stale, []*conf_v1.VirtualServer{vs}); err != nil {
+		t.Fatalf("UpdateVirtualServerRouteReferencedBy() returned unexpected error: %v", err)
+	}
+
+	got, err := fakeClient.K8sV1().VirtualServerRoutes("default").Get(context.TODO(), "vsr-1", meta_v1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get VirtualServerRoute: %v", err)
+	}
+	if got.Status.State != conf_v1.StateWarning || got.Status.Reason != "AddedOrUpdatedWithWarning" {
+		t.Errorf("conflict retry overwrote state/reason: got state=%q reason=%q, want state=%q reason=%q",
+			got.Status.State, got.Status.Reason, conf_v1.StateWarning, "AddedOrUpdatedWithWarning")
+	}
+	if got.Status.ReferencedBy != "default/vs-a" {
+		t.Errorf("ReferencedBy = %q, want %q", got.Status.ReferencedBy, "default/vs-a")
+	}
+}
+
+func TestUpdateVirtualServerRouteStatusNamespaceNotWatched(t *testing.T) {
+	t.Parallel()
+	su := newTestStatusUpdater()
+
+	vsr := &conf_v1.VirtualServerRoute{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "vsr-1", Namespace: "not-watched"},
+	}
+	if err := su.UpdateVirtualServerRouteStatus(vsr, "state", "reason", "message"); err != nil {
+		t.Errorf("UpdateVirtualServerRouteStatus() returned unexpected error: %v", err)
+	}
+}
+
+func TestUpdateVirtualServerExternalEndpointsNamespaceNotWatched(t *testing.T) {
+	t.Parallel()
+	su := newTestStatusUpdater()
+
+	vs := &conf_v1.VirtualServer{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "vs-1", Namespace: "not-watched"},
+	}
+	if err := su.updateVirtualServerExternalEndpoints(vs); err != nil {
+		t.Errorf("updateVirtualServerExternalEndpoints() returned unexpected error: %v", err)
+	}
+}
+
+func TestUpdateVirtualServerRouteExternalEndpointsNamespaceNotWatched(t *testing.T) {
+	t.Parallel()
+	su := newTestStatusUpdater()
+
+	vsr := &conf_v1.VirtualServerRoute{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "vsr-1", Namespace: "not-watched"},
+	}
+	if err := su.updateVirtualServerRouteExternalEndpoints(vsr); err != nil {
+		t.Errorf("updateVirtualServerRouteExternalEndpoints() returned unexpected error: %v", err)
+	}
+}
+
+func TestUpdatePolicyStatusNamespaceNotWatched(t *testing.T) {
+	t.Parallel()
+	su := newTestStatusUpdater()
+
+	pol := &conf_v1.Policy{
+		ObjectMeta: meta_v1.ObjectMeta{Name: "pol-1", Namespace: "not-watched"},
+	}
+	if err := su.UpdatePolicyStatus(pol, "state", "reason", "message"); err != nil {
+		t.Errorf("UpdatePolicyStatus() returned unexpected error: %v", err)
+	}
+}
+
+func TestStatusUpdateWithExternalStatusAndExternalService(t *testing.T) {
+	t.Parallel()
+	ing := networking.Ingress{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:      "ing-1",
+			Namespace: "namespace",
+		},
+		Status: networking.IngressStatus{
+			LoadBalancer: networking.IngressLoadBalancerStatus{
+				Ingress: []networking.IngressLoadBalancerIngress{
+					{
+						IP: "1.2.3.4",
+					},
+				},
+			},
+		},
+	}
+	fakeClient := fake.NewClientset(
+		&networking.IngressList{Items: []networking.Ingress{
+			ing,
+		}},
+	)
+	ingLister := storeToIngressLister{}
+	ingLister.Store, _ = cache.NewInformerWithOptions(
+		cache.InformerOptions{
+			ListerWatcher: cache.NewListWatchFromClient(
+				fakeClient.NetworkingV1().RESTClient(),
+				"ingresses",
+				"nginx-ingress",
+				fields.Everything(),
+			),
+			ObjectType:   &networking.Ingress{},
+			ResyncPeriod: 2 * time.Second,
+			Handler:      nil,
+		},
+	)
+
+	err := ingLister.Store.Add(&ing)
+	if err != nil {
+		t.Errorf("Error adding Ingress to the ingress lister: %v", err)
+	}
+
+	nsi := make(map[string]*namespacedInformer)
+	nsi[""] = &namespacedInformer{ingressLister: ingLister}
+
+	l := slog.New(nic_glog.New(io.Discard, &nic_glog.Options{Level: levels.LevelInfo}))
+	su := statusUpdater{
+		client:                fakeClient,
+		namespace:             "namespace",
+		externalServiceName:   "service-name",
+		externalStatusAddress: "123.123.123.123",
+		namespacedInformers:   registryFrom(nsi),
+		keyFunc:               cache.DeletionHandlingMetaNamespaceKeyFunc,
+		logger:                l,
+	}
+	err = su.ClearIngressStatus(ing)
+	if err != nil {
+		t.Errorf("error clearing ing status: %v", err)
+	}
+	ings, _ := fakeClient.NetworkingV1().Ingresses("namespace").List(context.TODO(), meta_v1.ListOptions{})
+	ingf := ings.Items[0]
+	if !checkStatus("", ingf) {
+		t.Errorf("expected: %v actual: %v", "", ingf.Status.LoadBalancer.Ingress[0])
+	}
+
+	su.SaveStatusFromExternalStatus("1.1.1.1")
+	err = su.UpdateIngressStatus(ing)
+	if err != nil {
+		t.Errorf("error updating ing status: %v", err)
+	}
+	ring, _ := fakeClient.NetworkingV1().Ingresses(ing.Namespace).Get(context.TODO(), ing.Name, meta_v1.GetOptions{})
+	if !checkStatus("1.1.1.1", *ring) {
+		t.Errorf("expected: %v actual: %v", "", ring.Status.LoadBalancer.Ingress)
+	}
+
+	svc := v1.Service{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Namespace: "namespace",
+			Name:      "service-name",
+		},
+		Status: v1.ServiceStatus{
+			LoadBalancer: v1.LoadBalancerStatus{
+				Ingress: []v1.LoadBalancerIngress{{
+					IP: "2.2.2.2",
+				}},
+			},
+		},
+	}
+	su.SaveStatusFromExternalService(&svc)
+	err = su.UpdateIngressStatus(ing)
+	if err != nil {
+		t.Errorf("error updating ing status: %v", err)
+	}
+	ring, _ = fakeClient.NetworkingV1().Ingresses(ing.Namespace).Get(context.TODO(), ing.Name, meta_v1.GetOptions{})
+	if !checkStatus("1.1.1.1", *ring) {
+		t.Errorf("expected: %v actual: %v", "1.1.1.1", ring.Status.LoadBalancer.Ingress)
+	}
+
+	su.SaveStatusFromExternalStatus("")
+	err = su.UpdateIngressStatus(ing)
+	if err != nil {
+		t.Errorf("error updating ing status: %v", err)
+	}
+	ring, _ = fakeClient.NetworkingV1().Ingresses(ing.Namespace).Get(context.TODO(), ing.Name, meta_v1.GetOptions{})
+	if !checkStatus("2.2.2.2", *ring) {
+		t.Errorf("expected: %v actual: %v", "2.2.2.2", ring.Status.LoadBalancer.Ingress)
+	}
+
+	su.ClearStatusFromExternalService()
+	err = su.UpdateIngressStatus(ing)
+	if err != nil {
+		t.Errorf("error updating ing status: %v", err)
+	}
+	ring, _ = fakeClient.NetworkingV1().Ingresses(ing.Namespace).Get(context.TODO(), ing.Name, meta_v1.GetOptions{})
+	if !checkStatus("", *ring) {
+		t.Errorf("expected: %v actual: %v", "", ring.Status.LoadBalancer.Ingress)
+	}
+}
+
+func TestStatusUpdateWithExternalStatusAndIngressLink(t *testing.T) {
+	t.Parallel()
+	ing := networking.Ingress{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:      "ing-1",
+			Namespace: "namespace",
+		},
+		Status: networking.IngressStatus{
+			LoadBalancer: networking.IngressLoadBalancerStatus{
+				Ingress: []networking.IngressLoadBalancerIngress{
+					{
+						IP: "1.2.3.4",
+					},
+				},
+			},
+		},
+	}
+	fakeClient := fake.NewClientset(
+		&networking.IngressList{Items: []networking.Ingress{
+			ing,
+		}},
+	)
+	ingLister := storeToIngressLister{}
+	ingLister.Store, _ = cache.NewInformerWithOptions(
+		cache.InformerOptions{
+			ListerWatcher: cache.NewListWatchFromClient(
+				fakeClient.NetworkingV1().RESTClient(),
+				"ingresses",
+				"nginx-ingress",
+				fields.Everything(),
+			),
+			ObjectType:   &networking.Ingress{},
+			ResyncPeriod: 2 * time.Second,
+			Handler:      nil,
+		},
+	)
+
+	err := ingLister.Store.Add(&ing)
+	if err != nil {
+		t.Errorf("Error adding Ingress to the ingress lister: %v", err)
+	}
+
+	nsi := make(map[string]*namespacedInformer)
+	nsi[""] = &namespacedInformer{ingressLister: ingLister}
+
+	l := slog.New(nic_glog.New(io.Discard, &nic_glog.Options{Level: levels.LevelInfo}))
+	su := statusUpdater{
+		client:                fakeClient,
+		namespace:             "namespace",
+		externalStatusAddress: "",
+		namespacedInformers:   registryFrom(nsi),
+		keyFunc:               cache.DeletionHandlingMetaNamespaceKeyFunc,
+		logger:                l,
+	}
+
+	su.SaveStatusFromIngressLink("3.3.3.3")
+	err = su.UpdateIngressStatus(ing)
+	if err != nil {
+		t.Errorf("error updating ing status: %v", err)
+	}
+	ring, _ := fakeClient.NetworkingV1().Ingresses(ing.Namespace).Get(context.TODO(), ing.Name, meta_v1.GetOptions{})
+	if !checkStatus("3.3.3.3", *ring) {
+		t.Errorf("expected: %v actual: %v", "3.3.3.3", ring.Status.LoadBalancer.Ingress)
+	}
+
+	su.SaveStatusFromExternalStatus("1.1.1.1")
+	err = su.UpdateIngressStatus(ing)
+	if err != nil {
+		t.Errorf("error updating ing status: %v", err)
+	}
+	ring, _ = fakeClient.NetworkingV1().Ingresses(ing.Namespace).Get(context.TODO(), ing.Name, meta_v1.GetOptions{})
+	if !checkStatus("1.1.1.1", *ring) {
+		t.Errorf("expected: %v actual: %v", "1.1.1.1", ring.Status.LoadBalancer.Ingress)
+	}
+
+	su.ClearStatusFromIngressLink()
+	err = su.UpdateIngressStatus(ing)
+	if err != nil {
+		t.Errorf("error updating ing status: %v", err)
+	}
+	ring, _ = fakeClient.NetworkingV1().Ingresses(ing.Namespace).Get(context.TODO(), ing.Name, meta_v1.GetOptions{})
+	if !checkStatus("1.1.1.1", *ring) {
+		t.Errorf("expected: %v actual: %v", "1.1.1.1", ring.Status.LoadBalancer.Ingress)
+	}
+
+	su.SaveStatusFromIngressLink("4.4.4.4")
+	err = su.UpdateIngressStatus(ing)
+	if err != nil {
+		t.Errorf("error updating ing status: %v", err)
+	}
+	ring, _ = fakeClient.NetworkingV1().Ingresses(ing.Namespace).Get(context.TODO(), ing.Name, meta_v1.GetOptions{})
+	if !checkStatus("1.1.1.1", *ring) {
+		t.Errorf("expected: %v actual: %v", "1.1.1.1", ring.Status.LoadBalancer.Ingress)
+	}
+
+	su.SaveStatusFromExternalStatus("")
+	err = su.UpdateIngressStatus(ing)
+	if err != nil {
+		t.Errorf("error updating ing status: %v", err)
+	}
+	ring, _ = fakeClient.NetworkingV1().Ingresses(ing.Namespace).Get(context.TODO(), ing.Name, meta_v1.GetOptions{})
+	if !checkStatus("4.4.4.4", *ring) {
+		t.Errorf("expected: %v actual: %v", "4.4.4.4", ring.Status.LoadBalancer.Ingress)
+	}
+
+	su.ClearStatusFromIngressLink()
+	err = su.UpdateIngressStatus(ing)
+	if err != nil {
+		t.Errorf("error updating ing status: %v", err)
+	}
+	ring, _ = fakeClient.NetworkingV1().Ingresses(ing.Namespace).Get(context.TODO(), ing.Name, meta_v1.GetOptions{})
+	if !checkStatus("", *ring) {
+		t.Errorf("expected: %v actual: %v", "", ring.Status.LoadBalancer.Ingress)
+	}
+}
+
+func checkStatus(expected string, actual networking.Ingress) bool {
+	if len(actual.Status.LoadBalancer.Ingress) == 0 {
+		return expected == ""
+	}
+	return expected == actual.Status.LoadBalancer.Ingress[0].IP
+}
+
+func TestGenerateExternalEndpointsFromStatus(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		su                statusUpdater
+		expectedEndpoints []conf_v1.ExternalEndpoint
+	}{
+		{
+			su: statusUpdater{
+				status: []networking.IngressLoadBalancerIngress{
+					{
+						IP: "8.8.8.8",
+					},
+				},
+			},
+			expectedEndpoints: []conf_v1.ExternalEndpoint{
+				{IP: "8.8.8.8", Ports: ""},
+			},
+		},
+		{
+			su: statusUpdater{
+				status: []networking.IngressLoadBalancerIngress{
+					{
+						Hostname: "my-loadbalancer.example.com",
+					},
+				},
+			},
+			expectedEndpoints: []conf_v1.ExternalEndpoint{
+				{Hostname: "my-loadbalancer.example.com", Ports: ""},
+			},
+		},
+	}
+	for _, test := range tests {
+		endpoints := test.su.generateExternalEndpointsFromStatus(test.su.status)
+
+		if !reflect.DeepEqual(endpoints, test.expectedEndpoints) {
+			t.Errorf("generateExternalEndpointsFromStatus(%v) returned %v but expected %v", test.su.status, endpoints, test.expectedEndpoints)
+		}
+
+	}
+}
+
+func TestHasVsStatusChanged(t *testing.T) {
+	t.Parallel()
+	state := "Valid"
+	reason := "AddedOrUpdated"
+	msg := "Configuration was added or updated"
+
+	// Create a statusUpdater with some external endpoints
+	su := &statusUpdater{
+		externalEndpoints: []conf_v1.ExternalEndpoint{
+			{
+				IP:    "1.2.3.4",
+				Ports: "80,443",
+			},
+		},
+	}
+
+	tests := []struct {
+		expected bool
+		vs       conf_v1.VirtualServer
+		desc     string
+	}{
+		{
+			expected: false,
+			desc:     "no change in status or external endpoints",
+			vs: conf_v1.VirtualServer{
+				Status: conf_v1.VirtualServerStatus{
+					State:   state,
+					Reason:  reason,
+					Message: msg,
+					ExternalEndpoints: []conf_v1.ExternalEndpoint{
+						{
+							IP:    "1.2.3.4",
+							Ports: "80,443",
+						},
+					},
+				},
+			},
+		},
+		{
+			expected: true,
+			desc:     "different state",
+			vs: conf_v1.VirtualServer{
+				Status: conf_v1.VirtualServerStatus{
+					State:   "Invalid",
+					Reason:  reason,
+					Message: msg,
+					ExternalEndpoints: []conf_v1.ExternalEndpoint{
+						{
+							IP:    "1.2.3.4",
+							Ports: "80,443",
+						},
+					},
+				},
+			},
+		},
+		{
+			expected: true,
+			desc:     "different reason",
+			vs: conf_v1.VirtualServer{
+				Status: conf_v1.VirtualServerStatus{
+					State:   state,
+					Reason:  "DifferentReason",
+					Message: msg,
+					ExternalEndpoints: []conf_v1.ExternalEndpoint{
+						{
+							IP:    "1.2.3.4",
+							Ports: "80,443",
+						},
+					},
+				},
+			},
+		},
+		{
+			expected: true,
+			desc:     "different message",
+			vs: conf_v1.VirtualServer{
+				Status: conf_v1.VirtualServerStatus{
+					State:   state,
+					Reason:  reason,
+					Message: "DifferentMessage",
+					ExternalEndpoints: []conf_v1.ExternalEndpoint{
+						{
+							IP:    "1.2.3.4",
+							Ports: "80,443",
+						},
+					},
+				},
+			},
+		},
+		{
+			expected: true,
+			desc:     "different external endpoints - different IP",
+			vs: conf_v1.VirtualServer{
+				Status: conf_v1.VirtualServerStatus{
+					State:   state,
+					Reason:  reason,
+					Message: msg,
+					ExternalEndpoints: []conf_v1.ExternalEndpoint{
+						{
+							IP:    "5.6.7.8",
+							Ports: "80,443",
+						},
+					},
+				},
+			},
+		},
+		{
+			expected: true,
+			desc:     "different external endpoints - different ports",
+			vs: conf_v1.VirtualServer{
+				Status: conf_v1.VirtualServerStatus{
+					State:   state,
+					Reason:  reason,
+					Message: msg,
+					ExternalEndpoints: []conf_v1.ExternalEndpoint{
+						{
+							IP:    "1.2.3.4",
+							Ports: "8080,8443",
+						},
+					},
+				},
+			},
+		},
+		{
+			expected: true,
+			desc:     "missing external endpoints in VS",
+			vs: conf_v1.VirtualServer{
+				Status: conf_v1.VirtualServerStatus{
+					State:   state,
+					Reason:  reason,
+					Message: msg,
+					// No ExternalEndpoints
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test // address gosec G601
+		t.Run(test.desc, func(t *testing.T) {
+			changed := su.hasVsStatusChanged(&test.vs, state, reason, msg)
+
+			if changed != test.expected {
+				t.Errorf("hasVsStatusChanged(%v, %v, %v, %v) returned %v but expected %v for test: %s", test.vs, state, reason, msg, changed, test.expected, test.desc)
+			}
+		})
+	}
+}
+
+func TestHasVsrStatusChanged(t *testing.T) {
+	t.Parallel()
+	referencedBy := "namespace/name"
+	state := "Valid"
+	reason := "AddedOrUpdated"
+	msg := "Configuration was added or updated"
+
+	// Create a statusUpdater with some external endpoints
+	su := &statusUpdater{
+		externalEndpoints: []conf_v1.ExternalEndpoint{
+			{
+				IP:    "1.2.3.4",
+				Ports: "80,443",
+			},
+		},
+	}
+
+	tests := []struct {
+		expected bool
+		vsr      conf_v1.VirtualServerRoute
+		desc     string
+	}{
+		{
+			expected: false,
+			desc:     "no change in status or external endpoints",
+			vsr: conf_v1.VirtualServerRoute{
+				Status: conf_v1.VirtualServerRouteStatus{
+					State:        state,
+					Reason:       reason,
+					Message:      msg,
+					ReferencedBy: referencedBy,
+					ExternalEndpoints: []conf_v1.ExternalEndpoint{
+						{
+							IP:    "1.2.3.4",
+							Ports: "80,443",
+						},
+					},
+				},
+			},
+		},
+		{
+			expected: true,
+			desc:     "different state",
+			vsr: conf_v1.VirtualServerRoute{
+				Status: conf_v1.VirtualServerRouteStatus{
+					State:        "Invalid",
+					Reason:       reason,
+					Message:      msg,
+					ReferencedBy: referencedBy,
+					ExternalEndpoints: []conf_v1.ExternalEndpoint{
+						{
+							IP:    "1.2.3.4",
+							Ports: "80,443",
+						},
+					},
+				},
+			},
+		},
+		{
+			expected: true,
+			desc:     "different reason",
+			vsr: conf_v1.VirtualServerRoute{
+				Status: conf_v1.VirtualServerRouteStatus{
+					State:        state,
+					Reason:       "DifferentReason",
+					Message:      msg,
+					ReferencedBy: referencedBy,
+					ExternalEndpoints: []conf_v1.ExternalEndpoint{
+						{
+							IP:    "1.2.3.4",
+							Ports: "80,443",
+						},
+					},
+				},
+			},
+		},
+		{
+			expected: true,
+			desc:     "different message",
+			vsr: conf_v1.VirtualServerRoute{
+				Status: conf_v1.VirtualServerRouteStatus{
+					State:        state,
+					Reason:       reason,
+					Message:      "DifferentMessage",
+					ReferencedBy: referencedBy,
+					ExternalEndpoints: []conf_v1.ExternalEndpoint{
+						{
+							IP:    "1.2.3.4",
+							Ports: "80,443",
+						},
+					},
+				},
+			},
+		},
+		{
+			expected: true,
+			desc:     "different referenced by",
+			vsr: conf_v1.VirtualServerRoute{
+				Status: conf_v1.VirtualServerRouteStatus{
+					State:        state,
+					Reason:       reason,
+					Message:      msg,
+					ReferencedBy: "DifferentReferencedBy",
+					ExternalEndpoints: []conf_v1.ExternalEndpoint{
+						{
+							IP:    "1.2.3.4",
+							Ports: "80,443",
+						},
+					},
+				},
+			},
+		},
+		{
+			expected: true,
+			desc:     "different external endpoints - different IP",
+			vsr: conf_v1.VirtualServerRoute{
+				Status: conf_v1.VirtualServerRouteStatus{
+					State:        state,
+					Reason:       reason,
+					Message:      msg,
+					ReferencedBy: referencedBy,
+					ExternalEndpoints: []conf_v1.ExternalEndpoint{
+						{
+							IP:    "5.6.7.8",
+							Ports: "80,443",
+						},
+					},
+				},
+			},
+		},
+		{
+			expected: true,
+			desc:     "missing external endpoints in VSR",
+			vsr: conf_v1.VirtualServerRoute{
+				Status: conf_v1.VirtualServerRouteStatus{
+					State:        state,
+					Reason:       reason,
+					Message:      msg,
+					ReferencedBy: referencedBy,
+					// No ExternalEndpoints
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test // address gosec G601
+		t.Run(test.desc, func(t *testing.T) {
+			changed := su.hasVsrStatusChanged(&test.vsr, state, reason, msg, &referencedBy)
+
+			if changed != test.expected {
+				t.Errorf("hasVsrStatusChanged(%v, %v, %v, %v) returned %v but expected %v for test: %s", test.vsr, state, reason, msg, changed, test.expected, test.desc)
+			}
+		})
+	}
+}
+
+// TestHasVsrStatusChangedReferencedByPointerSemantics distinguishes nil from an empty referencedBy value.
+func TestHasVsrStatusChangedReferencedByPointerSemantics(t *testing.T) {
+	t.Parallel()
+
+	state := "Valid"
+	reason := "AddedOrUpdated"
+	msg := "Configuration was added or updated"
+
+	su := &statusUpdater{}
+
+	vsr := &conf_v1.VirtualServerRoute{
+		Status: conf_v1.VirtualServerRouteStatus{
+			State:        state,
+			Reason:       reason,
+			Message:      msg,
+			ReferencedBy: "default/vs-a, default/vs-b",
+		},
+	}
+
+	if changed := su.hasVsrStatusChanged(vsr, state, reason, msg, nil); changed {
+		t.Errorf("hasVsrStatusChanged with nil referencedBy = true, want false (field must be ignored)")
+	}
+
+	empty := ""
+	if changed := su.hasVsrStatusChanged(vsr, state, reason, msg, &empty); !changed {
+		t.Errorf("hasVsrStatusChanged with &\"\" referencedBy against a non-empty stored value = false, want true (must detect the shrink-to-empty case)")
+	}
+
+	same := "default/vs-a, default/vs-b"
+	if changed := su.hasVsrStatusChanged(vsr, state, reason, msg, &same); changed {
+		t.Errorf("hasVsrStatusChanged with an unchanged referencedBy pointer = true, want false")
+	}
+}
+
+func TestGetExternalServicePorts(t *testing.T) {
+	t.Parallel()
+	svc := v1.Service{
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Port: int32(80),
+					TargetPort: intstr.IntOrString{
+						Type:   intstr.Int,
+						IntVal: 80,
+					},
+				},
+				{
+					Port: int32(443),
+					TargetPort: intstr.IntOrString{
+						Type:   intstr.Int,
+						IntVal: 443,
+					},
+				},
+			},
+		},
+	}
+
+	expected := "[80,443]"
+	ports := getExternalServicePorts(&svc)
+
+	if ports != expected {
+		t.Errorf("getExternalServicePorts(%v) returned %v but expected %v", svc, ports, expected)
+	}
+}
+
+func TestIsRequiredPort(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		port     intstr.IntOrString
+		expected bool
+	}{
+		{
+			port: intstr.IntOrString{
+				Type:   intstr.Int,
+				IntVal: 999,
+			},
+			expected: false,
+		},
+		{
+			port: intstr.IntOrString{
+				Type:   intstr.Int,
+				IntVal: 80,
+			},
+			expected: true,
+		},
+		{
+			port: intstr.IntOrString{
+				Type:   intstr.Int,
+				IntVal: 443,
+			},
+			expected: true,
+		},
+		{
+			port: intstr.IntOrString{
+				Type:   intstr.String,
+				StrVal: "name",
+			},
+			expected: false,
+		},
+		{
+			port: intstr.IntOrString{
+				Type:   intstr.String,
+				StrVal: "http",
+			},
+			expected: true,
+		},
+		{
+			port: intstr.IntOrString{
+				Type:   intstr.String,
+				StrVal: "https",
+			},
+			expected: true,
+		},
+	}
+
+	for _, test := range tests {
+		result := isRequiredPort(test.port)
+
+		if result != test.expected {
+			t.Errorf("isRequiredPort(%+v) returned %v but expected %v", test.port, result, test.expected)
+		}
+	}
+}
+
+func TestHasPolicyStatusChanged(t *testing.T) {
+	t.Parallel()
+	state := "Valid"
+	reason := "AddedOrUpdated"
+	msg := "Configuration was added or updated"
+
+	tests := []struct {
+		expected bool
+		pol      conf_v1.Policy
+	}{
+		{
+			expected: false,
+			pol: conf_v1.Policy{
+				Status: conf_v1.PolicyStatus{
+					State:   state,
+					Reason:  reason,
+					Message: msg,
+				},
+			},
+		},
+		{
+			expected: true,
+			pol: conf_v1.Policy{
+				Status: conf_v1.PolicyStatus{
+					State:   "DifferentState",
+					Reason:  reason,
+					Message: msg,
+				},
+			},
+		},
+		{
+			expected: true,
+			pol: conf_v1.Policy{
+				Status: conf_v1.PolicyStatus{
+					State:   state,
+					Reason:  "DifferentReason",
+					Message: msg,
+				},
+			},
+		},
+		{
+			expected: true,
+			pol: conf_v1.Policy{
+				Status: conf_v1.PolicyStatus{
+					State:   state,
+					Reason:  reason,
+					Message: "DifferentMessage",
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test // address gosec G601
+		changed := hasPolicyStatusChanged(&test.pol, state, reason, msg)
+
+		if changed != test.expected {
+			t.Errorf("hasPolicyStatusChanged(%v, %v, %v, %v) returned %v but expected %v.", test.pol, state, reason, msg, changed, test.expected)
+		}
+	}
+}
+
+func TestFormatReferencedBy(t *testing.T) {
+	t.Parallel()
+
+	vs := func(ns, name string) *conf_v1.VirtualServer {
+		return &conf_v1.VirtualServer{
+			ObjectMeta: meta_v1.ObjectMeta{Namespace: ns, Name: name},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		input    []*conf_v1.VirtualServer
+		expected string
+	}{
+		{
+			name:     "nil slice",
+			input:    nil,
+			expected: "",
+		},
+		{
+			name:     "empty slice",
+			input:    []*conf_v1.VirtualServer{},
+			expected: "",
+		},
+		{
+			name:     "single VS",
+			input:    []*conf_v1.VirtualServer{vs("default", "cafe")},
+			expected: "default/cafe",
+		},
+		{
+			name: "two VSes",
+			input: []*conf_v1.VirtualServer{
+				vs("default", "cafe"),
+				vs("default", "cafe2"),
+			},
+			expected: "default/cafe, default/cafe2",
+		},
+		{
+			name: "three VSes preserves input order",
+			input: []*conf_v1.VirtualServer{
+				vs("default", "cafe"),
+				vs("default", "cafe2"),
+				vs("default", "cafe3"),
+			},
+			expected: "default/cafe, default/cafe2, default/cafe3",
+		},
+		{
+			name: "VSes across namespaces",
+			input: []*conf_v1.VirtualServer{
+				vs("ns-a", "cafe"),
+				vs("ns-b", "cafe"),
+			},
+			expected: "ns-a/cafe, ns-b/cafe",
+		},
+		{
+			name: "nil entries are skipped",
+			input: []*conf_v1.VirtualServer{
+				vs("default", "cafe"),
+				nil,
+				vs("default", "cafe2"),
+			},
+			expected: "default/cafe, default/cafe2",
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := formatReferencedBy(tc.input)
+			if got != tc.expected {
+				t.Errorf("formatReferencedBy() = %q, want %q", got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestSaveStatusFromExternalStatusList(t *testing.T) {
+	t.Parallel()
+	su := statusUpdater{logger: slog.New(nic_glog.New(io.Discard, &nic_glog.Options{Level: levels.LevelInfo}))}
+	su.SaveStatusFromExternalStatus("10.0.0.1, 10.0.0.2,lb.example.com,")
+	want := []networking.IngressLoadBalancerIngress{{IP: "10.0.0.1"}, {IP: "10.0.0.2"}, {Hostname: "lb.example.com"}}
+	if !reflect.DeepEqual(su.status, want) {
+		t.Errorf("status: want %v, got %v", want, su.status)
+	}
+	if len(su.externalEndpoints) != 3 {
+		t.Errorf("external endpoints: want 3, got %v", su.externalEndpoints)
+	}
+}

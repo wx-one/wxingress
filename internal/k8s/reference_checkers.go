@@ -1,0 +1,479 @@
+package k8s
+
+import (
+	"strings"
+
+	"github.com/wx-one/wxingress/internal/configs"
+	k8spolicies "github.com/wx-one/wxingress/internal/k8s/policies"
+	"github.com/wx-one/wxingress/internal/nsutils"
+	conf_v1 "github.com/wx-one/wxingress/pkg/apis/configuration/v1"
+	networking "k8s.io/api/networking/v1"
+)
+
+type resourceReferenceChecker interface {
+	IsReferencedByIngress(namespace string, name string, ing *networking.Ingress) bool
+	IsReferencedByMinion(namespace string, name string, ing *networking.Ingress) bool
+	IsReferencedByVirtualServer(namespace string, name string, vs *conf_v1.VirtualServer) bool
+	IsReferencedByVirtualServerRoute(namespace string, name string, vsr *conf_v1.VirtualServerRoute) bool
+	IsReferencedByTransportServer(namespace string, name string, ts *conf_v1.TransportServer) bool
+}
+
+type secretReferenceChecker struct {
+	isPlus bool
+}
+
+func newSecretReferenceChecker(isPlus bool) *secretReferenceChecker {
+	return &secretReferenceChecker{isPlus}
+}
+
+func (rc *secretReferenceChecker) IsReferencedByIngress(secretNamespace string, secretName string, ing *networking.Ingress) bool {
+	if ing.Namespace != secretNamespace {
+		return false
+	}
+
+	for _, tls := range ing.Spec.TLS {
+		if tls.SecretName == secretName {
+			return true
+		}
+	}
+
+	if rc.isPlus {
+		if jwtKey, exists := ing.Annotations[configs.JWTKeyAnnotation]; exists {
+			if jwtKey == secretName {
+				return true
+			}
+		}
+	}
+
+	if basicAuth, exists := ing.Annotations[configs.BasicAuthSecretAnnotation]; exists {
+		if basicAuth == secretName {
+			return true
+		}
+	}
+
+	if key, _, exists := configs.IngressNginxBasicAuthSecret(ing); exists && key == secretNamespace+"/"+secretName {
+		return true
+	}
+
+	if key, exists := configs.IngressNginxAuthTLSSecret(ing); exists && key == secretNamespace+"/"+secretName {
+		return true
+	}
+
+	if key, exists := configs.IngressNginxProxySSLSecret(ing); exists && key == secretNamespace+"/"+secretName {
+		return true
+	}
+
+	return false
+}
+
+func (rc *secretReferenceChecker) IsReferencedByMinion(secretNamespace string, secretName string, ing *networking.Ingress) bool {
+	if ing.Namespace != secretNamespace {
+		return false
+	}
+
+	if rc.isPlus {
+		if jwtKey, exists := ing.Annotations[configs.JWTKeyAnnotation]; exists {
+			if jwtKey == secretName {
+				return true
+			}
+		}
+	}
+
+	if basicAuth, exists := ing.Annotations[configs.BasicAuthSecretAnnotation]; exists {
+		if basicAuth == secretName {
+			return true
+		}
+	}
+
+	if key, _, exists := configs.IngressNginxBasicAuthSecret(ing); exists && key == secretNamespace+"/"+secretName {
+		return true
+	}
+
+	if key, exists := configs.IngressNginxAuthTLSSecret(ing); exists && key == secretNamespace+"/"+secretName {
+		return true
+	}
+
+	if key, exists := configs.IngressNginxProxySSLSecret(ing); exists && key == secretNamespace+"/"+secretName {
+		return true
+	}
+
+	return false
+}
+
+func (rc *secretReferenceChecker) IsReferencedByVirtualServer(secretNamespace string, secretName string, vs *conf_v1.VirtualServer) bool {
+	if vs.Namespace != secretNamespace {
+		return false
+	}
+
+	if vs.Spec.TLS != nil && vs.Spec.TLS.Secret == secretName {
+		return true
+	}
+
+	return false
+}
+
+func (rc *secretReferenceChecker) IsReferencedByVirtualServerRoute(_ string, _ string, _ *conf_v1.VirtualServerRoute) bool {
+	return false
+}
+
+func (rc *secretReferenceChecker) IsReferencedByTransportServer(secretNamespace string, secretName string, ts *conf_v1.TransportServer) bool {
+	if ts.Namespace != secretNamespace {
+		return false
+	}
+
+	if ts.Spec.TLS != nil && ts.Spec.TLS.Secret == secretName {
+		return true
+	}
+
+	return false
+}
+
+// isReferencedOnlyForTLS reports whether an Ingress or VirtualServer names a
+// Secret only as the certificate of its hosts: an Ingress in spec.tls alone,
+// not in an annotation, nor its minions, and a VirtualServer in spec.tls,
+// the only place it names one (its Policies are not the resource's).
+func isReferencedOnlyForTLS(secretNamespace string, secretName string, r Resource) bool {
+	checker := newSecretReferenceChecker(true)
+	otherwise := func(ing *networking.Ingress) bool {
+		withoutTLS := *ing
+		withoutTLS.Spec.TLS = nil
+		return checker.IsReferencedByIngress(secretNamespace, secretName, &withoutTLS)
+	}
+
+	switch impl := r.(type) {
+	case *IngressConfiguration:
+		if otherwise(impl.Ingress) {
+			return false
+		}
+		for _, minion := range impl.Minions {
+			if checker.IsReferencedByMinion(secretNamespace, secretName, minion.Ingress) {
+				return false
+			}
+		}
+		for _, canary := range impl.Canaries {
+			if otherwise(canary) {
+				return false
+			}
+		}
+		for _, merged := range impl.Merged {
+			if otherwise(merged.Ingress) {
+				return false
+			}
+		}
+		return true
+	case *VirtualServerConfiguration:
+		return true
+	}
+	return false
+}
+
+type serviceReferenceChecker struct {
+	hasClusterIP bool
+	// policyServices maps policy keys ("namespace/name") to the raw AuthServiceName
+	// from ExternalAuth policies. This allows service/endpoint changes to be correlated
+	// back to VirtualServers that reference external auth services via policies.
+	policyServices map[string]string
+}
+
+func newServiceReferenceChecker(hasClusterIP bool, policyServices map[string]string) *serviceReferenceChecker {
+	return &serviceReferenceChecker{hasClusterIP: hasClusterIP, policyServices: policyServices}
+}
+
+func (rc *serviceReferenceChecker) IsReferencedByIngress(svcNamespace string, svcName string, ing *networking.Ingress) bool {
+	if ing.Namespace == svcNamespace {
+
+		if ing.Spec.DefaultBackend != nil {
+			if ing.Spec.DefaultBackend.Service.Name == svcName {
+				return true
+			}
+		}
+		if name, ok := configs.IngressNginxDefaultBackendService(ing); ok && name == svcName {
+			return true
+		}
+		for _, rules := range ing.Spec.Rules {
+			if rules.HTTP == nil {
+				continue
+			}
+			for _, p := range rules.HTTP.Paths {
+				if p.Backend.Service.Name == svcName {
+					return true
+				}
+			}
+		}
+	}
+
+	if value, exists := ing.Annotations[configs.PoliciesAnnotation]; exists {
+		if rc.isPolicyServiceReferenced(svcNamespace, svcName, k8spolicies.GetPolicyRefsFromAnnotation(value, ing.Namespace), ing.Namespace) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (rc *serviceReferenceChecker) IsReferencedByMinion(svcNamespace string, svcName string, ing *networking.Ingress) bool {
+	return rc.IsReferencedByIngress(svcNamespace, svcName, ing)
+}
+
+func (rc *serviceReferenceChecker) IsReferencedByVirtualServer(svcNamespace string, svcName string, vs *conf_v1.VirtualServer) bool {
+	for _, u := range vs.Spec.Upstreams {
+		if rc.hasClusterIP && u.UseClusterIP {
+			continue
+		}
+		ns, name := configs.ParseServiceReference(u.Service, vs.Namespace)
+		if ns == svcNamespace && name == svcName {
+			return true
+		}
+		if vs.Namespace == svcNamespace && u.Backup == svcName {
+			return true
+		}
+	}
+
+	if rc.isPolicyServiceReferenced(svcNamespace, svcName, vs.Spec.Policies, vs.Namespace) {
+		return true
+	}
+	for _, r := range vs.Spec.Routes {
+		if rc.isPolicyServiceReferenced(svcNamespace, svcName, r.Policies, vs.Namespace) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (rc *serviceReferenceChecker) IsReferencedByVirtualServerRoute(svcNamespace string, svcName string, vsr *conf_v1.VirtualServerRoute) bool {
+	for _, u := range vsr.Spec.Upstreams {
+		if rc.hasClusterIP && u.UseClusterIP {
+			continue
+		}
+		ns, name := configs.ParseServiceReference(u.Service, vsr.Namespace)
+		if ns == svcNamespace && name == svcName {
+			return true
+		}
+	}
+
+	for _, sr := range vsr.Spec.Subroutes {
+		if rc.isPolicyServiceReferenced(svcNamespace, svcName, sr.Policies, vsr.Namespace) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// isPolicyServiceReferenced checks if any policy in the given list references the specified service
+// via its ExternalAuth configuration.
+func (rc *serviceReferenceChecker) isPolicyServiceReferenced(svcNamespace, svcName string, policies []conf_v1.PolicyReference, ownerNamespace string) bool {
+	if len(rc.policyServices) == 0 {
+		return false
+	}
+	for _, p := range policies {
+		policyNamespace := p.Namespace
+		if policyNamespace == "" {
+			policyNamespace = ownerNamespace
+		}
+		policyKey := policyNamespace + "/" + p.Name
+		authServiceName, exists := rc.policyServices[policyKey]
+		if !exists {
+			continue
+		}
+		resolvedNs, resolvedName := configs.ParseServiceReference(authServiceName, policyNamespace)
+		if resolvedNs == svcNamespace && resolvedName == svcName {
+			return true
+		}
+	}
+	return false
+}
+
+func (rc *serviceReferenceChecker) IsReferencedByTransportServer(svcNamespace string, svcName string, ts *conf_v1.TransportServer) bool {
+	for _, u := range ts.Spec.Upstreams {
+		// the Service of an upstream may be in another namespace, as a VirtualServer upstream's; its backup is not
+		if ns, name := configs.ParseServiceReference(u.Service, ts.Namespace); ns == svcNamespace && name == svcName {
+			return true
+		}
+		if ts.Namespace == svcNamespace && u.Backup == svcName {
+			return true
+		}
+	}
+
+	return false
+}
+
+type policyReferenceChecker struct{}
+
+func newPolicyReferenceChecker() *policyReferenceChecker {
+	return &policyReferenceChecker{}
+}
+
+func (rc *policyReferenceChecker) IsReferencedByIngress(policyNamespace string, policyName string, ing *networking.Ingress) bool {
+	for _, annotation := range []string{configs.PoliciesAnnotation, configs.PoliciesAnnotationPlus} {
+		if value, exists := ing.Annotations[annotation]; exists {
+			for _, p := range strings.Split(value, ",") {
+				p = strings.TrimSpace(p)
+				if p == nsutils.FormatResourceReference(policyNamespace, policyName) || (policyNamespace == ing.Namespace && p == policyName) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func (rc *policyReferenceChecker) IsReferencedByMinion(policyNamespace string, policyName string, ing *networking.Ingress) bool {
+	return rc.IsReferencedByIngress(policyNamespace, policyName, ing)
+}
+
+func (rc *policyReferenceChecker) IsReferencedByVirtualServer(policyNamespace string, policyName string, vs *conf_v1.VirtualServer) bool {
+	if isPolicyReferenced(vs.Spec.Policies, vs.Namespace, policyNamespace, policyName) {
+		return true
+	}
+
+	for _, r := range vs.Spec.Routes {
+		if isPolicyReferenced(r.Policies, vs.Namespace, policyNamespace, policyName) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (rc *policyReferenceChecker) IsReferencedByVirtualServerRoute(policyNamespace string, policyName string, vsr *conf_v1.VirtualServerRoute) bool {
+	for _, r := range vsr.Spec.Subroutes {
+		if isPolicyReferenced(r.Policies, vsr.Namespace, policyNamespace, policyName) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (rc *policyReferenceChecker) IsReferencedByTransportServer(_ string, _ string, _ *conf_v1.TransportServer) bool {
+	return false
+}
+
+// appProtectResourceReferenceChecker is a reference checker for AppProtect related resources.
+// Only Regular/Master Ingress can reference those resources.
+type appProtectResourceReferenceChecker struct {
+	annotation string
+}
+
+func newAppProtectResourceReferenceChecker(annotation string) *appProtectResourceReferenceChecker {
+	return &appProtectResourceReferenceChecker{annotation}
+}
+
+func (rc *appProtectResourceReferenceChecker) IsReferencedByIngress(namespace string, name string, ing *networking.Ingress) bool {
+	if resName, exists := ing.Annotations[rc.annotation]; exists {
+		resNames := strings.Split(resName, ",")
+		for _, res := range resNames {
+			if res == namespace+"/"+name || (namespace == ing.Namespace && res == name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (rc *appProtectResourceReferenceChecker) IsReferencedByMinion(_ string, _ string, _ *networking.Ingress) bool {
+	return false
+}
+
+func (rc *appProtectResourceReferenceChecker) IsReferencedByVirtualServer(_ string, _ string, _ *conf_v1.VirtualServer) bool {
+	return false
+}
+
+func (rc *appProtectResourceReferenceChecker) IsReferencedByVirtualServerRoute(_ string, _ string, _ *conf_v1.VirtualServerRoute) bool {
+	return false
+}
+
+func (rc *appProtectResourceReferenceChecker) IsReferencedByTransportServer(_ string, _ string, _ *conf_v1.TransportServer) bool {
+	return false
+}
+
+func isPolicyReferenced(policies []conf_v1.PolicyReference, resourceNamespace string, policyNamespace string, policyName string) bool {
+	for _, p := range policies {
+		namespace := p.Namespace
+		if namespace == "" {
+			namespace = resourceNamespace
+		}
+
+		if p.Name == policyName && namespace == policyNamespace {
+			return true
+		}
+	}
+
+	return false
+}
+
+type dosResourceReferenceChecker struct {
+	annotation string
+}
+
+func newDosResourceReferenceChecker(annotation string) *dosResourceReferenceChecker {
+	return &dosResourceReferenceChecker{annotation}
+}
+
+func (rc *dosResourceReferenceChecker) IsReferencedByIngress(namespace string, name string, ing *networking.Ingress) bool {
+	res, exists := ing.Annotations[rc.annotation]
+	if !exists {
+		return false
+	}
+	return res == namespace+"/"+name || (namespace == ing.Namespace && res == name)
+}
+
+func (rc *dosResourceReferenceChecker) IsReferencedByMinion(_ string, _ string, _ *networking.Ingress) bool {
+	return false
+}
+
+func (rc *dosResourceReferenceChecker) IsReferencedByVirtualServer(namespace string, name string, vs *conf_v1.VirtualServer) bool {
+	if vs.Spec.Dos == namespace+"/"+name || (namespace == vs.Namespace && vs.Spec.Dos == name) {
+		return true
+	}
+	for _, route := range vs.Spec.Routes {
+		if route.Dos == namespace+"/"+name || (namespace == vs.Namespace && route.Dos == name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (rc *dosResourceReferenceChecker) IsReferencedByVirtualServerRoute(namespace string, name string, vsr *conf_v1.VirtualServerRoute) bool {
+	for _, route := range vsr.Spec.Subroutes {
+		if route.Dos == namespace+"/"+name || (namespace == vsr.Namespace && route.Dos == name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (rc *dosResourceReferenceChecker) IsReferencedByTransportServer(_ string, _ string, _ *conf_v1.TransportServer) bool {
+	return false
+}
+
+type ratelimitScalingAnnotationChecker struct{}
+
+func (rc *ratelimitScalingAnnotationChecker) IsReferencedByIngress(_ string, _ string, ing *networking.Ingress) bool {
+	for key, value := range ing.Annotations {
+		if key == "nginx.org/limit-req-scale" && value == "true" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (rc *ratelimitScalingAnnotationChecker) IsReferencedByMinion(svcNamespace string, svcName string, ing *networking.Ingress) bool {
+	return rc.IsReferencedByIngress(svcNamespace, svcName, ing)
+}
+
+func (rc *ratelimitScalingAnnotationChecker) IsReferencedByVirtualServer(_ string, _ string, _ *conf_v1.VirtualServer) bool {
+	return false
+}
+
+func (rc *ratelimitScalingAnnotationChecker) IsReferencedByVirtualServerRoute(_ string, _ string, _ *conf_v1.VirtualServerRoute) bool {
+	return false
+}
+
+func (rc *ratelimitScalingAnnotationChecker) IsReferencedByTransportServer(_ string, _ string, _ *conf_v1.TransportServer) bool {
+	return false
+}

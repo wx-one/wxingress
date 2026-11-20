@@ -1,0 +1,3229 @@
+package dataplane
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"maps"
+	"net"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/go-logr/logr"
+	discoveryV1 "k8s.io/api/discovery/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	v1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPIv1alpha1 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	ngfAPIv1alpha2 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha2"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/ngfsort"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies/upstreamsettings"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/shared"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/configmaps"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/secrets"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/resolver"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+)
+
+const (
+	wildcardHostname               = "~^"
+	defaultErrorLogLevel           = "info"
+	AlpineSSLRootCAPath            = "/etc/ssl/cert.pem"
+	DefaultWorkerConnections       = int32(1024)
+	DefaultWorkerProcesses         = "auto"
+	DefaultNginxReadinessProbePort = int32(8081)
+	DefaultNginxReadinessProbePath = "/readyz"
+	// DefaultLogFormatName is used when user provides custom access_log format.
+	DefaultLogFormatName = "ngf_user_defined_log_format"
+	// DefaultAccessLogPath is the default path for the access log.
+	DefaultAccessLogPath = "/dev/stdout"
+	// JSONAccessLogFormat is the JSON access log template emitted when JSON logging
+	// is enabled and the user has not supplied their own access log format. Fields mirror
+	// nginx's implicit 'combined' format.
+	JSONAccessLogFormat = `{` +
+		`"time_local":"$time_local",` +
+		`"remote_addr":"$remote_addr",` +
+		`"remote_user":"$remote_user",` +
+		`"request":"$request",` +
+		`"status":"$status",` +
+		`"body_bytes_sent":"$body_bytes_sent",` +
+		`"http_referer":"$http_referer",` +
+		`"http_user_agent":"$http_user_agent"` +
+		`}`
+	// InternalRLPAnnotationKey is the annotation key used to mark internally generated
+	// RateLimitPolicies. These policies are created when a RateLimitPolicy targets a route and not
+	// the Gateway itself; in this situation we need an additional policy to generate the http context
+	// configuration.
+	InternalRLPAnnotationKey = "nginx.org/internal-annotation-http-context-only"
+	// InternalRLPAnnotationValue is the annotation value used to mark internally generated RateLimitPolicies.
+	InternalRLPAnnotationValue = "true"
+
+	// GatewayLevelAccessPolicyAnnotationKey marks an AccessPolicy deep-copy as originating from the
+	// gateway level. Injected into route PathRule policies so the location generator can distinguish
+	// gateway-level from route-level AccessPolicies when computing the merged effective ruleset.
+	GatewayLevelAccessPolicyAnnotationKey   = "nginx.org/internal-gateway-level-access-policy"
+	GatewayLevelAccessPolicyAnnotationValue = "true"
+
+	// GeoAccessPolicyAnnotationKey marks an AccessPolicy deep-copy for geo block generation in the HTTP context.
+	GeoAccessPolicyAnnotationKey   = "nginx.org/internal-geo-access-policy"
+	GeoAccessPolicyAnnotationValue = "true"
+
+	// EffectiveAllowsAnnotationKey carries the graph-computed CIDR intersection for a
+	// route-level Allow AccessPolicy clipped by the gateway ceiling.
+	// Value is a comma-separated list of CIDRs; empty string means deny-all.
+	EffectiveAllowsAnnotationKey = "nginx.org/internal-effective-allows"
+
+	crlBundleIDPrefix = "crl_bundle"
+)
+
+// BuildConfiguration builds the Configuration from the Graph.
+func BuildConfiguration(
+	ctx context.Context,
+	logger logr.Logger,
+	g *graph.Graph,
+	gateway *graph.Gateway,
+	serviceResolver resolver.ServiceResolver,
+	plus bool,
+	clusterIPFamily ngfAPIv1alpha2.IPFamilyType,
+) Configuration {
+	if g.GatewayClass == nil || !g.GatewayClass.Valid || gateway == nil {
+		config := GetDefaultConfiguration(g, gateway)
+		if plus {
+			config.NginxPlus = buildNginxPlus(gateway)
+		}
+
+		return config
+	}
+
+	// Get SnippetsFilters that are specifically referenced by routes attached to this gateway
+	gatewaySnippetsFilters := gateway.GetReferencedSnippetsFilters(g.Routes, g.SnippetsFilters)
+
+	// Get all RateLimitPolicies that target routes attached to this Gateway, excluding
+	// policies that are attached directly to the Gateway
+	gatewayRateLimitPolicies := gateway.GetReferencedRateLimitPolicies(g.Routes, g.NGFPolicies)
+
+	baseHTTPConfig := buildBaseHTTPConfig(gateway, gatewaySnippetsFilters, gatewayRateLimitPolicies, clusterIPFamily)
+	baseHTTPConfig.Policies = append(baseHTTPConfig.Policies, buildGeoAccessPolicies(gateway, g.Routes)...)
+	baseHTTPConfig.AuthZConfigs = buildAuthZConfigs(g.AuthenticationFilters)
+	baseStreamConfig := buildBaseStreamConfig(gateway)
+
+	httpServers, sslServers, sslListenerHostnames, extAuthCertBundleIDs := buildServers(
+		gateway,
+		g.ReferencedServices,
+		g.ReferencedSecrets,
+	)
+
+	authCertBundles := make(map[CertBundleID]CertBundle)
+
+	oidcProvider, oidcCertBundles := buildOIDCProviderFromAuthenticationFilters(
+		g.AuthenticationFilters,
+		g.ReferencedSecrets,
+	)
+	maps.Copy(authCertBundles, oidcCertBundles)
+	maps.Copy(authCertBundles, buildJWTRemoteTLSCABundles(g.AuthenticationFilters, g.ReferencedSecrets))
+
+	backendGroups := buildBackendGroups(append(httpServers, sslServers...))
+	tlsServers := buildTLSServers(gateway)
+
+	upstreams := buildUpstreams(
+		ctx,
+		logger,
+		gateway,
+		serviceResolver,
+		g.ReferencedServices,
+	)
+
+	var nginxPlus NginxPlus
+	if plus {
+		nginxPlus = buildNginxPlus(gateway)
+	}
+
+	refCertBundles := buildRefCertificateBundles(g.ReferencedSecrets, g.ReferencedCaCertConfigMaps)
+
+	// Guardrails HTTPS backends carry their own BackendTLSPolicy-derived CA bundle that must be
+	// materialized so the guardrails internal location can proxy_ssl_verify the backend certificate.
+	// Merge those IDs with the ext-auth IDs before resolving referenced bundles.
+	guardrailsCertBundleIDs := collectGuardrailsCertBundleIDs(append(httpServers, sslServers...))
+	for id := range guardrailsCertBundleIDs {
+		extAuthCertBundleIDs[id] = struct{}{}
+	}
+
+	certBundles := buildCertBundles(
+		refCertBundles,
+		backendGroups,
+		tlsServers,
+		extAuthCertBundleIDs,
+		authCertBundles,
+	)
+	maps.Copy(certBundles, buildFrontendTLSCertBundles(
+		gateway,
+		sslServers,
+		refCertBundles,
+	))
+
+	config := Configuration{
+		HTTPServers:   httpServers,
+		SSLServers:    sslServers,
+		OIDCProviders: oidcProvider,
+		TLSServers:    tlsServers,
+		TCPServers:    buildL4Servers(logger, gateway, v1.TCPProtocolType),
+		UDPServers:    buildL4Servers(logger, gateway, v1.UDPProtocolType),
+		Upstreams:     upstreams,
+		StreamUpstreams: buildStreamUpstreams(
+			ctx,
+			logger,
+			gateway,
+			serviceResolver,
+			g.ReferencedServices,
+		),
+		BackendGroups:        backendGroups,
+		SSLKeyPairs:          buildSSLKeyPairs(g.ReferencedSecrets, gateway),
+		AuthSecrets:          buildAuthSecrets(g.AuthenticationFilters, g.ReferencedSecrets),
+		Telemetry:            buildTelemetry(g, gateway),
+		GuardrailsEnabled:    guardrailsEnabled(httpServers, sslServers),
+		BaseHTTPConfig:       baseHTTPConfig,
+		BaseStreamConfig:     baseStreamConfig,
+		Logging:              buildLogging(gateway),
+		NginxPlus:            nginxPlus,
+		MainSnippets:         buildSnippetsForContext(gatewaySnippetsFilters, ngfAPIv1alpha1.NginxContextMain),
+		Policies:             buildPolicies(gateway, gateway.Policies),
+		AuxiliarySecrets:     buildAuxiliarySecrets(g.PlusSecrets),
+		WorkerConnections:    buildWorkerConnections(gateway),
+		WorkerProcesses:      buildWorkerProcesses(gateway),
+		WorkerRlimitNofile:   buildWorkerRlimitNofile(gateway),
+		SSLListenerHostnames: sslListenerHostnames,
+		CertBundles:          certBundles,
+		WAF:                  buildWAF(gateway),
+	}
+
+	maps.Copy(config.AuthSecrets, buildGuardrailsAuthSecrets(gateway))
+
+	return config
+}
+
+// isTLSTerminateListener returns true if the listener is a TLS listener in Terminate mode.
+func isTLSTerminateListener(l *graph.Listener) bool {
+	return l.Source.TLS != nil && (l.Source.TLS.Mode == nil || *l.Source.TLS.Mode == v1.TLSModeTerminate)
+}
+
+// buildTLSServers builds TLSServers from TLSRoutes attached to TLS listeners.
+// Both Passthrough and Terminate mode listeners are processed. Terminate mode servers
+// include SSL configuration for TLS termination in the stream block.
+func buildTLSServers(gateway *graph.Gateway) []Layer4VirtualServer {
+	var gatewayNsName types.NamespacedName
+	if gateway.Source != nil {
+		gatewayNsName = types.NamespacedName{Namespace: gateway.Source.Namespace, Name: gateway.Source.Name}
+	}
+	tlsServersMap := make(map[graph.L4RouteKey][]Layer4VirtualServer)
+	listenerDefaultServers := make([]Layer4VirtualServer, 0)
+
+	tlsServerCount := 0
+
+	for _, l := range gateway.Listeners {
+		if !l.Valid || l.Source.Protocol != v1.TLSProtocolType {
+			continue
+		}
+
+		var ssl *SSL
+		if isTLSTerminateListener(l) {
+			ssl = buildSSL(l)
+		}
+
+		count, matched := buildTLSServersForListener(l, ssl, gatewayNsName, tlsServersMap)
+		tlsServerCount += count
+
+		if !matched {
+			if ds := buildTLSDefaultServer(l, ssl); ds != nil {
+				listenerDefaultServers = append(listenerDefaultServers, *ds)
+			}
+		}
+	}
+	tlsServers := make([]Layer4VirtualServer, 0, tlsServerCount+len(listenerDefaultServers))
+
+	// Collect route keys in sorted order for deterministic output.
+	routeKeys := make([]graph.L4RouteKey, 0, len(tlsServersMap))
+	for key := range tlsServersMap {
+		routeKeys = append(routeKeys, key)
+	}
+	sort.Slice(routeKeys, func(i, j int) bool {
+		if routeKeys[i].NamespacedName.Namespace != routeKeys[j].NamespacedName.Namespace {
+			return routeKeys[i].NamespacedName.Namespace < routeKeys[j].NamespacedName.Namespace
+		}
+		return routeKeys[i].NamespacedName.Name < routeKeys[j].NamespacedName.Name
+	})
+
+	for _, key := range routeKeys {
+		tlsServers = append(tlsServers, tlsServersMap[key]...)
+	}
+
+	tlsServers = append(tlsServers, listenerDefaultServers...)
+
+	// Sort for deterministic output: by port, then hostname, then defaults last.
+	sort.Slice(tlsServers, func(i, j int) bool {
+		if tlsServers[i].Port != tlsServers[j].Port {
+			return tlsServers[i].Port < tlsServers[j].Port
+		}
+		if tlsServers[i].IsDefault != tlsServers[j].IsDefault {
+			return !tlsServers[i].IsDefault // non-defaults first
+		}
+		return tlsServers[i].Hostname < tlsServers[j].Hostname
+	})
+
+	return tlsServers
+}
+
+// buildTLSServersForListener processes routes on a TLS listener, adding servers to tlsServersMap.
+// Returns the number of servers added and whether any route hostname matched the listener hostname.
+func buildTLSServersForListener(
+	l *graph.Listener,
+	ssl *SSL,
+	gatewayNsName types.NamespacedName,
+	tlsServersMap map[graph.L4RouteKey][]Layer4VirtualServer,
+) (int, bool) {
+	count := 0
+	foundRouteMatchingListenerHostname := false
+
+	for key, r := range l.L4Routes {
+		if !r.Valid {
+			continue
+		}
+
+		var hostnames []string
+
+		for _, p := range r.ParentRefs {
+			if p.Attachment == nil {
+				continue
+			}
+
+			listenerAttachment := p.Attachment.FindListenerAttachment(graph.CreateParentRefListenerKeyFromListener(l))
+			if listenerAttachment != nil {
+				hostnames = listenerAttachment.AcceptedHostnames
+				break
+			}
+		}
+
+		if _, ok := tlsServersMap[key]; !ok {
+			tlsServersMap[key] = make([]Layer4VirtualServer, 0)
+		}
+
+		count += len(hostnames)
+
+		for _, h := range hostnames {
+			if l.Source.Hostname != nil && h == string(*l.Source.Hostname) {
+				foundRouteMatchingListenerHostname = true
+			}
+			tlsServersMap[key] = append(tlsServersMap[key], Layer4VirtualServer{
+				Hostname: h,
+				Upstreams: []Layer4Upstream{
+					{
+						Name:   r.Spec.BackendRef.ServicePortReference(),
+						Weight: 0, // TLSRoute doesn't support weights
+					},
+				},
+				Port:      l.Source.Port,
+				SSL:       ssl,
+				VerifyTLS: convertBackendTLS(r.Spec.BackendRef.BackendTLSPolicy, gatewayNsName),
+			})
+		}
+	}
+
+	return count, foundRouteMatchingListenerHostname
+}
+
+// buildTLSDefaultServer creates a default server for a TLS listener if needed.
+func buildTLSDefaultServer(l *graph.Listener, ssl *SSL) *Layer4VirtualServer {
+	hostname := ""
+	if l.Source.Hostname != nil {
+		hostname = string(*l.Source.Hostname)
+	}
+
+	return &Layer4VirtualServer{
+		Hostname:  hostname,
+		IsDefault: true,
+		Port:      l.Source.Port,
+		Upstreams: []Layer4Upstream{},
+		SSL:       ssl,
+	}
+}
+
+// buildL4Servers builds Layer4 servers (TCP or UDP) from routes attached to listeners.
+// Per the Gateway API conflict resolution guidelines, when multiple routes target the
+// same listener only the oldest route (by creation timestamp) is programmed.
+func buildL4Servers(logger logr.Logger, gateway *graph.Gateway, protocol v1.ProtocolType) []Layer4VirtualServer {
+	protocolName := string(protocol)
+
+	var servers []Layer4VirtualServer
+
+	for _, l := range gateway.Listeners {
+		if !l.Valid || l.Source.Protocol != protocol {
+			continue
+		}
+
+		// Find the oldest valid route with usable backends for this listener.
+		oldest := oldestValidL4Route(l.L4Routes, logger, protocolName)
+		if oldest == nil {
+			continue
+		}
+
+		servers = append(servers, *oldest.withPort(l.Source.Port))
+	}
+
+	if len(servers) == 0 {
+		return nil
+	}
+
+	// Preserve order so that this doesn't trigger an unnecessary reload.
+	sort.Slice(servers, func(i, j int) bool {
+		return servers[i].Port < servers[j].Port
+	})
+
+	return servers
+}
+
+// l4RouteUpstreams holds the extracted upstreams for a single L4 route along with
+// the source object for age comparison.
+type l4RouteUpstreams struct {
+	source    client.Object
+	upstreams []Layer4Upstream
+}
+
+func (u *l4RouteUpstreams) withPort(port v1.PortNumber) *Layer4VirtualServer {
+	return &Layer4VirtualServer{
+		Hostname:  "", // Layer4 doesn't use hostnames
+		Upstreams: u.upstreams,
+		Port:      port,
+	}
+}
+
+// oldestValidL4Route returns the oldest route (by creation timestamp) that has
+// at least one valid backend reference, or nil if no such route exists.
+func oldestValidL4Route(
+	routes map[graph.L4RouteKey]*graph.L4Route,
+	logger logr.Logger,
+	protocolName string,
+) *l4RouteUpstreams {
+	var oldest *l4RouteUpstreams
+
+	for _, r := range routes {
+		if !r.Valid {
+			continue
+		}
+
+		backendRefs := r.Spec.GetBackendRefs()
+
+		if len(backendRefs) == 0 {
+			logger.V(1).Info("Route has no valid backend references, skipping",
+				"route", r.Source.GetName(),
+				"protocol", protocolName,
+			)
+			continue
+		}
+
+		var upstreams []Layer4Upstream
+		for _, br := range backendRefs {
+			if !br.Valid {
+				continue
+			}
+
+			upstreams = append(upstreams, Layer4Upstream{
+				Name:   br.ServicePortReference(),
+				Weight: br.Weight,
+			})
+		}
+
+		if len(upstreams) == 0 {
+			logger.V(1).Info("No valid upstreams for route, skipping",
+				"route", r.Source.GetName(),
+				"protocol", protocolName,
+			)
+			continue
+		}
+
+		// Sort upstreams within each route for deterministic output.
+		sort.Slice(upstreams, func(i, j int) bool {
+			return upstreams[i].Name < upstreams[j].Name
+		})
+
+		candidate := &l4RouteUpstreams{
+			source:    r.Source,
+			upstreams: upstreams,
+		}
+
+		if oldest == nil || ngfsort.LessClientObject(candidate.source, oldest.source) {
+			oldest = candidate
+		}
+	}
+
+	return oldest
+}
+
+// buildStreamUpstreams builds all stream upstreams.
+func buildStreamUpstreams(
+	ctx context.Context,
+	logger logr.Logger,
+	gateway *graph.Gateway,
+	serviceResolver resolver.ServiceResolver,
+	referencedServices map[types.NamespacedName]*graph.ReferencedService,
+) []Upstream {
+	// There can be duplicate upstreams if multiple routes reference the same upstream.
+	// We use a map to deduplicate them.
+	uniqueUpstreams := make(map[string]Upstream)
+
+	gatewayNSName := client.ObjectKeyFromObject(gateway.Source)
+
+	// Supported protocols for stream upstreams
+	supportedProtocols := map[v1.ProtocolType]bool{
+		v1.TLSProtocolType: true,
+		v1.TCPProtocolType: true,
+		v1.UDPProtocolType: true,
+	}
+
+	for _, l := range gateway.Listeners {
+		if !l.Valid || !supportedProtocols[l.Source.Protocol] {
+			continue
+		}
+
+		for _, route := range l.L4Routes {
+			if !route.Valid {
+				continue
+			}
+
+			backendRefs := route.Spec.GetBackendRefs()
+			if len(backendRefs) == 0 {
+				continue
+			}
+
+			// Process each backend reference
+			for _, br := range backendRefs {
+				if !br.Valid {
+					continue
+				}
+
+				if _, ok := br.InvalidForGateways[gatewayNSName]; ok {
+					continue
+				}
+
+				upstreamName := br.ServicePortReference()
+
+				if _, exist := uniqueUpstreams[upstreamName]; exist {
+					continue
+				}
+
+				var errMsg string
+
+				// Use resolveUpstreamEndpoints to handle both regular and ExternalName services
+				eps, err := resolveUpstreamEndpoints(
+					ctx,
+					logger,
+					br,
+					serviceResolver,
+					referencedServices,
+					false, // L4 stream upstreams do not support UseClusterIP
+				)
+				if err != nil {
+					errMsg = err.Error()
+				}
+
+				uniqueUpstreams[upstreamName] = Upstream{
+					Name:      upstreamName,
+					Endpoints: eps,
+					ErrorMsg:  errMsg,
+				}
+			}
+		}
+	}
+
+	if len(uniqueUpstreams) == 0 {
+		return nil
+	}
+
+	upstreams := make([]Upstream, 0, len(uniqueUpstreams))
+
+	for _, up := range uniqueUpstreams {
+		upstreams = append(upstreams, up)
+	}
+
+	// Preserve order so that this doesn't trigger an unnecessary reload.
+	sort.Slice(upstreams, func(i, j int) bool {
+		return upstreams[i].Name < upstreams[j].Name
+	})
+
+	return upstreams
+}
+
+// buildSSLKeyPairs builds the SSLKeyPairs from the Secrets. It will only include Secrets that are referenced by
+// valid gateway and its listeners, so that we don't include unused Secrets in the configuration of the data plane.
+func buildSSLKeyPairs(
+	secretsMap map[types.NamespacedName]*secrets.Secret,
+	gateway *graph.Gateway,
+) map[SSLKeyPairID]SSLKeyPair {
+	keyPairs := make(map[SSLKeyPairID]SSLKeyPair)
+
+	for _, l := range gateway.Listeners {
+		if l.Valid && len(l.ResolvedSecrets) > 0 {
+			for _, secretNsName := range l.ResolvedSecrets {
+				id := generateSSLKeyPairID(secretNsName)
+				secret := secretsMap[secretNsName]
+				if secret != nil && secret.CertBundle != nil {
+					keyPairs[id] = SSLKeyPair{
+						Cert: secret.CertBundle.Cert.TLSCert,
+						Key:  secret.CertBundle.Cert.TLSPrivateKey,
+					}
+				}
+			}
+		}
+	}
+
+	if gateway.Valid && gateway.SecretRef != nil {
+		id := generateSSLKeyPairID(*gateway.SecretRef)
+		secret := secretsMap[*gateway.SecretRef]
+		if secret != nil && secret.CertBundle != nil {
+			keyPairs[id] = SSLKeyPair{
+				Cert: secret.CertBundle.Cert.TLSCert,
+				Key:  secret.CertBundle.Cert.TLSPrivateKey,
+			}
+		}
+	}
+
+	return keyPairs
+}
+
+func buildJWTRemoteTLSCABundles(
+	authFilters map[types.NamespacedName]*graph.AuthenticationFilter,
+	secretsMap map[types.NamespacedName]*secrets.Secret,
+) map[CertBundleID]CertBundle {
+	bundles := make(map[CertBundleID]CertBundle)
+
+	for _, filter := range authFilters {
+		if !filter.Valid || filter.Source.Spec.JWT == nil {
+			continue
+		}
+
+		specJWT := filter.Source.Spec.JWT
+		if specJWT.Source != ngfAPIv1alpha1.JWTKeySourceRemote {
+			continue
+		}
+		if specJWT.Remote == nil || len(specJWT.Remote.CACertificateRefs) == 0 {
+			continue
+		}
+
+		for _, ref := range specJWT.Remote.CACertificateRefs {
+			secretNsName := types.NamespacedName{
+				Namespace: filter.Source.Namespace,
+				Name:      ref.Name,
+			}
+			secret := secretsMap[secretNsName]
+			if secret != nil && secret.Source != nil && secret.Source.Data[secrets.CAKey] != nil {
+				id := generateJWTRemoteTLSCABundleID(secretNsName.Namespace, secretNsName.Name)
+				bundles[id] = secret.Source.Data[secrets.CAKey]
+			}
+		}
+	}
+
+	return bundles
+}
+
+// listenerClientSettings captures the information about a listener
+// for configuring SSL servers with client verification settings.
+type listenerClientSettings struct {
+	CertBundleID   CertBundleID
+	validationMode v1.FrontendValidationModeType
+}
+
+func buildFrontendTLSCertBundles(
+	gateway *graph.Gateway,
+	sslServers []VirtualServer,
+	refCertBundles []secrets.CertificateBundle,
+) map[CertBundleID]CertBundle {
+	bundles := make(map[CertBundleID]CertBundle, len(refCertBundles))
+	clientSettingsMap := make(map[int32]listenerClientSettings)
+
+	if !gateway.Valid || gateway.Source.Spec.TLS == nil || gateway.Source.Spec.TLS.Frontend == nil {
+		return bundles
+	}
+
+	refCertBundleIndex := indexRefCertBundles(refCertBundles)
+
+	for _, listener := range gateway.Listeners {
+		if listener.Source.Protocol != v1.HTTPSProtocolType {
+			continue
+		}
+
+		if len(listener.CACertificateRefs) == 0 {
+			continue
+		}
+		// Create a unique cert bundle ID for this listener gateway combo.
+		// e.g. cert_bundle_default_gateway_443 for a HTTPS listener on port 443
+		// for a gateway in the default namespace.
+		caCertRef := types.NamespacedName{
+			Namespace: gateway.Source.Namespace,
+			Name: fmt.Sprintf("%s_%d",
+				gateway.Source.Name,
+				listener.Source.Port,
+			),
+		}
+		id := generateCertBundleID(caCertRef)
+		// We map listener port to the CertBundleID and ValidationMode of this listener
+		// to later configure the relevant SSL Servers with this data.
+		// This avoids iterating over each SSL Server for each Listener.
+		clientSettingsMap[listener.Source.Port] = listenerClientSettings{
+			CertBundleID:   id,
+			validationMode: listener.ValidationMode,
+		}
+		// If the validation mode is AllowInsecureFallback
+		// we do not want to configure any CA bundles for this listener.
+		if listener.ValidationMode != v1.AllowInsecureFallback {
+			bundles = getFrontendTLSCertBundles(
+				id,
+				bundles,
+				gateway,
+				refCertBundleIndex,
+				listener.CACertificateRefs,
+			)
+		}
+	}
+	addClientSettingsToSSLServers(sslServers, clientSettingsMap)
+	return bundles
+}
+
+// refCertBundleKey is used as the key for indexing referenced certificate bundles
+// when building frontend TLS cert bundles.
+// It consists of the kind, namespace, and name of the referenced certificate bundle.
+type refCertBundleKey struct {
+	kind      v1.Kind
+	namespace v1.Namespace
+	name      v1.ObjectName
+}
+
+// indexRefCertBundles creates an index of the referenced certificate bundles
+// based on their kind, namespace, and name for faster lookup when building frontend TLS cert bundles.
+func indexRefCertBundles(
+	refCertBundles []secrets.CertificateBundle,
+) map[refCertBundleKey]secrets.CertificateBundle {
+	index := make(map[refCertBundleKey]secrets.CertificateBundle, len(refCertBundles))
+	for _, bundle := range refCertBundles {
+		key := refCertBundleKey{
+			kind:      bundle.Kind,
+			namespace: v1.Namespace(bundle.Name.Namespace),
+			name:      v1.ObjectName(bundle.Name.Name),
+		}
+		index[key] = bundle
+	}
+	return index
+}
+
+func getFrontendTLSCertBundles(
+	id CertBundleID,
+	bundles map[CertBundleID]CertBundle,
+	gateway *graph.Gateway,
+	refCertBundleIndex map[refCertBundleKey]secrets.CertificateBundle,
+	listenerCACertRefs []v1.ObjectReference,
+) map[CertBundleID]CertBundle {
+	certBundles := make([]CertBundle, 0, len(listenerCACertRefs))
+	for _, ref := range listenerCACertRefs {
+		if ref.Name == "" {
+			continue
+		}
+		refNamespace := v1.Namespace(gateway.Source.Namespace)
+		if ref.Namespace != nil {
+			refNamespace = *ref.Namespace
+		}
+
+		key := refCertBundleKey{
+			kind:      ref.Kind,
+			namespace: refNamespace,
+			name:      ref.Name,
+		}
+		if bundle, exists := refCertBundleIndex[key]; exists {
+			certRefData := getCertRefBundleData(bundle)
+			certBundles = append(certBundles, certRefData)
+		}
+	}
+	if len(certBundles) == 0 {
+		return bundles
+	}
+
+	if _, exists := bundles[id]; !exists {
+		for _, v := range certBundles {
+			bundles[id] = append(bundles[id], v...)
+		}
+	}
+
+	return bundles
+}
+
+// addClientSettingsToSSLServers modifies existing SSL servers to assign
+// client certificate verification settings based on the listener's validation mode and CA cert refs.
+func addClientSettingsToSSLServers(
+	sslServers []VirtualServer,
+	clientSettingsMap map[int32]listenerClientSettings,
+) {
+	for i := range sslServers {
+		if sslServers[i].SSL == nil {
+			continue
+		}
+		if clientSettings, exists := clientSettingsMap[sslServers[i].Port]; exists {
+			switch clientSettings.validationMode {
+			case v1.AllowInsecureFallback:
+				// Request client certificate but allow any certificate (valid, invalid, or none)
+				// Do not configure CA bundle verification for this mode
+				sslServers[i].SSL.ClientCertBundleID = ""
+				sslServers[i].SSL.VerifyClient = SSLVerifyClientOptionalNoCA
+				sslServers[i].SSL.RequireVerifiedCert = false
+			default:
+				// AllowValidOnly is default when no validation mode is specified.
+				sslServers[i].SSL.ClientCertBundleID = clientSettings.CertBundleID
+				sslServers[i].SSL.VerifyClient = SSLVerifyClientOn
+				sslServers[i].SSL.RequireVerifiedCert = true
+			}
+		}
+	}
+}
+
+func buildRefCertificateBundles(
+	secretsMap map[types.NamespacedName]*secrets.Secret,
+	configMaps map[types.NamespacedName]*configmaps.CaCertConfigMap,
+) []secrets.CertificateBundle {
+	bundles := []secrets.CertificateBundle{}
+
+	for _, secret := range secretsMap {
+		if secret.CertBundle != nil {
+			bundles = append(bundles, *secret.CertBundle)
+		}
+	}
+
+	for _, configMap := range configMaps {
+		if configMap.CertBundle != nil {
+			bundles = append(bundles, *configMap.CertBundle)
+		}
+	}
+
+	return bundles
+}
+
+func buildCertBundles(
+	refCertBundles []secrets.CertificateBundle,
+	backendGroups []BackendGroup,
+	tlsServers []Layer4VirtualServer,
+	extAuthCertBundleIDs map[CertBundleID]struct{},
+	authCertBundles map[CertBundleID]CertBundle,
+) map[CertBundleID]CertBundle {
+	bundles := make(map[CertBundleID]CertBundle)
+
+	maps.Copy(bundles, authCertBundles)
+
+	referenced := make(map[CertBundleID]struct{}, len(extAuthCertBundleIDs))
+	for id := range extAuthCertBundleIDs {
+		referenced[id] = struct{}{}
+	}
+	for _, bg := range backendGroups {
+		for _, b := range bg.Backends {
+			if !b.Valid {
+				continue
+			}
+
+			if b.VerifyTLS != nil && b.VerifyTLS.CertBundleID != "" {
+				referenced[b.VerifyTLS.CertBundleID] = struct{}{}
+			}
+			if b.EndpointPickerConfig != nil &&
+				b.EndpointPickerConfig.VerifyTLS != nil &&
+				b.EndpointPickerConfig.VerifyTLS.CertBundleID != "" {
+				referenced[b.EndpointPickerConfig.VerifyTLS.CertBundleID] = struct{}{}
+			}
+		}
+	}
+	for _, s := range tlsServers {
+		if s.VerifyTLS == nil {
+			continue
+		}
+		referenced[s.VerifyTLS.CertBundleID] = struct{}{}
+	}
+
+	if len(referenced) == 0 {
+		return bundles
+	}
+
+	for _, bundle := range refCertBundles {
+		id := generateCertBundleID(bundle.Name)
+		if _, exists := referenced[id]; exists {
+			bundles[id] = getCertRefBundleData(bundle)
+		}
+	}
+	return bundles
+}
+
+// collectGuardrailsCertBundleIDs walks the built virtual servers and returns the set of CA cert
+// bundle IDs referenced by guardrails HTTPS backends (via a BackendTLSPolicy). Bundles using the
+// system trust store (RootCAPath set, no CertBundleID) are skipped as they need no materialization.
+func collectGuardrailsCertBundleIDs(servers []VirtualServer) map[CertBundleID]struct{} {
+	ids := make(map[CertBundleID]struct{})
+	for _, server := range servers {
+		for _, pr := range server.PathRules {
+			for _, mr := range pr.MatchRules {
+				if mr.Guardrails == nil || mr.Guardrails.VerifyTLS == nil {
+					continue
+				}
+				if mr.Guardrails.VerifyTLS.CertBundleID != "" {
+					ids[mr.Guardrails.VerifyTLS.CertBundleID] = struct{}{}
+				}
+			}
+		}
+	}
+	return ids
+}
+
+func getCertRefBundleData(bundle secrets.CertificateBundle) []byte {
+	// the cert could be base64 encoded or plaintext
+	data := make([]byte, base64.StdEncoding.DecodedLen(len(bundle.Cert.CACert)))
+	n, err := base64.StdEncoding.Decode(data, bundle.Cert.CACert)
+	if err != nil {
+		data = bundle.Cert.CACert
+	} else {
+		data = data[:n]
+	}
+	return data
+}
+
+func buildAuthSecrets(
+	authenticationFilters map[types.NamespacedName]*graph.AuthenticationFilter,
+	secretsMap map[types.NamespacedName]*secrets.Secret,
+) map[AuthFileID]AuthFileData {
+	authFileData := make(map[AuthFileID]AuthFileData, len(authenticationFilters))
+
+	for _, filter := range authenticationFilters {
+		if filter == nil || filter.Source == nil {
+			continue
+		}
+
+		id, data := getAuthFileIDAndData(filter, secretsMap)
+
+		if id == "" || data == nil {
+			continue
+		}
+
+		authFileData[id] = data
+	}
+
+	return authFileData
+}
+
+func getAuthFileIDAndData(
+	filter *graph.AuthenticationFilter,
+	secretsMap map[types.NamespacedName]*secrets.Secret,
+) (authFileID AuthFileID, data []byte) {
+	secretNsName := types.NamespacedName{
+		Namespace: filter.Source.Namespace,
+	}
+
+	switch filter.Source.Spec.Type {
+	case ngfAPIv1alpha1.AuthTypeBasic:
+		if filter.Source.Spec.Basic == nil {
+			return "", nil
+		}
+		secretNsName.Name = filter.Source.Spec.Basic.SecretRef.Name
+		authFileID = GenerateAuthBasicFileID(secretNsName.Namespace, secretNsName.Name)
+	case ngfAPIv1alpha1.AuthTypeJWT:
+		if filter.Source.Spec.JWT == nil || filter.Source.Spec.JWT.File == nil {
+			return "", nil
+		}
+		secretNsName.Name = filter.Source.Spec.JWT.File.SecretRef.Name
+		authFileID = GenerateAuthJWTFileID(secretNsName.Namespace, secretNsName.Name)
+	}
+
+	secret := secretsMap[secretNsName]
+	if secret == nil || secret.Source == nil {
+		return "", nil
+	}
+	data, exists := secret.Source.Data[secrets.AuthKey]
+	if !exists {
+		return "", nil
+	}
+
+	return authFileID, data
+}
+
+// buildAuthZConfigs builds AuthZConfig entries from authentication filters.
+func buildAuthZConfigs(
+	authenticationFilters map[types.NamespacedName]*graph.AuthenticationFilter,
+) []*AuthZConfig {
+	var authZConfigs []*AuthZConfig
+
+	for nsName, filter := range authenticationFilters {
+		if filter == nil || filter.Source == nil || !filter.Valid || !filter.Referenced {
+			continue
+		}
+
+		var authzSpec *ngfAPIv1alpha1.Authorization
+
+		switch filter.Source.Spec.Type {
+		case ngfAPIv1alpha1.AuthTypeJWT:
+			if filter.Source.Spec.JWT != nil {
+				authzSpec = filter.Source.Spec.JWT.Authorization
+			}
+		case ngfAPIv1alpha1.AuthTypeOIDC:
+			if filter.Source.Spec.OIDC != nil {
+				authzSpec = filter.Source.Spec.OIDC.Authorization
+			}
+		}
+
+		if authzSpec == nil {
+			continue
+		}
+
+		filterNsName := strings.Join([]string{nsName.Namespace, nsName.Name}, "_")
+		filterPrefix := sanitizeVariablePrefix(filterNsName)
+		if cfg := buildAuthZConfigFromAuthZSpec(filterPrefix, authzSpec); cfg != nil {
+			cfg.FilterNsName = filterNsName
+			authZConfigs = append(authZConfigs, cfg)
+		}
+	}
+	return authZConfigs
+}
+
+// buildAuthZConfigFromAuthZSpec builds a complete AuthZConfig from an Authorization spec.
+// This produces:
+//   - ClaimSets: auth_jwt_claim_set directives for each unique claim name
+//   - RuleMaps: per-rule NGINX maps that validate claim values
+//   - AuthZMap: a final aggregation map combining all rule results
+//   - RequireVariable: the variable name for the auth_jwt_require directive
+//   - ProxySetHeaders: claim-based proxy_set_header directives
+func buildAuthZConfigFromAuthZSpec(
+	filterPrefix string,
+	authZSpec *ngfAPIv1alpha1.Authorization,
+) *AuthZConfig {
+	if authZSpec == nil || len(authZSpec.Rules) == 0 {
+		return nil
+	}
+
+	config := &AuthZConfig{}
+
+	// 1. Build ClaimSets from unique claim names across all rules
+	config.AuthClaimSets = make(map[string][]string)
+	for _, rule := range authZSpec.Rules {
+		for _, claim := range rule.Claims {
+			varName := generateClaimVariableName(filterPrefix, claim.Name)
+			if _, exists := config.AuthClaimSets[varName]; !exists {
+				config.AuthClaimSets[varName] = splitClaimName(claim.Name)
+			}
+			// Get proxy_set_header entries
+			if claim.ProxySetHeader != nil && *claim.ProxySetHeader != "" {
+				config.ProxySetHeaders = append(config.ProxySetHeaders, HTTPHeader{
+					Name:  *claim.ProxySetHeader,
+					Value: varName,
+				})
+			}
+		}
+	}
+
+	// 2. Build per-rule maps
+	ruleResultVars := make([]string, 0, len(authZSpec.Rules))
+	for ruleIdx, rule := range authZSpec.Rules {
+		requireType := ngfAPIv1alpha1.RequireTypeAny
+		if rule.Require != nil {
+			requireType = *rule.Require
+		}
+
+		ruleMap := buildAuthZRuleMap(filterPrefix, ruleIdx, requireType, rule.Claims)
+		config.RuleMaps = append(config.RuleMaps, ruleMap)
+
+		// Collect the result variable name for this map
+		ruleResultVars = append(ruleResultVars, ruleMap.Maps[len(ruleMap.Maps)-1].Variable)
+	}
+
+	// 3. Build aggregation map
+	authZRequire := ngfAPIv1alpha1.RequireTypeAny
+	if authZSpec.Require != nil {
+		authZRequire = *authZSpec.Require
+	}
+	config.AuthZMap = buildAuthZRuleResultMap(filterPrefix, authZRequire, ruleResultVars)
+	if config.AuthZMap != nil {
+		config.RequireVariable = config.AuthZMap.Variable
+	} else {
+		// Single rule: use the rule's result variable directly
+		config.RequireVariable = ruleResultVars[len(ruleResultVars)-1]
+	}
+
+	return config
+}
+
+// buildAuthZRuleMap builds the NGINX maps for a single authorization rule.
+func buildAuthZRuleMap(
+	filterPrefix string,
+	ruleIndex int,
+	requireType ngfAPIv1alpha1.RequireType,
+	claims []ngfAPIv1alpha1.Claim,
+) AuthZRuleMap {
+	switch requireType {
+	case ngfAPIv1alpha1.RequireTypeAll:
+		return buildAuthZRuleMapAll(filterPrefix, ruleIndex, claims)
+	default: // RequireTypeAny
+		return buildAuthZRuleMapAny(filterPrefix, ruleIndex, claims)
+	}
+}
+
+// buildAuthZRuleMapAny builds maps for require:Any mode.
+// In Any mode, we create one map per claim, then a combining map.
+// Example:
+//
+//	map $claim_iss $iss_rule_0 {
+//	    ~^(?:.*\b)?val1(?:\b.*)?$ 1;
+//	    default 0;
+//	}
+//	map $claim_aud $aud_rule_0 {
+//	    ~^(?:.*\b)?val2(?:\b.*)?$ 1;
+//	    default 0;
+//	}
+//	map $iss_rule_0$aud_rule_0 $rule_0_any {
+//	    ~1 1;
+//	    default 0;
+//	}
+func buildAuthZRuleMapAny(filterPrefix string, ruleIndex int, claims []ngfAPIv1alpha1.Claim) AuthZRuleMap {
+	var ruleMaps []shared.Map
+	perClaimVars := make([]string, 0, len(claims))
+
+	for _, claim := range claims {
+		claimVarName := generateClaimVariableName(filterPrefix, claim.Name)
+		claimShortName := strings.TrimPrefix(claimVarName, "$"+filterPrefix+"_claim_")
+		// Use filterPrefix at start to scope per-filter.
+		perClaimVar := fmt.Sprintf("$%s_claim_%s_rule_%d", filterPrefix, claimShortName, ruleIndex)
+		perClaimVars = append(perClaimVars, perClaimVar)
+
+		pattern := "\"~" + generateClaimValuePattern(claim.Values, &claim.Match, anyAnchors) + "\""
+
+		ruleMaps = append(ruleMaps, shared.Map{
+			Source:   claimVarName,
+			Variable: perClaimVar,
+			Parameters: []shared.MapParameter{
+				{Value: pattern, Result: "1"},
+				{Value: "default", Result: "0"},
+			},
+		})
+	}
+
+	// Combining map: used only for rules[].claims in Any mode;
+	// if any per-claim variable is 1, the rule passes
+	resultVar := fmt.Sprintf("$%s_rule_%d_any", filterPrefix, ruleIndex)
+	combiningSource := strings.Join(perClaimVars, "")
+
+	ruleMaps = append(ruleMaps, shared.Map{
+		Source:   combiningSource,
+		Variable: resultVar,
+		Parameters: []shared.MapParameter{
+			{Value: "~1", Result: "1"},
+			{Value: "default", Result: "0"},
+		},
+	})
+
+	return AuthZRuleMap{Maps: ruleMaps, Require: ngfAPIv1alpha1.RequireTypeAny}
+}
+
+// buildAuthZRuleMapAll builds maps for require:All mode.
+// In All mode, all claim variables are concatenated as the map source,
+// and all values are matched simultaneously in a single regex pattern.
+// Example:
+//
+//	map $claim_iss+$claim_aud $rule_0_all {
+//	    ~^(?:.*\b)?myissuer(?:\b.*)?\+(?:.*\b)?myaudience(?:\b.*)?$ 1;
+//	    default 0;
+//	}
+func buildAuthZRuleMapAll(filterPrefix string, ruleIndex int, claims []ngfAPIv1alpha1.Claim) AuthZRuleMap {
+	sources := make([]string, 0, len(claims))
+	patterns := make([]string, 0, len(claims))
+
+	for _, claim := range claims {
+		sources = append(sources, generateClaimVariableName(filterPrefix, claim.Name))
+		patterns = append(patterns, generateClaimValuePattern(claim.Values, &claim.Match, allAnchors))
+	}
+
+	resultVar := fmt.Sprintf("$%s_rule_%d_all", filterPrefix, ruleIndex)
+	source := strings.Join(sources, "+")
+	combinedPattern := "\"~^" + strings.Join(patterns, `\+`) + "$\""
+
+	authZMap := shared.Map{
+		Source:   source,
+		Variable: resultVar,
+		Parameters: []shared.MapParameter{
+			{Value: combinedPattern, Result: "1"},
+			{Value: "default", Result: "0"},
+		},
+	}
+
+	return AuthZRuleMap{Maps: []shared.Map{authZMap}, Require: ngfAPIv1alpha1.RequireTypeAll}
+}
+
+// buildAuthZRuleResultMap builds the final aggregation map that combines all per-rule result
+// variables into a single NGINX map whose output variable is used by the auth_jwt_require directive.
+// Returns nil when there are zero or one rules.
+// When one rule exists, use the result variable directly.
+//
+// In require:Any mode, the concatenated rule results are checked for the presence of at least
+// one "1" i.e. at least one rule passed.
+// Example with 3 rules:
+//
+//	map $rule_0_any$rule_1_all$rule_2_any $test_auth_authz_require_any {
+//	    ~1      1;
+//	    default 0;
+//	}
+//
+// In require:All mode, the concatenated rule results must all be "1".
+// The match pattern is an exact string of N ones, where N is the number of rules.
+// Example with 3 rules:
+//
+//	map $rule_0_any$rule_1_all$rule_2_any $test_auth_authz_require_all {
+//	    111     1;
+//	    default 0;
+//	}
+func buildAuthZRuleResultMap(
+	filterPrefix string,
+	requireType ngfAPIv1alpha1.RequireType,
+	ruleResultVars []string,
+) *AuthZMap {
+	if len(ruleResultVars) == 0 {
+		return nil
+	}
+
+	// If there's only one rule, no aggregation map is needed;
+	// the caller uses the rule's result variable directly.
+	if len(ruleResultVars) == 1 {
+		return nil
+	}
+
+	var variable string
+	var matchPattern string
+	source := strings.Join(ruleResultVars, "")
+
+	switch requireType {
+	case ngfAPIv1alpha1.RequireTypeAny:
+		variable = fmt.Sprintf("$%s_authz_require_any", filterPrefix)
+		matchPattern = "~1" // if any rule result contains 1
+	default: // RequireTypeAll
+		variable = fmt.Sprintf("$%s_authz_require_all", filterPrefix)
+		// All rule results must be 1: e.g., for 3 rules, match "111"
+		matchPattern = strings.Repeat("1", len(ruleResultVars))
+	}
+
+	return &AuthZMap{
+		Map: shared.Map{
+			Source:   source,
+			Variable: variable,
+			Parameters: []shared.MapParameter{
+				{Value: matchPattern, Result: "1"},
+				{Value: "default", Result: "0"},
+			},
+		},
+		Require: requireType,
+	}
+}
+
+// generateClaimVariableName generates the NGINX variable name for a claim, scoped by filter prefix.
+// Dots, slashes, and dashes in claim names are replaced with underscores for NGINX variable compatibility,
+// since NGINX variable names only allow [a-zA-Z0-9_].
+// The filterPrefix ensures uniqueness across multiple AuthenticationFilters.
+// Examples (with filterPrefix "test_auth"):
+//   - "realm_access/roles" becomes "$test_auth_claim_realm_access_roles"
+//   - "app_1-role" becomes "$test_auth_claim_app_1_role"
+func generateClaimVariableName(filterPrefix, claimName string) string {
+	safeName := sanitizeVariablePrefix(claimName)
+	return fmt.Sprintf("$%s_claim_%s", filterPrefix, safeName)
+}
+
+// sanitizeVariablePrefix converts a string value into a valid NGINX variable prefix.
+// NGINX variable names only allow [a-zA-Z0-9_], so any other characters are replaced with underscores.
+func sanitizeVariablePrefix(value string) string {
+	return helpers.SanitizeNginxVar(value)
+}
+
+// splitClaimName splits a claim name into parts for the auth_jwt_claim_set directive.
+// The "/" character is used as the nesting separator for nested JWT claims.
+// For example, "realm_access/roles" becomes ["realm_access", "roles"].
+// A claim name without "/" (e.g., "aud") returns ["aud"].
+func splitClaimName(name string) []string {
+	return strings.Split(name, "/")
+}
+
+// claimPatternAnchors defines the regex prefix and suffix for wrapping claim value patterns.
+type claimPatternAnchors struct {
+	prefix string
+	suffix string
+}
+
+var (
+	// allAnchors uses (?:.*,)? and (?:,.*)? to match a value within a comma-separated list
+	// when multiple claims are concatenated with +.
+	// Example: (?:.*,)?acme-co(?:,.*)? as part of a larger ^...$ anchored pattern.
+	allAnchors = claimPatternAnchors{prefix: "(?:.*,)?", suffix: "(?:,.*)?"}
+
+	// anyAnchors uses (?:^|,) and (?:,|$) to match a value within a comma-separated list
+	// when the claim is evaluated independently.
+	// Example: (?:^|,)cli(?:,|$) matches "cli", "cli,api", "api,cli", "api,cli,ops".
+	anyAnchors = claimPatternAnchors{prefix: "(?:^|,)", suffix: "(?:,|$)"}
+)
+
+// generateClaimValuePattern generates a regex pattern for claim value matching,
+// wrapping the value pattern with the provided anchors.
+func generateClaimValuePattern(
+	values []string,
+	matchType *ngfAPIv1alpha1.ClaimMatchType,
+	anchors claimPatternAnchors,
+) string {
+	if len(values) == 0 {
+		return ".*"
+	}
+
+	valuePattern := buildMapValuePattern(values, matchType)
+
+	return fmt.Sprintf("%s%s%s", anchors.prefix, valuePattern, anchors.suffix)
+}
+
+// buildMapValuePattern builds a regex safe pattern for list of values
+// and applying regex escaping where necessary.
+// Examples:
+// - Values ["val1", "val2"] and exact match, returns (?:^|,)(?:val1|val2)(?:,|$)
+// - Value "https://issuer.example-1.com" with exact match returns https://issuer\.example-1\.com
+func buildMapValuePattern(values []string, matchType *ngfAPIv1alpha1.ClaimMatchType) string {
+	patterns := make([]string, 0, len(values))
+	for _, value := range values {
+		if matchType != nil && *matchType == ngfAPIv1alpha1.ClaimMatchTypeRegex {
+			// Regex match: use the value as-is
+			patterns = append(patterns, value)
+		} else {
+			// Exact match: escape regex special characters
+			patterns = append(patterns, regexEscape(value))
+		}
+	}
+
+	if len(patterns) == 1 {
+		return patterns[0]
+	}
+	return generateListMatchPattern(patterns)
+}
+
+// generateListMatchPattern generates a regex pattern that matches any of the provided patterns.
+// Example: input ["val1", "val2"] returns (val1|val2).
+func generateListMatchPattern(patterns []string) string {
+	return "(" + strings.Join(patterns, "|") + ")"
+}
+
+// regexEscape escapes special regex characters in a string.
+// Example: "https://issuer.example-1.com" becomes "https://issuer\.example-1\.com"
+func regexEscape(value string) string {
+	special := `\.+*?^${}()|[]`
+	var result strings.Builder
+	for _, character := range value {
+		if strings.ContainsRune(special, character) {
+			result.WriteRune('\\')
+		}
+		result.WriteRune(character)
+	}
+	return result.String()
+}
+
+func buildBackendGroups(servers []VirtualServer) []BackendGroup {
+	type key struct {
+		nsname      types.NamespacedName
+		ruleIdx     int
+		pathRuleIdx int
+	}
+
+	// There can be duplicate backend groups if a route is attached to multiple listeners.
+	// We use a map to deduplicate them.
+	uniqueGroups := make(map[key]BackendGroup)
+
+	for _, s := range servers {
+		for _, pr := range s.PathRules {
+			for _, mr := range pr.MatchRules {
+				group := mr.BackendGroup
+
+				k := key{
+					nsname:      group.Source,
+					ruleIdx:     group.RuleIdx,
+					pathRuleIdx: group.PathRuleIdx,
+				}
+
+				uniqueGroups[k] = group
+			}
+		}
+	}
+
+	if len(uniqueGroups) == 0 {
+		return nil
+	}
+
+	groups := make([]BackendGroup, 0, len(uniqueGroups))
+	for _, group := range uniqueGroups {
+		groups = append(groups, group)
+	}
+
+	return groups
+}
+
+func newBackendGroup(
+	refs []graph.BackendRef,
+	gatewayName types.NamespacedName,
+	sourceNsName types.NamespacedName,
+	ruleIdx int,
+	referencedServices map[types.NamespacedName]*graph.ReferencedService,
+) (BackendGroup, bool) {
+	var backends []Backend
+
+	if len(refs) > 0 {
+		backends = make([]Backend, 0, len(refs))
+	}
+	var inferencePoolBackendExists bool
+
+	for _, ref := range refs {
+		if ref.IsMirrorBackend || ref.IsExternalAuthBackend {
+			continue
+		}
+
+		valid := ref.Valid
+		if _, ok := ref.InvalidForGateways[gatewayName]; ok {
+			valid = false
+		}
+
+		inferencePoolBackendExists = inferencePoolBackendExists || ref.IsInferencePool
+
+		var eppRef *EndpointPickerConfig
+		if ref.EndpointPickerConfig.EndpointPickerRef != nil {
+			eppRef = &EndpointPickerConfig{
+				EndpointPickerRef: ref.EndpointPickerConfig.EndpointPickerRef,
+				NsName:            ref.EndpointPickerConfig.NsName,
+				VerifyTLS:         convertBackendTLS(ref.EndpointPickerConfig.BackendTLSPolicy, gatewayName),
+			}
+		}
+
+		// Check if this backend is an ExternalName service
+		externalHostname := getExternalHostname(ref.SvcNsName, referencedServices)
+
+		var appProtocol string
+		if ref.ServicePort.AppProtocol != nil {
+			appProtocol = *ref.ServicePort.AppProtocol
+		}
+
+		backends = append(backends, Backend{
+			UpstreamName:         ref.ServicePortReference(),
+			Weight:               ref.Weight,
+			Valid:                valid,
+			VerifyTLS:            convertBackendTLS(ref.BackendTLSPolicy, gatewayName),
+			EndpointPickerConfig: eppRef,
+			ExternalHostname:     externalHostname,
+			AppProtocol:          appProtocol,
+		})
+	}
+
+	return BackendGroup{
+		Backends: backends,
+		Source:   sourceNsName,
+		RuleIdx:  ruleIdx,
+	}, inferencePoolBackendExists
+}
+
+// convertBackendTLS returns the per-Gateway TLS verification settings for a backend targeted by a
+// BackendTLSPolicy.
+func convertBackendTLS(btp *graph.BackendTLSPolicy, gwNsName types.NamespacedName) *VerifyTLS {
+	if btp == nil || !btp.Valid {
+		return nil
+	}
+
+	if !slices.Contains(btp.Gateways, gwNsName) {
+		return nil
+	}
+
+	verify := &VerifyTLS{}
+	if btp.CaCertRef.Name != "" {
+		verify.CertBundleID = generateCertBundleID(btp.CaCertRef)
+	} else {
+		verify.RootCAPath = AlpineSSLRootCAPath
+	}
+	verify.Hostname = string(btp.Source.Spec.Validation.Hostname)
+	return verify
+}
+
+func buildServers(
+	gateway *graph.Gateway,
+	referencedServices map[types.NamespacedName]*graph.ReferencedService,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+) (http, ssl []VirtualServer, sslListenerHostnames map[int32][]string, extAuthCertBundleIDs map[CertBundleID]struct{}) {
+	rulesForProtocol := map[v1.ProtocolType]portPathRules{
+		v1.HTTPProtocolType:  make(portPathRules),
+		v1.HTTPSProtocolType: make(portPathRules),
+	}
+	extAuthCertBundleIDs = make(map[CertBundleID]struct{})
+
+	for _, l := range gateway.Listeners {
+		if l.Source.Protocol == v1.TLSProtocolType ||
+			l.Source.Protocol == v1.TCPProtocolType ||
+			l.Source.Protocol == v1.UDPProtocolType {
+			continue
+		}
+		if l.Valid {
+			rules := rulesForProtocol[l.Source.Protocol][l.Source.Port]
+			if rules == nil {
+				rules = newHostPathRules()
+				rulesForProtocol[l.Source.Protocol][l.Source.Port] = rules
+			}
+
+			rules.upsertListener(l, gateway, referencedServices, referencedSecrets, extAuthCertBundleIDs)
+
+			if l.Source.Protocol == v1.HTTPSProtocolType {
+				hostname := ""
+				if l.Source.Hostname != nil {
+					hostname = string(*l.Source.Hostname)
+				}
+				if sslListenerHostnames == nil {
+					sslListenerHostnames = make(map[int32][]string)
+				}
+				sslListenerHostnames[l.Source.Port] = append(sslListenerHostnames[l.Source.Port], hostname)
+			}
+		}
+	}
+
+	httpRules := rulesForProtocol[v1.HTTPProtocolType]
+	sslRules := rulesForProtocol[v1.HTTPSProtocolType]
+
+	httpServers, sslServers := httpRules.buildServers(), sslRules.buildServers()
+
+	pols := buildPolicies(gateway, gateway.Policies)
+
+	for i := range httpServers {
+		httpServers[i].Policies = pols
+	}
+
+	for i := range sslServers {
+		sslServers[i].Policies = pols
+	}
+
+	return httpServers, sslServers, sslListenerHostnames, extAuthCertBundleIDs
+}
+
+// portPathRules keeps track of hostPathRules per port.
+type portPathRules map[v1.PortNumber]*hostPathRules
+
+func (p portPathRules) buildServers() []VirtualServer {
+	serverCount := 0
+	for _, rules := range p {
+		serverCount += rules.maxServerCount()
+	}
+
+	servers := make([]VirtualServer, 0, serverCount)
+
+	for _, rules := range p {
+		servers = append(servers, rules.buildServers()...)
+	}
+
+	return servers
+}
+
+type pathAndType struct {
+	path     string
+	pathType v1.PathMatchType
+}
+
+type hostPathRules struct {
+	rulesPerHost     map[string]map[pathAndType]PathRule
+	listenersForHost map[string]*graph.Listener
+	httpsListeners   []*graph.Listener
+	port             int32
+	listenersExist   bool
+}
+
+func newHostPathRules() *hostPathRules {
+	return &hostPathRules{
+		rulesPerHost:     make(map[string]map[pathAndType]PathRule),
+		listenersForHost: make(map[string]*graph.Listener),
+		httpsListeners:   make([]*graph.Listener, 0),
+	}
+}
+
+func (hpr *hostPathRules) upsertListener(
+	l *graph.Listener,
+	gateway *graph.Gateway,
+	referencedServices map[types.NamespacedName]*graph.ReferencedService,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+	extAuthCertBundleIDs map[CertBundleID]struct{},
+) {
+	hpr.listenersExist = true
+	hpr.port = l.Source.Port
+
+	if l.Source.Protocol == v1.HTTPSProtocolType {
+		hpr.httpsListeners = append(hpr.httpsListeners, l)
+	}
+
+	for _, r := range l.Routes {
+		if !r.Valid {
+			continue
+		}
+
+		hpr.upsertRoute(r, l, gateway, referencedServices, referencedSecrets, extAuthCertBundleIDs)
+	}
+}
+
+func (hpr *hostPathRules) upsertRoute(
+	route *graph.L7Route,
+	listener *graph.Listener,
+	gateway *graph.Gateway,
+	referencedServices map[types.NamespacedName]*graph.ReferencedService,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+	extAuthCertBundleIDs map[CertBundleID]struct{},
+) {
+	routeNsName := client.ObjectKeyFromObject(route.Source)
+	hostnames := acceptedHostnamesForListener(route, listener)
+	grpc := route.RouteType == graph.RouteTypeGRPC
+	objectSrc := routeObjectMeta(route, grpc)
+
+	hpr.ensureHostEntries(hostnames, listener)
+
+	for idx, rule := range route.Spec.Rules {
+		if !rule.ValidMatches {
+			continue
+		}
+
+		var filters HTTPFilters
+		if rule.Filters.Valid {
+			filters = createHTTPFilters(
+				rule.Filters.Filters,
+				idx,
+				routeNsName,
+				referencedSecrets,
+				rule.BackendRefs,
+				listener.GatewayName,
+				extAuthCertBundleIDs,
+			)
+		} else {
+			filters = HTTPFilters{
+				InvalidFilter: &InvalidHTTPFilter{},
+			}
+		}
+
+		pols := injectGatewayAccessPolicies(routeNsName, route.Policies, gateway)
+
+		guardrails := convertGraphGuardrails(route, client.ObjectKeyFromObject(gateway.Source), routeNsName, idx)
+
+		hpr.upsertRuleMatches(
+			hostnames,
+			rule,
+			idx,
+			grpc,
+			objectSrc,
+			filters,
+			guardrails,
+			pols,
+			listener.GatewayName,
+			routeNsName,
+			referencedServices,
+		)
+	}
+}
+
+// acceptedHostnamesForListener returns the set of hostnames this route was accepted for on the
+// provided listener. It uses the route parent attachment state rather than route spec hostnames so
+// only effective listener-specific hostnames are considered.
+func acceptedHostnamesForListener(route *graph.L7Route, listener *graph.Listener) []string {
+	for _, parentRef := range route.ParentRefs {
+		if parentRef.Attachment == nil {
+			continue
+		}
+
+		listenerAttachment := parentRef.Attachment.FindListenerAttachment(
+			graph.CreateParentRefListenerKeyFromListener(listener),
+		)
+		if listenerAttachment != nil {
+			return listenerAttachment.AcceptedHostnames
+		}
+	}
+
+	return nil
+}
+
+// routeObjectMeta returns the concrete route ObjectMeta for use in emitted match rules, selecting
+// the underlying HTTPRoute or GRPCRoute object based on the route type.
+func routeObjectMeta(route *graph.L7Route, grpc bool) *metav1.ObjectMeta {
+	if grpc {
+		return &helpers.MustCastObject[*v1.GRPCRoute](route.Source).ObjectMeta
+	}
+
+	return &helpers.MustCastObject[*v1.HTTPRoute](route.Source).ObjectMeta
+}
+
+// ensureHostEntries initializes per-host rule storage and records the most specific listener seen
+// for each accepted hostname.
+func (hpr *hostPathRules) ensureHostEntries(hostnames []string, listener *graph.Listener) {
+	for _, hostname := range hostnames {
+		if prevListener, exists := hpr.listenersForHost[hostname]; exists {
+			if listenerHostnameMoreSpecific(listener.Source.Hostname, prevListener.Source.Hostname) {
+				hpr.listenersForHost[hostname] = listener
+			}
+		} else {
+			hpr.listenersForHost[hostname] = listener
+		}
+
+		if _, exist := hpr.rulesPerHost[hostname]; !exist {
+			hpr.rulesPerHost[hostname] = make(map[pathAndType]PathRule)
+		}
+	}
+}
+
+// upsertRuleMatches applies all matches from a single route rule across the accepted hostnames for
+// the listener, delegating the actual host/path entry update to upsertMatchRule.
+func (hpr *hostPathRules) upsertRuleMatches(
+	hostnames []string,
+	rule graph.RouteRule,
+	ruleIdx int,
+	grpc bool,
+	objectSrc *metav1.ObjectMeta,
+	filters HTTPFilters,
+	guardrails *GuardrailsConfig,
+	pols []policies.Policy,
+	gatewayName types.NamespacedName,
+	routeNsName types.NamespacedName,
+	referencedServices map[types.NamespacedName]*graph.ReferencedService,
+) {
+	for _, hostname := range hostnames {
+		for _, match := range rule.Matches {
+			hpr.upsertMatchRule(
+				hostname,
+				match,
+				rule,
+				ruleIdx,
+				grpc,
+				objectSrc,
+				filters,
+				guardrails,
+				pols,
+				gatewayName,
+				routeNsName,
+				referencedServices,
+			)
+		}
+	}
+}
+
+// upsertMatchRule creates or updates the PathRule for a single hostname and match, then appends the
+// generated MatchRule and backend group information for the route rule.
+func (hpr *hostPathRules) upsertMatchRule(
+	hostname string,
+	match v1.HTTPRouteMatch,
+	rule graph.RouteRule,
+	ruleIdx int,
+	grpc bool,
+	objectSrc *metav1.ObjectMeta,
+	filters HTTPFilters,
+	guardrails *GuardrailsConfig,
+	pols []policies.Policy,
+	gatewayName types.NamespacedName,
+	routeNsName types.NamespacedName,
+	referencedServices map[types.NamespacedName]*graph.ReferencedService,
+) {
+	path := getPath(match.Path)
+	key := pathAndType{
+		path:     path,
+		pathType: *match.Path.Type,
+	}
+
+	hostRule, exists := hpr.rulesPerHost[hostname][key]
+	if !exists {
+		hostRule.Path = path
+		hostRule.PathType = convertPathType(*match.Path.Type)
+		hostRule.Policies = append(hostRule.Policies, pols...)
+	}
+
+	hostRule.GRPC = grpc
+	backendGroup, inferencePoolBackendExists := newBackendGroup(
+		rule.BackendRefs,
+		gatewayName,
+		routeNsName,
+		ruleIdx,
+		referencedServices,
+	)
+	if inferencePoolBackendExists {
+		hostRule.HasInferenceBackends = true
+	}
+
+	hostRule.MatchRules = append(hostRule.MatchRules, MatchRule{
+		Source:       objectSrc,
+		BackendGroup: backendGroup,
+		Filters:      filters,
+		Match:        convertMatch(match),
+		Guardrails:   guardrails,
+	})
+
+	hpr.rulesPerHost[hostname][key] = hostRule
+}
+
+func (hpr *hostPathRules) buildServers() []VirtualServer {
+	servers := make([]VirtualServer, 0, len(hpr.rulesPerHost)+len(hpr.httpsListeners))
+
+	for h, rules := range hpr.rulesPerHost {
+		s := VirtualServer{
+			Hostname:  h,
+			PathRules: make([]PathRule, 0, len(rules)),
+			Port:      hpr.port,
+		}
+
+		l, ok := hpr.listenersForHost[h]
+		if !ok {
+			panic(fmt.Sprintf("no listener found for hostname: %s", h))
+		}
+
+		if len(l.ResolvedSecrets) > 0 {
+			s.SSL = buildSSL(l)
+		}
+
+		for _, r := range rules {
+			sortMatchRules(r.MatchRules)
+
+			s.PathRules = append(s.PathRules, r)
+		}
+
+		sortPathRules(s.PathRules)
+
+		for pathRuleIdx := range s.PathRules {
+			for matchRuleIdx := range s.PathRules[pathRuleIdx].MatchRules {
+				s.PathRules[pathRuleIdx].MatchRules[matchRuleIdx].BackendGroup.PathRuleIdx = pathRuleIdx
+			}
+		}
+
+		servers = append(servers, s)
+	}
+
+	var defaultSSL *SSL
+	for _, l := range hpr.httpsListeners {
+		hostname := getListenerHostname(l.Source.Hostname)
+		// Generate a 404 ssl server block for listeners with no routes or listeners with wildcard (match-all) routes.
+		// If SNI isn't set in a request, the default ssl server will be used first to terminate TLS,
+		// then the Host header will be used to route to the correct server block.
+		// If there is no matching hostname, then this wildcard server will be used.
+		if len(l.Routes) == 0 || hostname == wildcardHostname {
+			s := VirtualServer{
+				Hostname: hostname,
+				Port:     hpr.port,
+			}
+
+			if len(l.ResolvedSecrets) > 0 {
+				s.SSL = buildSSL(l)
+
+				// If this is a wildcard, save SSL config for default server
+				if hostname == wildcardHostname {
+					defaultSSL = s.SSL
+				}
+			}
+
+			servers = append(servers, s)
+		}
+	}
+
+	// if any listeners exist, we need to generate a default server block.
+	if hpr.listenersExist {
+		vs := VirtualServer{
+			IsDefault: true,
+			Port:      hpr.port,
+			SSL:       defaultSSL,
+		}
+
+		servers = append(servers, vs)
+	}
+
+	// We sort the servers so the order is preserved after reconfiguration.
+	sort.Slice(servers, func(i, j int) bool {
+		return servers[i].Hostname < servers[j].Hostname
+	})
+
+	return servers
+}
+
+func buildSSL(listener *graph.Listener) *SSL {
+	keyPairIDs := make([]SSLKeyPairID, 0, len(listener.ResolvedSecrets))
+	for _, secretNsName := range listener.ResolvedSecrets {
+		keyPairIDs = append(keyPairIDs, generateSSLKeyPairID(secretNsName))
+	}
+
+	ssl := &SSL{
+		KeyPairIDs: keyPairIDs,
+	}
+
+	if listener.Source.TLS != nil && listener.Source.TLS.Options != nil {
+		if protocols, ok := listener.Source.TLS.Options[graph.SSLProtocolsKey]; ok {
+			ssl.Protocols = string(protocols)
+		}
+		if ciphers, ok := listener.Source.TLS.Options[graph.SSLCiphersKey]; ok {
+			ssl.Ciphers = string(ciphers)
+		}
+		if prefer, ok := listener.Source.TLS.Options[graph.SSLPreferServerCiphersKey]; ok {
+			ssl.PreferServerCiphers = (string(prefer) == "on")
+		}
+		if cache, ok := listener.Source.TLS.Options[graph.SSLSessionCacheKey]; ok {
+			ssl.SessionCache = buildSSLSessionCache(listener, string(cache))
+		}
+		if timeout, ok := listener.Source.TLS.Options[graph.SSLSessionTimeoutKey]; ok {
+			ssl.SessionTimeout = string(timeout)
+		}
+		if curve, ok := listener.Source.TLS.Options[graph.SSLEcdhCurveKey]; ok {
+			ssl.EcdhCurve = string(curve)
+		}
+	}
+
+	return ssl
+}
+
+// buildSSLSessionCache converts the user-provided ssl-session-cache option value into a complete
+// ssl_session_cache directive value. The special values "off" and "none" are passed through as-is;
+// any other value is treated as the size of a shared cache whose zone name NGF generates from the
+// listener (the user does not provide the zone name).
+func buildSSLSessionCache(listener *graph.Listener, value string) string {
+	if value == "off" || value == "none" {
+		return value
+	}
+
+	return fmt.Sprintf("shared:%s:%s", generateSSLSessionCacheZoneName(listener), value)
+}
+
+// generateSSLSessionCacheZoneName builds a shared SSL session cache zone name that is unique to the
+// listener. The Gateway (and ListenerSet) namespace and name are included so that Gateways sharing a
+// name across namespaces do not produce the same zone name. Non-alphanumeric characters in the
+// identifiers are replaced with underscores so the result is a valid NGINX zone name.
+func generateSSLSessionCacheZoneName(listener *graph.Listener) string {
+	parts := []string{
+		"ssl",
+		helpers.SanitizeNginxVar(listener.GatewayName.Namespace),
+		helpers.SanitizeNginxVar(listener.GatewayName.Name),
+	}
+	if listener.ListenerSetName.Name != "" {
+		parts = append(parts,
+			helpers.SanitizeNginxVar(listener.ListenerSetName.Namespace),
+			helpers.SanitizeNginxVar(listener.ListenerSetName.Name),
+		)
+	}
+	parts = append(parts, helpers.SanitizeNginxVar(listener.Name))
+
+	return strings.Join(parts, "_")
+}
+
+// maxServerCount returns the maximum number of VirtualServers that can be built from the host path rules.
+func (hpr *hostPathRules) maxServerCount() int {
+	// to calculate max # of servers we add up:
+	// - # of hostnames
+	// - # of https listeners - this is to account for https wildcard default servers
+	// - default server - for every hostPathRules we generate 1 default server
+	return len(hpr.rulesPerHost) + len(hpr.httpsListeners) + 1
+}
+
+func buildUpstreams(
+	ctx context.Context,
+	logger logr.Logger,
+	gateway *graph.Gateway,
+	svcResolver resolver.ServiceResolver,
+	referencedServices map[types.NamespacedName]*graph.ReferencedService,
+) []Upstream {
+	// There can be duplicate upstreams if multiple routes reference the same upstream.
+	// We use a map to deduplicate them.
+	uniqueUpstreams := make(map[string]Upstream)
+
+	for _, l := range gateway.Listeners {
+		if !l.Valid {
+			continue
+		}
+
+		for _, route := range l.Routes {
+			if !route.Valid {
+				continue
+			}
+
+			for _, rule := range route.Spec.Rules {
+				if !rule.ValidMatches || !rule.Filters.Valid {
+					// don't generate upstreams for rules that have invalid matches or filters
+					continue
+				}
+
+				for _, br := range rule.BackendRefs {
+					if upstream := buildUpstream(
+						ctx,
+						logger,
+						br,
+						gateway,
+						svcResolver,
+						referencedServices,
+						uniqueUpstreams,
+						br.SessionPersistence,
+					); upstream != nil {
+						uniqueUpstreams[upstream.Name] = *upstream
+					}
+				}
+			}
+		}
+	}
+
+	if len(uniqueUpstreams) == 0 {
+		return nil
+	}
+
+	upstreams := make([]Upstream, 0, len(uniqueUpstreams))
+
+	for _, up := range uniqueUpstreams {
+		upstreams = append(upstreams, up)
+	}
+
+	// Preserve order so that this doesn't trigger an unnecessary reload.
+	sort.Slice(upstreams, func(i, j int) bool {
+		return upstreams[i].Name < upstreams[j].Name
+	})
+
+	return upstreams
+}
+
+func buildUpstream(
+	ctx context.Context,
+	logger logr.Logger,
+	br graph.BackendRef,
+	gateway *graph.Gateway,
+	svcResolver resolver.ServiceResolver,
+	referencedServices map[types.NamespacedName]*graph.ReferencedService,
+	uniqueUpstreams map[string]Upstream,
+	sessionPersistence *graph.SessionPersistenceConfig,
+) *Upstream {
+	if !br.Valid {
+		return nil
+	}
+
+	gatewayNSName := client.ObjectKeyFromObject(gateway.Source)
+	if _, ok := br.InvalidForGateways[gatewayNSName]; ok {
+		return nil
+	}
+
+	upstreamName := br.ServicePortReference()
+	_, exist := uniqueUpstreams[upstreamName]
+
+	if exist {
+		return nil
+	}
+
+	var errMsg string
+
+	var upstreamPolicies []policies.Policy
+	var uspSettings upstreamsettings.UpstreamSettings
+	if graphSvc, exists := referencedServices[br.SvcNsName]; exists {
+		upstreamPolicies = buildPolicies(gateway, graphSvc.Policies)
+		uspSettings = upstreamsettings.Processor{}.Process(upstreamPolicies)
+	}
+
+	// The NginxProxy setting provides the default; a UseClusterIP value set in an
+	// UpstreamSettingsPolicy for this Service takes precedence over that default.
+	useClusterIP := useClusterIPForNginxProxy(gateway.EffectiveNginxProxy)
+	if uspSettings.UseClusterIP != nil {
+		useClusterIP = *uspSettings.UseClusterIP
+	}
+
+	// The NginxProxy setting provides the default; If the upstream value is not set, the default takes over
+	if gateway.EffectiveNginxProxy != nil && gateway.EffectiveNginxProxy.ZoneSize != nil && uspSettings.ZoneSize == nil {
+		uspSettings.ZoneSize = gateway.EffectiveNginxProxy.ZoneSize
+	}
+
+	eps, err := resolveUpstreamEndpoints(
+		ctx,
+		logger,
+		br,
+		svcResolver,
+		referencedServices,
+		useClusterIP,
+	)
+	if err != nil {
+		errMsg = err.Error()
+		logger.V(1).Info(
+			"Failed to resolve endpoints, endpoints may not be ready",
+			"error", errMsg,
+			"service", br.SvcNsName,
+		)
+	} else {
+		logger.V(1).Info(
+			"Successfully resolved endpoints",
+			"service", br.SvcNsName,
+		)
+	}
+
+	var sp SessionPersistenceConfig
+	if sessionPersistence != nil {
+		sp = SessionPersistenceConfig{
+			Name:        sessionPersistence.Name,
+			Expiry:      sessionPersistence.Expiry,
+			Path:        sessionPersistence.Path,
+			SessionType: CookieBasedSessionPersistence,
+		}
+	}
+
+	return &Upstream{
+		Name:               upstreamName,
+		VerifyTLS:          convertBackendTLS(br.BackendTLSPolicy, gatewayNSName),
+		Endpoints:          eps,
+		ErrorMsg:           errMsg,
+		Policies:           upstreamPolicies,
+		UpstreamSettings:   uspSettings,
+		SessionPersistence: sp,
+		StateFileKey:       br.BaseServicePortKey(),
+	}
+}
+
+func getListenerHostname(h *v1.Hostname) string {
+	if h == nil || *h == "" {
+		return wildcardHostname
+	}
+
+	return string(*h)
+}
+
+func getPath(path *v1.HTTPPathMatch) string {
+	if path == nil || path.Value == nil || *path.Value == "" {
+		return "/"
+	}
+	return *path.Value
+}
+
+func createHTTPFilters(
+	filters []graph.Filter,
+	ruleIdx int,
+	routeNsName types.NamespacedName,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+	backendRefs []graph.BackendRef,
+	gwNsName types.NamespacedName,
+	extAuthCertBundleIDs map[CertBundleID]struct{},
+) HTTPFilters {
+	var result HTTPFilters
+
+	for _, f := range filters {
+		switch f.FilterType {
+		case graph.FilterRequestRedirect:
+			result.addRequestRedirect(f.RequestRedirect)
+		case graph.FilterURLRewrite:
+			result.addURLRewrite(f.URLRewrite)
+		case graph.FilterRequestMirror:
+			result.addRequestMirror(f.RequestMirror, ruleIdx, routeNsName)
+		case graph.FilterRequestHeaderModifier:
+			result.addRequestHeaderModifier(f.RequestHeaderModifier)
+		case graph.FilterResponseHeaderModifier:
+			result.addResponseHeaderModifier(f.ResponseHeaderModifier)
+		case graph.FilterExtensionRef:
+			result.addExtensionRef(f.ResolvedExtensionRef, referencedSecrets)
+		case graph.FilterCORS:
+			result.addCORS(f.CORS)
+		case graph.FilterExternalAuth:
+			result.addExternalAuth(f.ExternalAuth, backendRefs, routeNsName, ruleIdx, gwNsName, extAuthCertBundleIDs)
+		}
+	}
+
+	return result
+}
+
+func (hf *HTTPFilters) addRequestRedirect(redirect *v1.HTTPRequestRedirectFilter) {
+	if hf.RequestRedirect == nil {
+		// using the first filter
+		hf.RequestRedirect = convertHTTPRequestRedirectFilter(redirect)
+	}
+}
+
+func (hf *HTTPFilters) addURLRewrite(rewrite *v1.HTTPURLRewriteFilter) {
+	if hf.RequestURLRewrite == nil {
+		// using the first filter
+		hf.RequestURLRewrite = convertHTTPURLRewriteFilter(rewrite)
+	}
+}
+
+func (hf *HTTPFilters) addRequestMirror(
+	mirror *v1.HTTPRequestMirrorFilter,
+	ruleIdx int,
+	routeNsName types.NamespacedName,
+) {
+	hf.RequestMirrors = append(
+		hf.RequestMirrors,
+		convertHTTPRequestMirrorFilter(mirror, ruleIdx, routeNsName),
+	)
+}
+
+func (hf *HTTPFilters) addRequestHeaderModifier(modifier *v1.HTTPHeaderFilter) {
+	if hf.RequestHeaderModifiers == nil {
+		// using the first filter
+		hf.RequestHeaderModifiers = convertHTTPHeaderFilter(modifier)
+	}
+}
+
+func (hf *HTTPFilters) addResponseHeaderModifier(modifier *v1.HTTPHeaderFilter) {
+	if hf.ResponseHeaderModifiers == nil {
+		// using the first filter
+		hf.ResponseHeaderModifiers = convertHTTPHeaderFilter(modifier)
+	}
+}
+
+func (hf *HTTPFilters) addExtensionRef(
+	ref *graph.ExtensionRefFilter,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+) {
+	if ref == nil {
+		return
+	}
+
+	if ref.SnippetsFilter != nil {
+		hf.SnippetsFilters = append(
+			hf.SnippetsFilters,
+			convertSnippetsFilter(ref.SnippetsFilter),
+		)
+	}
+	if ref.AuthenticationFilter != nil {
+		hf.AuthenticationFilter = convertAuthenticationFilter(
+			ref.AuthenticationFilter,
+			referencedSecrets,
+		)
+	}
+}
+
+func (hf *HTTPFilters) addCORS(cors *v1.HTTPCORSFilter) {
+	if hf.CORSFilter == nil {
+		hf.CORSFilter = convertHTTPCORSFilter(cors)
+	}
+}
+
+func (hf *HTTPFilters) addExternalAuth(
+	extAuth *v1.HTTPExternalAuthFilter,
+	backendRefs []graph.BackendRef,
+	routeNsName types.NamespacedName,
+	ruleIdx int,
+	gwNsName types.NamespacedName,
+	extAuthCertBundleIDs map[CertBundleID]struct{},
+) {
+	if hf.ExternalAuthFilter != nil {
+		return
+	}
+
+	for _, br := range backendRefs {
+		if br.IsExternalAuthBackend && br.Valid {
+			hf.ExternalAuthFilter = convertHTTPExternalAuthFilter(extAuth, br, routeNsName, ruleIdx, gwNsName)
+			if hf.ExternalAuthFilter.VerifyTLS != nil && extAuthCertBundleIDs != nil {
+				extAuthCertBundleIDs[hf.ExternalAuthFilter.VerifyTLS.CertBundleID] = struct{}{}
+			}
+			break
+		}
+	}
+}
+
+// listenerHostnameMoreSpecific returns true if host1 is more specific than host2.
+func listenerHostnameMoreSpecific(host1, host2 *v1.Hostname) bool {
+	var host1Str, host2Str string
+	if host1 != nil {
+		host1Str = string(*host1)
+	}
+
+	if host2 != nil {
+		host2Str = string(*host2)
+	}
+
+	return graph.GetMoreSpecificHostname(host1Str, host2Str) == host1Str
+}
+
+// generateSSLKeyPairID generates an ID for the SSL key pair based on the Secret namespaced name.
+// It is guaranteed to be unique per unique namespaced name.
+// The ID is safe to use as a file name.
+func generateSSLKeyPairID(secret types.NamespacedName) SSLKeyPairID {
+	return SSLKeyPairID(fmt.Sprintf("ssl_keypair_%s_%s", secret.Namespace, secret.Name))
+}
+
+// generateCertBundleID generates an ID for the certificate bundle based on the ConfigMap/Secret namespaced name.
+// It is guaranteed to be unique per unique namespaced name.
+// The ID is safe to use as a file name.
+func generateCertBundleID(caCertRef types.NamespacedName) CertBundleID {
+	return CertBundleID(fmt.Sprintf("cert_bundle_%s_%s", caCertRef.Namespace, caCertRef.Name))
+}
+
+// generateCRLBundleID generates an ID for a CRL bundle.
+// Uses a distinct prefix to avoid collisions when the same secret is referenced as both CA cert and CRL.
+func generateCRLBundleID(ref types.NamespacedName) CertBundleID {
+	return CertBundleID(fmt.Sprintf("%s_%s_%s", crlBundleIDPrefix, ref.Namespace, ref.Name))
+}
+
+// IsCRLBundle reports whether this CertBundleID identifies a CRL bundle.
+func (id CertBundleID) IsCRLBundle() bool {
+	return strings.HasPrefix(string(id), crlBundleIDPrefix)
+}
+
+// generateJWTRemoteTLSCABundleID generates an ID for JWT remote TLS CA bundle based on the Secret namespaced name.
+// It is guaranteed to be unique per unique namespaced name.
+// The ID is safe to use as a file name.
+func generateJWTRemoteTLSCABundleID(namespace, secretName string) CertBundleID {
+	return CertBundleID(fmt.Sprintf("jwt_remote_tls_ca_%s_%s", namespace, secretName))
+}
+
+// GenerateAuthBasicFileID is used to generate IDs for basic auth files.
+func GenerateAuthBasicFileID(namespace, name string) AuthFileID {
+	return AuthFileID(fmt.Sprintf("basic_auth_%s_%s", namespace, name))
+}
+
+// GenerateAuthJWTFileID is used to generate IDs for jwt auth files.
+func GenerateAuthJWTFileID(namespace, name string) AuthFileID {
+	return AuthFileID(fmt.Sprintf("jwt_auth_%s_%s", namespace, name))
+}
+
+// GenerateGuardrailsTokenFileID is used to generate IDs for guardrails ExtProcess auth token files.
+func GenerateGuardrailsTokenFileID(namespace, name string) AuthFileID {
+	return AuthFileID(fmt.Sprintf("guardrails_token_%s_%s", namespace, name))
+}
+
+// buildGuardrailsAuthSecrets collects the resolved ExtProcess auth token files for the routes attached
+// to this gateway's valid listeners, keyed by their AuthFileID so they are written to the NGINX secrets
+// directory.
+func buildGuardrailsAuthSecrets(
+	gateway *graph.Gateway,
+) map[AuthFileID]AuthFileData {
+	tokens := make(map[AuthFileID]AuthFileData)
+	if gateway == nil || gateway.Source == nil {
+		return tokens
+	}
+
+	gwNsName := client.ObjectKeyFromObject(gateway.Source)
+
+	for _, l := range gateway.Listeners {
+		if !l.Valid {
+			continue
+		}
+
+		for _, route := range l.Routes {
+			if !route.Valid {
+				continue
+			}
+
+			policy := route.EffectivePayloadProcessors[gwNsName]
+			if policy == nil || !policy.Valid || policy.PayloadProcessorState == nil {
+				continue
+			}
+
+			state := policy.PayloadProcessorState
+			if state.AuthTokenSecret == nil || len(state.ResolvedAuthToken) == 0 {
+				continue
+			}
+
+			id := GenerateGuardrailsTokenFileID(state.AuthTokenSecret.Namespace, state.AuthTokenSecret.Name)
+			tokens[id] = state.ResolvedAuthToken
+		}
+	}
+
+	return tokens
+}
+
+// guardrailsEnabled reports whether any location across the given servers has a Guardrails config,
+// which requires the ai-guardrails NGINX module to be loaded.
+func guardrailsEnabled(serverGroups ...[]VirtualServer) bool {
+	for _, servers := range serverGroups {
+		for _, s := range servers {
+			for _, pr := range s.PathRules {
+				for _, mr := range pr.MatchRules {
+					if mr.Guardrails != nil {
+						return true
+					}
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+// buildOIDCProviderFromAuthenticationFilters builds the OIDC provider configs from the processed
+// authentication filters. It also returns any certificate bundles (CA certs and CRLs) that are needed.
+func buildOIDCProviderFromAuthenticationFilters(
+	authFilters map[types.NamespacedName]*graph.AuthenticationFilter,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+) ([]OIDCProvider, map[CertBundleID]CertBundle) {
+	var providers []OIDCProvider
+	certBundles := make(map[CertBundleID]CertBundle)
+
+	for _, af := range authFilters {
+		if !af.Valid || !af.Referenced {
+			continue
+		}
+		if af.Source.Spec.Type != ngfAPIv1alpha1.AuthTypeOIDC {
+			continue
+		}
+		converted := convertAuthenticationFilter(af, referencedSecrets)
+		if converted.OIDC == nil || converted.OIDC.Provider == nil {
+			continue
+		}
+		provider := *converted.OIDC.Provider
+		if provider.CACertBundleID != "" && provider.CACertData != nil {
+			certBundles[provider.CACertBundleID] = provider.CACertData
+		}
+		if provider.CRLBundleID != "" && provider.CRLData != nil {
+			certBundles[provider.CRLBundleID] = provider.CRLData
+		}
+		providers = append(providers, provider)
+	}
+
+	if len(certBundles) == 0 {
+		return providers, nil
+	}
+	return providers, certBundles
+}
+
+func telemetryEnabled(gw *graph.Gateway) bool {
+	if gw == nil {
+		return false
+	}
+
+	if gw.EffectiveNginxProxy == nil || gw.EffectiveNginxProxy.Telemetry == nil {
+		return false
+	}
+
+	tel := gw.EffectiveNginxProxy.Telemetry
+
+	if slices.Contains(tel.DisabledFeatures, ngfAPIv1alpha2.DisableTracing) {
+		return false
+	}
+
+	if tel.Exporter == nil || tel.Exporter.Endpoint == nil {
+		return false
+	}
+
+	return true
+}
+
+// buildTelemetry generates the Otel configuration.
+func buildTelemetry(g *graph.Graph, gateway *graph.Gateway) Telemetry {
+	if !telemetryEnabled(gateway) {
+		return Telemetry{}
+	}
+
+	serviceName := fmt.Sprintf("ngf:%s:%s", gateway.Source.Namespace, gateway.Source.Name)
+	telemetry := gateway.EffectiveNginxProxy.Telemetry
+	if telemetry.ServiceName != nil {
+		serviceName = serviceName + ":" + *telemetry.ServiceName
+	}
+
+	tel := Telemetry{
+		Endpoint:    *telemetry.Exporter.Endpoint, // safe to deref here since we verified that telemetry is enabled
+		ServiceName: serviceName,
+	}
+
+	if telemetry.Exporter.BatchCount != nil {
+		tel.BatchCount = *telemetry.Exporter.BatchCount
+	}
+	if telemetry.Exporter.BatchSize != nil {
+		tel.BatchSize = *telemetry.Exporter.BatchSize
+	}
+	if telemetry.Exporter.Interval != nil {
+		tel.Interval = string(*telemetry.Exporter.Interval)
+	}
+
+	tel.SpanAttributes = setSpanAttributes(telemetry.SpanAttributes)
+
+	// FIXME(sberman): https://github.com/nginx/nginx-gateway-fabric/issues/2038
+	// Find a generic way to include relevant policy info at the http context so we don't need policy-specific
+	// logic in this function
+	ratioMap := make(map[string]int32)
+	for _, pol := range g.NGFPolicies {
+		if obsPol, ok := pol.Source.(*ngfAPIv1alpha2.ObservabilityPolicy); ok {
+			if obsPol.Spec.Tracing != nil && obsPol.Spec.Tracing.Ratio != nil && *obsPol.Spec.Tracing.Ratio > 0 {
+				ratioName := CreateRatioVarName(*obsPol.Spec.Tracing.Ratio)
+				ratioMap[ratioName] = *obsPol.Spec.Tracing.Ratio
+			}
+		}
+	}
+
+	tel.Ratios = make([]Ratio, 0, len(ratioMap))
+	for name, ratio := range ratioMap {
+		tel.Ratios = append(tel.Ratios, Ratio{Name: name, Value: ratio})
+	}
+
+	return tel
+}
+
+func setSpanAttributes(spanAttributes []ngfAPIv1alpha1.SpanAttribute) []SpanAttribute {
+	spanAttrs := make([]SpanAttribute, 0, len(spanAttributes))
+	for _, spanAttr := range spanAttributes {
+		sa := SpanAttribute{
+			Key:   spanAttr.Key,
+			Value: spanAttr.Value,
+		}
+		spanAttrs = append(spanAttrs, sa)
+	}
+
+	return spanAttrs
+}
+
+// CreateRatioVarName builds a variable name for an ObservabilityPolicy to be used with
+// ratio-based trace sampling.
+func CreateRatioVarName(ratio int32) string {
+	return fmt.Sprintf("$otel_ratio_%d", ratio)
+}
+
+// buildBaseHTTPConfig generates the base http context config that should be applied to all servers.
+func buildBaseHTTPConfig(
+	gateway *graph.Gateway,
+	gatewaySnippetsFilters map[types.NamespacedName]*graph.SnippetsFilter,
+	gatewayRateLimitPolicies map[graph.PolicyKey]*graph.Policy,
+	clusterIPFamily ngfAPIv1alpha2.IPFamilyType,
+) BaseHTTPConfig {
+	baseConfig := BaseHTTPConfig{
+		// HTTP2 should be enabled by default
+		HTTP2:    true,
+		IPFamily: Dual,
+		Policies: buildPolicies(gateway, gateway.Policies),
+		Snippets: buildSnippetsForContext(gatewaySnippetsFilters, ngfAPIv1alpha1.NginxContextHTTP),
+	}
+
+	// Create HTTP context policies for route-targeting RateLimitPolicies
+	// For RateLimitPolicies that target routes that aren't attached to the Gateway,
+	// these policies need to create the limit_req_zone directive at the http context.
+	// To achieve this, we create a modified copy of the RateLimitPolicy with an annotation
+	// indicating it's for HTTP context use only and attach it to the base HTTP config.
+	httpContextRateLimitPolicies := buildHTTPContextRateLimitPolicies(gatewayRateLimitPolicies)
+	baseConfig.Policies = append(baseConfig.Policies, httpContextRateLimitPolicies...)
+
+	if gateway.Valid && gateway.SecretRef != nil {
+		baseConfig.GatewaySecretID = generateSSLKeyPairID(*gateway.SecretRef)
+	}
+
+	// safe to access EffectiveNginxProxy since we only call this function when the Gateway is not nil.
+	np := gateway.EffectiveNginxProxy
+
+	// These helpers handle np == nil internally, so call them before the nil check.
+	baseConfig.NginxReadinessProbePort = GetNginxReadinessProbePort(np)
+	baseConfig.NginxReadinessProbePath = GetNginxReadinessProbePath(np)
+
+	if np == nil {
+		return baseConfig
+	}
+
+	if np.DisableHTTP2 != nil && *np.DisableHTTP2 {
+		baseConfig.HTTP2 = false
+	}
+
+	if np.DisableSNIHostValidation != nil && *np.DisableSNIHostValidation {
+		baseConfig.DisableSNIHostValidation = true
+	}
+
+	ipFamily := np.IPFamily
+	if ipFamily == nil {
+		// Assign the value from clusterIPFamily if np.IPFamily is empty
+		ipFamily = &clusterIPFamily
+	}
+
+	switch *ipFamily {
+	case ngfAPIv1alpha2.IPv4:
+		baseConfig.IPFamily = IPv4
+	case ngfAPIv1alpha2.IPv6:
+		baseConfig.IPFamily = IPv6
+	}
+
+	baseConfig.RewriteClientIPSettings = buildRewriteClientIPConfig(np.RewriteClientIP)
+
+	baseConfig.DNSResolver = buildDNSResolverConfig(np.DNSResolver)
+
+	baseConfig.ServerTokens = buildServerTokens(gateway)
+	baseConfig.DisableBaseProxySetHeaders = buildDisableBaseProxySetHeaders(np)
+
+	baseConfig.Compression = buildCompressionConfig(np.Compression)
+
+	return baseConfig
+}
+
+func buildDisableBaseProxySetHeaders(np *graph.EffectiveNginxProxy) []string {
+	if np == nil || len(np.DisableBaseHeaders) == 0 {
+		return nil
+	}
+
+	disabledHeaders := make([]string, 0, len(np.DisableBaseHeaders))
+	for _, header := range np.DisableBaseHeaders {
+		disabledHeaders = append(disabledHeaders, string(header))
+	}
+
+	return disabledHeaders
+}
+
+// buildHTTPContextRateLimitPolicies creates HTTP context versions of RateLimitPolicies that target routes.
+// These policies are modified copies with an annotation to indicate they're for HTTP context use only.
+func buildHTTPContextRateLimitPolicies(gatewayRateLimitPolicies map[graph.PolicyKey]*graph.Policy) []policies.Policy {
+	if len(gatewayRateLimitPolicies) == 0 {
+		return nil
+	}
+
+	httpContextRateLimitPolicies := make([]policies.Policy, 0, len(gatewayRateLimitPolicies))
+
+	for _, graphPolicy := range gatewayRateLimitPolicies {
+		if graphPolicy == nil || !graphPolicy.Valid {
+			continue
+		}
+
+		// Extract the actual RateLimitPolicy from the graph.Policy wrapper
+		rateLimitPolicy, ok := graphPolicy.Source.(*ngfAPIv1alpha1.RateLimitPolicy)
+		if !ok {
+			continue
+		}
+
+		// Create a deep copy of the RateLimitPolicy
+		httpContextPolicy := rateLimitPolicy.DeepCopy()
+
+		// Add a marker annotation to identify this as a fake HTTP context policy
+		if httpContextPolicy.Annotations == nil {
+			httpContextPolicy.Annotations = make(map[string]string)
+		}
+		httpContextPolicy.Annotations[InternalRLPAnnotationKey] = InternalRLPAnnotationValue
+
+		// Convert to policies.Policy interface and add to the list
+		httpContextRateLimitPolicies = append(httpContextRateLimitPolicies, httpContextPolicy)
+	}
+
+	// Sort for deterministic ordering
+	sort.Slice(httpContextRateLimitPolicies, func(i, j int) bool {
+		policyI, okI := httpContextRateLimitPolicies[i].(*ngfAPIv1alpha1.RateLimitPolicy)
+		policyJ, okJ := httpContextRateLimitPolicies[j].(*ngfAPIv1alpha1.RateLimitPolicy)
+
+		if !okI || !okJ {
+			// If type cast fails, fall back to comparing by string representation
+			return fmt.Sprintf("%v", httpContextRateLimitPolicies[i]) < fmt.Sprintf("%v", httpContextRateLimitPolicies[j])
+		}
+
+		if policyI.Namespace != policyJ.Namespace {
+			return policyI.Namespace < policyJ.Namespace
+		}
+		return policyI.Name < policyJ.Name
+	})
+
+	return httpContextRateLimitPolicies
+}
+
+func GetNginxReadinessProbePort(np *graph.EffectiveNginxProxy) int32 {
+	port := DefaultNginxReadinessProbePort
+
+	if np != nil && np.Kubernetes != nil {
+		var containerSpec *ngfAPIv1alpha2.ContainerSpec
+		if np.Kubernetes.Deployment != nil {
+			containerSpec = &np.Kubernetes.Deployment.Container
+		} else if np.Kubernetes.DaemonSet != nil {
+			containerSpec = &np.Kubernetes.DaemonSet.Container
+		}
+		if containerSpec != nil && containerSpec.ReadinessProbe != nil && containerSpec.ReadinessProbe.Port != nil {
+			port = *containerSpec.ReadinessProbe.Port
+		}
+	}
+	return port
+}
+
+func GetNginxReadinessProbePath(np *graph.EffectiveNginxProxy) string {
+	path := DefaultNginxReadinessProbePath
+
+	if np != nil && np.Kubernetes != nil {
+		var containerSpec *ngfAPIv1alpha2.ContainerSpec
+		if np.Kubernetes.Deployment != nil {
+			containerSpec = &np.Kubernetes.Deployment.Container
+		} else if np.Kubernetes.DaemonSet != nil {
+			containerSpec = &np.Kubernetes.DaemonSet.Container
+		}
+		if containerSpec != nil && containerSpec.ReadinessProbe != nil && containerSpec.ReadinessProbe.Path != nil {
+			path = *containerSpec.ReadinessProbe.Path
+		}
+	}
+	return path
+}
+
+// buildBaseStreamConfig generates the base stream context config that should be applied to all stream servers.
+func buildBaseStreamConfig(gateway *graph.Gateway) BaseStreamConfig {
+	baseConfig := BaseStreamConfig{}
+
+	// safe to access EffectiveNginxProxy since we only call this function when the Gateway is not nil.
+	np := gateway.EffectiveNginxProxy
+	if np == nil {
+		return baseConfig
+	}
+
+	// Add DNS resolver configuration for ExternalName services in stream context
+	baseConfig.DNSResolver = buildDNSResolverConfig(np.DNSResolver)
+
+	return baseConfig
+}
+
+func buildRewriteClientIPConfig(rewriteClientIPConfig *ngfAPIv1alpha2.RewriteClientIP) RewriteClientIPSettings {
+	var rewriteClientIPSettings RewriteClientIPSettings
+	if rewriteClientIPConfig != nil {
+		if rewriteClientIPConfig.Mode != nil {
+			switch *rewriteClientIPConfig.Mode {
+			case ngfAPIv1alpha2.RewriteClientIPModeProxyProtocol:
+				rewriteClientIPSettings.Mode = RewriteIPModeProxyProtocol
+			case ngfAPIv1alpha2.RewriteClientIPModeXForwardedFor:
+				rewriteClientIPSettings.Mode = RewriteIPModeXForwardedFor
+			}
+		}
+
+		if len(rewriteClientIPConfig.TrustedAddresses) > 0 {
+			rewriteClientIPSettings.TrustedAddresses = convertAddresses(
+				rewriteClientIPConfig.TrustedAddresses,
+			)
+		}
+
+		if rewriteClientIPConfig.SetIPRecursively != nil {
+			rewriteClientIPSettings.IPRecursive = *rewriteClientIPConfig.SetIPRecursively
+		}
+	}
+
+	return rewriteClientIPSettings
+}
+
+func createSnippetName(nc ngfAPIv1alpha1.NginxContext, nsname types.NamespacedName) string {
+	return fmt.Sprintf(
+		"SnippetsFilter_%s_%s_%s",
+		nc,
+		nsname.Namespace,
+		nsname.Name,
+	)
+}
+
+func buildSnippetsForContext(
+	snippetFilters map[types.NamespacedName]*graph.SnippetsFilter,
+	nc ngfAPIv1alpha1.NginxContext,
+) []Snippet {
+	if len(snippetFilters) == 0 {
+		return nil
+	}
+
+	snippetsForContext := make([]Snippet, 0)
+
+	for _, filter := range snippetFilters {
+		if !filter.Valid || !filter.Referenced {
+			continue
+		}
+
+		snippetValue, ok := filter.Snippets[nc]
+
+		if !ok {
+			continue
+		}
+
+		snippetsForContext = append(snippetsForContext, Snippet{
+			Name:     createSnippetName(nc, client.ObjectKeyFromObject(filter.Source)),
+			Contents: snippetValue,
+		})
+	}
+
+	return snippetsForContext
+}
+
+func buildPolicies(gateway *graph.Gateway, graphPolicies []*graph.Policy) []policies.Policy {
+	if len(graphPolicies) == 0 || gateway == nil {
+		return nil
+	}
+
+	finalPolicies := make([]policies.Policy, 0, len(graphPolicies))
+
+	for _, policy := range graphPolicies {
+		if !policy.Valid {
+			continue
+		}
+		if _, exists := policy.InvalidForGateways[client.ObjectKeyFromObject(gateway.Source)]; exists {
+			continue
+		}
+		if policy.WAFState != nil && policy.WAFState.BundlePending {
+			continue
+		}
+
+		finalPolicies = append(finalPolicies, policy.Source)
+	}
+
+	return finalPolicies
+}
+
+// buildGeoAccessPolicies collects all unique valid AccessPolicies from the gateway and all routes,
+// returning annotated deep-copies for geo block generation in the HTTP context.
+func buildGeoAccessPolicies(gateway *graph.Gateway, routes map[graph.RouteKey]*graph.L7Route) []policies.Policy {
+	seen := make(map[types.NamespacedName]struct{})
+	var result []policies.Policy
+
+	annotate := func(ap *ngfAPIv1alpha1.AccessPolicy) {
+		key := client.ObjectKeyFromObject(ap)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		geoAP := ap.DeepCopy()
+		if geoAP.Annotations == nil {
+			geoAP.Annotations = make(map[string]string)
+		}
+		geoAP.Annotations[GeoAccessPolicyAnnotationKey] = GeoAccessPolicyAnnotationValue
+		result = append(result, geoAP)
+	}
+
+	for _, p := range buildPolicies(gateway, gateway.Policies) {
+		if ap, ok := p.(*ngfAPIv1alpha1.AccessPolicy); ok {
+			annotate(ap)
+		}
+	}
+
+	for _, route := range routes {
+		for _, p := range buildPolicies(gateway, route.Policies) {
+			if ap, ok := p.(*ngfAPIv1alpha1.AccessPolicy); ok {
+				annotate(ap)
+			}
+		}
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		return ngfsort.LessClientObject(result[i], result[j])
+	})
+
+	return result
+}
+
+// injectGatewayAccessPolicies builds the merged policy list for a route.
+// Route-level Allow AccessPolicies that the graph clipped are annotated with their
+// effective addresses. Gateway-level AccessPolicies are appended annotated.
+func injectGatewayAccessPolicies(
+	routeNsName types.NamespacedName,
+	routeGraphPolicies []*graph.Policy,
+	gateway *graph.Gateway,
+) []policies.Policy {
+	routePolicies := buildPolicies(gateway, routeGraphPolicies)
+	gatewayPolicies := buildPolicies(gateway, gateway.Policies)
+
+	gwNsName := client.ObjectKeyFromObject(gateway.Source)
+	effectiveBySource := make(map[policies.Policy][]string, len(routeGraphPolicies))
+	for _, gp := range routeGraphPolicies {
+		if !gp.Valid {
+			continue
+		}
+		for _, ea := range gp.EffectiveAllows {
+			if ea.Route == routeNsName && ea.Gateway == gwNsName {
+				effectiveBySource[gp.Source] = ea.Addresses
+				break
+			}
+		}
+	}
+
+	result := make([]policies.Policy, len(routePolicies), len(routePolicies)+len(gatewayPolicies))
+	for i, p := range routePolicies {
+		result[i] = p
+		ap, ok := p.(*ngfAPIv1alpha1.AccessPolicy)
+		if !ok {
+			continue
+		}
+		routeAP := ap.DeepCopy()
+		delete(routeAP.Annotations, GatewayLevelAccessPolicyAnnotationKey)
+		delete(routeAP.Annotations, GeoAccessPolicyAnnotationKey)
+		delete(routeAP.Annotations, EffectiveAllowsAnnotationKey)
+		if effective, clipped := effectiveBySource[ap]; clipped {
+			if routeAP.Annotations == nil {
+				routeAP.Annotations = make(map[string]string)
+			}
+			routeAP.Annotations[EffectiveAllowsAnnotationKey] = strings.Join(effective, ",")
+		}
+		result[i] = routeAP
+	}
+
+	for _, p := range gatewayPolicies {
+		ap, ok := p.(*ngfAPIv1alpha1.AccessPolicy)
+		if !ok {
+			continue
+		}
+		annotated := ap.DeepCopy()
+		if annotated.Annotations == nil {
+			annotated.Annotations = make(map[string]string)
+		}
+		annotated.Annotations[GatewayLevelAccessPolicyAnnotationKey] = GatewayLevelAccessPolicyAnnotationValue
+		result = append(result, annotated)
+	}
+	return result
+}
+
+func convertAddresses(addresses []ngfAPIv1alpha2.RewriteClientIPAddress) []string {
+	trustedAddresses := make([]string, len(addresses))
+	for i, addr := range addresses {
+		trustedAddresses[i] = addr.Value
+	}
+	return trustedAddresses
+}
+
+// buildLogging converts the API logging spec (currently singular LogFormat / AccessLog fields
+// in v1alpha2) into internal representation used by templates.
+func buildLogging(gateway *graph.Gateway) Logging {
+	logSettings := Logging{ErrorLevel: defaultErrorLogLevel}
+
+	if gateway == nil || gateway.EffectiveNginxProxy == nil {
+		return logSettings
+	}
+
+	ngfProxy := gateway.EffectiveNginxProxy
+	if ngfProxy.Logging != nil {
+		if ngfProxy.Logging.ErrorLevel != nil {
+			logSettings.ErrorLevel = string(*ngfProxy.Logging.ErrorLevel)
+		}
+
+		if ngfProxy.Logging.ErrorLogFormat != nil {
+			logSettings.ErrorLogFormat = string(*ngfProxy.Logging.ErrorLogFormat)
+		}
+
+		srcLogSettings := ngfProxy.Logging
+
+		if accessLog := buildAccessLog(srcLogSettings); accessLog != nil {
+			logSettings.AccessLog = accessLog
+		}
+	}
+
+	return logSettings
+}
+
+func buildAccessLog(srcLogSettings *ngfAPIv1alpha2.NginxLogging) *AccessLog {
+	if srcLogSettings.AccessLog != nil {
+		if srcLogSettings.AccessLog.Disable != nil && *srcLogSettings.AccessLog.Disable {
+			return &AccessLog{Disable: true}
+		}
+
+		if srcLogSettings.AccessLog.Format != nil && *srcLogSettings.AccessLog.Format != "" {
+			accessLog := &AccessLog{
+				Path:   DefaultAccessLogPath,
+				Format: *srcLogSettings.AccessLog.Format,
+			}
+
+			if srcLogSettings.AccessLog.Escape != nil {
+				accessLog.Escape = string(*srcLogSettings.AccessLog.Escape)
+			}
+			if srcLogSettings.AccessLog.Destination != nil {
+				setAccessLogDestination(accessLog, srcLogSettings.AccessLog.Destination)
+			}
+			return accessLog
+		}
+	}
+
+	if srcLogSettings.ErrorLogFormat != nil && *srcLogSettings.ErrorLogFormat == ngfAPIv1alpha2.NginxErrorLogFormatJSON {
+		accessLog := &AccessLog{
+			Format: JSONAccessLogFormat,
+			Escape: string(ngfAPIv1alpha2.NginxAccessLogEscapeJSON),
+			Path:   DefaultAccessLogPath,
+		}
+		if srcLogSettings.AccessLog != nil && srcLogSettings.AccessLog.Destination != nil {
+			setAccessLogDestination(accessLog, srcLogSettings.AccessLog.Destination)
+		}
+		return accessLog
+	}
+
+	if srcLogSettings.AccessLog != nil && srcLogSettings.AccessLog.Destination != nil {
+		accessLog := &AccessLog{}
+		setAccessLogDestination(accessLog, srcLogSettings.AccessLog.Destination)
+		return accessLog
+	}
+
+	return nil
+}
+
+func setAccessLogDestination(accessLog *AccessLog, destination *ngfAPIv1alpha2.NginxAccessLogDestination) {
+	if accessLog == nil || destination == nil {
+		return
+	}
+	accessLog.Path = DefaultAccessLogPath
+	destinationType := ngfAPIv1alpha2.NginxAccessLogDestinationTypeFile
+	if destination.Type != "" {
+		destinationType = destination.Type
+	}
+	if destinationType == ngfAPIv1alpha2.NginxAccessLogDestinationTypeSyslog && destination.Syslog != nil &&
+		destination.Syslog.Server != "" {
+		accessLog.Path = "syslog:server=" + destination.Syslog.Server
+	} else if destinationType == ngfAPIv1alpha2.NginxAccessLogDestinationTypeFile &&
+		destination.File != nil && destination.File.Path != "" {
+		accessLog.Path = destination.File.Path
+	}
+}
+
+func buildWorkerConnections(gateway *graph.Gateway) int32 {
+	if gateway == nil || gateway.EffectiveNginxProxy == nil {
+		return DefaultWorkerConnections
+	}
+
+	ngfProxy := gateway.EffectiveNginxProxy
+	if ngfProxy.WorkerConnections != nil {
+		return *ngfProxy.WorkerConnections
+	}
+
+	return DefaultWorkerConnections
+}
+
+func buildWorkerProcesses(gateway *graph.Gateway) string {
+	if gateway == nil || gateway.EffectiveNginxProxy == nil {
+		return DefaultWorkerProcesses
+	}
+
+	ngfProxy := gateway.EffectiveNginxProxy
+	if ngfProxy.WorkerProcesses != nil {
+		return strconv.FormatInt(int64(*ngfProxy.WorkerProcesses), 10)
+	}
+
+	return DefaultWorkerProcesses
+}
+
+// buildWorkerRlimitNofile returns the configured worker_rlimit_nofile value, or nil when unset
+// (in which case the directive is omitted and NGINX inherits the OS limit).
+func buildWorkerRlimitNofile(gateway *graph.Gateway) *int32 {
+	if gateway == nil || gateway.EffectiveNginxProxy == nil {
+		return nil
+	}
+
+	return gateway.EffectiveNginxProxy.WorkerRlimitNofile
+}
+
+func buildAuxiliarySecrets(
+	secretsMap map[types.NamespacedName][]graph.PlusSecretFile,
+) map[graph.SecretFileType][]byte {
+	auxSecrets := make(map[graph.SecretFileType][]byte)
+
+	for _, secretFiles := range secretsMap {
+		for _, file := range secretFiles {
+			auxSecrets[file.Type] = file.Content
+		}
+	}
+
+	return auxSecrets
+}
+
+func buildNginxPlus(gateway *graph.Gateway) NginxPlus {
+	nginxPlusSettings := NginxPlus{AllowedAddresses: []string{"127.0.0.1"}}
+
+	if gateway == nil || gateway.EffectiveNginxProxy == nil {
+		return nginxPlusSettings
+	}
+
+	ngfProxy := gateway.EffectiveNginxProxy
+	if ngfProxy.NginxPlus != nil {
+		if ngfProxy.NginxPlus.AllowedAddresses != nil {
+			addresses := make([]string, 0, len(ngfProxy.NginxPlus.AllowedAddresses))
+			for _, addr := range ngfProxy.NginxPlus.AllowedAddresses {
+				addresses = append(addresses, addr.Value)
+			}
+
+			nginxPlusSettings.AllowedAddresses = addresses
+		}
+	}
+
+	return nginxPlusSettings
+}
+
+func GetDefaultConfiguration(g *graph.Graph, gateway *graph.Gateway) Configuration {
+	return Configuration{
+		Logging:            buildLogging(gateway),
+		NginxPlus:          NginxPlus{},
+		AuxiliarySecrets:   buildAuxiliarySecrets(g.PlusSecrets),
+		WorkerConnections:  buildWorkerConnections(gateway),
+		WorkerProcesses:    buildWorkerProcesses(gateway),
+		WorkerRlimitNofile: buildWorkerRlimitNofile(gateway),
+	}
+}
+
+// buildDNSResolverConfig builds a DNSResolverConfig from an NginxProxy DNSResolver configuration.
+func buildDNSResolverConfig(dnsResolver *ngfAPIv1alpha2.DNSResolver) *DNSResolverConfig {
+	if dnsResolver == nil {
+		return nil
+	}
+
+	config := &DNSResolverConfig{
+		Addresses: convertDNSResolverAddresses(dnsResolver.Addresses),
+	}
+
+	if dnsResolver.Timeout != nil {
+		config.Timeout = string(*dnsResolver.Timeout)
+	}
+
+	if dnsResolver.CacheTTL != nil {
+		config.Valid = string(*dnsResolver.CacheTTL)
+	}
+
+	if dnsResolver.DisableIPv6 != nil {
+		config.DisableIPv6 = *dnsResolver.DisableIPv6
+	}
+
+	return config
+}
+
+// getExternalHostname returns the external hostname if the service is an ExternalName type.
+// Returns an empty string if the service is not found or is not an ExternalName service.
+func getExternalHostname(
+	svcNsName types.NamespacedName,
+	referencedServices map[types.NamespacedName]*graph.ReferencedService,
+) string {
+	if graphSvc, exists := referencedServices[svcNsName]; exists && graphSvc.IsExternalName {
+		return graphSvc.ExternalName
+	}
+	return ""
+}
+
+// getClusterIP returns the ClusterIP of a Service if known, or empty string.
+// Returns an empty string for headless services or if the service is not found.
+func getClusterIP(
+	svcNsName types.NamespacedName,
+	referencedServices map[types.NamespacedName]*graph.ReferencedService,
+) string {
+	if graphSvc, exists := referencedServices[svcNsName]; exists {
+		return graphSvc.ClusterIP
+	}
+	return ""
+}
+
+// useClusterIPForNginxProxy returns whether the NginxProxy configuration enables routing to the
+// Service ClusterIP instead of individual Pod IPs.
+func useClusterIPForNginxProxy(np *graph.EffectiveNginxProxy) bool {
+	return np != nil && np.UseClusterIP != nil && *np.UseClusterIP
+}
+
+// resolveUpstreamEndpoints handles service resolution for both regular and ExternalName services.
+// When useClusterIP is true, it returns a single endpoint using the Service ClusterIP.
+func resolveUpstreamEndpoints(
+	ctx context.Context,
+	logger logr.Logger,
+	br graph.BackendRef,
+	svcResolver resolver.ServiceResolver,
+	referencedServices map[types.NamespacedName]*graph.ReferencedService,
+	useClusterIP bool,
+) ([]resolver.Endpoint, error) {
+	// Check if this is an ExternalName service
+	if externalName := getExternalHostname(br.SvcNsName, referencedServices); externalName != "" {
+		// For ExternalName services, create an endpoint directly with the external name
+		endpoint := resolver.Endpoint{
+			Address: externalName,
+			Port:    br.ServicePort.Port,
+			IPv6:    false, // DNS names are neither IPv4 nor IPv6
+			Resolve: true,  // ExternalName services require DNS resolution
+		}
+
+		logger.V(1).Info(
+			"Resolved ExternalName service",
+			"service", br.SvcNsName,
+			"externalName", externalName,
+			"port", br.ServicePort.Port)
+
+		return []resolver.Endpoint{endpoint}, nil
+	}
+
+	// When UseClusterIP is enabled, route to the Service ClusterIP instead of Pod IPs.
+	if useClusterIP {
+		if clusterIP := getClusterIP(br.SvcNsName, referencedServices); clusterIP != "" {
+			ip := net.ParseIP(clusterIP)
+			isIPv6 := ip != nil && ip.To4() == nil
+			endpoint := resolver.Endpoint{
+				Address: clusterIP,
+				Port:    br.ServicePort.Port,
+				IPv6:    isIPv6,
+			}
+			return []resolver.Endpoint{endpoint}, nil
+		}
+	}
+
+	// Resolve endpoints for both IPv4 and IPv6. NginxProxy ipFamily controls only the
+	// NGINX listen directives, not which upstream endpoints are selected.
+	return svcResolver.Resolve(
+		ctx,
+		logger,
+		br.SvcNsName,
+		br.ServicePort,
+		[]discoveryV1.AddressType{discoveryV1.AddressTypeIPv4, discoveryV1.AddressTypeIPv6},
+	)
+}
+
+func buildServerTokens(gateway *graph.Gateway) string {
+	if gateway == nil || gateway.EffectiveNginxProxy == nil || gateway.EffectiveNginxProxy.ServerTokens == nil {
+		return graph.ServerTokenOff
+	}
+
+	serverToken := *gateway.EffectiveNginxProxy.ServerTokens
+	if _, isKeyword := serverTokensKeywords[serverToken]; isKeyword {
+		return serverToken
+	}
+
+	return fmt.Sprintf(`"%s"`, serverToken)
+}
+
+func buildCompressionConfig(compression *ngfAPIv1alpha2.Compression) *CompressionSettings {
+	if compression == nil {
+		return nil
+	}
+
+	settings := &CompressionSettings{
+		MimeTypes: compression.MimeTypes,
+	}
+
+	if compression.Level != nil {
+		settings.Level = *compression.Level
+	}
+
+	if compression.MinLength != nil {
+		settings.MinLength = compression.MinLength
+	}
+
+	if compression.Buffers != nil {
+		settings.BufferNumber = compression.Buffers.Number
+		settings.BufferSize = string(compression.Buffers.Size)
+	}
+
+	if compression.Gzip != nil {
+		if compression.Gzip.Vary != nil {
+			settings.Vary = *compression.Gzip.Vary
+		}
+
+		if compression.Gzip.HTTPVersion != nil {
+			settings.HTTPVersion = string(*compression.Gzip.HTTPVersion)
+		} else {
+			settings.HTTPVersion = "1.1"
+		}
+
+		if len(compression.Gzip.Proxied) > 0 {
+			settings.Proxied = make([]string, 0, len(compression.Gzip.Proxied))
+			for _, p := range compression.Gzip.Proxied {
+				settings.Proxied = append(settings.Proxied, string(p))
+			}
+		}
+
+		if len(compression.Gzip.Disable) > 0 {
+			settings.Disable = compression.Gzip.Disable
+		}
+	}
+
+	return settings
+}
+
+func buildWAF(gateway *graph.Gateway) WAFConfig {
+	gatewayBundles := collectGatewayWAFBundles(gateway)
+	wb := convertWAFBundles(gatewayBundles)
+
+	var cookieSeed string
+	if gateway.Source != nil && !graph.WAFCookieSeedDisabledForNginxProxy(gateway.EffectiveNginxProxy) {
+		cookieSeed = string(gateway.Source.UID)
+	}
+
+	wc := WAFConfig{
+		Enabled:    graph.WAFEnabledForNginxProxy(gateway.EffectiveNginxProxy),
+		WAFBundles: wb,
+		CookieSeed: cookieSeed,
+	}
+	return wc
+}
+
+// collectGatewayWAFBundles collects WAF bundles from all WAFPolicies that target
+// this gateway directly or target routes attached to this gateway.
+func collectGatewayWAFBundles(gateway *graph.Gateway) map[graph.WAFBundleKey]*graph.WAFBundleData {
+	bundles := make(map[graph.WAFBundleKey]*graph.WAFBundleData)
+
+	// Collect bundles from policies targeting the gateway directly.
+	for _, policy := range gateway.Policies {
+		if policy.WAFState == nil {
+			continue
+		}
+
+		maps.Copy(bundles, policy.WAFState.Bundles)
+	}
+
+	// Collect bundles from policies targeting routes attached to this gateway.
+	for _, listener := range gateway.Listeners {
+		for _, route := range listener.Routes {
+			for _, policy := range route.Policies {
+				if policy.WAFState == nil {
+					continue
+				}
+
+				maps.Copy(bundles, policy.WAFState.Bundles)
+			}
+		}
+	}
+
+	return bundles
+}

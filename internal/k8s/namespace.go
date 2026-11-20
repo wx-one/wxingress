@@ -1,0 +1,125 @@
+package k8s
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+
+	nl "github.com/wx-one/wxingress/internal/logger"
+	"github.com/wx-one/wxingress/internal/nsregistry"
+	api_v1 "k8s.io/api/core/v1"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/tools/cache"
+)
+
+// createNamespaceHandlers builds the handler funcs for namespaces
+func createNamespaceHandlers(lbc *LoadBalancerController) cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			ns := obj.(*api_v1.Namespace)
+			nl.Debugf(lbc.Logger.With(logNamespaceKey, ns.Name, logKindKey, namespaceKind), "Adding Namespace to list of watched Namespaces: %v", ns.Name)
+			lbc.AddSyncQueue(obj)
+		},
+		DeleteFunc: func(obj interface{}) {
+			ns, isNs := obj.(*api_v1.Namespace)
+			if !isNs {
+				deletedState, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					nl.Debugf(lbc.Logger, "Error received unexpected object: %v", obj)
+					return
+				}
+				ns, ok = deletedState.Obj.(*api_v1.Namespace)
+				if !ok {
+					nl.Debugf(lbc.Logger, "Error DeletedFinalStateUnknown contained non-Namespace object: %v", deletedState.Obj)
+					return
+				}
+			}
+			nl.Debugf(lbc.Logger.With(logNamespaceKey, ns.Name, logKindKey, namespaceKind), "Removing Namespace from list of watched Namespaces: %v", ns.Name)
+			lbc.AddSyncQueue(ns)
+		},
+		UpdateFunc: func(old, cur interface{}) {
+			if !reflect.DeepEqual(old, cur) {
+				nl.Debugf(lbc.Logger.With(logNamespaceKey, cur.(*api_v1.Namespace).Name, logKindKey, namespaceKind), "Namespace %v changed, syncing", cur.(*api_v1.Namespace).Name)
+				lbc.AddSyncQueue(cur)
+			}
+		},
+	}
+}
+
+func (lbc *LoadBalancerController) addNamespaceHandler(handlers cache.ResourceEventHandlerFuncs, nsLabel string) error {
+	optionsModifier := func(options *meta_v1.ListOptions) {
+		options.LabelSelector = nsLabel
+	}
+	nsInformer := informers.NewSharedInformerFactoryWithOptions(lbc.client, lbc.resync, informers.WithTweakListOptions(optionsModifier)).Core().V1().Namespaces().Informer()
+	if _, err := nsInformer.AddEventHandler(handlers); err != nil {
+		return fmt.Errorf("failed to add Namespace event handler: %w", err)
+	}
+	lbc.namespaceLabeledLister = nsInformer.GetStore()
+	lbc.namespaceWatcherController = nsInformer
+
+	lbc.cacheSyncs = append(lbc.cacheSyncs, nsInformer.HasSynced)
+	return nil
+}
+
+func (lbc *LoadBalancerController) syncNamespace(task task) {
+	key := task.Key
+	l := lbc.Logger.With(logNamespaceKey, key, logKindKey, namespaceKind)
+	// process namespace and add to / remove from watched namespace list
+	_, exists, err := lbc.namespaceLabeledLister.GetByKey(key)
+	if err != nil {
+		lbc.syncQueue.Requeue(task, err)
+		return
+	}
+
+	if !exists {
+		// Check if change is because of a new label, or because of a deleted namespace
+		ns, _ := lbc.client.CoreV1().Namespaces().Get(context.TODO(), key, meta_v1.GetOptions{})
+
+		if ns != nil && ns.Status.Phase == api_v1.NamespaceActive {
+			// namespace still exists
+			nl.Infof(l, "Removing Configuration for Unwatched Namespace: %v", key)
+			// Watched label for namespace was removed
+			// delete any now unwatched namespaced informer groups if required
+			lbc.unwatchNamespace(key, lbc.cleanupUnwatchedNamespacedResources)
+		} else {
+			nl.Infof(l, "Deleting Watchers for Deleted Namespace: %v", key)
+			lbc.removeNamespacedInformer(key)
+		}
+		if lbc.certManagerController != nil {
+			lbc.certManagerController.RemoveNamespacedInformer(key)
+		}
+		if lbc.externalDNSController != nil {
+			lbc.externalDNSController.RemoveNamespacedInformer(key)
+		}
+	} else {
+		// check if informer group already exists
+		// if not create new namespaced informer group
+		// update cert-manager informer group if required
+		// update external-dns informer group if required
+		nl.Debugf(l, "Adding or Updating Watched Namespace: %v", key)
+		nsi := lbc.getNamespacedInformer(key)
+		if nsi == nil {
+			nl.Infof(l, "Adding New Watched Namespace: %v", key)
+			var err error
+			nsi, err = lbc.newNamespacedInformer(key)
+			if err != nil {
+				nl.Errorf(l, "Failed to create namespaced informer for namespace %s: %v", key, err)
+				lbc.syncQueue.Requeue(task, err)
+				return
+			}
+			nsi.start()
+		}
+		if lbc.certManagerController != nil {
+			lbc.certManagerController.AddNewNamespacedInformer(lbc.runContext(), key)
+		}
+		if lbc.externalDNSController != nil {
+			lbc.externalDNSController.AddNewNamespacedInformer(lbc.runContext(), key)
+		}
+		// Also give up when the controller is stopping: Stop waits for this
+		// worker to exit before it closes a newly registered group's stopCh.
+		if !nsregistry.WaitForCacheSync(lbc.runContext(), nsi.stopCh, nsi.cacheSyncs...) {
+			return
+		}
+	}
+}

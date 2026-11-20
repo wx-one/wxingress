@@ -1,0 +1,7 @@
+controller:
+  gatewayAPI:
+    enable: true
+    defaultGateway:
+      name: default
+    service:
+      type: ClusterIP

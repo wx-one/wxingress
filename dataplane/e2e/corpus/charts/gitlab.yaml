@@ -1,0 +1,174 @@
+# helm template gitlab gitlab/gitlab --version 9.5.1 -n gitlab --kube-version 1.31.0 --set global.hosts.domain=parity.test --set global.ingress.class=nginx --set global.kas.enabled=true --set global.pages.enabled=true --set global.ingress.configureCertmanager=false (the Ingresses only)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.provider: nginx
+  labels:
+    app: gitlab-pages
+    chart: gitlab-pages-9.5.1
+    heritage: Helm
+    release: gitlab
+  name: gitlab-gitlab-pages
+  namespace: gitlab
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: '*.pages.parity.test'
+    http:
+      paths:
+      - backend:
+          service:
+            name: gitlab-gitlab-pages
+            port:
+              number: 8090
+        path: /
+        pathType: Prefix
+  tls:
+  - hosts:
+    - pages.parity.test
+    - '*.pages.parity.test'
+    secretName: gitlab-wildcard-tls
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.provider: nginx
+    nginx.ingress.kubernetes.io/custom-http-errors: ''
+    nginx.ingress.kubernetes.io/proxy-buffering: 'off'
+  labels:
+    app: kas
+    chart: kas-9.5.1
+    heritage: Helm
+    release: gitlab
+  name: gitlab-kas
+  namespace: gitlab
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: kas.parity.test
+    http:
+      paths:
+      - backend:
+          service:
+            name: gitlab-kas
+            port:
+              number: 8154
+        path: /k8s-proxy/
+        pathType: Prefix
+      - backend:
+          service:
+            name: gitlab-kas
+            port:
+              number: 8150
+        path: /
+        pathType: Prefix
+  tls:
+  - hosts:
+    - kas.parity.test
+    secretName: gitlab-wildcard-tls
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.provider: nginx
+    nginx.ingress.kubernetes.io/proxy-body-size: 512m
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: '15'
+    nginx.ingress.kubernetes.io/proxy-read-timeout: '600'
+    nginx.ingress.kubernetes.io/service-upstream: 'true'
+  labels:
+    app: webservice
+    chart: webservice-9.5.1
+    gitlab.com/webservice-name: default
+    heritage: Helm
+    release: gitlab
+  name: gitlab-webservice-default
+  namespace: gitlab
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: gitlab.parity.test
+    http:
+      paths:
+      - backend:
+          service:
+            name: gitlab-webservice-default
+            port:
+              number: 8181
+        path: /
+        pathType: Prefix
+  tls:
+  - hosts:
+    - gitlab.parity.test
+    secretName: gitlab-wildcard-tls
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.provider: nginx
+    nginx.ingress.kubernetes.io/proxy-body-size: '0'
+    nginx.ingress.kubernetes.io/proxy-buffering: 'off'
+    nginx.ingress.kubernetes.io/proxy-read-timeout: '900'
+    nginx.ingress.kubernetes.io/proxy-request-buffering: 'off'
+  labels:
+    app: minio
+    chart: minio-0.4.3
+    heritage: Helm
+    release: gitlab
+  name: gitlab-minio
+  namespace: gitlab
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: minio.parity.test
+    http:
+      paths:
+      - backend:
+          service:
+            name: gitlab-minio-svc
+            port:
+              number: 9000
+        path: /
+        pathType: Prefix
+  tls:
+  - hosts:
+    - minio.parity.test
+    secretName: gitlab-wildcard-tls
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  annotations:
+    kubernetes.io/ingress.provider: nginx
+    nginx.ingress.kubernetes.io/proxy-body-size: '0'
+    nginx.ingress.kubernetes.io/proxy-buffering: 'off'
+    nginx.ingress.kubernetes.io/proxy-read-timeout: '900'
+    nginx.ingress.kubernetes.io/proxy-request-buffering: 'off'
+  labels:
+    app: registry
+    chart: registry-0.7.0
+    heritage: Helm
+    release: gitlab
+  name: gitlab-registry
+  namespace: gitlab
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: registry.parity.test
+    http:
+      paths:
+      - backend:
+          service:
+            name: gitlab-registry
+            port:
+              number: 5000
+        path: /
+        pathType: Prefix
+  tls:
+  - hosts:
+    - registry.parity.test
+    secretName: gitlab-wildcard-tls
+

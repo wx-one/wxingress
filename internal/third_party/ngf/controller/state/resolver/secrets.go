@@ -1,0 +1,139 @@
+package resolver
+
+import (
+	"fmt"
+
+	v1 "k8s.io/api/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/secrets"
+)
+
+type secretEntry struct {
+	secrets.Secret
+	err         error
+	expectedKey string
+}
+
+func (s *secretEntry) setError(err error) {
+	s.err = err
+}
+
+func (s *secretEntry) error() error {
+	return s.err
+}
+
+func (s *secretEntry) validate(obj client.Object) {
+	secret, ok := obj.(*v1.Secret)
+	if !ok {
+		panic(fmt.Sprintf("expected Secret object, got %T", obj))
+	}
+
+	var validationErr error
+	var certBundle *secrets.CertificateBundle
+
+	switch {
+	// Any future Secret keys that are needed MUST be added to cache/transform.go
+	// in order to track them.
+	case secret.Type == v1.SecretTypeTLS:
+		// A TLS Secret is guaranteed to have these data fields.
+		cert := &secrets.Certificate{
+			TLSCert:       secret.Data[v1.TLSCertKey],
+			TLSPrivateKey: secret.Data[v1.TLSPrivateKeyKey],
+		}
+		validationErr = secrets.ValidateTLS(cert.TLSCert, cert.TLSPrivateKey)
+
+		// Not always guaranteed to have a ca certificate in the secret.
+		// Cert-Manager puts this at ca.crt and thus this is statically placed like so.
+		// To follow the convention setup by kubernetes for a service account root ca
+		// for optional root certificate authority
+		if _, exists := secret.Data[secrets.CAKey]; exists {
+			cert.CACert = secret.Data[secrets.CAKey]
+			if validationErr == nil {
+				validationErr = secrets.ValidateCA(cert.CACert)
+			}
+		} else if s.expectedKey == secrets.CAKey {
+			// For Frontend TLS, we need to ensure the ca.crt key exists
+			// as TLS secrets are considered valid by default without a CA certificate.
+			validationErr = fmt.Errorf("missing expected key %q in secret %s/%s", secrets.CAKey, secret.Namespace, secret.Name)
+		}
+
+		certBundle = secrets.NewCertificateBundle(client.ObjectKeyFromObject(secret), "Secret", cert)
+	case secret.Type == v1.SecretTypeOpaque && s.expectedKey != "":
+		validationErr = validateOpaqueSecretKey(secret, s.expectedKey)
+		if validationErr == nil {
+			certBundle = addCertBundleToOpaqueSecret(secret, s.expectedKey)
+		}
+	default:
+		validationErr = fmt.Errorf("unsupported secret type %q", secret.Type)
+	}
+
+	s.Secret = secrets.Secret{
+		Source:     secret,
+		CertBundle: certBundle,
+	}
+	s.setError(validationErr)
+}
+
+func (s *secretEntry) needsRevalidation(opts *resolveOptions) bool {
+	return opts.expectedSecretKey != s.expectedKey
+}
+
+// revalidate re-validates the secret against new resolve options.
+// For TLS secrets, it re-runs the full validation logic to check for the new expectedKey.
+// For Opaque secrets, it validates the expected key exists.
+func (s *secretEntry) revalidate(opts *resolveOptions, obj client.Object) error {
+	secret, ok := obj.(*v1.Secret)
+	if !ok {
+		panic(fmt.Sprintf("expected Secret object, got %T", obj))
+	}
+
+	switch secret.Type {
+	case v1.SecretTypeTLS:
+		// Re-run full validation for TLS secrets with the new expectedKey
+		s.expectedKey = opts.expectedSecretKey
+		s.validate(obj)
+		return s.error()
+	case v1.SecretTypeOpaque:
+		err := validateOpaqueSecretKey(secret, opts.expectedSecretKey)
+		s.expectedKey = opts.expectedSecretKey
+		s.setError(err)
+		if err == nil {
+			s.CertBundle = addCertBundleToOpaqueSecret(secret, s.expectedKey)
+		} else {
+			// Clear the certificate bundle if validation failed
+			s.CertBundle = nil
+		}
+		return err
+	default:
+		return fmt.Errorf("unsupported secret type %q", secret.Type)
+	}
+}
+
+func addCertBundleToOpaqueSecret(secret *v1.Secret, expectedKey string) *secrets.CertificateBundle {
+	if expectedKey == secrets.CAKey {
+		cert := &secrets.Certificate{
+			CACert: secret.Data[secrets.CAKey],
+		}
+		return secrets.NewCertificateBundle(
+			client.ObjectKeyFromObject(secret), "Secret", cert,
+		)
+	}
+	return nil
+}
+
+func validateOpaqueSecretKey(secret *v1.Secret, key string) error {
+	if data, exists := secret.Data[key]; exists && len(data) > 0 {
+		if key == secrets.CAKey {
+			return secrets.ValidateCA(data)
+		}
+	} else {
+		return fmt.Errorf(
+			"opaque secret %s/%s does not contain the expected key %q",
+			secret.Namespace,
+			secret.Name,
+			key,
+		)
+	}
+	return nil
+}

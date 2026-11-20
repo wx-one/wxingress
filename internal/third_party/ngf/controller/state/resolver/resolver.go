@@ -1,0 +1,452 @@
+package resolver
+
+import (
+	"cmp"
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+	"sync"
+
+	"github.com/go-logr/logr"
+	v1 "k8s.io/api/core/v1"
+	discoveryV1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/configmaps"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/secrets"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/controller/index"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+)
+
+//go:generate go tool moq -skip-ensure -pkg resolverfakes -out resolverfakes/fake_service_resolver.go . ServiceResolver
+
+// ServiceResolver resolves a Service's NamespacedName and ServicePort to a list of Endpoints.
+// Returns an error if the Service or Service Port cannot be resolved.
+type ServiceResolver interface {
+	Resolve(
+		ctx context.Context,
+		logger logr.Logger,
+		svcNsName types.NamespacedName,
+		svcPort v1.ServicePort,
+		allowedAddressType []discoveryV1.AddressType,
+	) ([]Endpoint, error)
+}
+
+// Endpoint is the internal representation of a Kubernetes endpoint.
+type Endpoint struct {
+	// Address is the IP address or DNS name of the endpoint.
+	Address string
+	// Port is the port of the endpoint.
+	Port int32
+	// IPv6 is true if the endpoint is an IPv6 address.
+	IPv6 bool
+	// Resolve is true if the address is a DNS name that needs to be resolved (e.g., for ExternalName services).
+	Resolve bool
+	// Weight is the weight for load balancing, used for TCPRoute/UDPRoute multi-backend support.
+	Weight int32
+}
+
+// ServiceResolverImpl implements ServiceResolver.
+type ServiceResolverImpl struct {
+	reader    client.Reader
+	ownership *EndpointSliceOwnership
+}
+
+// NewServiceResolverImpl creates a new instance of a ServiceResolverImpl.
+func NewServiceResolverImpl(c client.Reader, ownership *EndpointSliceOwnership) *ServiceResolverImpl {
+	return &ServiceResolverImpl{reader: c, ownership: ownership}
+}
+
+// Resolve resolves a Service's NamespacedName and ServicePort to a list of Endpoints.
+// Returns an error if the Service or ServicePort cannot be resolved.
+func (e *ServiceResolverImpl) Resolve(
+	ctx context.Context,
+	logger logr.Logger,
+	svcNsName types.NamespacedName,
+	svcPort v1.ServicePort,
+	allowedAddressType []discoveryV1.AddressType,
+) ([]Endpoint, error) {
+	if svcPort.Port == 0 || svcNsName.Name == "" || svcNsName.Namespace == "" {
+		panic(fmt.Errorf("expected the following fields to be non-empty: name: %s, ns: %s, port: %d",
+			svcNsName.Name, svcNsName.Namespace, svcPort.Port))
+	}
+
+	// We list EndpointSlices using the Service Name Index Field we added as an index to the EndpointSlice cache.
+	// This allows us to perform a quick lookup of all EndpointSlices for a Service.
+	var endpointSliceList discoveryV1.EndpointSliceList
+	err := e.reader.List(
+		ctx,
+		&endpointSliceList,
+		client.MatchingFields{index.KubernetesServiceNameIndexField: svcNsName.Name},
+		client.InNamespace(svcNsName.Namespace),
+	)
+
+	if err != nil || len(endpointSliceList.Items) == 0 {
+		if e.ownership != nil {
+			e.ownership.Replace(svcNsName, nil)
+		}
+		return nil, fmt.Errorf("no endpoints found for Service %s", svcNsName)
+	}
+
+	// Record which EndpointSlices currently back this Service, including any that will be
+	// filtered out below (e.g. wrong port). This lets a later EndpointSlice deletion -- which
+	// carries no labels -- still be attributed to its Service.
+	if e.ownership != nil {
+		e.ownership.Replace(svcNsName, endpointSliceList.Items)
+	}
+
+	return resolveEndpoints(
+		logger,
+		svcNsName,
+		svcPort,
+		endpointSliceList,
+		initEndpointSetWithCalculatedSize,
+		allowedAddressType,
+	)
+}
+
+type initEndpointSetFunc func(logr.Logger, []discoveryV1.EndpointSlice) map[Endpoint]struct{}
+
+func initEndpointSetWithCalculatedSize(
+	logger logr.Logger,
+	endpointSlices []discoveryV1.EndpointSlice,
+) map[Endpoint]struct{} {
+	// performance optimization to reduce the cost of growing the map. See the benchamarks for performance comparison.
+	return make(map[Endpoint]struct{}, calculateReadyEndpoints(logger, endpointSlices))
+}
+
+func calculateReadyEndpoints(logger logr.Logger, endpointSlices []discoveryV1.EndpointSlice) int {
+	total := 0
+
+	for _, eps := range endpointSlices {
+		for _, endpoint := range eps.Endpoints {
+			if !endpointReady(endpoint) {
+				logger.V(1).Info(
+					"Ignoring endpoint that is not ready",
+					"endpoint", endpoint,
+				)
+				continue
+			}
+
+			total += len(endpoint.Addresses)
+		}
+	}
+
+	return total
+}
+
+func resolveEndpoints(
+	logger logr.Logger,
+	svcNsName types.NamespacedName,
+	svcPort v1.ServicePort,
+	endpointSliceList discoveryV1.EndpointSliceList,
+	initEndpointsSet initEndpointSetFunc,
+	allowedAddressType []discoveryV1.AddressType,
+) ([]Endpoint, error) {
+	filteredSlices := filterEndpointSliceList(endpointSliceList, svcPort, allowedAddressType)
+
+	if len(filteredSlices) == 0 {
+		return nil, fmt.Errorf("no valid endpoints found for Service %s and port %d", svcNsName, svcPort.Port)
+	}
+
+	// Endpoints may be duplicated across multiple EndpointSlices.
+	// Using a set to prevent returning duplicate endpoints.
+	endpointSet := initEndpointsSet(logger, filteredSlices)
+
+	for _, eps := range filteredSlices {
+		ipv6 := eps.AddressType == discoveryV1.AddressTypeIPv6
+		for _, endpoint := range eps.Endpoints {
+			if !endpointReady(endpoint) {
+				logger.V(1).Info(
+					"Ignoring endpoint that is not ready",
+					"endpoint", endpoint,
+				)
+				continue
+			}
+
+			// We don't check for a zero port value here because we are only working with EndpointSlices
+			// that have a matching port.
+			endpointPort := findPort(eps.Ports, svcPort)
+
+			for _, address := range endpoint.Addresses {
+				ep := Endpoint{Address: address, Port: endpointPort, IPv6: ipv6}
+				endpointSet[ep] = struct{}{}
+			}
+		}
+	}
+
+	endpoints := make([]Endpoint, 0, len(endpointSet))
+	for ep := range endpointSet {
+		endpoints = append(endpoints, ep)
+	}
+
+	slices.SortFunc(endpoints, compareEndpoints)
+
+	return endpoints, nil
+}
+
+func compareEndpoints(a, b Endpoint) int {
+	if c := strings.Compare(a.Address, b.Address); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.Port, b.Port)
+}
+
+// getDefaultPort returns the default port for a ServicePort.
+// This default port is used when the EndpointPort has a nil port which indicates all ports are valid.
+// If the ServicePort has a non-zero integer TargetPort, the TargetPort integer value is returned.
+// Otherwise, the ServicePort port value is returned.
+func getDefaultPort(svcPort v1.ServicePort) int32 {
+	if svcPort.TargetPort.Type == intstr.Int && svcPort.TargetPort.IntVal != 0 {
+		return svcPort.TargetPort.IntVal
+	}
+
+	return svcPort.Port
+}
+
+func ignoreEndpointSlice(
+	endpointSlice discoveryV1.EndpointSlice,
+	port v1.ServicePort,
+	allowedAddressType []discoveryV1.AddressType,
+) bool {
+	if endpointSlice.AddressType == discoveryV1.AddressTypeFQDN {
+		return true
+	}
+
+	if !slices.Contains(allowedAddressType, endpointSlice.AddressType) {
+		return true
+	}
+
+	// ignore endpoint slices that don't have a matching port.
+	return findPort(endpointSlice.Ports, port) == 0
+}
+
+func endpointReady(endpoint discoveryV1.Endpoint) bool {
+	ready := endpoint.Conditions.Ready
+	return ready == nil || *ready
+}
+
+func filterEndpointSliceList(
+	endpointSliceList discoveryV1.EndpointSliceList,
+	port v1.ServicePort,
+	allowedAddressType []discoveryV1.AddressType,
+) []discoveryV1.EndpointSlice {
+	filtered := make([]discoveryV1.EndpointSlice, 0, len(endpointSliceList.Items))
+
+	for _, endpointSlice := range endpointSliceList.Items {
+		if !ignoreEndpointSlice(endpointSlice, port, allowedAddressType) {
+			filtered = append(filtered, endpointSlice)
+		}
+	}
+
+	return filtered
+}
+
+// findPort locates the port in the slice of EndpointPort that matches the ServicePort name.
+// The Kubernetes EndpointSlice controller handles matching the TargetPort of a ServicePort to the container port of
+// an endpoint. All we have to do is find the port with the same name as the ServicePort.
+// If a ServicePort is unnamed, then the EndpointPort will also be unnamed (empty string).
+//
+// If an EndpointPort port is nil -- indicating all ports are valid --
+// the default port for the ServicePort is returned.
+// If no matching port is found, 0 is returned.
+func findPort(ports []discoveryV1.EndpointPort, svcPort v1.ServicePort) int32 {
+	portName := svcPort.Name
+
+	for _, p := range ports {
+		if p.Port == nil {
+			return getDefaultPort(svcPort)
+		}
+
+		if p.Name != nil && *p.Name == portName {
+			return *p.Port
+		}
+	}
+
+	return 0
+}
+
+//go:generate go tool moq -skip-ensure -pkg resolverfakes -out resolverfakes/fake_resolver.go . Resolver
+
+// Resolver defines an interface for resolving resources that are referenced by other resources.
+type Resolver interface {
+	Resolve(ResourceType, types.NamespacedName, ...ResolveOption) error
+	GetSecrets() map[types.NamespacedName]*secrets.Secret
+	GetConfigMaps() map[types.NamespacedName]*configmaps.CaCertConfigMap
+}
+
+// ResolveOption is an option for the Resolve method.
+type ResolveOption func(*resolveOptions)
+
+type resolveOptions struct {
+	expectedSecretKey string
+}
+
+// ResourceType represents the type of resource to be resolved.
+type ResourceType string
+
+const (
+	// ResourceTypeSecret represents a Secret resource.
+	ResourceTypeSecret ResourceType = kinds.Secret
+	// ResourceTypeConfigMap represents a ConfigMap resource.
+	ResourceTypeConfigMap ResourceType = kinds.ConfigMap
+)
+
+// ResourceKey is a unique identifier for a resource in the resolver map.
+type ResourceKey struct {
+	// NamespacedName is the namespaced name of the resource.
+	NamespacedName types.NamespacedName
+	// ResourceType is the type of the resource.
+	ResourceType ResourceType
+}
+
+type resourceEntry interface {
+	validate(client.Object)
+	setError(error)
+	error() error
+	// needsRevalidation returns true if the cached entry must be re-validated given the current resolve options.
+	needsRevalidation(opts *resolveOptions) bool
+	// revalidate performs additional validation against the underlying object using the resolve options,
+	// and returns the result. It is only called when needsRevalidation returns true.
+	revalidate(opts *resolveOptions, obj client.Object) error
+}
+
+// ResourceResolver implements the Resolver interface.
+type ResourceResolver struct {
+	clusterResources  map[ResourceKey]client.Object
+	resolvedResources map[ResourceKey]resourceEntry
+	lock              sync.RWMutex
+}
+
+// NewResourceResolver creates a new instance of a ResourceResolver.
+func NewResourceResolver(resources map[ResourceKey]client.Object) Resolver {
+	return &ResourceResolver{
+		clusterResources:  resources,
+		resolvedResources: make(map[ResourceKey]resourceEntry),
+	}
+}
+
+// Resolve resolves the resource of the given type and namespaced name. A resource is resolved if
+// it exists in the cluster. If there is a validation error, the resource is still included
+// in the map of resolved resources, but with an error defined.
+func (r *ResourceResolver) Resolve(resType ResourceType, nsname types.NamespacedName, opts ...ResolveOption) error {
+	key := ResourceKey{
+		NamespacedName: nsname,
+		ResourceType:   resType,
+	}
+	options := &resolveOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+	r.lock.RLock()
+	if res, resolved := r.resolvedResources[key]; resolved {
+		r.lock.RUnlock()
+
+		// this should only be done for secrets with an expected key
+		if res.needsRevalidation(options) {
+			// get the current object from the cluster resources to
+			// re-validate against the new expected key
+			obj, exist := r.clusterResources[key]
+			if !exist {
+				return fmt.Errorf("%s %s does not exist", resType, nsname.String())
+			}
+			return res.revalidate(options, obj)
+		}
+		return res.error()
+	}
+	r.lock.RUnlock()
+
+	var resource resourceEntry
+	var obj client.Object
+
+	switch resType {
+	case ResourceTypeSecret:
+		resource = &secretEntry{expectedKey: options.expectedSecretKey}
+	case ResourceTypeConfigMap:
+		resource = &configMapEntry{}
+	default:
+		panic(fmt.Sprintf("unsupported resource type: %s", resType))
+	}
+
+	obj, exist := r.clusterResources[key]
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	if !exist {
+		errMsg := fmt.Sprintf("%s %s does not exist", resType, nsname.String())
+		if resType == ResourceTypeConfigMap {
+			errMsg += ", or is missing an expected key"
+		}
+		resource.setError(fmt.Errorf("%s", errMsg))
+		r.resolvedResources[key] = resource
+		return resource.error()
+	}
+
+	resource.validate(obj)
+	r.resolvedResources[key] = resource
+	return resource.error()
+}
+
+// GetSecrets returns a map of resolved Secrets. It could contain invalid secrets.
+func (r *ResourceResolver) GetSecrets() map[types.NamespacedName]*secrets.Secret {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	secretsMap := make(map[types.NamespacedName]*secrets.Secret)
+
+	for key, res := range r.resolvedResources {
+		if key.ResourceType != ResourceTypeSecret {
+			continue
+		}
+
+		secretRes, ok := res.(*secretEntry)
+		if !ok {
+			panic(fmt.Sprintf("expected secretEntry, got %T", res))
+		}
+
+		secretsMap[key.NamespacedName] = &secretRes.Secret
+	}
+
+	if len(secretsMap) == 0 {
+		return nil
+	}
+
+	return secretsMap
+}
+
+// GetConfigMaps returns a map of resolved ConfigMaps. It could contain invalid configmaps.
+func (r *ResourceResolver) GetConfigMaps() map[types.NamespacedName]*configmaps.CaCertConfigMap {
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+
+	configMaps := make(map[types.NamespacedName]*configmaps.CaCertConfigMap)
+
+	for key, res := range r.resolvedResources {
+		if key.ResourceType != ResourceTypeConfigMap {
+			continue
+		}
+
+		cmRes, ok := res.(*configMapEntry)
+		if !ok {
+			panic(fmt.Sprintf("expected configMapEntry, got %T", res))
+		}
+
+		configMaps[key.NamespacedName] = &cmRes.caCertConfigMap
+	}
+
+	if len(configMaps) == 0 {
+		return nil
+	}
+
+	return configMaps
+}
+
+// WithExpectedSecretKey sets the expected key for an Opaque secret.
+func WithExpectedSecretKey(key string) ResolveOption {
+	return func(o *resolveOptions) {
+		o.expectedSecretKey = key
+	}
+}

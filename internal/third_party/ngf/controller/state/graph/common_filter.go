@@ -1,0 +1,556 @@
+package graph
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	v1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/validation"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+)
+
+// RouteRuleFilters holds the Filters for a RouteRule.
+type RouteRuleFilters struct {
+	// Filters are the filters in the RouteRule.
+	Filters []Filter
+	// Valid indicates if the filters are valid and accepted by the Route.
+	Valid bool
+}
+
+// Filter is a filter in a Route. The Filter can belong to a GRPCRoute or an HTTPRoute.
+type Filter struct {
+	// CORS holds an HTTP CORS filter.
+	// Will be non-nil if FilterType is FilterCORS.
+	// Can be set on HTTPRoutes only.
+	CORS *v1.HTTPCORSFilter
+	// RequestHeaderModifier holds an HTTP Request Header Modifier filter.
+	// Will be non-nil if FilterType is FilterRequestHeaderModifier.
+	// Can be set on GRPCRoutes and HTTPRoutes.
+	RequestHeaderModifier *v1.HTTPHeaderFilter
+	// ResponseHeaderModifier holds an HTTP Response Header Modifier filter.
+	// Will be non-nil if FilterType is FilterResponseHeaderModifier.
+	// Can be set on GRPCRoutes and HTTPRoutes.
+	ResponseHeaderModifier *v1.HTTPHeaderFilter
+	// RequestRedirect holds an HTTP Request Redirect filter.
+	// Will be non-nil if FilterType is FilterRequestRedirect.
+	// Can be set on HTTPRoutes only.
+	RequestRedirect *v1.HTTPRequestRedirectFilter
+	// URLRewrite holds an HTTP URL Rewrite filter.
+	// Will be non-nil if FilterType is FilterURLRewrite.
+	// Can be set on HTTPRoutes only.
+	URLRewrite *v1.HTTPURLRewriteFilter
+	// RequestMirror holds an HTTP Request Mirror filter.
+	// Will be non-nil if FilterType is FilterRequestMirror.
+	// Can be set on GRPCRoutes and HTTPRoutes.
+	RequestMirror *v1.HTTPRequestMirrorFilter
+	// ExternalAuth holds an HTTP External Auth filter.
+	// Will be non-nil if FilterType is FilterExternalAuth.
+	// Can be set on HTTPRoutes only.
+	ExternalAuth *v1.HTTPExternalAuthFilter
+	// ExtensionRef holds an Extension Ref filter.
+	// Will be non-nil if FilterType is FilterExtensionRef.
+	// Can be set on GRPCRoutes and HTTPRoutes.
+	ExtensionRef *v1.LocalObjectReference
+	// ResolvedExtensionRef holds the filter that the Extension Ref points to.
+	// Will be non-nil if the Extension Ref is non-nil and was resolved successfully.
+	// Can be set on GRPCRoutes and HTTPRoutes.
+	ResolvedExtensionRef *ExtensionRefFilter
+	// RouteType is the type of Route that this filter is on.
+	RouteType RouteType
+	// FilterType is the type of filter.
+	FilterType FilterType
+}
+
+// FilterType is the type of filter.
+type FilterType string
+
+// The following FilterTypes are supported by GRPCRoutes and HTTPRoutes.
+const (
+	FilterCORS                   = FilterType(v1.HTTPRouteFilterCORS)
+	FilterRequestHeaderModifier  = FilterType(v1.HTTPRouteFilterRequestHeaderModifier)
+	FilterResponseHeaderModifier = FilterType(v1.HTTPRouteFilterResponseHeaderModifier)
+	FilterExtensionRef           = FilterType(v1.HTTPRouteFilterExtensionRef)
+	FilterRequestMirror          = FilterType(v1.HTTPRouteFilterRequestMirror)
+)
+
+// The following FilterTypes are supported by HTTPRoutes only.
+const (
+	FilterRequestRedirect = FilterType(v1.HTTPRouteFilterRequestRedirect)
+	FilterURLRewrite      = FilterType(v1.HTTPRouteFilterURLRewrite)
+	FilterExternalAuth    = FilterType(v1.HTTPRouteFilterExternalAuth)
+)
+
+func convertHTTPRouteFilters(filters []v1.HTTPRouteFilter) []Filter {
+	routeFilters := make([]Filter, 0, len(filters))
+
+	for _, filter := range filters {
+		routeFilters = append(routeFilters, Filter{
+			RouteType:              RouteTypeHTTP,
+			FilterType:             FilterType(filter.Type),
+			RequestHeaderModifier:  filter.RequestHeaderModifier,
+			ResponseHeaderModifier: filter.ResponseHeaderModifier,
+			RequestRedirect:        filter.RequestRedirect,
+			URLRewrite:             filter.URLRewrite,
+			RequestMirror:          filter.RequestMirror,
+			ExternalAuth:           filter.ExternalAuth,
+			ExtensionRef:           filter.ExtensionRef,
+			CORS:                   filter.CORS,
+		})
+	}
+
+	return routeFilters
+}
+
+func convertGRPCRouteFilters(filters []v1.GRPCRouteFilter) []Filter {
+	routeFilters := make([]Filter, 0, len(filters))
+
+	for _, filter := range filters {
+		routeFilters = append(routeFilters, Filter{
+			RouteType:              RouteTypeGRPC,
+			FilterType:             FilterType(filter.Type),
+			RequestHeaderModifier:  filter.RequestHeaderModifier,
+			ResponseHeaderModifier: filter.ResponseHeaderModifier,
+			RequestMirror:          filter.RequestMirror,
+			ExtensionRef:           filter.ExtensionRef,
+		})
+	}
+
+	return routeFilters
+}
+
+func processRouteRuleFilters(
+	filters []Filter,
+	path *field.Path,
+	validator validation.HTTPFieldsValidator,
+	extRefFilterResolvers map[string]resolveExtRefFilter,
+) (RouteRuleFilters, routeRuleErrors) {
+	errors := routeRuleErrors{}
+	valid := true
+	seenAuth := false
+	seenExternalAuth := false
+
+	for i, f := range filters {
+		filterPath := path.Index(i)
+
+		isExtRef := f.FilterType == FilterExtensionRef && f.ExtensionRef != nil
+
+		if f.FilterType == FilterExternalAuth {
+			if seenExternalAuth {
+				errors.warn = append(errors.warn, field.Invalid(
+					filterPath,
+					f.FilterType,
+					"only one HTTPExternalAuthFilter is allowed per Route rule; subsequent filters are ignored",
+				))
+				continue
+			}
+			seenExternalAuth = true
+		}
+
+		if isExtRef && f.ExtensionRef.Kind == kinds.AuthenticationFilter {
+			if seenAuth {
+				err := field.Invalid(
+					filterPath.Child("extensionRef"),
+					f.ExtensionRef,
+					"only one AuthenticationFilter is allowed per Route rule",
+				)
+				errors.invalid = append(errors.invalid, err)
+				valid = false
+				continue
+			}
+			seenAuth = true
+		}
+
+		validateErrs := validateFilter(validator, f, filterPath)
+		if len(validateErrs) > 0 {
+			errors.invalid = append(errors.invalid, validateErrs...)
+			valid = false
+			continue
+		}
+
+		if isExtRef {
+			extRefFilterResolver := extRefFilterResolvers[string(f.ExtensionRef.Kind)]
+			resolved := extRefFilterResolver(*f.ExtensionRef)
+
+			if resolved == nil {
+				err := field.NotFound(filterPath.Child("extensionRef"), f.ExtensionRef)
+				errors.resolve = append(errors.resolve, err)
+				valid = false
+
+				continue
+			}
+
+			if !resolved.Valid {
+				err := field.Invalid(
+					filterPath.Child("extensionRef"),
+					f.ExtensionRef,
+					"referenced filter is invalid. See filter status for more details.",
+				)
+				errors.resolve = append(errors.resolve, err)
+				valid = false
+
+				continue
+			}
+
+			filters[i].ResolvedExtensionRef = resolved
+		}
+	}
+
+	return RouteRuleFilters{Valid: valid, Filters: filters}, errors
+}
+
+var supportedGRPCFilterTypes = []FilterType{
+	FilterResponseHeaderModifier,
+	FilterRequestHeaderModifier,
+	FilterRequestMirror,
+	FilterExtensionRef,
+}
+
+var supportedHTTPFilterTypes = []FilterType{
+	FilterResponseHeaderModifier,
+	FilterRequestHeaderModifier,
+	FilterExtensionRef,
+	FilterRequestRedirect,
+	FilterURLRewrite,
+	FilterRequestMirror,
+	FilterCORS,
+	FilterExternalAuth,
+}
+
+func validateFilterType(filter Filter, filterPath *field.Path) *field.Error {
+	if filter.RouteType == RouteTypeGRPC && !slices.Contains(supportedGRPCFilterTypes, filter.FilterType) {
+		return field.NotSupported(filterPath.Child("type"), filter.FilterType, supportedGRPCFilterTypes)
+	}
+
+	if !slices.Contains(supportedHTTPFilterTypes, filter.FilterType) {
+		return field.NotSupported(filterPath.Child("type"), filter.FilterType, supportedHTTPFilterTypes)
+	}
+
+	return nil
+}
+
+func validateFilter(
+	validator validation.HTTPFieldsValidator,
+	filter Filter,
+	filterPath *field.Path,
+) field.ErrorList {
+	var allErrs field.ErrorList
+
+	if err := validateFilterType(filter, filterPath); err != nil {
+		allErrs = append(allErrs, err)
+		return allErrs
+	}
+
+	switch filter.FilterType {
+	case FilterRequestRedirect:
+		return validateFilterRedirect(validator, filter.RequestRedirect, filterPath)
+	case FilterURLRewrite:
+		return validateFilterRewrite(validator, filter.URLRewrite, filterPath)
+	case FilterRequestMirror:
+		return validateFilterMirror(filter.RequestMirror, filterPath)
+	case FilterRequestHeaderModifier:
+		return validateFilterHeaderModifier(
+			validator,
+			filter.RequestHeaderModifier,
+			filterPath.Child(string(filter.FilterType)),
+		)
+	case FilterResponseHeaderModifier:
+		return validateFilterResponseHeaderModifier(
+			validator,
+			filter.ResponseHeaderModifier,
+			filterPath.Child(string(filter.FilterType)),
+		)
+	case FilterExtensionRef:
+		return validateExtensionRefFilter(filter.ExtensionRef, filterPath)
+	case FilterCORS:
+		return validateFilterCORS(filter.CORS, filterPath)
+	case FilterExternalAuth:
+		return validateFilterExternalAuth(validator, filter.ExternalAuth, filterPath)
+	default:
+		panic(fmt.Sprintf("unexpected filter type %v", filter.FilterType))
+	}
+}
+
+func validateFilterExternalAuth(
+	validator validation.HTTPFieldsValidator,
+	filter *v1.HTTPExternalAuthFilter,
+	filterPath *field.Path,
+) field.ErrorList {
+	if filter == nil {
+		return field.ErrorList{field.Required(filterPath.Child("externalAuth"), "cannot be nil")}
+	}
+	if filter.ExternalAuthProtocol != v1.HTTPRouteExternalAuthHTTPProtocol {
+		return field.ErrorList{
+			field.NotSupported(
+				filterPath.Child("externalAuth", "protocol"),
+				filter.ExternalAuthProtocol,
+				[]string{string(v1.HTTPRouteExternalAuthHTTPProtocol)},
+			),
+		}
+	}
+
+	var allErrs field.ErrorList
+
+	if filter.HTTPAuthConfig != nil {
+		reqErrs := verifyExternalAuthHeaders(
+			validator,
+			filter.HTTPAuthConfig.AllowedRequestHeaders,
+			filterPath.Child("externalAuth", "http", "allowedRequestHeaders"),
+		)
+		allErrs = append(allErrs, reqErrs...)
+
+		respErrs := verifyExternalAuthHeaders(
+			validator,
+			filter.HTTPAuthConfig.AllowedResponseHeaders,
+			filterPath.Child("externalAuth", "http", "allowedResponseHeaders"),
+		)
+		allErrs = append(allErrs, respErrs...)
+
+		if filter.HTTPAuthConfig.Path != "" {
+			if err := validator.ValidatePath(filter.HTTPAuthConfig.Path); err != nil {
+				allErrs = append(
+					allErrs,
+					field.Invalid(filterPath.Child("externalAuth", "http", "path"), filter.HTTPAuthConfig.Path, err.Error()),
+				)
+			}
+		}
+	}
+
+	return allErrs
+}
+
+// verifyExternalAuthHeaders validates header names and returns any validation errors.
+func verifyExternalAuthHeaders(
+	validator validation.HTTPFieldsValidator,
+	headers []string,
+	headerPath *field.Path,
+) field.ErrorList {
+	var allErrs field.ErrorList
+
+	for i, h := range headers {
+		if err := validator.ValidateFilterHeaderName(h); err != nil {
+			allErrs = append(allErrs, field.Invalid(headerPath.Index(i), h, err.Error()))
+		}
+	}
+
+	return allErrs
+}
+
+func validateFilterMirror(mirror *v1.HTTPRequestMirrorFilter, filterPath *field.Path) field.ErrorList {
+	mirrorPath := filterPath.Child("requestMirror")
+
+	if mirror == nil {
+		return field.ErrorList{field.Required(mirrorPath, "cannot be nil")}
+	}
+
+	if mirror.Percent != nil && mirror.Fraction != nil {
+		return field.ErrorList{field.Invalid(mirrorPath, mirror, "cannot set both percent and fraction")}
+	}
+
+	if mirror.Fraction != nil && mirror.Fraction.Denominator != nil {
+		if *mirror.Fraction.Denominator <= 0 {
+			return field.ErrorList{
+				field.Invalid(
+					mirrorPath.Child("fraction", "denominator"),
+					mirror.Fraction.Denominator,
+					"must be greater than 0",
+				),
+			}
+		}
+		if mirror.Fraction.Numerator < 0 {
+			return field.ErrorList{
+				field.Invalid(
+					mirrorPath.Child("fraction", "numerator"),
+					mirror.Fraction.Numerator,
+					"must be greater than or equal to 0",
+				),
+			}
+		}
+		if mirror.Fraction.Numerator > *mirror.Fraction.Denominator {
+			return field.ErrorList{
+				field.Invalid(
+					mirrorPath.Child("fraction", "numerator"),
+					mirror.Fraction.Numerator,
+					"must be less than or equal to denominator",
+				),
+			}
+		}
+	}
+
+	return nil
+}
+
+func validateFilterHeaderModifier(
+	validator validation.HTTPFieldsValidator,
+	headerModifier *v1.HTTPHeaderFilter,
+	filterPath *field.Path,
+) field.ErrorList {
+	if headerModifier == nil {
+		return field.ErrorList{field.Required(filterPath, "cannot be nil")}
+	}
+
+	return validateFilterHeaderModifierFields(validator, headerModifier, filterPath)
+}
+
+func validateFilterHeaderModifierFields(
+	validator validation.HTTPFieldsValidator,
+	headerModifier *v1.HTTPHeaderFilter,
+	headerModifierPath *field.Path,
+) field.ErrorList {
+	var allErrs field.ErrorList
+
+	// Ensure that the header names are case-insensitive unique
+	allErrs = append(allErrs, validateRequestHeadersCaseInsensitiveUnique(
+		headerModifier.Add,
+		headerModifierPath.Child(add),
+	)...)
+	allErrs = append(allErrs, validateRequestHeadersCaseInsensitiveUnique(
+		headerModifier.Set,
+		headerModifierPath.Child(set),
+	)...)
+	allErrs = append(allErrs, validateRequestHeaderStringCaseInsensitiveUnique(
+		headerModifier.Remove,
+		headerModifierPath.Child(remove),
+	)...)
+
+	for _, h := range headerModifier.Add {
+		if err := validator.ValidateFilterHeaderName(string(h.Name)); err != nil {
+			valErr := field.Invalid(headerModifierPath.Child(add), h, err.Error())
+			allErrs = append(allErrs, valErr)
+		}
+		if err := validator.ValidateFilterHeaderValue(h.Value); err != nil {
+			valErr := field.Invalid(headerModifierPath.Child(add), h, err.Error())
+			allErrs = append(allErrs, valErr)
+		}
+	}
+	for _, h := range headerModifier.Set {
+		if err := validator.ValidateFilterHeaderName(string(h.Name)); err != nil {
+			valErr := field.Invalid(headerModifierPath.Child(set), h, err.Error())
+			allErrs = append(allErrs, valErr)
+		}
+		if err := validator.ValidateFilterHeaderValue(h.Value); err != nil {
+			valErr := field.Invalid(headerModifierPath.Child(set), h, err.Error())
+			allErrs = append(allErrs, valErr)
+		}
+	}
+	for _, h := range headerModifier.Remove {
+		if err := validator.ValidateFilterHeaderName(h); err != nil {
+			valErr := field.Invalid(headerModifierPath.Child(remove), h, err.Error())
+			allErrs = append(allErrs, valErr)
+		}
+	}
+
+	return allErrs
+}
+
+func validateFilterResponseHeaderModifier(
+	validator validation.HTTPFieldsValidator,
+	responseHeaderModifier *v1.HTTPHeaderFilter,
+	filterPath *field.Path,
+) field.ErrorList {
+	if errList := validateFilterHeaderModifier(validator, responseHeaderModifier, filterPath); errList != nil {
+		return errList
+	}
+	var allErrs field.ErrorList
+
+	allErrs = append(allErrs, validateResponseHeaders(
+		responseHeaderModifier.Add,
+		filterPath.Child(add),
+	)...)
+
+	allErrs = append(allErrs, validateResponseHeaders(
+		responseHeaderModifier.Set,
+		filterPath.Child(set),
+	)...)
+
+	var removeHeaders []v1.HTTPHeader
+	for _, h := range responseHeaderModifier.Remove {
+		removeHeaders = append(removeHeaders, v1.HTTPHeader{Name: v1.HTTPHeaderName(h)})
+	}
+
+	allErrs = append(allErrs, validateResponseHeaders(
+		removeHeaders,
+		filterPath.Child(remove),
+	)...)
+
+	return allErrs
+}
+
+func validateResponseHeaders(
+	headers []v1.HTTPHeader,
+	path *field.Path,
+) field.ErrorList {
+	var allErrs field.ErrorList
+	disallowedResponseHeaderSet := map[string]struct{}{
+		"server":         {},
+		"date":           {},
+		"x-pad":          {},
+		"content-type":   {},
+		"content-length": {},
+		"connection":     {},
+	}
+	invalidPrefix := "x-accel"
+
+	for _, h := range headers {
+		valErr := field.Invalid(path, h, "header name is not allowed")
+		name := strings.ToLower(string(h.Name))
+		if _, exists := disallowedResponseHeaderSet[name]; exists ||
+			strings.HasPrefix(name, strings.ToLower(invalidPrefix)) {
+			allErrs = append(allErrs, valErr)
+		}
+	}
+
+	return allErrs
+}
+
+func validateRequestHeadersCaseInsensitiveUnique(
+	headers []v1.HTTPHeader,
+	path *field.Path,
+) field.ErrorList {
+	var allErrs field.ErrorList
+
+	seen := make(map[string]struct{})
+
+	for _, h := range headers {
+		name := strings.ToLower(string(h.Name))
+		if _, exists := seen[name]; exists {
+			valErr := field.Invalid(path, h, "header name is not unique")
+			allErrs = append(allErrs, valErr)
+		}
+		seen[name] = struct{}{}
+	}
+
+	return allErrs
+}
+
+func validateRequestHeaderStringCaseInsensitiveUnique(headers []string, path *field.Path) field.ErrorList {
+	var allErrs field.ErrorList
+
+	seen := make(map[string]struct{})
+
+	for _, h := range headers {
+		name := strings.ToLower(h)
+		if _, exists := seen[name]; exists {
+			valErr := field.Invalid(path, h, "header name is not unique")
+			allErrs = append(allErrs, valErr)
+		}
+		seen[name] = struct{}{}
+	}
+
+	return allErrs
+}
+
+func validateFilterCORS(
+	corsFilter *v1.HTTPCORSFilter,
+	filterPath *field.Path,
+) field.ErrorList {
+	if corsFilter == nil {
+		return field.ErrorList{
+			field.Required(filterPath.Child(string(FilterCORS)), "CORS filter cannot be nil"),
+		}
+	}
+
+	return nil
+}

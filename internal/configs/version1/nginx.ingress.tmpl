@@ -1,0 +1,957 @@
+{{- /*gotype: github.com/wx-one/wxingress/internal/configs/version1.IngressNginxConfig*/ -}}
+# configuration for {{.Ingress.Namespace}}/{{.Ingress.Name}}
+{{- range $upstream := .Upstreams}}
+upstream {{$upstream.Name}} {
+	{{- if ne $upstream.UpstreamZoneSize "0"}}
+	zone {{if $upstream.Zone}}{{$upstream.Zone}}{{else}}{{$upstream.Name}}{{end}} {{$upstream.UpstreamZoneSize}};
+	{{- end}}
+	{{- if $upstream.LBMethod}}
+	{{$upstream.LBMethod}};
+	{{- end}}
+	{{- range $server := $upstream.UpstreamServers}}
+	server {{$server.Address}} max_fails={{$server.MaxFails}} fail_timeout={{$server.FailTimeout}} max_conns={{$server.MaxConns}};
+	{{- end}}
+	{{- if $upstream.MetaBalancer}}
+	meta_balancer;
+	{{- end}}
+	{{- if $upstream.Keepalive}}
+	keepalive {{$upstream.Keepalive}};
+	{{- end}}
+	{{- if $upstream.StickyCookie}}
+	sticky cookie {{$upstream.StickyCookie}};
+	{{- end}}
+}
+{{end -}}
+
+{{- if .Maps}}
+{{- range $m := .Maps}}
+map {{ $m.Source }} {{ $m.Variable }} {
+	{{- range $p := $m.Parameters }}
+	{{ $p.Value }} {{ $p.Result }};
+	{{- end }}
+}
+{{- end}}
+{{- end -}}
+{{- range $u := .IngressNginxAuthUpstreams}}
+upstream {{$u.Name}} {
+	zone {{$u.Name}} 64k;
+	{{- if $u.Resolver}}
+	resolver {{$u.Resolver}};
+	{{- end}}
+	server {{$u.Server}}{{if $u.Resolve}} resolve{{end}};
+	keepalive {{$u.Keepalive}};
+	keepalive_requests {{$u.KeepaliveRequests}};
+	keepalive_timeout {{$u.KeepaliveTimeout}}s;
+}
+{{- end}}
+{{- range $c := .IngressNginxAuthCaches}}
+proxy_cache_path {{$c.Path}} levels=1:2 keys_zone={{$c.Zone}}:10m max_size=128m inactive=30m use_temp_path=off;
+{{- end -}}
+{{- range $rl := .IngressNginxRateLimits}}
+{{$rl.HTTP}}
+{{- end -}}
+{{range $limitReqZone := .LimitReqZones}}
+limit_req_zone {{ $limitReqZone.Key }} zone={{ $limitReqZone.Name }}:{{$limitReqZone.Size}} rate={{$limitReqZone.Rate}};
+{{end}}
+
+{{range $server := .Servers}}
+server {
+	{{- /* a gRPC-only server with TLS has no plain http - but in ingress-nginx's place it has, to send it to https */}}
+	{{- if or (not $server.GRPCOnly) (not $server.SSL) $server.IngressNginxRedirect}}
+	{{- range $port := $server.Ports}}
+	listen {{$port}}{{if $server.IsDefaultServer}} default_server{{end}}{{if $server.ProxyProtocol}} proxy_protocol{{end}};
+	{{- if not $server.DisableIPV6}}listen [::]:{{$port}}{{if $server.IsDefaultServer}} default_server{{end}}{{if $server.ProxyProtocol}} proxy_protocol{{end}};{{end}}
+	{{- end}}
+	{{- end}}
+	{{- if $server.HTTP2}}
+	http2 on;
+	{{- else if $.HTTP2}}
+	http2 off;
+	{{- end}}
+
+	{{- if $server.SSL}}
+	{{- if $server.TLSPassthrough}}
+	listen unix:/var/lib/nginx/passthrough-https.sock ssl{{if $server.IsDefaultServer}} default_server{{end}} proxy_protocol;
+	set_real_ip_from unix:;
+	real_ip_header proxy_protocol;
+	{{- else}}
+	{{- range $port := $server.SSLPorts}}
+	listen {{$port}} ssl{{if $server.IsDefaultServer}} default_server{{end}}{{if $server.ProxyProtocol}} proxy_protocol{{end}};
+	{{- if not $server.DisableIPV6}}listen [::]:{{$port}} ssl{{if $server.IsDefaultServer}} default_server{{end}}{{if $server.ProxyProtocol}} proxy_protocol{{end}};{{end}}
+	{{- end}}
+	{{- end}}
+	{{- if $.DefaultCertificate}}
+	{{- /* the certificate of the host comes from the wxingress module by name; this is the one for a name it has none for */}}
+	ssl_certificate {{$.DefaultCertificate}};
+	ssl_certificate_key {{$.DefaultCertificate}};
+	{{- end}}
+	{{- if and $server.SSLRejectHandshake (not $.DefaultCertificate)}}
+	ssl_reject_handshake on;
+	{{- else}}
+	{{- if not $.DefaultCertificate}}
+	ssl_certificate {{ makeSecretPath $server.SSLCertificate $.StaticSSLPath "$secret_dir_path" $.DynamicSSLReloadEnabled }};
+	ssl_certificate_key {{ makeSecretPath $server.SSLCertificateKey $.StaticSSLPath "$secret_dir_path" $.DynamicSSLReloadEnabled }};
+	{{- end}}
+	{{- if $server.SSLCiphers}}
+	ssl_ciphers {{ printf "%q" $server.SSLCiphers }};
+	{{- end}}
+	{{- if $server.SSLPreferServerCiphers}}
+	ssl_prefer_server_ciphers on;
+	{{- end}}
+	{{- end}}
+	{{- end}}
+
+	{{- with $server.IngressMTLS }}
+	ssl_client_certificate {{ .ClientCert }};
+	{{- if .ClientCrl }}
+	ssl_crl {{ .ClientCrl }};
+	{{- end }}
+	ssl_verify_client {{ .VerifyClient }};
+	ssl_verify_depth {{ .VerifyDepth }};
+	{{- end }}
+	{{- with $server.IngressNginxClientCertErrorPage }}
+	error_page 495 496 = {{ . }};
+	{{- end }}
+	{{- if $server.IngressNginxClientCertHTTPSOnly }}
+	if ($https != on) {
+		return 503;
+	}
+	{{- end }}
+	{{- with $server.IngressNginxMatchCN }}
+	if ($ssl_client_s_dn !~ {{ printf "%q" . }}) {
+		return 403 "client certificate unauthorized";
+	}
+	{{- end }}
+
+	{{- range $allow := $server.Allow }}
+		allow {{ $allow }};
+	{{- end }}
+	{{- if gt (len $server.Allow) 0 }}
+		deny all;
+	{{- end }}
+
+	{{- range $deny := $server.Deny }}
+		deny {{ $deny }};
+	{{- end }}
+	{{- if gt (len $server.Deny) 0 }}
+		allow all;
+	{{- end }}
+
+	{{- range $setRealIPFrom := $server.SetRealIPFrom}}
+	set_real_ip_from {{$setRealIPFrom}};{{end}}
+	{{- if $server.RealIPHeader}}real_ip_header {{$server.RealIPHeader}};{{end}}
+	{{- if $server.RealIPRecursive}}real_ip_recursive on;{{end}}
+
+	server_tokens {{$server.ServerTokens}};
+	{{- with $server.RedirectAllTo }}
+	return {{ $server.HTTPRedirectCode }} {{ . }}$ingress_nginx_redirect_uri;
+	{{- end }}
+
+	{{- with $server.PoliciesErrorReturn }}
+	return {{ .Code }};
+	{{- end }}
+
+	server_name {{$server.Name}}{{ range $server.ServerAliases }} {{ . }}{{ end }};
+	{{- if $.Ingress.Name}}
+	set $resource_type "ingress";
+	set $resource_name "{{$.Ingress.Name}}";
+	set $resource_namespace "{{$.Ingress.Namespace}}";
+	set $service "-";
+	{{- end}}
+
+	{{- range $proxyHideHeader := $server.ProxyHideHeaders}}
+	proxy_hide_header {{$proxyHideHeader}};{{end}}
+	{{- range $proxyPassHeader := $server.ProxyPassHeaders}}
+	proxy_pass_header {{$proxyPassHeader}};{{end}}
+	{{- range $h := $server.AddHeaders}}
+	add_header {{$h.Name}} {{ printf "%q" $h.Value }}{{if $h.Always}} always{{end}};
+	{{- end }}
+	{{- if $server.AddHeaderInherit}}
+	add_header_inherit {{$server.AddHeaderInherit}};
+	{{- end}}
+
+	{{- with $server.EgressMTLS }}
+		{{- if .Certificate }}
+	proxy_ssl_certificate {{ makeSecretPath .Certificate $.StaticSSLPath "$secret_dir_path" $.DynamicSSLReloadEnabled }};
+	proxy_ssl_certificate_key {{ makeSecretPath .CertificateKey $.StaticSSLPath "$secret_dir_path" $.DynamicSSLReloadEnabled }};
+		{{- end }}
+		{{- if .TrustedCert }}
+	proxy_ssl_trusted_certificate {{ .TrustedCert }};
+		{{- end }}
+	proxy_ssl_verify {{ if .VerifyServer }}on{{else}}off{{end}};
+	proxy_ssl_verify_depth {{ .VerifyDepth }};
+	proxy_ssl_protocols {{ .Protocols }};
+	proxy_ssl_ciphers {{ printf "%q" .Ciphers }};
+	proxy_ssl_session_reuse {{ if .SessionReuse }}on{{else}}off{{end}};
+	proxy_ssl_server_name {{ if .ServerName }}on{{else}}off{{end}};
+	proxy_ssl_name {{ printf "%q" .SSLName }};
+	{{- end }}
+
+	{{- if and $server.HSTS (or $server.SSL $server.HSTSBehindProxy)}}
+	set $hsts_header_value "max-age={{$server.HSTSMaxAge}}{{if $server.HSTSIncludeSubdomains}}; includeSubDomains{{end}}{{if $server.HSTSPreload}}; preload{{end}}";
+	proxy_hide_header Strict-Transport-Security;
+	add_header Strict-Transport-Security {{if $server.HSTSBehindProxy}}$hsts_header_behind_proxy{{else}}$hsts_header{{end}} always;
+	{{- end}}
+
+	{{- if $server.IngressNginxHTTPSRedirect}}
+	{{- /* ingress-nginx sends http to https in the rewrite phase of each location: after nginx refused a body over the
+	     location's client_max_body_size (413), after the location's own returns. The server decides, its locations send. */}}
+	set $ingress_nginx_https_redirect 0;
+	if ($scheme = http) {
+		set $ingress_nginx_https_redirect 1;
+	}
+	{{- if $server.HealthStatus}}
+	if ($request_uri = {{ printf "%q" $server.HealthStatusURI }}) {
+		set $ingress_nginx_https_redirect 0;
+	}
+	{{- end}}
+	{{- if $server.ACMEChallengeActive}}
+	if ($uri ~ "^/\.well-known/acme-challenge/") {
+		set $ingress_nginx_https_redirect 0;
+	}
+	{{- end}}
+	{{- else}}
+	{{- if $server.SSL}}
+	{{- if or (not $server.GRPCOnly) $server.IngressNginxRedirect}}
+	{{- if $server.SSLRedirect}}
+	{{- if or $server.HealthStatus $server.ACMEChallengeActive}}
+	set $redirect 0;
+	if ($scheme = http) {
+		set $redirect 1;
+	}
+	{{- if $server.HealthStatus}}
+	if ($request_uri = {{ printf "%q" $server.HealthStatusURI }}) {
+		set $redirect 0;
+	}
+	{{- end}}
+	{{- if $server.ACMEChallengeActive}}
+	if ($uri ~ "^/\.well-known/acme-challenge/") {
+		set $redirect 0;
+	}
+	{{- end}}
+	if ($redirect = 1) {
+		return {{$server.HTTPRedirectCode}} {{ template "sslRedirectTarget" $server }};
+	}
+	{{- else}}
+	if ($scheme = http) {
+		return {{$server.HTTPRedirectCode}} {{ template "sslRedirectTarget" $server }};
+	}
+	{{- end}}
+	{{- end}}
+	{{- end}}
+	{{- end}}
+
+	{{- if and $server.ForceSSLRedirect (not (and $server.SSL $server.SSLRedirect (not $server.GRPCOnly))) }}
+	{{- if or $server.HealthStatus $server.ACMEChallengeActive}}
+	set $redirect 0;
+	if ($scheme = http) {
+		set $redirect 1;
+	}
+	{{- if $server.HealthStatus}}
+	if ($request_uri = {{ printf "%q" $server.HealthStatusURI }}) {
+		set $redirect 0;
+	}
+	{{- end}}
+	{{- if $server.ACMEChallengeActive}}
+	if ($uri ~ "^/\.well-known/acme-challenge/") {
+		set $redirect 0;
+	}
+	{{- end}}
+	if ($redirect = 1) {
+		return {{$server.HTTPRedirectCode}} {{ template "sslRedirectTarget" $server }};
+	}
+	{{- else}}
+	if ($scheme = http) {
+		return {{$server.HTTPRedirectCode}} {{ template "sslRedirectTarget" $server }};
+	}
+	{{- end}}
+	{{- end}}
+	{{- end}}
+
+	{{- if $server.RedirectToHTTPS}}
+	{{- if $server.ACMEChallengeActive}}
+	set $redirect_to_https 0;
+	if ($http_x_forwarded_proto = 'http') {
+		set $redirect_to_https 1;
+	}
+	if ($uri ~ "^/\.well-known/acme-challenge/") {
+		set $redirect_to_https 0;
+	}
+	if ($redirect_to_https = 1) {
+		return {{$server.HTTPRedirectCode}} https://$host$request_uri;
+	}
+	{{- else}}
+	if ($http_x_forwarded_proto = 'http') {
+		return {{$server.HTTPRedirectCode}} https://$host$request_uri;
+	}
+	{{- end}}
+	{{- end}}
+
+	{{- with $server.BasicAuth }}
+	auth_basic {{ printf "%q" .Realm }};
+	auth_basic_user_file {{ .Secret }};
+	{{- end }}
+
+	{{- if $server.ExternalAuth }}
+	auth_request {{ printf "%q" $server.ExternalAuth.URI.InternalPath }};
+	{{- if $server.ExternalAuth.SigninURL }}
+	proxy_intercept_errors on;
+	set $external_auth_signin_uri {{ printf "%q" $server.ExternalAuth.SigninURL }};
+	error_page 401 = @external_auth_signin;
+	{{- end }}
+	{{- end }}
+
+	{{- range $value := $server.ServerSnippets}}
+	{{$value}}{{- end}}
+
+	{{- if $server.AppRoot }}
+	if ($uri = /) {
+		return 302 $scheme://$http_host{{ $server.AppRoot }};
+	}
+	{{- end }}
+
+	{{- if $server.ProxyRedirectFrom}}
+	{{- if eq $server.ProxyRedirectFrom "off"}}
+	proxy_redirect off;
+	{{- else if ne $server.ProxyRedirectFrom "default"}}
+	{{- /* "default" is not emitted, The default replacement specified by the default parameter uses the parameters of the location and proxy_pass directives  */}}
+	proxy_redirect {{$server.ProxyRedirectFrom}} {{$server.ProxyRedirectTo}};
+	{{- end}}
+	{{- end}}
+
+	{{- if $server.CustomHTTPErrorCodes}}
+	proxy_intercept_errors on;
+	{{- if $server.CustomHTTPErrorBackend}}
+	error_page{{range $c := $server.CustomHTTPErrorCodes}} {{$c}}{{end}} @custom_default_backend;
+	{{- end}}
+	{{- end}}
+
+	{{- if $server.AccessLogOff}}
+	access_log off;
+	{{- end}}
+
+	{{- if $server.HealthStatus}}
+	location = {{ printf "%q" $server.HealthStatusURI }} {
+		default_type text/plain;
+		return 200 "healthy\n";
+	}
+	{{- end}}
+
+	{{- range $location := $server.Locations}}
+	{{- if not $location.IngressNginxExternalAuthShared}}
+	{{- with $location.IngressNginxExternalAuth}}
+	location = {{.Location}} {
+		internal;
+		access_log off;
+		{{- if .CacheKey}}
+		proxy_cache {{.CacheZone}};
+		{{- range $d := .CacheDurations}}
+		proxy_cache_valid {{$d}};
+		{{- end}}
+		proxy_cache_key {{printf "%q" .CacheKey}};
+		{{- end}}
+		proxy_intercept_errors off;
+		proxy_pass_request_body off;
+		proxy_set_header Content-Length "";
+		proxy_set_header X-Forwarded-Proto "";
+		proxy_set_header X-Request-ID $ingress_nginx_req_id;
+		{{- if .Method}}
+		proxy_method {{.Method}};
+		proxy_set_header X-Original-URI $request_uri;
+		proxy_set_header X-Scheme $scheme;
+		{{- end}}
+		proxy_set_header Host {{.Host}};
+		proxy_set_header X-Original-URL $scheme://$http_host$request_uri;
+		proxy_set_header X-Original-Method $request_method;
+		proxy_set_header X-Sent-From "nginx-ingress-controller";
+		proxy_set_header X-Real-IP $remote_addr;
+		proxy_set_header X-Forwarded-For $remote_addr;
+		proxy_set_header X-Auth-Request-Redirect {{if .RequestRedirect}}{{.RequestRedirect}}{{else}}$request_uri{{end}};
+		proxy_buffering {{if or .CacheKey $location.ProxyBuffering}}on{{else}}off{{end}};
+		{{- if $location.ProxyBufferSize}}
+		proxy_buffer_size {{$location.ProxyBufferSize}};
+		{{- end}}
+		{{- if $location.ProxyBuffers}}
+		proxy_buffers {{$location.ProxyBuffers}};
+		{{- end}}
+		{{- if $location.ProxyBusyBuffersSize}}
+		proxy_busy_buffers_size {{$location.ProxyBusyBuffersSize}};
+		{{- end}}
+		{{- if $location.ProxyRequestBuffering}}
+		proxy_request_buffering {{$location.ProxyRequestBuffering}};
+		{{- end}}
+		proxy_ssl_server_name on;
+		proxy_pass_request_headers on;
+		client_max_body_size {{$location.ClientMaxBodySize}};
+		{{- if $location.ClientBodyBufferSize}}
+		client_body_buffer_size {{$location.ClientBodyBufferSize}};
+		{{- end}}
+		{{- if .Snippet}}
+		{{.Snippet}}
+		{{- end}}
+		{{- range $h := .ProxySetHeaders}}
+		proxy_set_header {{printf "%q" $h.Name}} {{printf "%q" $h.Value}};
+		{{- end}}
+		{{- if .Upstream}}
+		{{- /* auth-keepalive: HTTP/1.1 without Connection, so that nginx keeps the connections of the upstream */}}
+		proxy_http_version 1.1;
+		proxy_set_header Connection "";
+		{{- else}}
+		proxy_http_version {{if eq $location.ProxyHTTPVersion "1.0"}}1.0{{else}}1.1{{end}};
+		{{- end}}
+		{{- if .Resolver}}
+		resolver {{.Resolver}};
+		{{- end}}
+		set $target {{printf "%q" .URL}};
+		proxy_pass $target;
+	}
+	{{- if .SigninLocation}}
+	location {{.SigninLocation}} {
+		internal;
+		add_header Set-Cookie $auth_cookie;
+		return 302 {{.SigninURL}};
+	}
+	{{- end}}
+	{{- end}}
+	{{- end}}
+	location {{ makeLocationPath $location $.Ingress.Annotations }} {
+		set $service "{{$location.ServiceName}}";
+		{{- with $location.MetricsLabels}}
+		{{- /* ingress-nginx's request metrics, counted by the wxingress module (http.logIf) with these labels */}}
+		set $wxingress_metrics {{printf "%q" .}};
+		{{- end}}
+		{{- if $location.Internal}}
+		internal;
+		{{- end}}
+		{{- with $location.MinionIngress}}
+		# location for minion {{$location.MinionIngress.Namespace}}/{{$location.MinionIngress.Name}}
+		set $resource_name "{{$location.MinionIngress.Name}}";
+		set $resource_namespace "{{$location.MinionIngress.Namespace}}";
+		{{- end}}
+
+		{{- with $location.PoliciesErrorReturn }}
+		return {{ .Code }};
+		{{- end }}
+		{{- with $location.IngressNginxRedirect }}
+		return {{ .Code }} {{ printf "%q" .Text }};
+		{{- end }}
+		{{- with $location.IngressNginxExternalAuth}}
+		set $pass_access_scheme $scheme;
+		auth_request {{.Location}};
+		auth_request_set $auth_cookie $upstream_http_set_cookie;
+		add_header Set-Cookie $auth_cookie{{if .AlwaysSetCookie}} always{{end}};
+		{{- range $i, $h := .ResponseHeaders}}
+		auth_request_set $authHeader{{$i}} {{$h.Variable}};
+		{{if $location.GRPC}}grpc_set_header{{else}}proxy_set_header{{end}} '{{$h.Name}}' $authHeader{{$i}};
+		{{- end}}
+		{{- if .SigninLocation}}
+		error_page 401 = {{.SigninLocation}};
+		{{- end}}
+		{{- end}}
+
+		{{- if or $location.AuthRequestOff $location.ACMEChallenge}}
+		auth_request off;
+		{{- else if $location.ExternalAuth }}
+		auth_request {{ printf "%q" $location.ExternalAuth.URI.InternalPath }};
+		{{- if $location.ExternalAuth.SigninURL }}
+		proxy_intercept_errors on;
+		set $external_auth_signin_uri {{ printf "%q" $location.ExternalAuth.SigninURL }};
+		error_page 401 = @external_auth_signin;
+		{{- else}}
+		error_page 401 = @external_auth_unauthorized;
+		{{- end }}
+		{{- end }}
+
+		{{- range $allow := $location.Allow }}
+		allow {{ $allow }};
+		{{- end }}
+		{{- if gt (len $location.Allow) 0 }}
+		deny all;
+		{{- end }}
+
+		{{- with $location.IngressNginxCORS }}
+		# CORS of ingress-nginx
+		set $ingress_nginx_cors "";
+		{{- if .AnyOrigin }}
+		set $ingress_nginx_cors_origin "*";
+		set $ingress_nginx_cors "true";
+		{{- else if .OriginRegex }}
+		set $ingress_nginx_cors_origin $http_origin;
+		if ($http_origin ~* {{ printf "%q" .OriginRegex }}) {
+			set $ingress_nginx_cors "true";
+		}
+		{{- end }}
+		set $ingress_nginx_cors_methods "";
+		set $ingress_nginx_cors_headers "";
+		set $ingress_nginx_cors_credentials "";
+		set $ingress_nginx_cors_expose "";
+		set $ingress_nginx_cors_max_age "";
+		if ($ingress_nginx_cors = "true") {
+			set $ingress_nginx_cors_methods "{{ .Methods }}";
+			set $ingress_nginx_cors_headers "{{ .Headers }}";
+			{{- if .Credentials }}
+			set $ingress_nginx_cors_credentials "true";
+			{{- end }}
+			{{- if .ExposeHeaders }}
+			set $ingress_nginx_cors_expose "{{ .ExposeHeaders }}";
+			{{- end }}
+			set $ingress_nginx_cors_max_age "{{ .MaxAge }}";
+		}
+		if ($ingress_nginx_cors != "true") {
+			set $ingress_nginx_cors_origin "";
+		}
+		add_header Access-Control-Allow-Origin $ingress_nginx_cors_origin always;
+		add_header Access-Control-Allow-Credentials $ingress_nginx_cors_credentials always;
+		add_header Access-Control-Allow-Methods $ingress_nginx_cors_methods always;
+		add_header Access-Control-Allow-Headers $ingress_nginx_cors_headers always;
+		add_header Access-Control-Expose-Headers $ingress_nginx_cors_expose always;
+		add_header Access-Control-Max-Age $ingress_nginx_cors_max_age always;
+		if ($request_method = OPTIONS) {
+			set $ingress_nginx_cors "${ingress_nginx_cors}options";
+		}
+		if ($ingress_nginx_cors = "trueoptions") {
+			return 204;
+		}
+		{{- end }}
+		{{- if or $location.IngressNginxErrorPages $location.IngressNginxFallback }}
+		{{- /* an upstream without endpoints answers 502 from the placeholder server: intercepted too */}}
+		proxy_intercept_errors on;
+		{{- range $location.IngressNginxErrorPages }}
+		error_page {{ .Code }} = {{ .Name }};
+		{{- end }}
+		{{- with $location.IngressNginxFallback }}
+		error_page 502 503 = {{ . }};
+		{{- end }}
+		{{- end }}
+		{{- range $location.IngressNginxDirectives }}
+		{{ . }};
+		{{- end }}
+		{{- range $h := $location.IngressNginxCustomHeaders }}
+		{{- /* ingress-nginx's custom-headers: as its more_set_headers, the header of every answer, the backend's replaced */}}
+		proxy_hide_header {{ printf "%q" $h.Name }};
+		add_header {{ printf "%q" $h.Name }} {{ printf "%q" $h.Value }} always;
+		{{- end }}
+		{{- with $location.IngressNginxOtel }}
+		{{- if .Trace }}
+		otel_trace on;
+		otel_trace_context {{ .Context }};
+		{{- with .SpanName }}
+		otel_span_name {{ printf "%q" . }};
+		{{- end }}
+		{{- else }}
+		otel_trace off;
+		{{- end }}
+		{{- end }}
+		{{- with $location.IngressNginxMirror }}
+		{{- /* the mirror's subrequest has no $request_uri of its own: the variables are shared */}}
+		set $ingress_nginx_mirror_uri $request_uri;
+		mirror {{ printf "%q" .Source }};
+		mirror_request_body {{ .RequestBody }};
+		{{- end }}
+		{{- if $location.AccessLogOff }}
+		access_log off;
+		{{- end }}
+		{{- range $rule := $location.AccessRules }}
+		{{ $rule }};
+		{{- end }}
+
+		{{- range $deny := $location.Deny }}
+		deny {{ $deny }};
+		{{- end }}
+		{{- if gt (len $location.Deny) 0 }}
+		allow all;
+		{{- end }}
+		{{- if $location.AddHeaderInherit}}
+		add_header_inherit {{$location.AddHeaderInherit}};
+		{{- end}}
+		{{- if $location.RewriteTarget}}
+		{{- template "ingressNginxHTTPSRedirect" (dict "server" $server "location" $location) }}
+		rewrite {{ makeRewritePattern $location $.Ingress.Annotations }} {{$location.RewriteTarget}} break;
+		{{- end}}
+		{{- $proxyOrGRPC := "proxy" }}{{ if $location.GRPC }}{{ $proxyOrGRPC = "grpc" }}{{ end }}
+		{{- with $location.EgressMTLS}}
+			{{- if .Certificate }}
+		{{$proxyOrGRPC}}_ssl_certificate {{ makeSecretPath .Certificate $.StaticSSLPath "$secret_dir_path" $.DynamicSSLReloadEnabled }};
+		{{$proxyOrGRPC}}_ssl_certificate_key {{ makeSecretPath .CertificateKey $.StaticSSLPath "$secret_dir_path" $.DynamicSSLReloadEnabled }};
+			{{- end }}
+			{{- if .TrustedCert }}
+		{{$proxyOrGRPC}}_ssl_trusted_certificate {{ .TrustedCert }};
+			{{- end }}
+		{{$proxyOrGRPC}}_ssl_verify {{ if .VerifyServer }}on{{else}}off{{end}};
+		{{$proxyOrGRPC}}_ssl_verify_depth {{ .VerifyDepth }};
+		{{$proxyOrGRPC}}_ssl_protocols {{ .Protocols }};
+		{{$proxyOrGRPC}}_ssl_ciphers {{ printf "%q" .Ciphers }};
+		{{$proxyOrGRPC}}_ssl_session_reuse {{ if .SessionReuse }}on{{else}}off{{end}};
+		{{$proxyOrGRPC}}_ssl_server_name {{ if .ServerName }}on{{else}}off{{end}};
+		{{$proxyOrGRPC}}_ssl_name {{ printf "%q" .SSLName }};
+		{{- end}}
+		{{- if $location.GRPC}}
+		{{- if not $server.GRPCOnly}}
+		error_page 400 @grpcerror400;
+		error_page 401 @grpcerror401;
+		error_page 403 @grpcerror403;
+		error_page 404 @grpcerror404;
+		error_page 405 @grpcerror405;
+		error_page 408 @grpcerror408;
+		error_page 414 @grpcerror414;
+		error_page 426 @grpcerror426;
+		error_page 500 @grpcerror500;
+		error_page 501 @grpcerror501;
+		error_page 502 @grpcerror502;
+		error_page 503 @grpcerror503;
+		error_page 504 @grpcerror504;
+		{{- end}}
+
+		{{- if not (or $location.AuthRequestOff $location.ACMEChallenge)}}
+		{{- range $value := $location.LocationSnippets}}
+		{{$value}}{{- end}}
+		{{- end}}
+		{{- if not $location.RewriteTarget}}
+		{{- template "ingressNginxHTTPSRedirect" (dict "server" $server "location" $location) }}
+		{{- end}}
+
+		{{- if $location.ACMEChallenge }}
+		auth_basic off;
+		{{- else }}
+		{{- with $location.BasicAuth }}
+		auth_basic {{ printf "%q" .Realm }};
+		auth_basic_user_file {{ .Secret }};
+		{{- end }}
+		{{- end }}
+
+		grpc_connect_timeout {{$location.ProxyConnectTimeout}};
+		grpc_read_timeout {{$location.ProxyReadTimeout}};
+		grpc_send_timeout {{$location.ProxySendTimeout}};
+		grpc_set_header Host {{if $location.UpstreamVhost}}{{ $location.UpstreamVhost }}{{else if $location.UseForwardedHeaders}}$forwarded_host{{else}}$host{{end}};
+		grpc_set_header X-Real-IP $remote_addr;
+		{{- if not $location.DisableForwardedHeaders }}
+		grpc_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+		grpc_set_header X-Forwarded-Host {{if $location.UseForwardedHeaders}}$forwarded_host{{else}}$host{{end}};
+		grpc_set_header X-Forwarded-Port {{if $location.UseForwardedHeaders}}$forwarded_port{{else}}$server_port{{end}};
+		grpc_set_header X-Forwarded-Proto {{if $location.UseForwardedHeaders}}$forwarded_proto{{else if $server.RedirectToHTTPS}}https{{else}}$scheme{{end}};
+		{{- end}}
+		{{- if $location.ProxyBufferSize}}
+		grpc_buffer_size {{$location.ProxyBufferSize}};
+		{{- end}}
+		{{- if $location.SSL}}
+		grpc_pass grpcs://{{or $location.Canary $location.Upstream.Name}}{{$location.Rewrite}};
+		{{- else}}
+		grpc_pass grpc://{{or $location.Canary $location.Upstream.Name}}{{$location.Rewrite}};
+		{{- end}}
+		{{- else}}
+		{{- if $location.ProxyHTTPVersion}}
+		proxy_http_version {{$location.ProxyHTTPVersion}};
+		{{- end}}
+		{{- /* HTTP/1.0 has no persistent connections or Upgrade mechanism, so the connection is
+		       closed explicitly (https://blog.nginx.org/blog/keep-alive-to-upstreams-is-now-default-in-nginx-1-29-7).
+		       HTTP/2 forbids the hop-by-hop Connection and Upgrade headers (RFC 9113 8.2.2),
+		       so they are omitted when proxying over HTTP/2. */}}
+		{{- if and $location.IngressNginxConnection (ne $location.ProxyHTTPVersion "2")}}
+		{{- /* ingress-nginx's connection-proxy-header: its value in place of the Connection header the location would send */}}
+		{{- if $location.IngressNginxProxyHeaders}}
+		proxy_set_header Upgrade $http_upgrade;
+		{{- end}}
+		proxy_set_header Connection {{$location.IngressNginxConnection}};
+		{{- else if eq $location.ProxyHTTPVersion "1.0"}}
+		proxy_set_header Connection close;
+		{{- else if ne $location.ProxyHTTPVersion "2"}}
+		{{- if $location.IngressNginxProxyHeaders}}
+		proxy_set_header Upgrade $http_upgrade;
+		proxy_set_header Connection {{if $location.Upstream.Keepalive}}$ingress_nginx_connection_upgrade{{else}}$connection_upgrade{{end}};
+		{{- else if $location.Websocket}}
+		proxy_set_header Upgrade $http_upgrade;
+		proxy_set_header Connection $connection_upgrade;
+		{{- else}}
+		{{- if $location.Upstream.Keepalive}}
+		proxy_set_header Connection "";{{end}}
+		{{- end}}
+		{{- end}}
+		{{- if not (or $location.AuthRequestOff $location.ACMEChallenge)}}
+		{{- range $value := $location.LocationSnippets}}
+		{{$value}}{{- end}}
+		{{- end}}
+		{{- if not $location.RewriteTarget}}
+		{{- template "ingressNginxHTTPSRedirect" (dict "server" $server "location" $location) }}
+		{{- end}}
+		{{- if $location.ACMEChallenge }}
+		auth_basic off;
+		{{- else }}
+		{{- with $location.BasicAuth }}
+		auth_basic {{ printf "%q" .Realm }};
+		auth_basic_user_file {{ .Secret }};
+		{{- end }}
+		{{- end }}
+		proxy_connect_timeout {{$location.ProxyConnectTimeout}};
+		proxy_read_timeout {{$location.ProxyReadTimeout}};
+		proxy_send_timeout {{$location.ProxySendTimeout}};
+		client_max_body_size {{$location.ClientMaxBodySize}};
+		{{- if $location.ClientBodyBufferSize }}
+		client_body_buffer_size {{$location.ClientBodyBufferSize}};
+		{{- end}}
+		{{- if $location.ProxyPassRequestHeaders }}
+		proxy_pass_request_headers {{ $location.ProxyPassRequestHeaders }};
+		{{- end }}
+		{{- if $location.ProxyPassRequestBody }}
+		proxy_pass_request_body {{ $location.ProxyPassRequestBody }};
+		{{- end}}
+		{{- range $header := $location.ProxySetHeaders}}
+		proxy_set_header {{ $header.Name }} {{ printf "%q" $header.Value }};
+		{{- end}}
+		proxy_set_header Host {{if $location.UpstreamVhost}}{{ $location.UpstreamVhost }}{{else if $location.UseForwardedHeaders}}$forwarded_host{{else}}$host{{end}};
+		proxy_set_header X-Real-IP $remote_addr;
+		{{- if not $location.DisableForwardedHeaders }}
+		proxy_set_header X-Forwarded-For {{if $location.IngressNginxProxyHeaders}}$remote_addr{{else}}$proxy_add_x_forwarded_for{{end}};
+		proxy_set_header X-Forwarded-Host {{if $location.UseForwardedHeaders}}$forwarded_host{{else}}$host{{end}};
+		proxy_set_header X-Forwarded-Port {{if $location.UseForwardedHeaders}}$forwarded_port{{else}}$server_port{{end}};
+		proxy_set_header X-Forwarded-Proto {{if $location.UseForwardedHeaders}}$forwarded_proto{{else if $server.RedirectToHTTPS}}https{{else}}$scheme{{end}};
+		{{- if $location.IngressNginxProxyHeaders}}
+		proxy_set_header X-Forwarded-Scheme {{if $location.UseForwardedHeaders}}$forwarded_proto{{else if $server.RedirectToHTTPS}}https{{else}}$scheme{{end}};
+		proxy_set_header X-Scheme {{if $location.UseForwardedHeaders}}$forwarded_proto{{else if $server.RedirectToHTTPS}}https{{else}}$scheme{{end}};
+		proxy_set_header X-Original-Forwarded-For $http_x_forwarded_for;
+		{{- end}}
+		{{- end}}
+		{{- if $location.IngressNginxProxyHeaders}}
+		proxy_set_header X-Request-ID $ingress_nginx_req_id;
+		proxy_set_header Proxy "";
+		{{- end}}
+		proxy_buffering {{if $location.ProxyBuffering}}on{{else}}off{{end}};
+		{{- if $location.ProxyBuffers}}
+		proxy_buffers {{$location.ProxyBuffers}};
+		{{- end}}
+		{{- if $location.ProxyBufferSize}}
+		proxy_buffer_size {{$location.ProxyBufferSize}};
+		{{- end}}
+		{{- if $location.ProxyBusyBuffersSize}}
+		proxy_busy_buffers_size {{$location.ProxyBusyBuffersSize}};
+		{{- end}}
+		{{- if $location.ProxyMaxTempFileSize}}
+		proxy_max_temp_file_size {{$location.ProxyMaxTempFileSize}};
+		{{- end}}
+		{{- if $location.ProxyRequestBuffering}}
+		proxy_request_buffering {{$location.ProxyRequestBuffering}};
+		{{- end}}
+		{{- if $location.ProxyNextUpstream}}
+		proxy_next_upstream {{ $location.ProxyNextUpstream }};
+		{{- end }}
+		{{- if $location.ProxyNextUpstreamTimeout}}
+		proxy_next_upstream_timeout {{ $location.ProxyNextUpstreamTimeout }};
+		{{- end }}
+		{{- if $location.ProxyNextUpstreamTries}}
+		proxy_next_upstream_tries {{ $location.ProxyNextUpstreamTries }};
+		{{- end }}
+		{{- with $location.IngressNginxFastCGI}}
+		{{- /* ingress-nginx's backend-protocol FCGI: its fastcgi_params, fastcgi-index and the parameters of fastcgi-params-configmap */}}
+		include /etc/nginx/fastcgi_params;
+		{{- if .Index}}
+		fastcgi_index {{printf "%q" .Index}};
+		{{- end}}
+		{{- range $p := .Params}}
+		fastcgi_param {{$p.Name}} {{printf "%q" $p.Value}};
+		{{- end}}
+		fastcgi_pass {{or $location.Canary $location.Upstream.Name}};
+		{{- else}}
+		proxy_pass {{ $location.ProxyPass }}{{ $location.Rewrite }};
+		{{- end}}
+		{{- if $location.ProxyRedirectFrom}}
+		{{- if or (eq $location.ProxyRedirectFrom "off") (eq $location.ProxyRedirectFrom "default")}}
+		proxy_redirect {{$location.ProxyRedirectFrom}};
+		{{- else}}
+		proxy_redirect {{$location.ProxyRedirectFrom}} {{$location.ProxyRedirectTo}};
+		{{- end}}
+		{{- end}}
+		{{- if $location.SkipCustomHTTPErrors}}
+		proxy_intercept_errors off;
+		{{- else if $location.CustomHTTPErrorCodes}}
+		proxy_intercept_errors on;
+		{{- if $server.CustomHTTPErrorBackend}}
+		error_page{{range $c := $location.CustomHTTPErrorCodes}} {{$c}}{{end}} @custom_default_backend;
+		{{- end}}
+		{{- end}}
+		{{- end}}
+		{{- if $location.ProxySSLVerify }}
+		proxy_ssl_verify on;
+		proxy_ssl_verify_depth {{ $location.ProxySSLVerifyDepth }};
+		proxy_ssl_server_name on;
+		proxy_ssl_name {{ printf "%q" $location.ProxySSLName }};
+		{{- end }}
+		{{- if $location.ProxySSLTrustedCertificate }}
+		proxy_ssl_trusted_certificate {{ $location.ProxySSLTrustedCertificate }};
+		{{- end }}
+
+		{{- if or $location.CORSEnabled (gt (len $location.AddHeaders) 0) }}
+		{{- range $h := $location.AddHeaders }}
+		add_header {{ $h.Name }} {{ printf "%q" $h.Value }} {{ if $h.Always }}always{{ end }};
+		{{- end }}
+		{{- if $location.CORSEnabled }}
+		# CORS configuration per enable-cors.org
+		# Handle CORS preflight OPTIONS requests
+		if ($request_method = 'OPTIONS') {
+			{{- range $h := $location.AddHeaders }}
+			add_header {{ $h.Name }} {{ printf "%q" $h.Value }};
+			{{- end }}
+			add_header Content-Type text/plain;
+			add_header Content-Length 0;
+			return 204;
+		}
+		{{- end }}
+		{{- end }}
+		{{- with $location.IngressNginxRateLimit}}
+		{{- range .Directives}}
+		{{.}}
+		{{- end}}
+		{{- end}}
+		{{- if $location.LimitRateAfter}}
+		limit_rate_after {{$location.LimitRateAfter}};
+		{{- end}}
+		{{- if $location.LimitRate}}
+		limit_rate {{$location.LimitRate}};
+		{{- end}}
+		{{with $location.LimitReq}}
+		limit_req zone={{ $location.LimitReq.Zone }} {{if $location.LimitReq.Burst}}burst={{$location.LimitReq.Burst}}{{end}} {{if $location.LimitReq.NoDelay}}nodelay{{else if $location.LimitReq.Delay}}delay={{$location.LimitReq.Delay}}{{end}};
+		{{if $location.LimitReq.DryRun}}limit_req_dry_run on;{{end}}
+		{{if $location.LimitReq.LogLevel}}limit_req_log_level {{$location.LimitReq.LogLevel}};{{end}}
+		{{if $location.LimitReq.RejectCode}}limit_req_status {{$location.LimitReq.RejectCode}};{{end}}
+		{{end}}
+	}
+	{{end -}}
+	{{- if hasExternalAuthSignin $server}}
+	location @external_auth_signin {
+		auth_request off;
+		return 302 $external_auth_signin_uri;
+	}
+	{{- end}}
+	{{- if hasExternalAuthNoSignin $server}}
+	location @external_auth_unauthorized {
+		auth_request off;
+		return 401;
+	}
+	{{- end}}
+	{{- range $server.IngressNginxMirrors }}
+	location = {{ printf "%q" .Source }} {
+		internal;
+		{{- with $server.MirrorResolver }}
+		resolver {{ . }};
+		{{- end }}
+		proxy_set_header Host {{ printf "%q" .Host }};
+		proxy_pass {{ printf "%q" .Target }};
+	}
+	{{- end }}
+	{{- range $server.IngressNginxErrorLocations }}
+	location {{ .Name }} {
+		internal;
+		proxy_intercept_errors off;
+		{{- if .Code }}
+		proxy_set_header X-Code {{ .Code }};
+		proxy_set_header X-Format $http_accept;
+		proxy_set_header X-Original-URI $request_uri;
+		proxy_set_header X-Namespace $resource_namespace;
+		proxy_set_header X-Ingress-Name $resource_name;
+		proxy_set_header X-Service-Name $service;
+		proxy_set_header X-Request-ID $request_id;
+		proxy_set_header X-Forwarded-For $remote_addr;
+		proxy_set_header Host $host;
+		rewrite (.*) / break;
+		{{- else }}
+		{{- /* nginx's own 502 or 503 (a Service without endpoints): the request as it was, with ingress-nginx's headers of its custom default backend */}}
+		proxy_set_header Host $host;
+		proxy_set_header X-Code 503;
+		proxy_set_header X-Format $http_accept;
+		proxy_set_header X-Namespace $resource_namespace;
+		proxy_set_header X-Ingress-Name $resource_name;
+		proxy_set_header X-Service-Name $service;
+		proxy_set_header X-Request-ID $request_id;
+		proxy_set_header X-Real-IP $remote_addr;
+		proxy_set_header X-Forwarded-For $remote_addr;
+		proxy_set_header X-Forwarded-Host $host;
+		proxy_set_header X-Forwarded-Port $server_port;
+		proxy_set_header X-Forwarded-Proto $scheme;
+		proxy_set_header X-Forwarded-Scheme $scheme;
+		proxy_set_header X-Scheme $scheme;
+		proxy_set_header X-Original-Forwarded-For $http_x_forwarded_for;
+		proxy_http_version 1.1;
+		proxy_set_header Upgrade $http_upgrade;
+		proxy_set_header Connection $ingress_nginx_connection_upgrade;
+		{{- end }}
+		proxy_pass http://{{ .Upstream }};
+	}
+	{{- end }}
+	{{- if $server.CustomHTTPErrorBackend}}
+	location @custom_default_backend {
+		internal;
+		proxy_intercept_errors off;
+		proxy_pass http://{{$server.CustomHTTPErrorBackend}};
+	}
+	{{- end}}
+	{{- if $server.DefaultServerReturn}}
+	location / {
+		{{- template "ingressNginxHTTPSRedirect" (dict "server" $server) }}
+		return {{$server.DefaultServerReturn}};
+	}
+	{{- else if $server.IngressNginxDefaultBackend}}
+	{{- /* ingress-nginx's --default-backend-service: what no location is for */}}
+	location / {
+		{{- template "ingressNginxHTTPSRedirect" (dict "server" $server) }}
+		proxy_http_version 1.1;
+		proxy_set_header Connection "";
+		proxy_set_header Host $host;
+		proxy_set_header X-Real-IP $remote_addr;
+		proxy_set_header X-Forwarded-For $remote_addr;
+		proxy_set_header X-Forwarded-Host $host;
+		proxy_set_header X-Forwarded-Proto $scheme;
+		proxy_pass http://{{$server.IngressNginxDefaultBackend}};
+	}
+	{{- else if and $server.IngressNginxHTTPSRedirect (not (hasRootLocation $server.Locations))}}
+	{{- /* ingress-nginx's server has a location / for what no path is for, and it redirects too */}}
+	location / {
+		{{- template "ingressNginxHTTPSRedirect" (dict "server" $server) }}
+		return 404;
+	}
+	{{- end}}
+	{{- if $server.GRPCOnly}}
+	error_page 400 @grpcerror400;
+	error_page 401 @grpcerror401;
+	error_page 403 @grpcerror403;
+	error_page 404 @grpcerror404;
+	error_page 405 @grpcerror405;
+	error_page 408 @grpcerror408;
+	error_page 414 @grpcerror414;
+	error_page 426 @grpcerror426;
+	error_page 500 @grpcerror500;
+	error_page 501 @grpcerror501;
+	error_page 502 @grpcerror502;
+	error_page 503 @grpcerror503;
+	error_page 504 @grpcerror504;
+	{{- end}}
+	{{- if $server.HasGRPCLocations}}
+	location @grpcerror400 { default_type application/grpc; return 400 "\n"; }
+	location @grpcerror401 { default_type application/grpc; return 401 "\n"; }
+	location @grpcerror403 { default_type application/grpc; return 403 "\n"; }
+	location @grpcerror404 { default_type application/grpc; return 404 "\n"; }
+	location @grpcerror405 { default_type application/grpc; return 405 "\n"; }
+	location @grpcerror408 { default_type application/grpc; return 408 "\n"; }
+	location @grpcerror414 { default_type application/grpc; return 414 "\n"; }
+	location @grpcerror426 { default_type application/grpc; return 426 "\n"; }
+	location @grpcerror500 { default_type application/grpc; return 500 "\n"; }
+	location @grpcerror501 { default_type application/grpc; return 501 "\n"; }
+	location @grpcerror502 { default_type application/grpc; return 502 "\n"; }
+	location @grpcerror503 { default_type application/grpc; return 503 "\n"; }
+	location @grpcerror504 { default_type application/grpc; return 504 "\n"; }
+	{{- end}}
+}{{end}}
+
+{{- define "ingressNginxHTTPSRedirect" }}
+{{- $server := index . "server" }}{{ $location := index . "location" }}
+{{- if and $server.IngressNginxHTTPSRedirect (or (not $location) (not (or $location.Internal $location.ACMEChallenge))) }}
+		if ($ingress_nginx_https_redirect) {
+			return {{$server.HTTPRedirectCode}} {{ template "sslRedirectTarget" $server }};
+		}
+{{- end }}
+{{- end }}
+
+{{- define "sslRedirectTarget" -}}
+{{- if .IngressNginxRedirect -}}
+https://$ingress_nginx_redirect_host{{ if .PreserveTrailingSlash }}$request_uri{{ else }}$ingress_nginx_redirect_uri{{ end }}
+{{- else -}}
+https://$host:{{index .SSLPorts 0}}$request_uri
+{{- end -}}
+{{- end }}

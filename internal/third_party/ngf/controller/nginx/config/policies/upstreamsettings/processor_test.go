@@ -1,0 +1,597 @@
+package upstreamsettings
+
+import (
+	"testing"
+
+	. "github.com/onsi/gomega"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPIv1alpha1 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	ngfAPIv1alpha2 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha2"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/http"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+)
+
+func TestProcess(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		expUpstreamSettings UpstreamSettings
+		name                string
+		policies            []policies.Policy
+	}{
+		{
+			name: "all fields populated",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						ZoneSize: helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Connections: helpers.GetPointer(int32(1)),
+							Requests:    helpers.GetPointer(int32(1)),
+							Time:        helpers.GetPointer[ngfAPIv1alpha1.Duration]("5s"),
+							Timeout:     helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+						}),
+						LoadBalancingMethod: helpers.GetPointer(ngfAPIv1alpha1.LoadBalancingTypeIPHash),
+						HashMethodKey:       helpers.GetPointer[ngfAPIv1alpha1.HashMethodKey]("$upstream_addr"),
+						HealthCheck: helpers.GetPointer(ngfAPIv1alpha1.HealthCheck{
+							Passive: &ngfAPIv1alpha1.PassiveHealthCheck{
+								MaxFails:    helpers.GetPointer[int32](2),
+								FailTimeout: helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+							},
+							Active: &ngfAPIv1alpha1.ActiveHealthCheck{
+								Interval: helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+								Jitter:   helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+								Fails:    helpers.GetPointer[int32](1),
+								Passes:   helpers.GetPointer[int32](1),
+								Path:     helpers.GetPointer("/healthz"),
+								Port:     helpers.GetPointer[int32](8080),
+								Match: &ngfAPIv1alpha1.Match{
+									Status: helpers.GetPointer("200"),
+								},
+								Mandatory:     helpers.GetPointer(true),
+								Persistent:    helpers.GetPointer(true),
+								KeepAliveTime: helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+								Timeout: &ngfAPIv1alpha1.ProxyTimeout{
+									Connect: helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+									Send:    helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+									Read:    helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+								},
+								Headers: []v1.HTTPHeader{
+									{
+										Name:  "X-Real-IP",
+										Value: "$remote_addr",
+									},
+								},
+							},
+						}),
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				ZoneSize: helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+				KeepAlive: http.UpstreamKeepAlive{
+					Connections: helpers.GetPointer[int32](1),
+					Requests:    1,
+					Time:        "5s",
+					Timeout:     "10s",
+				},
+				LoadBalancingMethod: string(ngfAPIv1alpha1.LoadBalancingTypeIPHash),
+				HashMethodKey:       "$upstream_addr",
+				HealthCheck: &http.HealthCheck{
+					Passive: &http.PassiveHealthCheck{
+						MaxFails:    helpers.GetPointer[int32](2),
+						FailTimeout: "10s",
+					},
+					Active: &http.ActiveHealthCheck{
+						Interval: helpers.GetPointer("10s"),
+						Jitter:   helpers.GetPointer("10s"),
+						Fails:    helpers.GetPointer[int32](1),
+						Passes:   helpers.GetPointer[int32](1),
+						Path:     helpers.GetPointer("/healthz"),
+						Port:     helpers.GetPointer[int32](8080),
+						Match: &http.Match{
+							Status: helpers.GetPointer("200"),
+						},
+						Mandatory:     helpers.GetPointer(true),
+						Persistent:    helpers.GetPointer(true),
+						KeepAliveTime: helpers.GetPointer("10s"),
+						Timeout: &http.ProxyTimeout{
+							Connect: helpers.GetPointer("10s"),
+							Send:    helpers.GetPointer("10s"),
+							Read:    helpers.GetPointer("10s"),
+						},
+						Headers: []http.RequestHeader{
+							{
+								Name:  "X-Real-IP",
+								Value: "$remote_addr",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "load balancing method set",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						LoadBalancingMethod: helpers.GetPointer(ngfAPIv1alpha1.LoadBalancingTypeRandomTwoLeastConnection),
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				LoadBalancingMethod: string(ngfAPIv1alpha1.LoadBalancingTypeRandomTwoLeastConnection),
+			},
+		},
+		{
+			name: "load balancing method set with hash key",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						LoadBalancingMethod: helpers.GetPointer(ngfAPIv1alpha1.LoadBalancingTypeHashConsistent),
+						HashMethodKey:       helpers.GetPointer[ngfAPIv1alpha1.HashMethodKey]("$request_time"),
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				LoadBalancingMethod: string(ngfAPIv1alpha1.LoadBalancingTypeHashConsistent),
+				HashMethodKey:       "$request_time",
+			},
+		},
+		{
+			name: "zone size set",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						ZoneSize: helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				ZoneSize: helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+			},
+		},
+		{
+			name: "zone size not set",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						ZoneSize: nil,
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				ZoneSize: nil,
+			},
+		},
+		{
+			name: "keep alive connections set",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Connections: helpers.GetPointer(int32(1)),
+						}),
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				KeepAlive: http.UpstreamKeepAlive{
+					Connections: helpers.GetPointer[int32](1),
+				},
+			},
+		},
+		{
+			name: "keep alive requests set",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Requests: helpers.GetPointer(int32(1)),
+						}),
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				KeepAlive: http.UpstreamKeepAlive{
+					Requests: 1,
+				},
+			},
+		},
+		{
+			name: "keep alive time set",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Time: helpers.GetPointer[ngfAPIv1alpha1.Duration]("5s"),
+						}),
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				KeepAlive: http.UpstreamKeepAlive{
+					Time: "5s",
+				},
+			},
+		},
+		{
+			name: "keep alive timeout set",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Timeout: helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+						}),
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				KeepAlive: http.UpstreamKeepAlive{
+					Timeout: "10s",
+				},
+			},
+		},
+		{
+			name: "no fields populated",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{},
+		},
+		{
+			name: "multiple UpstreamSettingsPolicies",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-zonesize",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						ZoneSize: helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+					},
+				},
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-keepalive-connections",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Connections: helpers.GetPointer(int32(1)),
+						}),
+					},
+				},
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-keepalive-requests",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Requests: helpers.GetPointer(int32(1)),
+						}),
+					},
+				},
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-keepalive-time",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Time: helpers.GetPointer[ngfAPIv1alpha1.Duration]("5s"),
+						}),
+					},
+				},
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-keepalive-timeout",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Timeout: helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+						}),
+					},
+				},
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-loadBalancingMethod",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						LoadBalancingMethod: helpers.GetPointer(ngfAPIv1alpha1.LoadBalancingTypeHashConsistent),
+						HashMethodKey:       helpers.GetPointer[ngfAPIv1alpha1.HashMethodKey]("$upstream_addr"),
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				ZoneSize: helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+				KeepAlive: http.UpstreamKeepAlive{
+					Connections: helpers.GetPointer[int32](1),
+					Requests:    1,
+					Time:        "5s",
+					Timeout:     "10s",
+				},
+				LoadBalancingMethod: string(ngfAPIv1alpha1.LoadBalancingTypeHashConsistent),
+				HashMethodKey:       "$upstream_addr",
+			},
+		},
+		{
+			name: "multiple UpstreamSettingsPolicies along with other policies",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-zonesize",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						ZoneSize: helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+					},
+				},
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-keepalive-connections",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Connections: helpers.GetPointer(int32(1)),
+						}),
+					},
+				},
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-keepalive-requests",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Requests: helpers.GetPointer(int32(1)),
+						}),
+					},
+				},
+				&ngfAPIv1alpha1.ClientSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "client-settings-policy",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.ClientSettingsPolicySpec{
+						Body: &ngfAPIv1alpha1.ClientBody{
+							MaxSize: helpers.GetPointer[ngfAPIv1alpha1.Size]("1m"),
+						},
+					},
+				},
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-keepalive-time",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Time: helpers.GetPointer[ngfAPIv1alpha1.Duration]("5s"),
+						}),
+					},
+				},
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-keepalive-timeout",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						KeepAlive: helpers.GetPointer(ngfAPIv1alpha1.UpstreamKeepAlive{
+							Timeout: helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+						}),
+					},
+				},
+				&ngfAPIv1alpha2.ObservabilityPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "observability-policy",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha2.ObservabilityPolicySpec{
+						Tracing: &ngfAPIv1alpha2.Tracing{
+							Strategy: ngfAPIv1alpha2.TraceStrategyRatio,
+							Ratio:    helpers.GetPointer(int32(1)),
+						},
+					},
+				},
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-lb-method",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						LoadBalancingMethod: helpers.GetPointer(ngfAPIv1alpha1.LoadBalancingTypeHash),
+						HashMethodKey:       helpers.GetPointer[ngfAPIv1alpha1.HashMethodKey]("$remote_addr"),
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				ZoneSize: helpers.GetPointer[ngfAPIv1alpha1.Size]("2m"),
+				KeepAlive: http.UpstreamKeepAlive{
+					Connections: helpers.GetPointer[int32](1),
+					Requests:    1,
+					Time:        "5s",
+					Timeout:     "10s",
+				},
+				LoadBalancingMethod: string(ngfAPIv1alpha1.LoadBalancingTypeHash),
+				HashMethodKey:       "$remote_addr",
+			},
+		},
+		{
+			name: "UseClusterIP enabled",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-use-cluster-ip",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						UseClusterIP: helpers.GetPointer(true),
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				UseClusterIP: helpers.GetPointer(true),
+			},
+		},
+		{
+			name: "UseClusterIP disabled (explicitly false)",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "usp-use-cluster-ip-false",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						UseClusterIP: helpers.GetPointer(false),
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				UseClusterIP: helpers.GetPointer(false),
+			},
+		},
+		{
+			name: "passive health checks set only",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "passive-health-check",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						HealthCheck: &ngfAPIv1alpha1.HealthCheck{
+							Passive: &ngfAPIv1alpha1.PassiveHealthCheck{
+								MaxFails:    helpers.GetPointer[int32](2),
+								FailTimeout: helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+							},
+						},
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				HealthCheck: &http.HealthCheck{
+					Passive: &http.PassiveHealthCheck{
+						MaxFails:    helpers.GetPointer[int32](2),
+						FailTimeout: "10s",
+					},
+				},
+			},
+		},
+		{
+			name: "active health checks set only",
+			policies: []policies.Policy{
+				&ngfAPIv1alpha1.UpstreamSettingsPolicy{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "active-health-check",
+						Namespace: "test",
+					},
+					Spec: ngfAPIv1alpha1.UpstreamSettingsPolicySpec{
+						HealthCheck: &ngfAPIv1alpha1.HealthCheck{
+							Active: &ngfAPIv1alpha1.ActiveHealthCheck{
+								Interval: helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+								Jitter:   helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+								Fails:    helpers.GetPointer[int32](1),
+								Passes:   helpers.GetPointer[int32](1),
+								Port:     helpers.GetPointer[int32](8080),
+								GRPC: &ngfAPIv1alpha1.GRPCHealthCheck{
+									Service: helpers.GetPointer("my.Service"),
+									Status:  helpers.GetPointer(ngfAPIv1alpha1.GRPCStatusUnimplemented),
+								},
+								Mandatory:     helpers.GetPointer(true),
+								Persistent:    helpers.GetPointer(true),
+								KeepAliveTime: helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+								Timeout: &ngfAPIv1alpha1.ProxyTimeout{
+									Connect: helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+									Send:    helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+									Read:    helpers.GetPointer[ngfAPIv1alpha1.Duration]("10s"),
+								},
+							},
+						},
+					},
+				},
+			},
+			expUpstreamSettings: UpstreamSettings{
+				HealthCheck: &http.HealthCheck{
+					Active: &http.ActiveHealthCheck{
+						Interval: helpers.GetPointer("10s"),
+						Jitter:   helpers.GetPointer("10s"),
+						Fails:    helpers.GetPointer[int32](1),
+						Passes:   helpers.GetPointer[int32](1),
+						Port:     helpers.GetPointer[int32](8080),
+						GRPC: &http.GRPCHealthCheck{
+							Service: helpers.GetPointer("my.Service"),
+							Status:  helpers.GetPointer("12"),
+						},
+						Mandatory:     helpers.GetPointer(true),
+						Persistent:    helpers.GetPointer(true),
+						KeepAliveTime: helpers.GetPointer("10s"),
+						Timeout: &http.ProxyTimeout{
+							Connect: helpers.GetPointer("10s"),
+							Send:    helpers.GetPointer("10s"),
+							Read:    helpers.GetPointer("10s"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			processor := NewProcessor()
+
+			g.Expect(processor.Process(test.policies)).To(Equal(test.expUpstreamSettings))
+		})
+	}
+}

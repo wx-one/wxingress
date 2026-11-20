@@ -1,0 +1,739 @@
+package graph
+
+import (
+	"fmt"
+	"slices"
+	"strings"
+
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	v1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPI "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/ngfsort"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/conditions"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/secrets"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/resolver"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/validation"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+)
+
+// oidcClaimedEntry records which filter first claimed a given NGINX callback path on a hostname.
+type oidcClaimedEntry struct {
+	owner   types.NamespacedName
+	uriType string
+}
+
+// oidcRuleRef identifies a specific filter within a route rule, used for targeted propagation.
+type oidcRuleRef struct {
+	route     *L7Route
+	ruleIdx   int
+	filterIdx int
+	// nonHTTPS is true when this route-rule reference is attached via a non-HTTPS listener.
+	nonHTTPS bool
+}
+
+// AuthenticationFilter represents a ngfAPI.AuthenticationFilter.
+type AuthenticationFilter struct {
+	// Source is the AuthenticationFilter.
+	Source *ngfAPI.AuthenticationFilter
+	// Conditions define the conditions to be reported in the status of the AuthenticationFilter.
+	Conditions []conditions.Condition
+	// Valid indicates whether the AuthenticationFilter is semantically and syntactically valid.
+	Valid bool
+	// Referenced indicates whether the AuthenticationFilter is referenced by a Route.
+	Referenced bool
+}
+
+func getAuthenticationFilterResolverForNamespace(
+	authenticationFilters map[types.NamespacedName]*AuthenticationFilter,
+	namespace string,
+) resolveExtRefFilter {
+	return func(ref v1.LocalObjectReference) *ExtensionRefFilter {
+		if len(authenticationFilters) == 0 {
+			return nil
+		}
+
+		if ref.Group != ngfAPI.GroupName || ref.Kind != kinds.AuthenticationFilter {
+			return nil
+		}
+
+		af := authenticationFilters[types.NamespacedName{Namespace: namespace, Name: string(ref.Name)}]
+		if af == nil {
+			return nil
+		}
+
+		af.Referenced = true
+
+		return &ExtensionRefFilter{AuthenticationFilter: af, Valid: af.Valid}
+	}
+}
+
+func processAuthenticationFilters(
+	authenticationFilters map[types.NamespacedName]*ngfAPI.AuthenticationFilter,
+	resourceResolver resolver.Resolver,
+	authValidator validation.AuthFieldsValidator,
+	genericValidator validation.GenericValidator,
+	isPlus bool,
+) map[types.NamespacedName]*AuthenticationFilter {
+	if len(authenticationFilters) == 0 {
+		return nil
+	}
+
+	processed := make(map[types.NamespacedName]*AuthenticationFilter, len(authenticationFilters))
+
+	for nsname, af := range authenticationFilters {
+		conds, valid := validateAuthenticationFilter(af, nsname, resourceResolver, authValidator, genericValidator, isPlus)
+		processed[nsname] = &AuthenticationFilter{
+			Source:     af,
+			Conditions: conds,
+			Valid:      valid,
+		}
+	}
+
+	return processed
+}
+
+func validateAuthenticationFilter(
+	af *ngfAPI.AuthenticationFilter,
+	nsname types.NamespacedName,
+	resourceResolver resolver.Resolver,
+	authValidator validation.AuthFieldsValidator,
+	genericValidator validation.GenericValidator,
+	isPlus bool,
+) ([]conditions.Condition, bool) {
+	var conds []conditions.Condition
+	valid := true
+
+	switch af.Spec.Type {
+	case ngfAPI.AuthTypeBasic:
+		authBasicSecretNsName := types.NamespacedName{Namespace: nsname.Namespace, Name: af.Spec.Basic.SecretRef.Name}
+		conds, valid = resolveAuthenticationFilterSecret(
+			authBasicSecretNsName,
+			resourceResolver,
+			field.NewPath("spec.basic.secretRef"),
+		)
+		if err := authValidator.ValidateRealm(af.Spec.Basic.Realm); err != nil {
+			conds = append(conds, conditions.NewAuthenticationFilterInvalid(
+				field.Invalid(field.NewPath("spec.basic.realm"), af.Spec.Basic.Realm, err.Error()).Error(),
+			))
+			valid = false
+		}
+	case ngfAPI.AuthTypeJWT:
+		if !isPlus {
+			cond := conditions.NewAuthenticationFilterInvalid("JWT Authentication requires NGINX Plus.")
+			return []conditions.Condition{cond}, false
+		}
+		if af.Spec.JWT.Source == ngfAPI.JWTKeySourceFile {
+			authJWTSecretNsName := types.NamespacedName{Namespace: nsname.Namespace, Name: af.Spec.JWT.File.SecretRef.Name}
+			conds, valid = resolveAuthenticationFilterSecret(
+				authJWTSecretNsName,
+				resourceResolver,
+				field.NewPath("spec.jwt.file.secretRef"),
+			)
+		} else if af.Spec.JWT.Source == ngfAPI.JWTKeySourceRemote && af.Spec.JWT.Remote != nil {
+			conds, valid = validateRemoteJWT(af, nsname, resourceResolver)
+		}
+		if err := authValidator.ValidateRealm(af.Spec.JWT.Realm); err != nil {
+			conds = append(conds, conditions.NewAuthenticationFilterInvalid(
+				field.Invalid(field.NewPath("spec.jwt.realm"), af.Spec.JWT.Realm, err.Error()).Error(),
+			))
+			valid = false
+		}
+		if af.Spec.JWT.Authorization != nil {
+			if authZErrs := validateJWTAuthorization(af.Spec.JWT.Authorization, authValidator); len(authZErrs) > 0 {
+				conds = append(conds, conditions.NewAuthenticationFilterInvalid(authZErrs.ToAggregate().Error()))
+				valid = false
+			}
+		}
+	case ngfAPI.AuthTypeOIDC:
+		if !isPlus {
+			cond := conditions.NewAuthenticationFilterInvalid("OIDC Authentication requires NGINX Plus.")
+			return []conditions.Condition{cond}, false
+		}
+		conds, valid = validateOIDC(af.Spec.OIDC, nsname, resourceResolver, authValidator, genericValidator)
+	default:
+		err := field.Invalid(
+			field.NewPath("spec.type"),
+			af.Spec.Type,
+			"unsupported authentication type",
+		)
+		conds = append(conds, conditions.NewAuthenticationFilterInvalid(err.Error()))
+		valid = false
+	}
+
+	return conds, valid
+}
+
+func validateRemoteJWT(
+	af *ngfAPI.AuthenticationFilter,
+	nsname types.NamespacedName,
+	resourceResolver resolver.Resolver,
+) ([]conditions.Condition, bool) {
+	var allErrs field.ErrorList
+	for _, caCertRef := range af.Spec.JWT.Remote.CACertificateRefs {
+		caCertNsName := types.NamespacedName{Namespace: nsname.Namespace, Name: caCertRef.Name}
+		if err := resourceResolver.Resolve(resolver.ResourceTypeSecret, caCertNsName,
+			resolver.WithExpectedSecretKey(secrets.CAKey)); err != nil {
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("spec.jwt.remote.caCertificateRefs"),
+				caCertRef.Name,
+				err.Error(),
+			))
+		}
+	}
+
+	if allErrs != nil {
+		cond := conditions.NewAuthenticationFilterInvalid(allErrs.ToAggregate().Error())
+		return []conditions.Condition{cond}, false
+	}
+
+	return nil, true
+}
+
+func validateJWTAuthorization(
+	authz *ngfAPI.Authorization,
+	authValidator validation.AuthFieldsValidator,
+) field.ErrorList {
+	var allErrs field.ErrorList
+
+	// Track sanitized claim names across all rules to detect collisions.
+	// Key: sanitized name, Value: original claim name that first produced it.
+	globalSanitizedNames := make(map[string]string)
+
+	for ruleIdx, rule := range authz.Rules {
+		rulePath := field.NewPath("spec.jwt.authorization.rules").Index(ruleIdx)
+
+		for claimIdx, claim := range rule.Claims {
+			claimPath := rulePath.Child("claims").Index(claimIdx)
+
+			if err := authValidator.ValidateAuthZClaimName(claim.Name); err != nil {
+				allErrs = append(allErrs, field.Invalid(
+					claimPath.Child("name"),
+					claim.Name,
+					err.Error(),
+				))
+			}
+
+			// Check for sanitized name collisions across all rules.
+			// NGINX variable names only allow [a-zA-Z0-9_], so characters like -, ., /
+			// are replaced with underscores. This means distinct claim names like
+			// "realm_access/roles" and "realm_access_roles" would map to the same
+			// NGINX variable, causing silent incorrect authorization decisions.
+			sanitized := sanitizeClaimNameForVariable(claim.Name)
+			if originalName, exists := globalSanitizedNames[sanitized]; exists {
+				if originalName != claim.Name {
+					allErrs = append(allErrs, field.Invalid(
+						claimPath.Child("name"),
+						claim.Name,
+						fmt.Sprintf(
+							"claim name produces the same NGINX variable name as %q after sanitization "+
+								"(both become %q); use distinct claim names that don't collide",
+							originalName, sanitized,
+						),
+					))
+				}
+			} else {
+				globalSanitizedNames[sanitized] = claim.Name
+			}
+
+			for valueIdx, value := range claim.Values {
+				if err := authValidator.ValidateAuthZClaimValue(value); err != nil {
+					allErrs = append(allErrs, field.Invalid(
+						claimPath.Child("values").Index(valueIdx),
+						value,
+						err.Error(),
+					))
+				}
+			}
+
+			if claim.ProxySetHeader != nil {
+				if err := authValidator.ValidateAuthZProxySetHeader(*claim.ProxySetHeader); err != nil {
+					allErrs = append(allErrs, field.Invalid(
+						claimPath.Child("proxySetHeader"),
+						*claim.ProxySetHeader,
+						err.Error(),
+					))
+				}
+			}
+		}
+	}
+
+	return allErrs
+}
+
+// sanitizeClaimNameForVariable applies the same sanitization as the dataplane's
+// sanitizeVariablePrefix: it replaces characters that are invalid in NGINX variable
+// names (-, ., /) with underscores. This is used during validation to detect claim
+// names that would collide when converted to NGINX variables.
+func sanitizeClaimNameForVariable(name string) string {
+	return strings.NewReplacer("-", "_", ".", "_", "/", "_").Replace(name)
+}
+
+func resolveAuthenticationFilterSecret(
+	authSecretNsName types.NamespacedName,
+	resourceResolver resolver.Resolver,
+	path *field.Path,
+) ([]conditions.Condition, bool) {
+	var allErrs field.ErrorList
+
+	if err := resourceResolver.Resolve(
+		resolver.ResourceTypeSecret,
+		authSecretNsName,
+		resolver.WithExpectedSecretKey(secrets.AuthKey),
+	); err != nil {
+		allErrs = append(allErrs, field.Invalid(
+			path,
+			fmt.Sprintf("secret %s/%s is invalid", authSecretNsName.Namespace, authSecretNsName.Name),
+			err.Error(),
+		))
+	}
+
+	if allErrs != nil {
+		cond := conditions.NewAuthenticationFilterInvalid(allErrs.ToAggregate().Error())
+		return []conditions.Condition{cond}, false
+	}
+
+	return nil, true
+}
+
+func validateOIDC(
+	oidcSpec *ngfAPI.OIDCAuth,
+	nsname types.NamespacedName,
+	resourceResolver resolver.Resolver,
+	authValidator validation.AuthFieldsValidator,
+	genericValidator validation.GenericValidator,
+) ([]conditions.Condition, bool) {
+	var allErrs field.ErrorList
+
+	allErrs = append(allErrs, validateOIDCFields(oidcSpec, authValidator, genericValidator)...)
+	allErrs = append(allErrs, validateOIDCSecretRefs(oidcSpec, nsname, resourceResolver, authValidator)...)
+	allErrs = append(allErrs, validateOIDCLogoutURIs(oidcSpec, authValidator)...)
+
+	if allErrs != nil {
+		return []conditions.Condition{conditions.NewAuthenticationFilterInvalid(allErrs.ToAggregate().Error())}, false
+	}
+
+	return nil, true
+}
+
+func validateOIDCFields(
+	oidcSpec *ngfAPI.OIDCAuth,
+	authValidator validation.AuthFieldsValidator,
+	genericValidator validation.GenericValidator,
+) field.ErrorList {
+	var allErrs field.ErrorList
+
+	if err := authValidator.ValidateOIDCHTTPSURL(oidcSpec.Issuer); err != nil {
+		allErrs = append(allErrs, field.Invalid(
+			field.NewPath("spec.oidc.issuer"),
+			oidcSpec.Issuer,
+			err.Error(),
+		))
+	}
+	if err := authValidator.ValidateOIDCEscapedString(oidcSpec.ClientID); err != nil {
+		allErrs = append(allErrs, field.Invalid(
+			field.NewPath("spec.oidc.clientID"),
+			oidcSpec.ClientID,
+			err.Error(),
+		))
+	}
+	if oidcSpec.Session != nil && oidcSpec.Session.CookieName != nil {
+		if err := authValidator.ValidateOIDCEscapedString(*oidcSpec.Session.CookieName); err != nil {
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("spec.oidc.session.cookieName"),
+				*oidcSpec.Session.CookieName,
+				err.Error(),
+			))
+		}
+	}
+	if oidcSpec.ConfigURL != nil {
+		if err := authValidator.ValidateOIDCHTTPSURL(*oidcSpec.ConfigURL); err != nil {
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("spec.oidc.configURL"),
+				*oidcSpec.ConfigURL,
+				err.Error(),
+			))
+		}
+	}
+	if oidcSpec.RedirectURI != nil {
+		if err := authValidator.ValidateOIDCRedirectURI(*oidcSpec.RedirectURI); err != nil {
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("spec.oidc.redirectURI"),
+				*oidcSpec.RedirectURI,
+				err.Error(),
+			))
+		}
+	}
+	if oidcSpec.Session != nil && oidcSpec.Session.Timeout != nil {
+		if err := genericValidator.ValidateNginxDuration(string(*oidcSpec.Session.Timeout)); err != nil {
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("spec.oidc.session.timeout"),
+				*oidcSpec.Session.Timeout,
+				err.Error(),
+			))
+		}
+	}
+
+	extraAuthArgsPath := field.NewPath("spec", "oidc", "extraAuthArgs")
+	for key, value := range oidcSpec.ExtraAuthArgs {
+		if err := authValidator.ValidateOIDCExtraAuthArg(key, value); err != nil {
+			allErrs = append(allErrs, field.Invalid(
+				extraAuthArgsPath,
+				key+"="+value,
+				err.Error(),
+			))
+		}
+	}
+
+	return allErrs
+}
+
+func validateOIDCSecretRefs(
+	oidcSpec *ngfAPI.OIDCAuth,
+	nsname types.NamespacedName,
+	resourceResolver resolver.Resolver,
+	authValidator validation.AuthFieldsValidator,
+) field.ErrorList {
+	var allErrs field.ErrorList
+
+	clientSecretNsName := types.NamespacedName{Namespace: nsname.Namespace, Name: oidcSpec.ClientSecretRef.Name}
+	if err := resourceResolver.Resolve(resolver.ResourceTypeSecret, clientSecretNsName,
+		resolver.WithExpectedSecretKey(secrets.ClientSecretKey)); err != nil {
+		allErrs = append(allErrs, field.Invalid(
+			field.NewPath("spec.oidc.clientSecretRef"),
+			oidcSpec.ClientSecretRef.Name,
+			err.Error(),
+		))
+	} else if resolvedSecret, ok := resourceResolver.GetSecrets()[clientSecretNsName]; ok &&
+		resolvedSecret.Source != nil {
+		secretValue := string(resolvedSecret.Source.Data[secrets.ClientSecretKey])
+		if err := authValidator.ValidateOIDCEscapedString(secretValue); err != nil {
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("spec.oidc.clientSecretRef"),
+				oidcSpec.ClientSecretRef.Name,
+				fmt.Sprintf("the referenced Secret value is invalid: %s", err.Error()),
+			))
+		}
+	}
+	if len(oidcSpec.CACertificateRefs) > 1 {
+		allErrs = append(allErrs, field.Invalid(
+			field.NewPath("spec.oidc.caCertificateRefs"),
+			len(oidcSpec.CACertificateRefs),
+			"at most one CA certificate reference is supported for OIDC authentication filters",
+		))
+		return allErrs
+	}
+	for _, caCertRef := range oidcSpec.CACertificateRefs {
+		caCertNsName := types.NamespacedName{Namespace: nsname.Namespace, Name: caCertRef.Name}
+		if err := resourceResolver.Resolve(resolver.ResourceTypeSecret, caCertNsName,
+			resolver.WithExpectedSecretKey(secrets.CAKey)); err != nil {
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("spec.oidc.caCertificateRefs"),
+				caCertRef.Name,
+				err.Error(),
+			))
+		}
+	}
+	if oidcSpec.CRLSecretRef != nil {
+		crlNsName := types.NamespacedName{Namespace: nsname.Namespace, Name: oidcSpec.CRLSecretRef.Name}
+		if err := resourceResolver.Resolve(resolver.ResourceTypeSecret, crlNsName,
+			resolver.WithExpectedSecretKey(secrets.CRLKey)); err != nil {
+			allErrs = append(allErrs, field.Invalid(
+				field.NewPath("spec.oidc.crlSecretRef"),
+				oidcSpec.CRLSecretRef.Name,
+				err.Error(),
+			))
+		}
+	}
+
+	return allErrs
+}
+
+func validateOIDCLogoutURIs(
+	oidcSpec *ngfAPI.OIDCAuth,
+	authValidator validation.AuthFieldsValidator,
+) field.ErrorList {
+	logout := oidcSpec.Logout
+	if logout == nil {
+		return nil
+	}
+
+	var allErrs field.ErrorList
+
+	if logout.URI != nil {
+		if err := authValidator.ValidateOIDCPathURI(*logout.URI); err != nil {
+			allErrs = append(allErrs, field.Invalid(field.NewPath("spec.oidc.logout.uri"), *logout.URI, err.Error()))
+		}
+	}
+	if logout.PostLogoutURI != nil {
+		if err := authValidator.ValidateOIDCPostLogoutURI(*logout.PostLogoutURI); err != nil {
+			allErrs = append(
+				allErrs,
+				field.Invalid(field.NewPath("spec.oidc.logout.postLogoutURI"), *logout.PostLogoutURI, err.Error()),
+			)
+		}
+	}
+	if logout.FrontChannelLogoutURI != nil {
+		if err := authValidator.ValidateOIDCPathURI(*logout.FrontChannelLogoutURI); err != nil {
+			allErrs = append(
+				allErrs,
+				field.Invalid(field.NewPath("spec.oidc.logout.frontChannelLogoutURI"), *logout.FrontChannelLogoutURI, err.Error()),
+			)
+		}
+	}
+
+	return allErrs
+}
+
+// validateOIDCFilters performs all post-binding OIDC validations in a single pass over routes and rules:
+//   - filters referenced via non-HTTPS listeners are recorded per-route-rule
+//   - the remaining valid filters are collected for URI conflict detection across shared hostnames
+func validateOIDCFilters(routes map[RouteKey]*L7Route, gws map[types.NamespacedName]*Gateway) {
+	listenerProtocols := buildListenerProtocolMap(gws)
+	hostnameToFilters, filterRefs := collectOIDCFilterInfo(routes, listenerProtocols)
+	for hostname, filtersMap := range hostnameToFilters {
+		if len(filtersMap) >= 2 {
+			checkOIDCURIConflictsForHostname(hostname, filtersMap)
+		}
+	}
+	propagateInvalidOIDCFiltersToRouteRules(filterRefs)
+}
+
+// buildListenerProtocolMap returns a map from listener key to protocol for all listeners across all gateways.
+func buildListenerProtocolMap(gws map[types.NamespacedName]*Gateway) map[string]v1.ProtocolType {
+	protocols := make(map[string]v1.ProtocolType)
+	for _, gw := range gws {
+		for _, l := range gw.Listeners {
+			protocols[CreateParentRefListenerKeyFromListener(l)] = l.Source.Protocol
+		}
+	}
+	return protocols
+}
+
+// hasNonHTTPSAttachment reports whether any of the parent refs has at least one accepted hostname
+// on a non-HTTPS listener.
+func hasNonHTTPSAttachment(parentRefs []ParentRef, listenerProtocols map[string]v1.ProtocolType) bool {
+	for _, ref := range parentRefs {
+		if ref.Attachment == nil {
+			continue
+		}
+		for _, listenerAttachment := range ref.Attachment.Listeners {
+			if len(listenerAttachment.AcceptedHostnames) == 0 {
+				continue
+			}
+			protocol, ok := listenerProtocols[listenerAttachment.Key]
+			if !ok {
+				continue
+			}
+			if protocol != v1.HTTPSProtocolType {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// collectOIDCFilterInfo performs a single pass over all valid routes and rules.
+// For each OIDC filter encountered:
+//   - if its route has a non-HTTPS listener attachment, the oidcRuleRef is flagged
+//   - all filters are registered in filterRefs for propagation
+//   - only valid filters on HTTPS routes are registered in hostnameToFilters for URI conflict detection
+func collectOIDCFilterInfo(
+	routes map[RouteKey]*L7Route,
+	listenerProtocols map[string]v1.ProtocolType,
+) (
+	map[v1.Hostname]map[types.NamespacedName]*AuthenticationFilter,
+	map[*AuthenticationFilter][]oidcRuleRef,
+) {
+	hostnameToFilters := make(map[v1.Hostname]map[types.NamespacedName]*AuthenticationFilter)
+	filterRefs := make(map[*AuthenticationFilter][]oidcRuleRef)
+
+	for _, route := range routes {
+		if !route.Valid {
+			continue
+		}
+		nonHTTPS := hasNonHTTPSAttachment(route.ParentRefs, listenerProtocols)
+		acceptedHostnames := collectAcceptedHostnames(route.ParentRefs)
+		if len(acceptedHostnames) == 0 {
+			continue
+		}
+		for i, rule := range route.Spec.Rules {
+			if !rule.ValidMatches || !rule.Filters.Valid {
+				continue
+			}
+			for j, f := range rule.Filters.Filters {
+				af := oidcAuthFilterFrom(f)
+				if af == nil {
+					continue
+				}
+				ref := oidcRuleRef{route: route, ruleIdx: i, filterIdx: j, nonHTTPS: nonHTTPS}
+				filterRefs[af] = append(filterRefs[af], ref)
+				if af.Valid && !nonHTTPS {
+					nsname := types.NamespacedName{Namespace: af.Source.Namespace, Name: af.Source.Name}
+					for _, hostname := range acceptedHostnames {
+						if hostnameToFilters[hostname] == nil {
+							hostnameToFilters[hostname] = make(map[types.NamespacedName]*AuthenticationFilter)
+						}
+						hostnameToFilters[hostname][nsname] = af
+					}
+				}
+			}
+		}
+	}
+
+	return hostnameToFilters, filterRefs
+}
+
+// propagateInvalidOIDCFiltersToRouteRules marks route rules as having an invalid filter when:
+//   - the filter is globally invalid (e.g. URI conflict), or
+//   - the route-rule reference is attached via a non-HTTPS listener.
+func propagateInvalidOIDCFiltersToRouteRules(filterRefs map[*AuthenticationFilter][]oidcRuleRef) {
+	const (
+		invalidMsg  = "OIDC filter is invalid; see filter status for details"
+		nonHTTPSMsg = "OIDC authentication requires an HTTPS listener"
+	)
+
+	globallyInvalidRoutes := make(map[*L7Route]struct{})
+	for af, refs := range filterRefs {
+		for _, ref := range refs {
+			if !af.Valid {
+				ref.route.Spec.Rules[ref.ruleIdx].Filters.Filters[ref.filterIdx].ResolvedExtensionRef.Valid = false
+				ref.route.Spec.Rules[ref.ruleIdx].Filters.Valid = false
+				globallyInvalidRoutes[ref.route] = struct{}{}
+			} else if ref.nonHTTPS {
+				ref.route.Spec.Rules[ref.ruleIdx].Filters.Filters[ref.filterIdx].ResolvedExtensionRef.Valid = false
+				ref.route.Spec.Rules[ref.ruleIdx].Filters.Valid = false
+				mergeOrAppendRouteCondition(
+					ref.route,
+					conditions.NewRouteResolvedRefsInvalidFilter(nonHTTPSMsg),
+				)
+			}
+		}
+	}
+
+	for route := range globallyInvalidRoutes {
+		mergeOrAppendRouteCondition(route, conditions.NewRouteResolvedRefsInvalidFilter(invalidMsg))
+	}
+}
+
+// mergeOrAppendRouteCondition appends newCond to route.Conditions unless a condition with the same
+// Type/Status/Reason already exists, in which case newCond's message is appended to it to avoid
+// the last-wins deduplication in status preparation silently dropping earlier messages.
+func mergeOrAppendRouteCondition(route *L7Route, newCond conditions.Condition) {
+	for i, existing := range route.Conditions {
+		if existing.Type == newCond.Type && existing.Status == newCond.Status && existing.Reason == newCond.Reason {
+			if !strings.Contains(existing.Message, newCond.Message) {
+				route.Conditions[i].Message = existing.Message + "; " + newCond.Message
+			}
+			return
+		}
+	}
+	route.Conditions = append(route.Conditions, newCond)
+}
+
+// collectAcceptedHostnames returns a deduplicated list of all accepted hostnames across all parent refs.
+func collectAcceptedHostnames(parentRefs []ParentRef) []v1.Hostname {
+	seen := make(map[v1.Hostname]struct{})
+	var hostnames []v1.Hostname
+	for _, ref := range parentRefs {
+		if ref.Attachment == nil {
+			continue
+		}
+		for _, listenerAttachment := range ref.Attachment.Listeners {
+			for _, h := range listenerAttachment.AcceptedHostnames {
+				hostname := v1.Hostname(h)
+				if _, exists := seen[hostname]; !exists {
+					seen[hostname] = struct{}{}
+					hostnames = append(hostnames, hostname)
+				}
+			}
+		}
+	}
+	return hostnames
+}
+
+// oidcAuthFilterFrom returns the AuthenticationFilter from a Filter if it is an OIDC extension ref, or nil.
+func oidcAuthFilterFrom(f Filter) *AuthenticationFilter {
+	if f.FilterType != FilterExtensionRef ||
+		f.ResolvedExtensionRef == nil ||
+		f.ResolvedExtensionRef.AuthenticationFilter == nil {
+		return nil
+	}
+	af := f.ResolvedExtensionRef.AuthenticationFilter
+	if af.Source.Spec.Type != ngfAPI.AuthTypeOIDC {
+		return nil
+	}
+	return af
+}
+
+// checkOIDCURIConflictsForHostname checks the given filters for duplicate logout, front-channel logout,
+// and path-only redirect URIs on a single hostname, marking conflicting filters invalid.
+func checkOIDCURIConflictsForHostname(
+	hostname v1.Hostname,
+	filtersMap map[types.NamespacedName]*AuthenticationFilter,
+) {
+	type filterEntry struct {
+		filter *AuthenticationFilter
+		nsname types.NamespacedName
+	}
+
+	entries := make([]filterEntry, 0, len(filtersMap))
+	for nsname, af := range filtersMap {
+		entries = append(entries, filterEntry{nsname: nsname, filter: af})
+	}
+	slices.SortFunc(entries, func(a, b filterEntry) int {
+		if ngfsort.LessObjectMeta(&a.filter.Source.ObjectMeta, &b.filter.Source.ObjectMeta) {
+			return -1
+		}
+		if ngfsort.LessObjectMeta(&b.filter.Source.ObjectMeta, &a.filter.Source.ObjectMeta) {
+			return 1
+		}
+		return 0
+	})
+
+	// All three URI types share the same NGINX location path spaces,
+	// so we use a single map to catch both same-type and cross-type conflicts.
+	claimedPaths := make(map[string]oidcClaimedEntry)
+
+	for _, entry := range entries {
+		if !entry.filter.Valid {
+			continue
+		}
+		oidc := entry.filter.Source.Spec.OIDC
+		if oidc.Logout != nil && oidc.Logout.URI != nil {
+			claimOIDCURI(entry.filter, entry.nsname, *oidc.Logout.URI, "logout URI", hostname, claimedPaths)
+		}
+		if entry.filter.Valid && oidc.Logout != nil && oidc.Logout.FrontChannelLogoutURI != nil {
+			claimOIDCURI(
+				entry.filter, entry.nsname,
+				*oidc.Logout.FrontChannelLogoutURI, "front-channel logout URI", hostname, claimedPaths,
+			)
+		}
+		if entry.filter.Valid && oidc.RedirectURI != nil && strings.HasPrefix(*oidc.RedirectURI, "/") {
+			claimOIDCURI(entry.filter, entry.nsname, *oidc.RedirectURI, "redirect URI", hostname, claimedPaths)
+		}
+	}
+}
+
+// claimOIDCURI attempts to register uri for the given filter on a hostname. If another filter already claimed
+// that URI on the same hostname, the current filter is marked invalid with a condition.
+func claimOIDCURI(
+	af *AuthenticationFilter,
+	afNsname types.NamespacedName,
+	uri, uriType string,
+	hostname v1.Hostname,
+	claimed map[string]oidcClaimedEntry,
+) {
+	if winner, exists := claimed[uri]; exists {
+		msg := fmt.Sprintf(
+			"%s %q conflicts with %s of OIDC filter %s/%s on hostname %q",
+			uriType, uri, winner.uriType, winner.owner.Namespace, winner.owner.Name, hostname,
+		)
+		cond := conditions.NewAuthenticationFilterInvalid(msg)
+		af.Conditions = append(af.Conditions, cond)
+		af.Valid = false
+	} else {
+		claimed[uri] = oidcClaimedEntry{owner: afNsname, uriType: uriType}
+	}
+}

@@ -1,0 +1,237 @@
+package version1
+
+import (
+	"fmt"
+	"strings"
+	"text/template"
+
+	"github.com/wx-one/wxingress/internal/configs/commonhelpers"
+)
+
+func split(s string, delim string) []string {
+	return strings.Split(s, delim)
+}
+
+func trim(s string) string {
+	return strings.TrimSpace(s)
+}
+
+// makeLocationPath takes location and Ingress annotations and returns
+// modified location path with added regex modifier or the original path
+// if no path-regex annotation is present in ingressAnnotations
+// or in Location's Ingress.
+//
+// A mergeable Minion's path-regex annotation takes precedence. A Master
+// annotation does not affect a Minion without its own path-regex annotation.
+func makeLocationPath(loc *Location, ingressAnnotations map[string]string) string {
+	regexType, hasRegex := getPathRegex(loc, ingressAnnotations)
+	if hasRegex {
+		return makePathWithRegex(loc.Path, regexType)
+	}
+	if loc.CaseInsensitiveRegex {
+		// as ingress-nginx renders every path of a server that has use-regex or a rewrite-target, Exact ones too
+		return makePathWithRegex(loc.Path, "case_insensitive")
+	}
+	if strings.HasPrefix(loc.Path, "= ") {
+		return "= " + quoteLocationPath(strings.TrimPrefix(loc.Path, "= "))
+	}
+
+	return quoteLocationPath(loc.Path)
+}
+
+func getPathRegex(loc *Location, ingressAnnotations map[string]string) (string, bool) {
+	if loc.MinionIngress != nil {
+		ingressType, isMergeable := loc.MinionIngress.Annotations["nginx.org/mergeable-ingress-type"]
+		if isMergeable && ingressType == "minion" {
+			regexType, hasRegex := loc.MinionIngress.Annotations["nginx.org/path-regex"]
+			return regexType, hasRegex
+		}
+	}
+
+	regexType, hasRegex := ingressAnnotations["nginx.org/path-regex"]
+	return regexType, hasRegex
+}
+
+// makePathWithRegex takes a path representing a location and a regexType
+// (one of `case_sensitive`, `case_insensitive` or `exact`).
+// It returns a location path with added regular expression modifier.
+// See [Location Directive].
+//
+// [Location Directive]: https://nginx.org/en/docs/http/ngx_http_core_module.html#location
+func makePathWithRegex(path, regexType string) string {
+	path = strings.TrimPrefix(path, "= ")
+
+	switch regexType {
+	case "case_sensitive":
+		return fmt.Sprintf("~ %s", quoteLocationPath("^"+path))
+	case "case_insensitive":
+		return fmt.Sprintf("~* %s", quoteLocationPath("^"+path))
+	case "exact":
+		return fmt.Sprintf("= %s", quoteLocationPath(path))
+	default:
+		return quoteLocationPath(path)
+	}
+}
+
+// quoteLocationPath renders a path as one quoted NGINX argument.
+//
+// The escaping is not optional. Ingress path validation permits '"' and '\'
+// (pathFmt is /[^\s;]*), and NGINX resolves a backslash escape inside a quoted
+// argument just as it does outside one, so wrapping the path in bare quotes lets
+// it break out: a path of /foo\ produces location "/foo\"; where the backslash
+// escapes the closing quote, and NGINX reads on past the semicolon. printf %q
+// doubles the backslash and escapes any quote, so every accepted path stays one
+// argument.
+func quoteLocationPath(path string) string {
+	return fmt.Sprintf("%q", path)
+}
+
+func makeResolver(resolverAddresses []string, resolverValid string, resolverIPV6 *bool) string {
+	var builder strings.Builder
+	if len(resolverAddresses) > 0 {
+		builder.WriteString("resolver")
+		for _, address := range resolverAddresses {
+			builder.WriteString(" ")
+			builder.WriteString(address)
+		}
+		if resolverValid != "" {
+			builder.WriteString(" valid=")
+			builder.WriteString(resolverValid)
+		}
+		if resolverIPV6 != nil && !*resolverIPV6 {
+			builder.WriteString(" ipv6=off")
+		}
+		builder.WriteString(";")
+	}
+	return builder.String()
+}
+
+// makeRewritePattern takes a location and Ingress annotations and returns
+// a rewrite pattern that matches the location pattern used.
+// This ensures the rewrite regex matches the same requests as the location.
+func makeRewritePattern(loc *Location, ingressAnnotations map[string]string) string {
+	regexType, hasRegex := getPathRegex(loc, ingressAnnotations)
+
+	// Extract original path from the processed Path field
+	originalPath := extractOriginalPath(loc.Path)
+
+	// rewrite-target of ingress-nginx: its pattern is the path, unanchored and case-insensitive
+	if !hasRegex && loc.CaseInsensitiveRewrite {
+		return quoteLocationPath("(?i)" + originalPath)
+	}
+
+	// If no path-regex annotation, return original path
+	if !hasRegex {
+		return quoteLocationPath(originalPath)
+	}
+
+	// Generate rewrite pattern based on regex type
+	switch regexType {
+	case "case_sensitive":
+		return quoteLocationPath(fmt.Sprintf("^%s", originalPath))
+	case "case_insensitive":
+		return quoteLocationPath(fmt.Sprintf("(?i)^%s", originalPath))
+	case "exact":
+		return quoteLocationPath(originalPath) // exact matches don't need anchors in rewrite
+	default:
+		return quoteLocationPath(originalPath)
+	}
+}
+
+// extractOriginalPath extracts the original path from a processed nginx location path
+func extractOriginalPath(processedPath string) string {
+	// Handle different nginx location formats:
+	// ~ "^/path"     -> /path
+	// ~* "^/path"    -> /path
+	// = "/path"      -> /path
+	// /path          -> /path
+
+	processedPath = strings.TrimSpace(processedPath)
+
+	// Case-sensitive regex: ~ "^/path"
+	if strings.HasPrefix(processedPath, "~ \"^") && strings.HasSuffix(processedPath, "\"") {
+		return processedPath[4 : len(processedPath)-1] // Remove ~ "^ and "
+	}
+
+	// Case-insensitive regex: ~* "^/path"
+	if strings.HasPrefix(processedPath, "~* \"^") && strings.HasSuffix(processedPath, "\"") {
+		return processedPath[5 : len(processedPath)-1] // Remove ~* "^ and "
+	}
+
+	// Exact match: = "/path"
+	if strings.HasPrefix(processedPath, "= \"") && strings.HasSuffix(processedPath, "\"") {
+		return processedPath[3 : len(processedPath)-1] // Remove = " and "
+	}
+	// Kubernetes Exact paths are stored internally as "= /path".
+	if strings.HasPrefix(processedPath, "= ") {
+		return strings.TrimPrefix(processedPath, "= ")
+	}
+
+	// Plain path: /path (no quotes)
+	return processedPath
+}
+
+// hasExternalAuthSignin reports whether the server needs the shared signin redirect location.
+func hasExternalAuthSignin(s Server) bool {
+	if s.ExternalAuth != nil && s.ExternalAuth.SigninURL != "" {
+		return true
+	}
+	for _, location := range s.Locations {
+		if location.ExternalAuth != nil && location.ExternalAuth.SigninURL != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasExternalAuthNoSignin reports whether a location needs an explicit 401 handler.
+func hasExternalAuthNoSignin(s Server) bool {
+	for _, location := range s.Locations {
+		if location.ExternalAuth != nil && location.ExternalAuth.SigninURL == "" {
+			return true
+		}
+	}
+	return false
+}
+
+var helperFunctions = template.FuncMap{
+	"split":                   split,
+	"trim":                    trim,
+	"contains":                strings.Contains,
+	"hasPrefix":               strings.HasPrefix,
+	"hasSuffix":               strings.HasSuffix,
+	"toLower":                 strings.ToLower,
+	"toUpper":                 strings.ToUpper,
+	"replaceAll":              strings.ReplaceAll,
+	"makeLocationPath":        makeLocationPath,
+	"makeRewritePattern":      makeRewritePattern,
+	"makeSecretPath":          commonhelpers.MakeSecretPath,
+	"makeOnOffFromBool":       commonhelpers.MakeOnOffFromBool,
+	"boolToPointerBool":       commonhelpers.BoolToPointerBool,
+	"makeResolver":            makeResolver,
+	"hasExternalAuthSignin":   hasExternalAuthSignin,
+	"hasExternalAuthNoSignin": hasExternalAuthNoSignin,
+	"hasRootLocation":         hasRootLocation,
+	"dict":                    dict,
+}
+
+// hasRootLocation tells if one of the locations is for the path / as a prefix (or a regex of it), which takes every request no other location takes.
+func hasRootLocation(locations []Location) bool {
+	for i := range locations {
+		if locations[i].Path == "/" && !locations[i].Internal {
+			return true
+		}
+	}
+	return false
+}
+
+// dict makes a map of its pairs of a key and a value, for a template called with more than one value.
+func dict(pairs ...interface{}) map[string]interface{} {
+	m := make(map[string]interface{}, len(pairs)/2)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		if k, ok := pairs[i].(string); ok {
+			m[k] = pairs[i+1]
+		}
+	}
+	return m
+}

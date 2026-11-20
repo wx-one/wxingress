@@ -1,0 +1,1534 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"runtime/debug"
+	"slices"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/nginx/nginx-plus-go-client/v3/client"
+	nginxCollector "github.com/nginx/nginx-prometheus-exporter/collector"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/wx-one/wxingress/internal/configs"
+	"github.com/wx-one/wxingress/internal/configs/version1"
+	"github.com/wx-one/wxingress/internal/configs/version2"
+	"github.com/wx-one/wxingress/internal/configs/wafbundle"
+	"github.com/wx-one/wxingress/internal/healthcheck"
+	"github.com/wx-one/wxingress/internal/k8s"
+	"github.com/wx-one/wxingress/internal/k8s/appprotect"
+	"github.com/wx-one/wxingress/internal/k8s/secrets"
+	license_reporting "github.com/wx-one/wxingress/internal/license_reporting"
+	"github.com/wx-one/wxingress/internal/metadata"
+	"github.com/wx-one/wxingress/internal/metrics"
+	"github.com/wx-one/wxingress/internal/metrics/collectors"
+	"github.com/wx-one/wxingress/internal/nginx"
+	cr_validation "github.com/wx-one/wxingress/pkg/apis/configuration/validation"
+	k8s_nginx "github.com/wx-one/wxingress/pkg/client/clientset/versioned"
+	conf_scheme "github.com/wx-one/wxingress/pkg/client/clientset/versioned/scheme"
+	api_v1 "k8s.io/api/core/v1"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	pkg_runtime "k8s.io/apimachinery/pkg/runtime"
+	util_version "k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	core_v1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
+	"k8s.io/client-go/tools/record"
+
+	nl "github.com/wx-one/wxingress/internal/logger"
+	nic_glog "github.com/wx-one/wxingress/internal/logger/glog"
+	"github.com/wx-one/wxingress/internal/logger/levels"
+)
+
+// Injected during build
+var (
+	version   string
+	logLevels = map[string]slog.Level{
+		"trace":   levels.LevelTrace,
+		"debug":   levels.LevelDebug,
+		"info":    levels.LevelInfo,
+		"warning": levels.LevelWarning,
+		"error":   levels.LevelError,
+		"fatal":   levels.LevelFatal,
+	}
+)
+
+const (
+	nginxVersionLabel        = "app.nginx.org/version"
+	versionLabel             = "app.kubernetes.io/version"
+	appProtectVersionLabel   = "appprotect.f5.com/version"
+	agentVersionLabel        = "app.nginx.org/agent-version"
+	appProtectVersionPath    = "/opt/app_protect/RELEASE"
+	appProtectv4BundleFolder = "/etc/nginx/waf/bundles/"
+	appProtectv5BundleFolder = "/etc/app_protect/bundles/"
+	socketPath               = "/var/lib/nginx"
+	fatalEventFlushTime      = 200 * time.Millisecond
+	secretErrorReason        = "SecretError"
+	fileErrorReason          = "FileError"
+	configMapErrorReason     = "ConfigMapError"
+)
+
+// maxProcs is how many threads run the controller's Go code at once unless
+// GOMAXPROCS says otherwise. Go's default is one per CPU of the node, and
+// with every P comes a cache of spans and a share of the GC's work: on a node
+// of 128 CPUs that is some 10 MB of a controller whose live heap is 10 MB,
+// for work - informer events, one sync queue, config generation - that is
+// mostly one goroutine at a time.
+const maxProcs = 4
+
+// gcPercent is the heap's growth between collections unless GOGC says
+// otherwise: half of Go's default 100, so the controller holds 1.5 times its
+// live heap instead of twice it, for collections that cost it little - its
+// CPU goes to events, not to allocating.
+const gcPercent = 50
+
+func main() {
+	if os.Getenv("GOMAXPROCS") == "" && runtime.GOMAXPROCS(0) > maxProcs {
+		runtime.GOMAXPROCS(maxProcs)
+	}
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(gcPercent)
+	}
+	commitHash, commitTime, dirtyBuild := getBuildInfo()
+	fmt.Printf("NGINX Ingress Controller Version=%v Commit=%v Date=%v DirtyState=%v Arch=%v/%v Go=%v\n", version, commitHash, commitTime, dirtyBuild, runtime.GOOS, runtime.GOARCH, runtime.Version())
+	parseFlags()
+	ctx := initLogger(*logFormat, logLevels[*logLevel], os.Stdout)
+	l := nl.LoggerFromContext(ctx)
+
+	cleanupSocketFiles(l)
+
+	initValidate(ctx)
+	if *enableTelemetryReporting {
+		nl.Warnf(l, "-enable-telemetry-reporting is ignored: wxingress has no telemetry and reports nothing to anyone")
+	}
+	parsedFlags := os.Args[1:]
+
+	buildOS := os.Getenv("BUILD_OS")
+	controllerNamespace := os.Getenv("POD_NAMESPACE")
+	podName := os.Getenv("POD_NAME")
+
+	config, kubeClient := mustCreateConfigAndKubeClient(ctx)
+	if err := validateKubernetesVersionInfo(ctx, kubeClient); err != nil {
+		nl.Fatal(l, err)
+	}
+	pod, err := kubeClient.CoreV1().Pods(controllerNamespace).Get(context.TODO(), podName, meta_v1.GetOptions{})
+	if err != nil {
+		nl.Fatalf(l, "Failed to get pod: %v", err)
+	}
+
+	controllerNodeName, controllerZone := getControllerTopology(ctx, kubeClient, pod, *enableTopologyAwareRouting)
+
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartLogging(func(format string, args ...interface{}) {
+		nl.Infof(l, format, args...)
+	})
+	eventBroadcaster.StartRecordingToSink(&core_v1.EventSinkImpl{
+		Interface: core_v1.New(kubeClient.CoreV1().RESTClient()).Events(""),
+	})
+	eventRecorder := eventBroadcaster.NewRecorder(scheme.Scheme,
+		api_v1.EventSource{Component: k8s.EventReporterName})
+	defer eventBroadcaster.Shutdown()
+	mustValidateIngressClass(ctx, kubeClient)
+
+	checkNamespaces(ctx, kubeClient)
+
+	dynClient, confClient := createCustomClients(ctx, config)
+
+	constLabels := map[string]string{"class": *ingressClass}
+
+	managerCollector, controllerCollector, registry := createManagerAndControllerCollectors(ctx, constLabels)
+	ingressNginxCollector := createIngressNginxCollector(ctx, registry, pod.Name, controllerNamespace)
+	if ingressNginxCollector != nil {
+		managerCollector = collectors.WithIngressNginxReloads(managerCollector, ingressNginxCollector)
+	}
+
+	var licenseReporter *license_reporting.LicenseReporter
+
+	if *nginxPlus {
+		licenseReporter = license_reporting.NewLicenseReporter(kubeClient, eventRecorder, pod)
+	}
+
+	var deploymentMetadata *metadata.Metadata
+
+	if *agent {
+		deploymentMetadata = metadata.NewMetadataReporter(kubeClient, pod, version)
+	}
+
+	nginxManager, useFakeNginxManager := createNginxManager(ctx, managerCollector, licenseReporter, deploymentMetadata)
+
+	nginxVersion := getNginxVersionInfo(ctx, nginxManager)
+
+	var appProtectVersion string
+	var appProtectV5 bool
+	appProtectBundlePath := appProtectv4BundleFolder
+	if *appProtect {
+		appProtectVersion = getAppProtectVersionInfo(ctx)
+
+		if _, err := os.Stat("/opt/app_protect/VERSION.common"); os.IsNotExist(err) {
+			appProtectV5 = true
+			appProtectBundlePath = appProtectv5BundleFolder
+		}
+
+		selectAppProtectAPIVersion(ctx, *plmStorageURL != "", eventRecorder, pod)
+
+		if *plmStorageURL != "" {
+			setupPLMStorage(ctx, kubeClient, eventRecorder, pod)
+		}
+	}
+
+	var agentVersion string
+	if *agent {
+		agentVersion = getAgentVersionInfo(nginxManager)
+	}
+
+	go updateSelfWithVersionInfo(ctx, eventRecorder, kubeClient, version, appProtectVersion, agentVersion, nginxVersion, 10, time.Second*5)
+
+	var mgmtCfgParams *configs.MGMTConfigParams
+	if *nginxPlus {
+		mgmtCfgParams = processMGMTConfigMap(kubeClient, configs.NewDefaultMGMTConfigParams(ctx), eventRecorder, pod)
+		if err := processLicenseSecret(kubeClient, nginxManager, mgmtCfgParams, controllerNamespace); err != nil {
+			logEventAndExit(ctx, eventRecorder, pod, secretErrorReason, err)
+		}
+
+		if err := processTrustedCertSecret(kubeClient, nginxManager, mgmtCfgParams, controllerNamespace); err != nil {
+			logEventAndExit(ctx, eventRecorder, pod, secretErrorReason, err)
+		}
+
+		if err := processClientAuthSecret(kubeClient, nginxManager, mgmtCfgParams, controllerNamespace); err != nil {
+			logEventAndExit(ctx, eventRecorder, pod, secretErrorReason, err)
+		}
+
+	}
+
+	templateExecutor, templateExecutorV2 := createTemplateExecutors(ctx)
+
+	sslRejectHandshake, err := processDefaultServerSecret(kubeClient, nginxManager)
+	if err != nil {
+		logEventAndExit(ctx, eventRecorder, pod, secretErrorReason, err)
+	}
+
+	staticSSLPath := nginxManager.GetSecretsDir()
+
+	isWildcardEnabled, err := processWildcardSecret(kubeClient, nginxManager)
+	if err != nil {
+		logEventAndExit(ctx, eventRecorder, pod, secretErrorReason, err)
+	}
+
+	caBundlePath, err := nginxManager.GetOSCABundlePath()
+	if err != nil {
+		logEventAndExit(ctx, eventRecorder, pod, fileErrorReason, err)
+	}
+
+	globalConfigurationValidator := createGlobalConfigurationValidator()
+
+	mustProcessGlobalConfiguration(ctx)
+
+	cfgParams := configs.NewDefaultConfigParamsFor(ctx, *nginxPlus, *ingressNginxDefaults)
+	cfgParams = processConfigMaps(kubeClient, cfgParams, nginxManager, templateExecutor, eventRecorder)
+
+	staticCfgParams := &configs.StaticConfigParams{
+		SystemResolvers:                configs.ReadSystemResolvers("/etc/resolv.conf"),
+		DisableIPV6:                    *disableIPV6,
+		DefaultHTTPListenerPort:        *defaultHTTPListenerPort,
+		DefaultHTTPSListenerPort:       *defaultHTTPSListenerPort,
+		HealthStatus:                   *healthStatus,
+		HealthStatusURI:                *healthStatusURI,
+		NginxStatus:                    *nginxStatus,
+		NginxStatusAllowCIDRs:          allowedCIDRs,
+		NginxStatusPort:                *nginxStatusPort,
+		StubStatusOverUnixSocketForOSS: *enablePrometheusMetrics,
+		TLSPassthrough:                 *enableTLSPassthrough,
+		TLSPassthroughPort:             *tlsPassthroughPort,
+		EnableSnippets:                 *enableSnippets,
+		MainAppProtectLoadModule:       *appProtect,
+		MainAppProtectV5LoadModule:     appProtectV5,
+		MainAppProtectDosLoadModule:    *appProtectDos,
+		MainAppProtectV5EnforcerAddr:   *appProtectEnforcerAddress,
+		EnableLatencyMetrics:           *enableLatencyMetrics,
+		EnableOIDC:                     *enableOIDC,
+		SSLRejectHandshake:             sslRejectHandshake,
+		EnableCertManager:              *enableCertManager,
+		DynamicSSLReload:               *enableDynamicSSLReload,
+		DynamicWeightChangesReload:     *enableDynamicWeightChangesReload,
+		IsDirectiveAutoadjustEnabled:   *enableDirectiveAutoadjust,
+		StaticSSLPath:                  staticSSLPath,
+		NginxVersion:                   nginxVersion,
+		AppProtectBundlePath:           appProtectBundlePath,
+		DefaultCABundle:                caBundlePath,
+		PLMEnabled:                     *plmStorageURL != "",
+		UpstreamAPI:                    *dynamicUpstreams,
+		IngressNginxMetrics:            *enablePrometheusMetrics && *dynamicUpstreams,
+	}
+
+	if *nginxPlus {
+		if cfgParams.ZoneSync.Enable && cfgParams.ZoneSync.Port != 0 {
+			err := createAndValidateHeadlessService(ctx, kubeClient, cfgParams, controllerNamespace, pod)
+			if err != nil {
+				logEventAndExit(ctx, eventRecorder, pod, nl.EventReasonServiceFailedToCreate, err)
+			}
+		}
+	}
+
+	mustWriteInitialNginxConfig(staticCfgParams, cfgParams, mgmtCfgParams, templateExecutor, nginxManager)
+
+	if *enableTLSPassthrough {
+		var emptyFile []byte
+		nginxManager.CreateTLSPassthroughHostsConfig(emptyFile)
+	}
+
+	process := startChildProcesses(nginxManager, appProtectV5)
+
+	plusClient := createPlusClient(ctx, *nginxPlus || *dynamicUpstreams, useFakeNginxManager, nginxManager)
+	if *nginxPlus {
+		licenseReporter.Config.PlusClient = plusClient
+	}
+
+	plusCollector, syslogListener, latencyCollector := createPlusAndLatencyCollectors(ctx, registry, constLabels, kubeClient, plusClient)
+	cnf := configs.NewConfigurator(configs.ConfiguratorParams{
+		NginxManager:                        nginxManager,
+		StaticCfgParams:                     staticCfgParams,
+		Config:                              cfgParams,
+		MGMTCfgParams:                       mgmtCfgParams,
+		TemplateExecutor:                    templateExecutor,
+		TemplateExecutorV2:                  templateExecutorV2,
+		LatencyCollector:                    latencyCollector,
+		LabelUpdater:                        plusCollector,
+		IsPlus:                              *nginxPlus,
+		IsWildcardEnabled:                   isWildcardEnabled,
+		IsPrometheusEnabled:                 *enablePrometheusMetrics,
+		IsLatencyMetricsEnabled:             *enableLatencyMetrics,
+		IsDynamicSSLReloadEnabled:           *enableDynamicSSLReload,
+		IsDynamicWeightChangesReloadEnabled: *enableDynamicWeightChangesReload,
+		IsDynamicUpstreams:                  *dynamicUpstreams,
+		SyncRateLimit:                       *syncRateLimit,
+		NginxVersion:                        nginxVersion,
+	})
+
+	if ingressNginxCollector != nil {
+		ingressNginxCollector.SetCertificates(cnf.CertificateInfos)
+	}
+
+	transportServerValidator := cr_validation.NewTransportServerValidator(*enableTLSPassthrough, *enableSnippets, *nginxPlus)
+	virtualServerValidator := cr_validation.NewVirtualServerValidator(
+		cr_validation.IsPlus(*nginxPlus),
+		cr_validation.IsDosEnabled(*appProtectDos),
+		cr_validation.IsCertManagerEnabled(*enableCertManager),
+		cr_validation.IsExternalDNSEnabled(*enableExternalDNS),
+		cr_validation.IsDirectiveAutoadjustEnabled(*enableDirectiveAutoadjust),
+	)
+
+	if *enableServiceInsight {
+		createHealthProbeEndpoint(kubeClient, plusClient, cnf)
+	}
+
+	lbcInput := k8s.NewLoadBalancerControllerInput{
+		KubeClient:                   kubeClient,
+		ConfClient:                   confClient,
+		DynClient:                    dynClient,
+		RestConfig:                   config,
+		Recorder:                     eventRecorder,
+		ResyncPeriod:                 30 * time.Second,
+		LoggerContext:                ctx,
+		Namespace:                    watchNamespaces,
+		SecretNamespace:              watchSecretNamespaces,
+		NginxConfigurator:            cnf,
+		DefaultServerSecret:          *defaultServerSecret,
+		AppProtectEnabled:            *appProtect,
+		AppProtectDosEnabled:         *appProtectDos,
+		AppProtectVersion:            appProtectVersion,
+		WAFBundlePath:                appProtectBundlePath,
+		PLMStorageSpec:               plmStorageSpec(),
+		IsNginxPlus:                  *nginxPlus,
+		IsDynamicUpstreams:           *dynamicUpstreams,
+		IngressNginxDefaults:         *ingressNginxDefaults,
+		IngressClass:                 *ingressClass,
+		IngressClassControllers:      ingressClassControllerList(),
+		WatchIngressWithoutClass:     *watchIngressWithoutClass,
+		TCPServicesConfigMap:         *tcpServicesConfigMap,
+		UDPServicesConfigMap:         *udpServicesConfigMap,
+		DefaultBackendService:        *defaultBackendService,
+		ExternalServiceName:          *externalService,
+		IngressLink:                  *ingressLink,
+		ControllerNamespace:          controllerNamespace,
+		Pod:                          pod,
+		ReportIngressStatus:          *reportIngressStatus,
+		IsLeaderElectionEnabled:      *leaderElectionEnabled,
+		LeaderElectionLockName:       *leaderElectionLockName,
+		WildcardTLSSecret:            *wildcardTLSSecret,
+		ConfigMaps:                   *nginxConfigMaps,
+		MGMTConfigMap:                *mgmtConfigMap,
+		GlobalConfiguration:          *globalConfiguration,
+		AreCustomResourcesEnabled:    *enableCustomResources,
+		EnableOIDC:                   *enableOIDC,
+		MetricsCollector:             controllerCollector,
+		GlobalConfigurationValidator: globalConfigurationValidator,
+		TransportServerValidator:     transportServerValidator,
+		VirtualServerValidator:       virtualServerValidator,
+		IsPrometheusEnabled:          *enablePrometheusMetrics,
+		IsLatencyMetricsEnabled:      *enableLatencyMetrics,
+		IsTLSPassthroughEnabled:      *enableTLSPassthrough,
+		TLSPassthroughPort:           *tlsPassthroughPort,
+		SnippetsEnabled:              *enableSnippets,
+		CertManagerEnabled:           *enableCertManager,
+		ExternalDNSEnabled:           *enableExternalDNS,
+		IsIPV6Disabled:               *disableIPV6,
+		IsDirectiveAutoadjustEnabled: *enableDirectiveAutoadjust,
+		AllowEmptyIngressHost:        *allowEmptyIngressHost,
+		WatchNamespaceLabel:          *watchNamespaceLabel,
+		BuildOS:                      buildOS,
+		NICVersion:                   version,
+		DynamicWeightChangesReload:   *enableDynamicWeightChangesReload,
+		InstallationFlags:            parsedFlags,
+		ShuttingDown:                 false,
+		Zone:                         controllerZone,
+		NodeName:                     controllerNodeName,
+		TopologyAwareRouting:         *enableTopologyAwareRouting,
+		GatewayAPI:                   newGatewayAPI(ctx, config, kubeClient, controllerNamespace),
+	}
+
+	lbc := k8s.NewLoadBalancerController(lbcInput)
+
+	if *readyStatus {
+		go func() {
+			port := fmt.Sprintf(":%v", *readyStatusPort)
+			s := http.NewServeMux()
+			s.HandleFunc("/nginx-ready", ready(lbc))
+			nl.Fatal(l, http.ListenAndServe(port, s)) // nolint:gosec
+		}()
+	}
+
+	if *validatingWebhook != "" {
+		var checks k8s.AdmissionChecks
+		if ingressNginxCollector != nil {
+			checks = ingressNginxCollector
+		}
+		lbc.EnableAdmission(*validatingWebhookNginxTest, checks)
+		go func() {
+			err := k8s.ServeAdmission(ctx, *validatingWebhook, *validatingWebhookCertificate, *validatingWebhookKey, k8s.AdmissionHandler(lbc))
+			nl.Fatalf(l, "The admission webhook on %s stopped: %v", *validatingWebhook, err)
+		}()
+	}
+
+	go handleTermination(lbc, nginxManager, syslogListener, process)
+
+	if *enableOIDC && *dynamicUpstreams && *oidcRevocationsConfigMap != "" {
+		if ns, name, found := strings.Cut(*oidcRevocationsConfigMap, "/"); found {
+			go k8s.RunOIDCRevocations(ctx, l, kubeClient, ns, name, nginxManager, 5*time.Second)
+		} else {
+			nl.Fatalf(l, "-oidc-revocations-configmap %q is not <namespace>/<name>", *oidcRevocationsConfigMap)
+		}
+	}
+
+	lbc.Run()
+
+	for {
+		nl.Info(l, "Waiting for the controller to exit...")
+		time.Sleep(30 * time.Second)
+	}
+}
+
+func processClientAuthSecret(kubeClient *kubernetes.Clientset, nginxManager nginx.Manager, mgmtCfgParams *configs.MGMTConfigParams, controllerNamespace string) error {
+	if mgmtCfgParams.Secrets.ClientAuth == "" {
+		return nil
+	}
+
+	clientAuthSecretNsName := controllerNamespace + "/" + mgmtCfgParams.Secrets.ClientAuth
+
+	secret, err := getAndValidateSecret(kubeClient, clientAuthSecretNsName, secrets.RoleTLS)
+	if err != nil {
+		return fmt.Errorf("error trying to get the client auth secret %v: %w", clientAuthSecretNsName, err)
+	}
+
+	bytes := configs.GenerateCertAndKeyFileContent(secret)
+	nginxManager.CreateSecret(fmt.Sprintf("mgmt/%s", configs.ClientAuthCertSecretFileName), bytes, nginx.ReadWriteOnlyFileMode)
+	return nil
+}
+
+func processTrustedCertSecret(kubeClient *kubernetes.Clientset, nginxManager nginx.Manager, mgmtCfgParams *configs.MGMTConfigParams, controllerNamespace string) error {
+	if mgmtCfgParams.Secrets.TrustedCert == "" {
+		return nil
+	}
+
+	trustedCertSecretNsName := controllerNamespace + "/" + mgmtCfgParams.Secrets.TrustedCert
+
+	secret, err := getAndValidateSecret(kubeClient, trustedCertSecretNsName, secrets.RoleCA)
+	if err != nil {
+		return fmt.Errorf("error trying to get the trusted cert secret %v: %w", trustedCertSecretNsName, err)
+	}
+
+	caBytes, crlBytes := configs.GenerateCAFileContent(secret)
+	nginxManager.CreateSecret(fmt.Sprintf("mgmt/%s", configs.CACrtKey), caBytes, nginx.ReadWriteOnlyFileMode)
+	if _, hasCRL := secret.Data[configs.CACrlKey]; hasCRL {
+		mgmtCfgParams.Secrets.TrustedCRL = secret.Name
+		nginxManager.CreateSecret(fmt.Sprintf("mgmt/%s", configs.CACrlKey), crlBytes, nginx.ReadWriteOnlyFileMode)
+	}
+	return nil
+}
+
+func mustCreateConfigAndKubeClient(ctx context.Context) (*rest.Config, *kubernetes.Clientset) {
+	l := nl.LoggerFromContext(ctx)
+	var config *rest.Config
+	var err error
+	if *proxyURL != "" {
+		config, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			&clientcmd.ClientConfigLoadingRules{},
+			&clientcmd.ConfigOverrides{
+				ClusterInfo: clientcmdapi.Cluster{
+					Server: *proxyURL,
+				},
+			},
+		).ClientConfig()
+		if err != nil {
+			nl.Fatalf(l, "error creating client configuration: %v", err)
+		}
+	} else {
+		if config, err = rest.InClusterConfig(); err != nil {
+			nl.Fatalf(l, "error creating client configuration: %v", err)
+		}
+	}
+
+	kubeClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		nl.Fatalf(l, "Failed to create client: %v.", err)
+	}
+
+	return config, kubeClient
+}
+
+// getControllerTopology returns the node name and zone used for topology-aware
+// routing. When the feature is disabled it returns empty values without
+// querying the API, so that the default behavior and RBAC needs are unchanged.
+func getControllerTopology(ctx context.Context, kubeClient kubernetes.Interface, pod *api_v1.Pod, enabled bool) (nodeName, zone string) {
+	if !enabled {
+		return "", ""
+	}
+	return pod.Spec.NodeName, getControllerZone(ctx, kubeClient, pod.Spec.NodeName)
+}
+
+// getControllerZone returns the topology.kubernetes.io/zone label of the node the
+// controller is running on, used to honor zone hints on EndpointSlices. Failures
+// are non-fatal: an empty zone disables zone-based topology filtering only.
+//
+// It lists with a field selector rather than calling Get so that the existing
+// `list` permission on nodes is sufficient.
+func getControllerZone(ctx context.Context, kubeClient kubernetes.Interface, nodeName string) string {
+	l := nl.LoggerFromContext(ctx)
+	if nodeName == "" {
+		nl.Warnf(l, "Pod has no spec.nodeName; topology-aware routing using EndpointSlice hints is unavailable")
+		return ""
+	}
+
+	nodeList, err := kubeClient.CoreV1().Nodes().List(ctx, meta_v1.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("metadata.name", nodeName).String(),
+	})
+	if err != nil {
+		nl.Warnf(l, "Failed to list node %s for zone detection: %v; same-zone routing using EndpointSlice hints is unavailable", nodeName, err)
+		return ""
+	}
+
+	for _, node := range nodeList.Items {
+		if node.Name != nodeName {
+			continue
+		}
+		zone := node.Labels[api_v1.LabelTopologyZone]
+		if zone == "" {
+			nl.Warnf(l, "Node %s has no %s label; same-zone routing using EndpointSlice hints is unavailable", nodeName, api_v1.LabelTopologyZone)
+		} else {
+			nl.Infof(l, "Controller node: %s, zone: %s", nodeName, zone)
+		}
+		return zone
+	}
+
+	nl.Warnf(l, "Node %s not found for zone detection; same-zone routing using EndpointSlice hints is unavailable", nodeName)
+	return ""
+}
+
+// validateKubernetesVersionInfo returns an Error if
+// the k8s version can not be retrieved or the version is not supported.
+func validateKubernetesVersionInfo(ctx context.Context, kubeClient kubernetes.Interface) error {
+	l := nl.LoggerFromContext(ctx)
+	k8sVersion, err := k8s.GetK8sVersion(kubeClient)
+	if err != nil {
+		return fmt.Errorf("error retrieving k8s version: %w", err)
+	}
+	nl.Infof(l, "Kubernetes version: %v", k8sVersion)
+
+	minK8sVersion, err := util_version.ParseGeneric("1.22.0")
+	if err != nil {
+		return fmt.Errorf("unexpected error parsing minimum supported version: %w", err)
+	}
+
+	if !k8sVersion.AtLeast(minK8sVersion) {
+		return fmt.Errorf("versions of kubernetes < %v are not supported, please refer to the documentation for details on supported versions and legacy controller support", minK8sVersion)
+	}
+	return nil
+}
+
+// ingressClassControllerList is -ingress-class-controllers as a list.
+func ingressClassControllerList() []string {
+	var out []string
+	for _, c := range strings.Split(*ingressClassControllers, ",") {
+		if c = strings.TrimSpace(c); c != "" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// mustValidateIngressClass warns when the IngressClass of -ingress-class is
+// missing or another controller's: the class is served anyway - by name,
+// through the kubernetes.io/ingress.class annotation - and IngressClasses of
+// -ingress-class-controllers are served whatever their name.
+func mustValidateIngressClass(ctx context.Context, kubeClient kubernetes.Interface) {
+	l := nl.LoggerFromContext(ctx)
+	ingressClassRes, err := kubeClient.NetworkingV1().IngressClasses().Get(context.TODO(), *ingressClass, meta_v1.GetOptions{})
+	if err != nil {
+		nl.Warnf(l, "IngressClass %v: %v; Ingresses naming it are served all the same", *ingressClass, err)
+		return
+	}
+
+	for _, c := range ingressClassControllerList() {
+		if ingressClassRes.Spec.Controller == c {
+			return
+		}
+	}
+	nl.Warnf(l, "IngressClass %v has the controller %v, which is not in -ingress-class-controllers %q; Ingresses naming it are served all the same",
+		ingressClassRes.Name, ingressClassRes.Spec.Controller, *ingressClassControllers)
+}
+
+func checkNamespaces(ctx context.Context, kubeClient kubernetes.Interface) {
+	l := nl.LoggerFromContext(ctx)
+	if *watchNamespaceLabel != "" {
+		// bootstrap the watched namespace list
+		var newWatchNamespaces []string
+		nsList, err := kubeClient.CoreV1().Namespaces().List(context.TODO(), meta_v1.ListOptions{LabelSelector: *watchNamespaceLabel})
+		if err != nil {
+			nl.Errorf(l, "error when getting Namespaces with the label selector %v: %v", watchNamespaceLabel, err)
+		}
+		for _, ns := range nsList.Items {
+			newWatchNamespaces = append(newWatchNamespaces, ns.Name)
+		}
+		watchNamespaces = newWatchNamespaces
+		nl.Infof(l, "Namespaces watched using label %v: %v", *watchNamespaceLabel, watchNamespaces)
+	} else {
+		checkNamespaceExists(ctx, kubeClient, watchNamespaces)
+	}
+	checkNamespaceExists(ctx, kubeClient, watchSecretNamespaces)
+}
+
+func checkNamespaceExists(ctx context.Context, kubeClient kubernetes.Interface, namespaces []string) {
+	l := nl.LoggerFromContext(ctx)
+	for _, ns := range namespaces {
+		if ns != "" {
+			_, err := kubeClient.CoreV1().Namespaces().Get(context.TODO(), ns, meta_v1.GetOptions{})
+			if err != nil {
+				nl.Warnf(l, "Error when getting Namespace %v: %v", ns, err)
+			}
+		}
+	}
+}
+
+func createCustomClients(ctx context.Context, config *rest.Config) (dynamic.Interface, k8s_nginx.Interface) {
+	l := nl.LoggerFromContext(ctx)
+	var dynClient dynamic.Interface
+	var err error
+	if *appProtectDos || *appProtect || *ingressLink != "" {
+		dynClient, err = dynamic.NewForConfig(config)
+		if err != nil {
+			nl.Fatalf(l, "Failed to create dynamic client: %v.", err)
+		}
+	}
+	var confClient k8s_nginx.Interface
+	if *enableCustomResources {
+		confClient, err = k8s_nginx.NewForConfig(config)
+		if err != nil {
+			nl.Fatalf(l, "Failed to create a conf client: %v", err)
+		}
+
+		// required for emitting Events for VirtualServer
+		err = conf_scheme.AddToScheme(scheme.Scheme)
+		if err != nil {
+			nl.Fatalf(l, "Failed to add configuration types to the scheme: %v", err)
+		}
+	}
+	return dynClient, confClient
+}
+
+// createPlusClient creates the client of the upstream API - NGINX Plus's own, or the one of the wxingress module in NGINX OSS, which answers the same requests on the same socket.
+func createPlusClient(ctx context.Context, upstreamAPI bool, useFakeNginxManager bool, nginxManager nginx.Manager) *client.NginxClient {
+	l := nl.LoggerFromContext(ctx)
+	var plusClient *client.NginxClient
+	var err error
+
+	if upstreamAPI && !useFakeNginxManager {
+		httpClient := getSocketClient(filepath.Join(socketPath, "nginx-plus-api.sock"))
+		plusClient, err = client.NewNginxClient("http://nginx-plus-api/api", client.WithHTTPClient(httpClient))
+		if err != nil {
+			nl.Fatalf(l, "Failed to create NginxClient for Plus: %v", err)
+		}
+		nginxManager.SetPlusClients(plusClient, httpClient)
+	}
+	return plusClient
+}
+
+func createTemplateExecutors(ctx context.Context) (*version1.TemplateExecutor, *version2.TemplateExecutor) {
+	l := nl.LoggerFromContext(ctx)
+	nginxConfTemplatePath := "nginx.tmpl"
+	nginxIngressTemplatePath := "nginx.ingress.tmpl"
+	nginxVirtualServerTemplatePath := "nginx.virtualserver.tmpl"
+	nginxTransportServerTemplatePath := "nginx.transportserver.tmpl"
+	nginxOIDCConfTemplatePath := ""
+	if *nginxPlus {
+		nginxConfTemplatePath = "nginx-plus.tmpl"
+		nginxIngressTemplatePath = "nginx-plus.ingress.tmpl"
+		nginxVirtualServerTemplatePath = "nginx-plus.virtualserver.tmpl"
+		nginxTransportServerTemplatePath = "nginx-plus.transportserver.tmpl"
+		nginxOIDCConfTemplatePath = "oidc.tmpl"
+	}
+
+	if *mainTemplatePath != "" {
+		nginxConfTemplatePath = *mainTemplatePath
+	}
+	if *ingressTemplatePath != "" {
+		nginxIngressTemplatePath = *ingressTemplatePath
+	}
+	if *virtualServerTemplatePath != "" {
+		nginxVirtualServerTemplatePath = *virtualServerTemplatePath
+	}
+	if *transportServerTemplatePath != "" {
+		nginxTransportServerTemplatePath = *transportServerTemplatePath
+	}
+
+	templateExecutor, err := version1.NewTemplateExecutor(nginxConfTemplatePath, nginxIngressTemplatePath)
+	if err != nil {
+		nl.Fatalf(l, "Error creating TemplateExecutor: %v", err)
+	}
+
+	templateExecutorV2, err := version2.NewTemplateExecutor(nginxVirtualServerTemplatePath, nginxTransportServerTemplatePath, nginxOIDCConfTemplatePath)
+	if err != nil {
+		nl.Fatalf(l, "Error creating TemplateExecutorV2: %v", err)
+	}
+
+	return templateExecutor, templateExecutorV2
+}
+
+func createNginxManager(ctx context.Context, managerCollector collectors.ManagerCollector, licenseReporter *license_reporting.LicenseReporter, deploymentMetadata *metadata.Metadata) (nginx.Manager, bool) {
+	useFakeNginxManager := *proxyURL != ""
+	timeout := time.Duration(*nginxReloadTimeout) * time.Millisecond
+	var nginxManager nginx.Manager
+	switch {
+	case useFakeNginxManager:
+		nginxManager = nginx.NewFakeManager("/etc/nginx")
+	case *enableConfigSafety:
+		nginxManager = nginx.NewConfigRollbackManager(ctx, "/etc/nginx/", *nginxDebug, managerCollector, licenseReporter, deploymentMetadata, timeout, *nginxPlus)
+	default:
+		nginxManager = nginx.NewLocalManager(ctx, "/etc/nginx/", *nginxDebug, managerCollector, licenseReporter, deploymentMetadata, timeout, *nginxPlus)
+	}
+	return nginxManager, useFakeNginxManager
+}
+
+func getNginxVersionInfo(ctx context.Context, nginxManager nginx.Manager) nginx.Version {
+	l := nl.LoggerFromContext(ctx)
+	nginxInfo := nginxManager.Version()
+	nl.Infof(l, "Using %s", nginxInfo.String())
+
+	if *nginxPlus && !nginxInfo.IsPlus {
+		nl.Fatalf(l, "NGINX Plus flag enabled (-nginx-plus) without NGINX Plus binary")
+	} else if !*nginxPlus && nginxInfo.IsPlus {
+		nl.Fatalf(l, "NGINX Plus binary found without NGINX Plus flag (-nginx-plus)")
+	}
+	return nginxInfo
+}
+
+func getAppProtectVersionInfo(ctx context.Context) string {
+	l := nl.LoggerFromContext(ctx)
+	v, err := os.ReadFile(appProtectVersionPath)
+	if err != nil {
+		nl.Fatalf(l, "Cannot detect the AppProtect version, %s", err.Error())
+	}
+	version := strings.TrimSpace(string(v))
+	nl.Infof(l, "Using AppProtect Version %s", version)
+	return version
+}
+
+// selectAppProtectAPIVersion configures the appprotect package to watch the
+// v1 CRDs when --plm-storage-url is set, otherwise the legacy v1beta1 CRDs.
+func selectAppProtectAPIVersion(ctx context.Context, plmEnabled bool, recorder record.EventRecorder, pod *api_v1.Pod) {
+	l := nl.LoggerFromContext(ctx)
+	version := appprotect.SelectAPIVersion(plmEnabled)
+	// Defensive: SelectAPIVersion only returns values SetAPIVersion accepts.
+	if err := appprotect.SetAPIVersion(version); err != nil {
+		nl.Fatalf(l, "Invalid %s API version %q: %v", appprotect.APIGroup, version, err)
+	}
+	nl.Infof(l, "Using %s/%s CRDs", appprotect.APIGroup, version)
+	recorder.Eventf(pod, api_v1.EventTypeNormal, nl.EventReasonAppProtectAPIVersionSelected,
+		"Using %s/%s CRDs", appprotect.APIGroup, version)
+}
+
+// plmStorageSpec assembles the wafbundle.S3ConfigSpec from the PLM flags and
+// the secret refs parsed once in flags.go (plmRefs). Endpoint is empty when
+// PLM is disabled, which callers treat as "PLM off".
+func plmStorageSpec() wafbundle.S3ConfigSpec {
+	return wafbundle.S3ConfigSpec{
+		Endpoint:           *plmStorageURL,
+		Credentials:        plmRefs.Credentials,
+		CA:                 plmRefs.CA,
+		ClientSSL:          plmRefs.ClientSSL,
+		InsecureSkipVerify: *plmStorageInsecureSkipVerify,
+	}
+}
+
+// setupPLMStorage validates the PLM S3 credentials at startup so that
+// misconfiguration surfaces immediately. Credentials are re-read on every
+// bundle fetch, so rotated Secrets are picked up automatically.
+func setupPLMStorage(ctx context.Context, kubeClient kubernetes.Interface, recorder record.EventRecorder, pod *api_v1.Pod) {
+	l := nl.LoggerFromContext(ctx)
+
+	spec := plmStorageSpec()
+	source := &wafbundle.KubeClientSecretSource{Client: kubeClient}
+
+	if _, err := wafbundle.LoadS3Config(source, spec); err != nil {
+		nl.Fatalf(l, "PLM: failed to load initial S3 credentials: %v", err)
+	}
+
+	nl.Infof(l, "PLM S3 client configured, endpoint=%s credentialsSecret=%s caSecret=%s clientSSLSecret=%s",
+		spec.Endpoint, spec.Credentials, spec.CA, spec.ClientSSL)
+	recorder.Eventf(pod, api_v1.EventTypeNormal, nl.EventReasonPLMStorageConfigured,
+		"PLM S3 client configured, endpoint=%s", spec.Endpoint)
+}
+
+func getAgentVersionInfo(nginxManager nginx.Manager) string {
+	return nginxManager.AgentVersion()
+}
+
+type childProcesses struct {
+	nginxDone      chan error
+	aPPluginEnable bool
+	aPPluginDone   chan error
+	aPDosEnable    bool
+	aPDosDone      chan error
+	agentEnable    bool
+	agentDone      chan error
+	ipRepdEnable   bool
+	ipRepdDone     chan error
+}
+
+// newChildProcesses starts the several child processes based on flags set.
+// AppProtect. AppProtectDos, Agent.
+func startChildProcesses(nginxManager nginx.Manager, appProtectV5 bool) childProcesses {
+	var aPPluginDone chan error
+	var ipRepdDone chan error
+
+	// Do not start AppProtect Plugins when using v5.
+	if *appProtect && !appProtectV5 {
+		aPPluginDone = make(chan error, 1)
+		nginxManager.AppProtectPluginStart(aPPluginDone, *appProtectLogLevel)
+
+		if *appProtectIPIntelligence {
+			ipRepdDone = make(chan error, 1)
+			nginxManager.IPRepdStart(ipRepdDone)
+		}
+	}
+
+	var aPPDosAgentDone chan error
+
+	if *appProtectDos {
+		aPPDosAgentDone = make(chan error, 1)
+		nginxManager.AppProtectDosAgentStart(aPPDosAgentDone, *appProtectDosDebug, *appProtectDosMaxDaemons, *appProtectDosMaxWorkers, *appProtectDosMemory)
+	}
+
+	nginxDone := make(chan error, 1)
+	nginxManager.Start(nginxDone)
+
+	var agentDone chan error
+	if *agent {
+		agentDone = make(chan error, 1)
+		nginxManager.AgentStart(agentDone, *agentInstanceGroup)
+	}
+
+	return childProcesses{
+		nginxDone:      nginxDone,
+		aPPluginEnable: *appProtect,
+		aPPluginDone:   aPPluginDone,
+		aPDosEnable:    *appProtectDos,
+		aPDosDone:      aPPDosAgentDone,
+		agentEnable:    *agent,
+		agentDone:      agentDone,
+		ipRepdEnable:   *appProtect && !appProtectV5,
+		ipRepdDone:     ipRepdDone,
+	}
+}
+
+func processDefaultServerSecret(kubeClient *kubernetes.Clientset, nginxManager nginx.Manager) (bool, error) {
+	var sslRejectHandshake bool
+
+	if *defaultServerSecret != "" {
+		secret, err := getAndValidateSecret(kubeClient, *defaultServerSecret, secrets.RoleTLS)
+		if err != nil {
+			return sslRejectHandshake, fmt.Errorf("error trying to get the default server TLS secret %v: %w", *defaultServerSecret, err)
+		}
+
+		bytes := configs.GenerateCertAndKeyFileContent(secret)
+		nginxManager.CreateSecret(configs.DefaultServerSecretFileName, bytes, nginx.ReadWriteOnlyFileMode)
+	} else {
+		_, err := os.Stat(configs.DefaultServerSecretPath)
+		if err != nil {
+			if os.IsNotExist(err) && *dynamicUpstreams {
+				// the certificates come from the wxingress module, and a name without one gets this one,
+				// as in ingress-nginx: its fake certificate where no default one is given
+				fake, err := configs.GenerateFakeCertificate()
+				if err != nil {
+					return sslRejectHandshake, err
+				}
+				nginxManager.CreateSecret(configs.DefaultServerSecretFileName, fake, nginx.ReadWriteOnlyFileMode)
+			} else if os.IsNotExist(err) {
+				// file doesn't exist - it is OK! we will reject TLS connections in the default server
+				sslRejectHandshake = true
+			} else {
+				return sslRejectHandshake, fmt.Errorf("error checking the default server TLS cert and key in %s: %w", configs.DefaultServerSecretPath, err)
+			}
+		}
+	}
+	return sslRejectHandshake, nil
+}
+
+func processWildcardSecret(kubeClient *kubernetes.Clientset, nginxManager nginx.Manager) (bool, error) {
+	isWildcardEnabled := *wildcardTLSSecret != ""
+	if isWildcardEnabled {
+		secret, err := getAndValidateSecret(kubeClient, *wildcardTLSSecret, secrets.RoleTLS)
+		if err != nil {
+			return false, fmt.Errorf("error trying to get the wildcard TLS secret %v: %w", *wildcardTLSSecret, err)
+		}
+
+		bytes := configs.GenerateCertAndKeyFileContent(secret)
+		nginxManager.CreateSecret(configs.WildcardSecretFileName, bytes, nginx.ReadWriteOnlyFileMode)
+	}
+	return isWildcardEnabled, nil
+}
+
+func processLicenseSecret(kubeClient *kubernetes.Clientset, nginxManager nginx.Manager, mgmtCfgParams *configs.MGMTConfigParams, controllerNamespace string) error {
+	licenseSecretNsName := controllerNamespace + "/" + mgmtCfgParams.Secrets.License
+
+	secret, err := getAndValidateSecret(kubeClient, licenseSecretNsName, secrets.RoleLicense)
+	if err != nil {
+		return fmt.Errorf("license secret: %w", err)
+	}
+
+	bytes, err := configs.GenerateLicenseSecret(secret)
+	if err != nil {
+		return err
+	}
+	nginxManager.CreateSecret(configs.LicenseSecretFileName, bytes, nginx.ReadWriteOnlyFileMode)
+	return nil
+}
+
+func createGlobalConfigurationValidator() *cr_validation.GlobalConfigurationValidator {
+	forbiddenListenerPorts := map[int]bool{
+		80:  true,
+		443: true,
+	}
+
+	if *nginxStatus {
+		forbiddenListenerPorts[*nginxStatusPort] = true
+	}
+	if *enablePrometheusMetrics {
+		forbiddenListenerPorts[*prometheusMetricsListenPort] = true
+	}
+
+	if *enableServiceInsight {
+		forbiddenListenerPorts[*serviceInsightListenPort] = true
+	}
+
+	if *enableTLSPassthrough {
+		forbiddenListenerPorts[*tlsPassthroughPort] = true
+	}
+
+	return cr_validation.NewGlobalConfigurationValidator(forbiddenListenerPorts)
+}
+
+// mustWriteInitialNginxConfig calls internally os.Exit
+// if it can't generate valid initial NGINX configs.
+func mustWriteInitialNginxConfig(staticCfgParams *configs.StaticConfigParams, cfgParams *configs.ConfigParams, mgmtCfgParams *configs.MGMTConfigParams, templateExecutor *version1.TemplateExecutor, nginxManager nginx.Manager) {
+	l := nl.LoggerFromContext(cfgParams.Context)
+	ngxConfig := configs.GenerateNginxMainConfig(staticCfgParams, cfgParams, mgmtCfgParams)
+	content, err := templateExecutor.ExecuteMainConfigTemplate(ngxConfig)
+	if err != nil {
+		nl.Fatalf(l, "Error generating NGINX main config: %v", err)
+	}
+	if _, err := nginxManager.CreateMainConfig(content); err != nil {
+		nl.Fatalf(l, "%v", err)
+	}
+
+	defaultServerCfg := configs.GenerateDefaultServerConfig(staticCfgParams, cfgParams)
+	defaultServerContent, err := templateExecutor.ExecuteIngressConfigTemplate(&defaultServerCfg)
+	if err != nil {
+		nl.Fatalf(l, "Error generating initial default server config: %v", err)
+	}
+	if _, err := nginxManager.CreateConfig(configs.DefaultServerConfigName, defaultServerContent); err != nil {
+		nl.Fatalf(l, "%v", err)
+	}
+
+	nginxManager.UpdateConfigVersionFile()
+}
+
+// getSocketClient gets a http.Client with a unix socket transport.
+func getSocketClient(sockPath string) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
+				return net.Dial("unix", sockPath)
+			},
+		},
+	}
+}
+
+// getAndValidateSecret gets and validates a secret.
+func getAndValidateSecret(kubeClient kubernetes.Interface, secretNsName string, role secrets.SecretRole) (secret *api_v1.Secret, err error) {
+	ns, name, err := k8s.ParseNamespaceName(secretNsName)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse the %v argument: %w", secretNsName, err)
+	}
+	secret, err = kubeClient.CoreV1().Secrets(ns).Get(context.TODO(), name, meta_v1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("could not find %v: %w", secretNsName, err)
+	}
+	err = secrets.ValidateSecretForRole(secret, role)
+	if err != nil {
+		return nil, fmt.Errorf("%v is invalid: %w", secretNsName, err)
+	}
+
+	return secret, nil
+}
+
+func handleTermination(lbc *k8s.LoadBalancerController, nginxManager nginx.Manager, listener metrics.SyslogListener, cpcfg childProcesses) {
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGTERM)
+
+	select {
+	case err := <-cpcfg.nginxDone:
+		if err != nil {
+			nl.Fatalf(lbc.Logger, "nginx command exited unexpectedly with status: %v", err)
+		} else {
+			nl.Info(lbc.Logger, "nginx command exited successfully")
+		}
+	case err := <-cpcfg.aPPluginDone:
+		nl.Fatalf(lbc.Logger, "AppProtectPlugin command exited unexpectedly with status: %v", err)
+	case err := <-cpcfg.aPDosDone:
+		nl.Fatalf(lbc.Logger, "AppProtectDosAgent command exited unexpectedly with status: %v", err)
+	case err := <-cpcfg.ipRepdDone:
+		nl.Fatalf(lbc.Logger, "iprepd command exited unexpectedly with status: %v", err)
+	case <-signalChan:
+		nl.Info(lbc.Logger, "Received SIGTERM, shutting down")
+		lbc.ShuttingDown = true
+		lbc.Stop()
+		nginxManager.Quit()
+		<-cpcfg.nginxDone
+		if cpcfg.aPPluginEnable {
+			nginxManager.AppProtectPluginQuit()
+			<-cpcfg.aPPluginDone
+		}
+		if cpcfg.aPDosEnable {
+			nginxManager.AppProtectDosAgentQuit()
+			<-cpcfg.aPDosDone
+		}
+		if cpcfg.ipRepdEnable {
+			nginxManager.IPRepdQuit()
+			<-cpcfg.ipRepdDone
+		}
+		listener.Stop()
+	}
+	nl.Info(lbc.Logger, "Exiting successfully")
+	os.Exit(0)
+}
+
+// Clean up any leftover socket files from previous runs
+func cleanupSocketFiles(l *slog.Logger) {
+	files, readErr := os.ReadDir(socketPath)
+	if readErr != nil {
+		nl.Errorf(l, "error trying to read directory %s: %v", socketPath, readErr)
+	} else {
+		for _, f := range files {
+			if !f.IsDir() && strings.HasSuffix(f.Name(), ".sock") {
+				fullPath := filepath.Join(socketPath, f.Name())
+				nl.Infof(l, "Removing socket file %s", fullPath)
+				if removeErr := os.Remove(fullPath); removeErr != nil {
+					nl.Errorf(l, "error trying to remove file %s: %v", fullPath, removeErr)
+				}
+			}
+		}
+	}
+}
+
+func ready(lbc *k8s.LoadBalancerController) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		if !lbc.IsNginxReady() {
+			http.Error(w, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		if _, err := fmt.Fprintln(w, "Ready"); err != nil {
+			// Log error but don't fail the handler since status was already written
+			nl.Error(lbc.Logger, "Failed to write readiness response", err)
+		}
+	}
+}
+
+func createManagerAndControllerCollectors(ctx context.Context, constLabels map[string]string) (collectors.ManagerCollector, collectors.ControllerCollector, *prometheus.Registry) {
+	l := nl.LoggerFromContext(ctx)
+	var err error
+
+	var registry *prometheus.Registry
+	var mc collectors.ManagerCollector
+	var cc collectors.ControllerCollector
+	mc = collectors.NewManagerFakeCollector()
+	cc = collectors.NewControllerFakeCollector()
+
+	if *enablePrometheusMetrics {
+		registry = prometheus.NewRegistry()
+		mc = collectors.NewLocalManagerMetricsCollector(constLabels)
+		cc = collectors.NewControllerMetricsCollector(*enableCustomResources, constLabels)
+		processCollector := collectors.NewNginxProcessesMetricsCollector(ctx, constLabels)
+		workQueueCollector := collectors.NewWorkQueueMetricsCollector(constLabels)
+
+		err = mc.Register(registry)
+		if err != nil {
+			nl.Errorf(l, "Error registering Manager Prometheus metrics: %v", err)
+		}
+
+		err = cc.Register(registry)
+		if err != nil {
+			nl.Errorf(l, "Error registering Controller Prometheus metrics: %v", err)
+		}
+
+		err = processCollector.Register(registry)
+		if err != nil {
+			nl.Errorf(l, "Error registering NginxProcess Prometheus metrics: %v", err)
+		}
+
+		err = workQueueCollector.Register(registry)
+		if err != nil {
+			nl.Errorf(l, "Error registering WorkQueue Prometheus metrics: %v", err)
+		}
+	}
+	return mc, cc, registry
+}
+
+// createIngressNginxCollector makes the collector of ingress-nginx's metrics:
+// the request metrics of the wxingress module (-dynamic-upstreams), the
+// reloads, the certificates and the nginx processes, with ingress-nginx's
+// constant labels - controller_class the IngressClass controller it serves
+// in ingress-nginx's place, k8s.io/ingress-nginx if it is one of them.
+func createIngressNginxCollector(ctx context.Context, registry *prometheus.Registry, pod, namespace string) *collectors.IngressNginxCollector {
+	if !*enablePrometheusMetrics || registry == nil {
+		return nil
+	}
+	controllers := ingressClassControllerList()
+	class := controllers[0]
+	if slices.Contains(controllers, "k8s.io/ingress-nginx") {
+		class = "k8s.io/ingress-nginx"
+	}
+	stub := metrics.NewNginxMetricsClient(getSocketClient(filepath.Join(socketPath, "nginx-status.sock")))
+	sources := collectors.IngressNginxSources{
+		Procs: "/proc",
+		Stub: func() (*collectors.StubStatus, error) {
+			s, err := stub.GetStubStats()
+			if err != nil {
+				return nil, err
+			}
+			return &collectors.StubStatus{
+				Active: s.Connections.Active, Accepted: s.Connections.Accepted, Handled: s.Connections.Handled,
+				Reading: s.Connections.Reading, Writing: s.Connections.Writing, Waiting: s.Connections.Waiting, Requests: s.Requests,
+			}, nil
+		},
+	}
+	if *dynamicUpstreams {
+		module := getSocketClient(filepath.Join(socketPath, "nginx-plus-api.sock"))
+		module.Timeout = 10 * time.Second
+		get := func(path string) func() ([]byte, error) {
+			return func() ([]byte, error) {
+				resp, err := module.Get("http://nginx-plus-api" + path)
+				if err != nil {
+					return nil, err
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					return nil, fmt.Errorf("the module answered %d", resp.StatusCode)
+				}
+				return io.ReadAll(resp.Body)
+			}
+		}
+		sources.Requests = get("/api/wxingress/1/metrics")
+		sources.Latency = get("/api/wxingress/1/metrics/latency")
+	}
+	c := collectors.NewIngressNginxCollector(pod, namespace, class, sources)
+	if err := c.Register(registry); err != nil {
+		nl.Errorf(nl.LoggerFromContext(ctx), "Error registering ingress-nginx Prometheus metrics: %v", err)
+		return nil
+	}
+	return c
+}
+
+func createPlusAndLatencyCollectors(
+	ctx context.Context,
+	registry *prometheus.Registry,
+	constLabels map[string]string,
+	kubeClient *kubernetes.Clientset,
+	plusClient *client.NginxClient,
+) (*nginxCollector.NginxPlusCollector, metrics.SyslogListener, collectors.LatencyCollector) {
+	l := nl.LoggerFromContext(ctx)
+	var prometheusSecret *api_v1.Secret
+	var err error
+	var lc collectors.LatencyCollector
+	lc = collectors.NewLatencyFakeCollector()
+	var syslogListener metrics.SyslogListener
+	syslogListener = metrics.NewSyslogFakeServer()
+
+	if *prometheusTLSSecretName != "" {
+		prometheusSecret, err = getAndValidateSecret(kubeClient, *prometheusTLSSecretName, secrets.RoleTLS)
+		if err != nil {
+			nl.Fatalf(l, "Error trying to get the prometheus TLS secret %v: %v", *prometheusTLSSecretName, err)
+		}
+	}
+
+	var plusCollector *nginxCollector.NginxPlusCollector
+	if *enablePrometheusMetrics {
+		upstreamServerVariableLabels := []string{"service", "resource_type", "resource_name", "resource_namespace"}
+		upstreamServerPeerVariableLabelNames := []string{"pod_name"}
+		if *nginxPlus {
+			streamUpstreamServerVariableLabels := []string{"service", "resource_type", "resource_name", "resource_namespace"}
+			streamUpstreamServerPeerVariableLabelNames := []string{"pod_name"}
+
+			serverZoneVariableLabels := []string{"resource_type", "resource_name", "resource_namespace"}
+			streamServerZoneVariableLabels := []string{"resource_type", "resource_name", "resource_namespace"}
+			variableLabelNames := nginxCollector.NewVariableLabelNames(upstreamServerVariableLabels, serverZoneVariableLabels, upstreamServerPeerVariableLabelNames,
+				streamUpstreamServerVariableLabels, streamServerZoneVariableLabels, streamUpstreamServerPeerVariableLabelNames, nil)
+			plusCollector = nginxCollector.NewNginxPlusCollector(plusClient, "nginx_ingress_nginxplus", variableLabelNames, constLabels, l)
+			go metrics.RunPrometheusListenerForNginxPlus(ctx, *prometheusMetricsListenPort, plusCollector, registry, prometheusSecret)
+		} else {
+			httpClient := getSocketClient(filepath.Join(socketPath, "nginx-status.sock"))
+			client := metrics.NewNginxMetricsClient(httpClient)
+			go metrics.RunPrometheusListenerForNginx(ctx, *prometheusMetricsListenPort, client, registry, constLabels, prometheusSecret)
+		}
+		if *enableLatencyMetrics {
+			lc = collectors.NewLatencyMetricsCollector(ctx, constLabels, upstreamServerVariableLabels, upstreamServerPeerVariableLabelNames, latencyBuckets)
+			if err := lc.Register(registry); err != nil {
+				nl.Errorf(l, "Error registering Latency Prometheus metrics: %v", err)
+			}
+			syslogListener = metrics.NewLatencyMetricsListener(ctx, filepath.Join(socketPath, "nginx-syslog.sock"), lc)
+			go syslogListener.Run()
+		}
+	}
+
+	return plusCollector, syslogListener, lc
+}
+
+func createHealthProbeEndpoint(kubeClient *kubernetes.Clientset, plusClient *client.NginxClient, cnf *configs.Configurator) {
+	l := nl.LoggerFromContext(cnf.CfgParams.Context)
+	if !*enableServiceInsight {
+		return
+	}
+	var serviceInsightSecret *api_v1.Secret
+	var err error
+
+	if *serviceInsightTLSSecretName != "" {
+		serviceInsightSecret, err = getAndValidateSecret(kubeClient, *serviceInsightTLSSecretName, secrets.RoleTLS)
+		if err != nil {
+			nl.Fatalf(l, "Error trying to get the service insight TLS secret %v: %v", *serviceInsightTLSSecretName, err)
+		}
+	}
+	go healthcheck.RunHealthCheck(*serviceInsightListenPort, plusClient, cnf, serviceInsightSecret)
+}
+
+// mustProcessGlobalConfiguration calls internally os.Exit
+// if unable to parse provided global configuration.
+func mustProcessGlobalConfiguration(ctx context.Context) {
+	l := nl.LoggerFromContext(ctx)
+	if *globalConfiguration != "" {
+		_, _, err := k8s.ParseNamespaceName(*globalConfiguration)
+		if err != nil {
+			nl.Fatalf(l, "Error parsing the global-configuration argument: %v", err)
+		}
+
+		if !*enableCustomResources {
+			nl.Fatalf(l, "global-configuration flag requires -enable-custom-resources")
+		}
+	}
+}
+
+func processConfigMaps(kubeClient *kubernetes.Clientset, cfgParams *configs.ConfigParams, nginxManager nginx.Manager, templateExecutor *version1.TemplateExecutor, eventLog record.EventRecorder) *configs.ConfigParams {
+	l := nl.LoggerFromContext(cfgParams.Context)
+	if *nginxConfigMaps != "" {
+		ns, name, err := k8s.ParseNamespaceName(*nginxConfigMaps)
+		if err != nil {
+			nl.Fatalf(l, "Error parsing the nginx-configmaps argument: %v", err)
+		}
+		cfm, err := kubeClient.CoreV1().ConfigMaps(ns).Get(context.TODO(), name, meta_v1.GetOptions{})
+		if err != nil {
+			nl.Fatalf(l, "Error when getting %v: %v", *nginxConfigMaps, err)
+		}
+		cfgParams, _ = configs.ParseConfigMap(cfgParams.Context, cfm, *nginxPlus, *appProtect, *appProtectDos, *enableTLSPassthrough, *enableDirectiveAutoadjust, *enableSnippets, *ingressNginxDefaults, eventLog)
+		if cfgParams.MainServerSSLDHParamFileContent != nil {
+			fileName, err := nginxManager.CreateDHParam(*cfgParams.MainServerSSLDHParamFileContent)
+			if err != nil {
+				nl.Fatalf(l, "Configmap %s/%s: Could not update dhparams: %v", ns, name, err)
+			} else {
+				cfgParams.MainServerSSLDHParam = fileName
+			}
+		}
+		if cfgParams.MainTemplate != nil {
+			err = templateExecutor.UpdateMainTemplate(cfgParams.MainTemplate)
+			if err != nil {
+				nl.Fatalf(l, "Error updating NGINX main template: %v", err)
+			}
+		}
+		if cfgParams.IngressTemplate != nil {
+			err = templateExecutor.UpdateIngressTemplate(cfgParams.IngressTemplate)
+			if err != nil {
+				nl.Fatalf(l, "Error updating ingress template: %v", err)
+			}
+		}
+	}
+	return cfgParams
+}
+
+func processMGMTConfigMap(kubeClient *kubernetes.Clientset, mgmtCfgParams *configs.MGMTConfigParams, eventLog record.EventRecorder, pod *api_v1.Pod) *configs.MGMTConfigParams {
+	ctx := mgmtCfgParams.Context
+	var fatalErr error
+
+	ns, name, err := k8s.ParseNamespaceName(*mgmtConfigMap)
+	if err != nil {
+		logEventAndExit(ctx, eventLog, pod, configMapErrorReason, fmt.Errorf("error parsing the mgmt-configmap argument: %w", err))
+	}
+	cfm, err := kubeClient.CoreV1().ConfigMaps(ns).Get(context.TODO(), name, meta_v1.GetOptions{})
+	if err != nil {
+		logEventAndExit(ctx, eventLog, cfm, configMapErrorReason, fmt.Errorf("error when getting mgmt-configmap [%v]: %w", *mgmtConfigMap, err))
+	}
+	if mgmtCfgParams, _, fatalErr = configs.ParseMGMTConfigMap(ctx, cfm, eventLog); fatalErr != nil {
+		logEventAndExit(ctx, eventLog, cfm, secretErrorReason, fatalErr)
+	}
+	return mgmtCfgParams
+}
+
+func updateSelfWithVersionInfo(ctx context.Context, eventLog record.EventRecorder, kubeClient *kubernetes.Clientset, version, appProtectVersion, agentVersion string, nginxVersion nginx.Version, maxRetries int, waitTime time.Duration) {
+	l := nl.LoggerFromContext(ctx)
+	podUpdated := false
+
+	for i := 0; (i < maxRetries || maxRetries == 0) && !podUpdated; i++ {
+		if i > 0 {
+			time.Sleep(waitTime)
+		}
+		pod, err := kubeClient.CoreV1().Pods(os.Getenv("POD_NAMESPACE")).Get(context.TODO(), os.Getenv("POD_NAME"), meta_v1.GetOptions{})
+		if err != nil {
+			nl.Errorf(l, "Error getting pod on attempt %d of %d: %v", i+1, maxRetries, err)
+			continue
+		}
+
+		// Copy pod and update the labels.
+		newPod := pod.DeepCopy()
+		labels := newPod.ObjectMeta.Labels
+		if labels == nil {
+			labels = make(map[string]string)
+		}
+
+		labels[nginxVersionLabel] = nginxVersion.Format()
+		labels[versionLabel] = strings.TrimPrefix(version, "v")
+		if appProtectVersion != "" {
+			labels[appProtectVersionLabel] = appProtectVersion
+		}
+		if agentVersion != "" {
+			labels[agentVersionLabel] = agentVersion
+		}
+		newPod.ObjectMeta.Labels = labels
+
+		_, err = kubeClient.CoreV1().Pods(newPod.ObjectMeta.Namespace).Update(context.TODO(), newPod, meta_v1.UpdateOptions{})
+		if err != nil {
+			nl.Errorf(l, "Error updating pod with labels on attempt %d of %d: %v", i+1, maxRetries, err)
+			continue
+		}
+
+		labelsString := new(bytes.Buffer)
+		for key, value := range labels {
+			fmt.Fprintf(labelsString, "%s=\"%s\", ", key, value)
+		}
+		eventLog.Eventf(newPod, api_v1.EventTypeNormal, nl.EventReasonUpdatePodLabel, "Successfully added version labels, %s", strings.TrimRight(labelsString.String(), ", "))
+		nl.Infof(l, "Pod label updated: %s", pod.ObjectMeta.Name)
+		podUpdated = true
+	}
+
+	if !podUpdated {
+		nl.Errorf(l, "Failed to update pod labels after %d attempts", maxRetries)
+	}
+}
+
+func createAndValidateHeadlessService(ctx context.Context, kubeClient kubernetes.Interface, cfgParams *configs.ConfigParams, controllerNamespace string, pod *api_v1.Pod) error {
+	l := nl.LoggerFromContext(ctx)
+	owner := pod.ObjectMeta.OwnerReferences[0]
+	name := owner.Name
+	if strings.ToLower(owner.Kind) == "replicaset" {
+		if dash := strings.LastIndex(name, "-"); dash != -1 {
+			name = name[:dash] // Remove hash
+		}
+	}
+	combinedDeployment := fmt.Sprintf("%s-%s", name, strings.ToLower(owner.Kind))
+	cfgParams.ZoneSync.Domain = combinedDeployment
+	err := createHeadlessService(l, kubeClient, controllerNamespace, fmt.Sprintf("%s-hl", combinedDeployment), *nginxConfigMaps, pod)
+	if err != nil {
+		return fmt.Errorf("failed to create headless Service: %w", err)
+	}
+	return nil
+}
+
+func createHeadlessService(l *slog.Logger, kubeClient kubernetes.Interface, controllerNamespace string, svcName string, configMapNamespacedName string, pod *api_v1.Pod) error {
+	configMapName := strings.SplitN(configMapNamespacedName, "/", 2)
+	if len(configMapName) != 2 {
+		return fmt.Errorf("wrong syntax for ConfigMap: %q", configMapNamespacedName)
+	}
+
+	configMapObj, err := kubeClient.CoreV1().ConfigMaps(configMapName[0]).Get(context.Background(), configMapName[1], meta_v1.GetOptions{})
+	if err != nil {
+		nl.Infof(l, "error getting ConfigMap %s/%s: %v", configMapName[0], configMapName[1], err)
+		return err
+	}
+
+	// Create uniform selector labels across deployment types (ReplicaSet, DaemonSet, StatefulSet)
+	requiredSelectors, err := k8s.CreateUniformSelectorsFromController(kubeClient, pod)
+	if err != nil {
+		return err
+	}
+	requiredOwnerReferences := []meta_v1.OwnerReference{
+		{
+			APIVersion:         "v1",
+			Kind:               "ConfigMap",
+			Name:               configMapObj.Name,
+			UID:                configMapObj.UID,
+			Controller:         new(true),
+			BlockOwnerDeletion: new(true),
+		},
+	}
+	existing, err := kubeClient.CoreV1().Services(controllerNamespace).Get(context.Background(), svcName, meta_v1.GetOptions{})
+	if err == nil && existing != nil {
+		needsUpdate := false
+		if !reflect.DeepEqual(existing.Spec.Selector, requiredSelectors) {
+			existing.Spec.Selector = requiredSelectors
+			needsUpdate = true
+		}
+		if !reflect.DeepEqual(existing.OwnerReferences, requiredOwnerReferences) {
+			existing.OwnerReferences = requiredOwnerReferences
+			needsUpdate = true
+		}
+		if needsUpdate {
+			nl.Infof(l, "Headless service %s/%s exists and needs update. Updating...", controllerNamespace, svcName)
+			_, updateErr := kubeClient.CoreV1().Services(controllerNamespace).Update(context.Background(), existing, meta_v1.UpdateOptions{})
+			if updateErr != nil {
+				return fmt.Errorf("failed to update headless service %s/%s: %w", controllerNamespace, svcName, updateErr)
+			}
+			nl.Infof(l, "Successfully updated headless service %s/%s.", controllerNamespace, svcName)
+		}
+		return nil
+	}
+
+	nl.Infof(l, "Headless service %s/%s not found. Creating...", controllerNamespace, svcName)
+	svc := &api_v1.Service{
+		ObjectMeta: meta_v1.ObjectMeta{
+			Name:            svcName,
+			Namespace:       controllerNamespace,
+			OwnerReferences: requiredOwnerReferences,
+		},
+		Spec: api_v1.ServiceSpec{
+			ClusterIP: api_v1.ClusterIPNone,
+			Selector:  requiredSelectors,
+		},
+	}
+
+	createdSvc, createErr := kubeClient.CoreV1().Services(controllerNamespace).Create(context.Background(), svc, meta_v1.CreateOptions{})
+	if createErr != nil {
+		return createErr
+	}
+
+	nl.Infof(l, "successfully created headless service: %s/%s", controllerNamespace, createdSvc.Name)
+	return nil
+}
+
+func logEventAndExit(ctx context.Context, eventLog record.EventRecorder, obj pkg_runtime.Object, reason string, err error) {
+	l := nl.LoggerFromContext(ctx)
+	eventLog.Event(obj, api_v1.EventTypeWarning, reason, err.Error())
+	time.Sleep(fatalEventFlushTime) // wait for the event to be flushed
+	nl.Fatal(l, err.Error())
+}
+
+func initLogger(logFormat string, level slog.Level, out io.Writer) context.Context {
+	programLevel := new(slog.LevelVar) // Info by default
+	var h slog.Handler
+
+	opts := &slog.HandlerOptions{
+		Level:     programLevel,
+		AddSource: true,
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.SourceKey {
+				if src, ok := a.Value.Any().(*slog.Source); ok {
+					src.Function = ""
+					src.File = filepath.Base(src.File)
+					a.Value = slog.AnyValue(src)
+				}
+			}
+			// Handle custom timestamp formatting
+			if a.Key == slog.TimeKey {
+				if t, ok := a.Value.Any().(time.Time); ok {
+					switch logFormat {
+					case "json-unix", "text-unix":
+						// Unix timestamp in seconds
+						return slog.Attr{
+							Key:   slog.TimeKey,
+							Value: slog.Int64Value(t.Unix()),
+						}
+					case "json-unix-ms", "text-unix-ms":
+						// Unix timestamp with milliseconds
+						return slog.Attr{
+							Key:   slog.TimeKey,
+							Value: slog.Int64Value(t.UnixMilli()),
+						}
+					default:
+						// Default timestamp format (keep original time key and format eg. RFC3339)
+						return a
+					}
+				}
+			}
+			return a
+		},
+	}
+
+	switch {
+	case logFormat == "glog":
+		h = nic_glog.New(out, &nic_glog.Options{Level: programLevel})
+	case strings.HasPrefix(logFormat, "json"):
+		h = slog.NewJSONHandler(out, opts)
+	case strings.HasPrefix(logFormat, "text"):
+		h = slog.NewTextHandler(out, opts)
+	default:
+		h = nic_glog.New(out, &nic_glog.Options{Level: programLevel})
+	}
+	l := slog.New(h)
+	slog.SetDefault(l)
+	c := context.Background()
+
+	programLevel.Set(level)
+
+	return nl.ContextWithLogger(c, l)
+}

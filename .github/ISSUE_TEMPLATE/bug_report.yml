@@ -1,0 +1,63 @@
+name: Bug report
+description: Something in wxingress does not work as documented.
+labels: ["bug", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Questions and support
+        requests belong in [Discussions](https://github.com/wx-one/wxingress/discussions).
+
+        **Do not report security vulnerabilities here** - see the
+        [security policy](https://github.com/wx-one/wxingress/blob/main/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: wxingress version
+      description: The image tag or Helm chart version you run (for example 5.7.1-wx5).
+    validations:
+      required: true
+  - type: input
+    id: kubernetes
+    attributes:
+      label: Kubernetes version and platform
+      description: For example 1.34 on kind, EKS, GKE, AKS, k3s, OpenShift.
+    validations:
+      required: true
+  - type: dropdown
+    id: resources
+    attributes:
+      label: Affected resources
+      multiple: true
+      options:
+        - Ingress
+        - VirtualServer / VirtualServerRoute
+        - TransportServer
+        - Policy
+        - Gateway API
+        - Helm chart
+        - Other
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps-to-reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Manifests and Helm values that reproduce the problem, trimmed to the minimum.
+      placeholder: |
+        1. Install with `helm install ... --set ...`
+        2. Apply the manifest below
+        3. curl ... returns ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Controller logs and, where relevant, the generated nginx configuration. Remove secrets before posting.
+      render: shell

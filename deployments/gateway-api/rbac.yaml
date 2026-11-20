@@ -1,0 +1,64 @@
+# What the controller needs for -enable-gateway-api, in addition to rbac/rbac.yaml.
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: nginx-ingress-gateway-api
+rules:
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - gatewayclasses
+  - gateways
+  - httproutes
+  - grpcroutes
+  - tlsroutes
+  - tcproutes
+  - udproutes
+  - referencegrants
+  verbs:
+  - list
+  - watch
+  - get
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - gatewayclasses/status
+  - gateways/status
+  - httproutes/status
+  - grpcroutes/status
+  - tlsroutes/status
+  - tcproutes/status
+  - udproutes/status
+  verbs:
+  - update
+# the Services of the Gateways with addresses of their own, in the Gateways'
+# namespaces, and their EndpointSlices with the controller's pods
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - create
+  - update
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: nginx-ingress-gateway-api
+subjects:
+- kind: ServiceAccount
+  name: nginx-ingress
+  namespace: nginx-ingress
+roleRef:
+  kind: ClusterRole
+  name: nginx-ingress-gateway-api
+  apiGroup: rbac.authorization.k8s.io

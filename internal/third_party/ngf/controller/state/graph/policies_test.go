@@ -1,0 +1,5971 @@
+package graph
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/go-logr/logr"
+	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	v1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPIv1alpha1 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	ngfAPIv1alpha2 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha2"
+	wafv1 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/waf/v1"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/policies/policiesfakes"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/conditions"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/secrets"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/validation"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/waf/fetch"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/waf/fetch/fetchfakes"
+	s3fetch "github.com/wx-one/wxingress/internal/third_party/ngf/framework/waf/fetch/s3"
+)
+
+var testNs = "test"
+
+func TestAttachPolicies(t *testing.T) {
+	t.Parallel()
+
+	policyGVK := schema.GroupVersionKind{Group: "Group", Version: "Version", Kind: "Policy"}
+
+	createPolicy := func(targetRefsNames []string, refKind v1.Kind) *Policy {
+		targetRefs := make([]PolicyTargetRef, 0, len(targetRefsNames))
+		for _, name := range targetRefsNames {
+			targetRefs = append(targetRefs, PolicyTargetRef{
+				Kind:   refKind,
+				Group:  v1.GroupName,
+				Nsname: types.NamespacedName{Namespace: testNs, Name: name},
+			})
+		}
+		return &Policy{
+			Valid: true,
+			Source: &policiesfakes.PolicyMock{
+				GetPolicyStatusFunc: func() v1.PolicyStatus { return v1.PolicyStatus{} },
+				GetObjectKindFunc: func() schema.ObjectKind {
+					return &policiesfakes.ObjectKindMock{
+						GroupVersionKindFunc: func() schema.GroupVersionKind { return policyGVK },
+					}
+				},
+			},
+			TargetRefs: targetRefs,
+		}
+	}
+
+	createRouteKey := func(name string, routeType RouteType) RouteKey {
+		return RouteKey{
+			NamespacedName: types.NamespacedName{Name: name, Namespace: testNs},
+			RouteType:      routeType,
+		}
+	}
+
+	createRoutesForGraph := func(routes map[string]RouteType) map[RouteKey]*L7Route {
+		routesMap := make(map[RouteKey]*L7Route, len(routes))
+		for routeName, routeType := range routes {
+			routesMap[createRouteKey(routeName, routeType)] = &L7Route{
+				Source: &v1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      routeName,
+						Namespace: testNs,
+					},
+				},
+				ParentRefs: []ParentRef{
+					{
+						Attachment: &ParentRefAttachmentStatus{
+							Attached: true,
+						},
+					},
+				},
+				Valid:      true,
+				Attachable: true,
+			}
+		}
+		return routesMap
+	}
+
+	expectNoGatewayPolicyAttachment := func(g *WithT, graph *Graph) {
+		for _, gw := range graph.Gateways {
+			if gw != nil {
+				g.Expect(gw.Policies).To(BeNil())
+			}
+		}
+	}
+
+	expectNoRoutePolicyAttachment := func(g *WithT, graph *Graph) {
+		for _, r := range graph.Routes {
+			g.Expect(r.Policies).To(BeNil())
+		}
+	}
+
+	expectNoSvcPolicyAttachment := func(g *WithT, graph *Graph) {
+		for _, r := range graph.ReferencedServices {
+			g.Expect(r.Policies).To(BeNil())
+		}
+	}
+
+	expectGatewayPolicyAttachment := func(g *WithT, graph *Graph) {
+		for _, gw := range graph.Gateways {
+			if gw != nil {
+				g.Expect(gw.Policies).To(HaveLen(1))
+			}
+		}
+	}
+
+	expectRoutePolicyAttachment := func(g *WithT, graph *Graph) {
+		for _, r := range graph.Routes {
+			g.Expect(r.Policies).To(HaveLen(1))
+		}
+	}
+
+	expectSvcPolicyAttachment := func(g *WithT, graph *Graph) {
+		for _, r := range graph.ReferencedServices {
+			g.Expect(r.Policies).To(HaveLen(1))
+		}
+	}
+
+	expectNoAttachmentList := []func(g *WithT, graph *Graph){
+		expectNoGatewayPolicyAttachment,
+		expectNoSvcPolicyAttachment,
+		expectNoRoutePolicyAttachment,
+	}
+
+	expectAllAttachmentList := []func(g *WithT, graph *Graph){
+		expectGatewayPolicyAttachment,
+		expectSvcPolicyAttachment,
+		expectRoutePolicyAttachment,
+	}
+
+	getPolicies := func() map[PolicyKey]*Policy {
+		return map[PolicyKey]*Policy{
+			createTestPolicyKey(policyGVK, "gw-policy1"): createPolicy([]string{"gateway", "gateway1"}, kinds.Gateway),
+			createTestPolicyKey(policyGVK, "route-policy1"): createPolicy(
+				[]string{"hr1-route", "hr2-route"},
+				kinds.HTTPRoute,
+			),
+			createTestPolicyKey(policyGVK, "grpc-route-policy1"): createPolicy([]string{"grpc-route"}, kinds.GRPCRoute),
+			createTestPolicyKey(policyGVK, "svc-policy"):         createPolicy([]string{"svc-1"}, kinds.Service),
+		}
+	}
+
+	getRoutes := func() map[RouteKey]*L7Route {
+		return createRoutesForGraph(
+			map[string]RouteType{
+				"hr1-route":  RouteTypeHTTP,
+				"hr2-route":  RouteTypeHTTP,
+				"grpc-route": RouteTypeGRPC,
+			},
+		)
+	}
+
+	getGateways := func() map[types.NamespacedName]*Gateway {
+		return map[types.NamespacedName]*Gateway{
+			{Namespace: testNs, Name: "gateway"}: {
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "gateway",
+						Namespace: testNs,
+					},
+				},
+				Valid:               true,
+				EffectiveNginxProxy: &EffectiveNginxProxy{},
+			},
+			{Namespace: testNs, Name: "gateway1"}: {
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "gateway1",
+						Namespace: testNs,
+					},
+				},
+				Valid:               true,
+				EffectiveNginxProxy: &EffectiveNginxProxy{},
+			},
+		}
+	}
+
+	getServices := func() map[types.NamespacedName]*ReferencedService {
+		return map[types.NamespacedName]*ReferencedService{
+			{Namespace: testNs, Name: "svc-1"}: {
+				GatewayNsNames: map[types.NamespacedName]struct{}{
+					{Namespace: testNs, Name: "gateway"}:  {},
+					{Namespace: testNs, Name: "gateway1"}: {},
+				},
+				Policies: nil,
+			},
+		}
+	}
+
+	tests := []struct {
+		gateway     map[types.NamespacedName]*Gateway
+		routes      map[RouteKey]*L7Route
+		svcs        map[types.NamespacedName]*ReferencedService
+		ngfPolicies map[PolicyKey]*Policy
+		name        string
+		expects     []func(g *WithT, graph *Graph)
+	}{
+		{
+			name:        "nil Gateway; no policies attach",
+			routes:      getRoutes(),
+			ngfPolicies: getPolicies(),
+			expects:     expectNoAttachmentList,
+		},
+		{
+			name:        "nil Routes; gateway and service policies attach",
+			gateway:     getGateways(),
+			svcs:        getServices(),
+			ngfPolicies: getPolicies(),
+			expects: []func(g *WithT, graph *Graph){
+				expectGatewayPolicyAttachment,
+				expectSvcPolicyAttachment,
+				expectNoRoutePolicyAttachment,
+			},
+		},
+		{
+			name:        "nil ReferencedServices; gateway and route policies attach",
+			routes:      getRoutes(),
+			ngfPolicies: getPolicies(),
+			gateway:     getGateways(),
+			expects: []func(g *WithT, graph *Graph){
+				expectGatewayPolicyAttachment,
+				expectRoutePolicyAttachment,
+				expectNoSvcPolicyAttachment,
+			},
+		},
+		{
+			name:        "all policies attach",
+			routes:      getRoutes(),
+			svcs:        getServices(),
+			ngfPolicies: getPolicies(),
+			gateway:     getGateways(),
+			expects:     expectAllAttachmentList,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			graph := &Graph{
+				Gateways:           test.gateway,
+				Routes:             test.routes,
+				ReferencedServices: test.svcs,
+				NGFPolicies:        test.ngfPolicies,
+			}
+
+			graph.attachPolicies(&policiesfakes.FakeValidator{}, "nginx-gateway", logr.Discard())
+			for _, expect := range test.expects {
+				expect(g, graph)
+			}
+		})
+	}
+}
+
+func TestAttachPolicyToRoute(t *testing.T) {
+	t.Parallel()
+	routeNsName := types.NamespacedName{Namespace: testNs, Name: "hr-route"}
+
+	createPolicyMock := func() *policiesfakes.PolicyMock {
+		return &policiesfakes.PolicyMock{
+			GetNameFunc:         func() string { return "policy" },
+			GetNamespaceFunc:    func() string { return testNs },
+			GetObjectKindFunc:   func() schema.ObjectKind { return nil },
+			GetPolicyStatusFunc: func() v1.PolicyStatus { return v1.PolicyStatus{} },
+		}
+	}
+
+	createRoute := func(routeType RouteType, valid, attachable, parentRefs bool) *L7Route {
+		route := &L7Route{
+			Source: &v1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      routeNsName.Name,
+					Namespace: routeNsName.Namespace,
+				},
+			},
+			Valid:      valid,
+			Attachable: attachable,
+			RouteType:  routeType,
+		}
+
+		if parentRefs {
+			route.ParentRefs = []ParentRef{
+				{
+					Kind: kinds.Gateway,
+					Attachment: &ParentRefAttachmentStatus{
+						Attached: true,
+					},
+				},
+			}
+		}
+
+		return route
+	}
+
+	createGRPCRoute := func(valid, attachable, parentRefs bool) *L7Route {
+		return createRoute(RouteTypeGRPC, valid, attachable, parentRefs)
+	}
+
+	createHTTPRoute := func(valid, attachable, parentRefs bool) *L7Route {
+		return createRoute(RouteTypeHTTP, valid, attachable, parentRefs)
+	}
+
+	createExpAncestor := func(kind v1.Kind) v1.ParentReference {
+		return v1.ParentReference{
+			Group:     helpers.GetPointer[v1.Group](v1.GroupName),
+			Kind:      helpers.GetPointer(kind),
+			Namespace: (*v1.Namespace)(&routeNsName.Namespace),
+			Name:      v1.ObjectName(routeNsName.Name),
+		}
+	}
+
+	validatorError := &policiesfakes.FakeValidator{
+		ValidateGlobalSettingsStub: func(_ policies.Policy, gs *policies.GlobalSettings) []conditions.Condition {
+			if !gs.TelemetryEnabled {
+				return []conditions.Condition{
+					conditions.NewPolicyNotAcceptedNginxProxyNotSet(conditions.PolicyMessageTelemetryNotEnabled),
+				}
+			}
+			return nil
+		},
+	}
+
+	tests := []struct {
+		route        *L7Route
+		policy       *Policy
+		validator    policies.Validator
+		name         string
+		expAncestors []PolicyAncestor
+		expAttached  bool
+	}{
+		{
+			name:      "policy attaches to http route",
+			route:     createHTTPRoute(true /*valid*/, true /*attachable*/, true /*parentRefs*/),
+			validator: &policiesfakes.FakeValidator{},
+			policy:    &Policy{Source: createPolicyMock()},
+			expAncestors: []PolicyAncestor{
+				{Ancestor: createExpAncestor(kinds.HTTPRoute)},
+			},
+			expAttached: true,
+		},
+		{
+			name:      "policy attaches to grpc route",
+			route:     createGRPCRoute(true /*valid*/, true /*attachable*/, true /*parentRefs*/),
+			validator: &policiesfakes.FakeValidator{},
+			policy:    &Policy{Source: createPolicyMock()},
+			expAncestors: []PolicyAncestor{
+				{Ancestor: createExpAncestor(kinds.GRPCRoute)},
+			},
+			expAttached: true,
+		},
+		{
+			name:      "attachment with existing ancestor",
+			route:     createHTTPRoute(true /*valid*/, true /*attachable*/, true /*parentRefs*/),
+			validator: &policiesfakes.FakeValidator{},
+			policy: &Policy{
+				Source: createPolicyMock(),
+				Ancestors: []PolicyAncestor{
+					{Ancestor: createExpAncestor(kinds.HTTPRoute)},
+				},
+			},
+			expAncestors: []PolicyAncestor{
+				{Ancestor: createExpAncestor(kinds.HTTPRoute)},
+				{Ancestor: createExpAncestor(kinds.HTTPRoute)},
+			},
+			expAttached: true,
+		},
+		{
+			name:      "no attachment; unattachable route",
+			route:     createHTTPRoute(true /*valid*/, false /*attachable*/, true /*parentRefs*/),
+			validator: &policiesfakes.FakeValidator{},
+			policy:    &Policy{Source: createPolicyMock()},
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor:   createExpAncestor(kinds.HTTPRoute),
+					Conditions: []conditions.Condition{conditions.NewPolicyTargetNotFound("The TargetRef is invalid")},
+				},
+			},
+			expAttached: false,
+		},
+		{
+			name:      "no attachment; missing parentRefs",
+			route:     createHTTPRoute(true /*valid*/, true /*attachable*/, false /*parentRefs*/),
+			validator: &policiesfakes.FakeValidator{},
+			policy:    &Policy{Source: createPolicyMock()},
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor:   createExpAncestor(kinds.HTTPRoute),
+					Conditions: []conditions.Condition{conditions.NewPolicyTargetNotFound("The TargetRef is invalid")},
+				},
+			},
+			expAttached: false,
+		},
+		{
+			name:      "no attachment; invalid route",
+			route:     createHTTPRoute(false /*valid*/, true /*attachable*/, true /*parentRefs*/),
+			validator: &policiesfakes.FakeValidator{},
+			policy:    &Policy{Source: createPolicyMock()},
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor:   createExpAncestor(kinds.HTTPRoute),
+					Conditions: []conditions.Condition{conditions.NewPolicyTargetNotFound("The TargetRef is invalid")},
+				},
+			},
+			expAttached: false,
+		},
+		{
+			name:         "no attachment; max ancestors",
+			route:        createHTTPRoute(true /*valid*/, true /*attachable*/, true /*parentRefs*/),
+			validator:    &policiesfakes.FakeValidator{},
+			policy:       &Policy{Source: createTestPolicyWithAncestors(16)},
+			expAncestors: nil,
+			expAttached:  false,
+		},
+		{
+			name: "invalid for some ParentRefs",
+			route: &L7Route{
+				Source: &v1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      routeNsName.Name,
+						Namespace: routeNsName.Namespace,
+					},
+				},
+				Valid:      true,
+				Attachable: true,
+				RouteType:  RouteTypeHTTP,
+				ParentRefs: []ParentRef{
+					{
+						Kind:           kinds.Gateway,
+						NamespacedName: types.NamespacedName{Name: "gateway1", Namespace: "test"},
+						EffectiveNginxProxy: &EffectiveNginxProxy{
+							Telemetry: &ngfAPIv1alpha2.Telemetry{
+								Exporter: &ngfAPIv1alpha2.TelemetryExporter{
+									Endpoint: helpers.GetPointer("test-endpoint"),
+								},
+							},
+						},
+						Attachment: &ParentRefAttachmentStatus{
+							Attached: true,
+						},
+					},
+					{
+						Kind:                kinds.Gateway,
+						NamespacedName:      types.NamespacedName{Name: "gateway2", Namespace: "test"},
+						EffectiveNginxProxy: &EffectiveNginxProxy{},
+						Attachment: &ParentRefAttachmentStatus{
+							Attached: true,
+						},
+					},
+				},
+			},
+			validator: validatorError,
+			policy: &Policy{
+				Source:             createPolicyMock(),
+				InvalidForGateways: map[types.NamespacedName]struct{}{},
+			},
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor: createExpAncestor(kinds.HTTPRoute),
+					Conditions: []conditions.Condition{
+						conditions.NewPolicyNotAcceptedNginxProxyNotSet(conditions.PolicyMessageTelemetryNotEnabled),
+					},
+				},
+			},
+			expAttached: true,
+		},
+		{
+			name: "invalid for all ParentRefs",
+			route: &L7Route{
+				Source: &v1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      routeNsName.Name,
+						Namespace: routeNsName.Namespace,
+					},
+				},
+				Valid:      true,
+				Attachable: true,
+				RouteType:  RouteTypeHTTP,
+				ParentRefs: []ParentRef{
+					{
+						Kind:                kinds.Gateway,
+						NamespacedName:      types.NamespacedName{Name: "gateway1", Namespace: "test"},
+						EffectiveNginxProxy: &EffectiveNginxProxy{},
+						Attachment: &ParentRefAttachmentStatus{
+							Attached: true,
+						},
+					},
+				},
+			},
+			validator: validatorError,
+			policy: &Policy{
+				Source:             createPolicyMock(),
+				InvalidForGateways: map[types.NamespacedName]struct{}{},
+			},
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor: createExpAncestor(kinds.HTTPRoute),
+					Conditions: []conditions.Condition{
+						conditions.NewPolicyNotAcceptedNginxProxyNotSet(conditions.PolicyMessageTelemetryNotEnabled),
+					},
+				},
+			},
+			expAttached: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			attachPolicyToRoute(test.policy, test.route, test.validator, "nginx-gateway", logr.Discard())
+
+			if test.expAttached {
+				g.Expect(test.route.Policies).To(HaveLen(1))
+			} else {
+				g.Expect(test.route.Policies).To(BeEmpty())
+			}
+
+			g.Expect(test.policy.Ancestors).To(BeEquivalentTo(test.expAncestors))
+		})
+	}
+}
+
+func TestAttachPolicyToGateway(t *testing.T) {
+	t.Parallel()
+	gatewayNsName := types.NamespacedName{Namespace: testNs, Name: "gateway"}
+	gateway2NsName := types.NamespacedName{Namespace: testNs, Name: "gateway2"}
+
+	newGatewayMap := func(valid bool, nsname []types.NamespacedName) map[types.NamespacedName]*Gateway {
+		gws := make(map[types.NamespacedName]*Gateway)
+		for _, name := range nsname {
+			gws[name] = &Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      name.Name,
+						Namespace: name.Namespace,
+					},
+				},
+				Valid:               valid,
+				EffectiveNginxProxy: &EffectiveNginxProxy{},
+			}
+		}
+		return gws
+	}
+
+	newGatewayMapWithNginxProxy := func(
+		valid bool,
+		nsname []types.NamespacedName,
+		effectiveNginxProxy *EffectiveNginxProxy,
+	) map[types.NamespacedName]*Gateway {
+		gws := make(map[types.NamespacedName]*Gateway)
+		for _, name := range nsname {
+			gws[name] = &Gateway{
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      name.Name,
+						Namespace: name.Namespace,
+					},
+				},
+				Valid:               valid,
+				EffectiveNginxProxy: effectiveNginxProxy,
+			}
+		}
+		return gws
+	}
+
+	validatorError := &policiesfakes.FakeValidator{
+		ValidateGlobalSettingsStub: func(_ policies.Policy, gs *policies.GlobalSettings) []conditions.Condition {
+			if !gs.TelemetryEnabled {
+				return []conditions.Condition{
+					conditions.NewPolicyNotAcceptedNginxProxyNotSet(conditions.PolicyMessageTelemetryNotEnabled),
+				}
+			}
+			return nil
+		},
+	}
+
+	validatorNoError := &policiesfakes.FakeValidator{
+		ValidateGlobalSettingsStub: func(_ policies.Policy, _ *policies.GlobalSettings) []conditions.Condition {
+			return nil
+		},
+	}
+
+	tests := []struct {
+		validator    validation.PolicyValidator
+		policy       *Policy
+		gws          map[types.NamespacedName]*Gateway
+		name         string
+		expAncestors []PolicyAncestor
+		expAttached  bool
+	}{
+		{
+			name: "attached",
+			policy: &Policy{
+				Source: &policiesfakes.PolicyMock{
+					GetObjectKindFunc:   func() schema.ObjectKind { return nil },
+					GetPolicyStatusFunc: func() v1.PolicyStatus { return v1.PolicyStatus{} },
+				},
+				TargetRefs: []PolicyTargetRef{
+					{
+						Nsname: gatewayNsName,
+						Kind:   kinds.Gateway,
+					},
+				},
+				InvalidForGateways: map[types.NamespacedName]struct{}{},
+			},
+			gws: newGatewayMap(true, []types.NamespacedName{gatewayNsName}),
+			expAncestors: []PolicyAncestor{
+				{Ancestor: getGatewayParentRef(gatewayNsName)},
+			},
+			expAttached: true,
+			validator:   validatorNoError,
+		},
+		{
+			name: "attached with existing ancestor",
+			policy: &Policy{
+				Source: &policiesfakes.PolicyMock{
+					GetObjectKindFunc:   func() schema.ObjectKind { return nil },
+					GetPolicyStatusFunc: func() v1.PolicyStatus { return v1.PolicyStatus{} },
+				},
+				TargetRefs: []PolicyTargetRef{
+					{
+						Nsname: gatewayNsName,
+						Kind:   kinds.Gateway,
+					},
+				},
+				InvalidForGateways: map[types.NamespacedName]struct{}{},
+				Ancestors: []PolicyAncestor{
+					{Ancestor: getGatewayParentRef(gatewayNsName)},
+				},
+			},
+			gws: newGatewayMap(true, []types.NamespacedName{gatewayNsName}),
+			expAncestors: []PolicyAncestor{
+				{Ancestor: getGatewayParentRef(gatewayNsName)},
+			},
+			expAttached: true,
+			validator:   validatorNoError,
+		},
+		{
+			name: "not attached; gateway is not found",
+			policy: &Policy{
+				Source: &policiesfakes.PolicyMock{
+					GetObjectKindFunc:   func() schema.ObjectKind { return nil },
+					GetPolicyStatusFunc: func() v1.PolicyStatus { return v1.PolicyStatus{} },
+				},
+				TargetRefs: []PolicyTargetRef{
+					{
+						Nsname: gateway2NsName,
+						Kind:   kinds.Gateway,
+					},
+				},
+				InvalidForGateways: map[types.NamespacedName]struct{}{},
+			},
+			gws: newGatewayMap(true, []types.NamespacedName{gatewayNsName}),
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor:   getGatewayParentRef(gateway2NsName),
+					Conditions: []conditions.Condition{conditions.NewPolicyTargetNotFound("The TargetRef is not found")},
+				},
+			},
+			expAttached: false,
+			validator:   validatorNoError,
+		},
+		{
+			name: "not attached; invalid gateway",
+			policy: &Policy{
+				Source: &policiesfakes.PolicyMock{
+					GetObjectKindFunc:   func() schema.ObjectKind { return nil },
+					GetPolicyStatusFunc: func() v1.PolicyStatus { return v1.PolicyStatus{} },
+				},
+				TargetRefs: []PolicyTargetRef{
+					{
+						Nsname: gatewayNsName,
+						Kind:   kinds.Gateway,
+					},
+				},
+				InvalidForGateways: map[types.NamespacedName]struct{}{},
+			},
+			gws: newGatewayMap(false, []types.NamespacedName{gatewayNsName}),
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor:   getGatewayParentRef(gatewayNsName),
+					Conditions: []conditions.Condition{conditions.NewPolicyTargetNotFound("The TargetRef is invalid")},
+				},
+			},
+			expAttached: false,
+			validator:   validatorNoError,
+		},
+		{
+			name: "not attached; max ancestors",
+			policy: &Policy{
+				Source: createTestPolicyWithAncestors(16),
+				TargetRefs: []PolicyTargetRef{
+					{
+						Nsname: gatewayNsName,
+						Kind:   kinds.Gateway,
+					},
+				},
+				InvalidForGateways: map[types.NamespacedName]struct{}{},
+			},
+			gws:          newGatewayMap(true, []types.NamespacedName{gatewayNsName}),
+			expAncestors: nil,
+			expAttached:  false,
+			validator:    validatorNoError,
+		},
+		{
+			name: "not attached; global settings validation fails",
+			policy: &Policy{
+				Source: &policiesfakes.PolicyMock{
+					GetObjectKindFunc:   func() schema.ObjectKind { return nil },
+					GetPolicyStatusFunc: func() v1.PolicyStatus { return v1.PolicyStatus{} },
+				},
+				TargetRefs: []PolicyTargetRef{
+					{
+						Nsname: gatewayNsName,
+						Kind:   "Gateway",
+					},
+				},
+				InvalidForGateways: map[types.NamespacedName]struct{}{},
+			},
+			gws: newGatewayMapWithNginxProxy(true, []types.NamespacedName{gatewayNsName}, &EffectiveNginxProxy{}),
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor: getGatewayParentRef(gatewayNsName),
+					Conditions: []conditions.Condition{
+						conditions.NewPolicyNotAcceptedNginxProxyNotSet(conditions.PolicyMessageTelemetryNotEnabled),
+					},
+				},
+			},
+			expAttached: false,
+			validator:   validatorError,
+		},
+		{
+			name: "attached; global settings validation passes",
+			policy: &Policy{
+				Source: &policiesfakes.PolicyMock{
+					GetObjectKindFunc:   func() schema.ObjectKind { return nil },
+					GetPolicyStatusFunc: func() v1.PolicyStatus { return v1.PolicyStatus{} },
+				},
+				TargetRefs: []PolicyTargetRef{
+					{
+						Nsname: gatewayNsName,
+						Kind:   "Gateway",
+					},
+				},
+				InvalidForGateways: map[types.NamespacedName]struct{}{},
+			},
+			gws: newGatewayMapWithNginxProxy(true, []types.NamespacedName{gatewayNsName}, &EffectiveNginxProxy{
+				Telemetry: &ngfAPIv1alpha2.Telemetry{
+					Exporter: &ngfAPIv1alpha2.TelemetryExporter{
+						Endpoint: helpers.GetPointer("test-endpoint"),
+					},
+				},
+			}),
+			expAncestors: []PolicyAncestor{
+				{Ancestor: getGatewayParentRef(gatewayNsName)},
+			},
+			expAttached: true,
+			validator:   validatorError,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			attachPolicyToGateway(
+				test.policy,
+				test.policy.TargetRefs[0],
+				test.gws, nil,
+				"nginx-gateway",
+				logr.Discard(),
+				test.validator,
+			)
+
+			if test.expAttached {
+				for _, gw := range test.gws {
+					g.Expect(gw.Policies).To(HaveLen(1))
+				}
+			} else {
+				for _, gw := range test.gws {
+					g.Expect(gw.Policies).To(BeEmpty())
+				}
+			}
+
+			g.Expect(test.policy.Ancestors).To(BeEquivalentTo(test.expAncestors))
+		})
+	}
+}
+
+func TestAttachPolicyToService(t *testing.T) {
+	t.Parallel()
+
+	gwNsname := types.NamespacedName{Namespace: testNs, Name: "gateway"}
+	gw2Nsname := types.NamespacedName{Namespace: testNs, Name: "gateway2"}
+
+	newPolicyMock := func() *policiesfakes.PolicyMock {
+		return &policiesfakes.PolicyMock{
+			GetObjectKindFunc:   func() schema.ObjectKind { return nil },
+			GetPolicyStatusFunc: func() v1.PolicyStatus { return v1.PolicyStatus{} },
+		}
+	}
+
+	getGateway := func(valid bool) map[types.NamespacedName]*Gateway {
+		return map[types.NamespacedName]*Gateway{
+			gwNsname: {
+				Source: &v1.Gateway{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      gwNsname.Name,
+						Namespace: gwNsname.Namespace,
+					},
+				},
+				Valid: valid,
+			},
+		}
+	}
+
+	tests := []struct {
+		policy       *Policy
+		svc          *ReferencedService
+		gws          map[types.NamespacedName]*Gateway
+		name         string
+		expAncestors []PolicyAncestor
+		expAttached  bool
+	}{
+		{
+			name:   "attachment",
+			policy: &Policy{Source: newPolicyMock(), InvalidForGateways: map[types.NamespacedName]struct{}{}},
+			svc: &ReferencedService{
+				GatewayNsNames: map[types.NamespacedName]struct{}{
+					gwNsname: {},
+				},
+			},
+			gws:         getGateway(true /*valid*/),
+			expAttached: true,
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor: getGatewayParentRef(gwNsname),
+				},
+			},
+		},
+		{
+			name: "attachment; ancestor already exists so don't duplicate",
+			policy: &Policy{
+				Source: newPolicyMock(),
+				Ancestors: []PolicyAncestor{
+					{
+						Ancestor: getGatewayParentRef(gwNsname),
+					},
+				},
+				InvalidForGateways: map[types.NamespacedName]struct{}{},
+			},
+			svc: &ReferencedService{
+				GatewayNsNames: map[types.NamespacedName]struct{}{
+					gwNsname: {},
+				},
+			},
+			gws:         getGateway(true /*valid*/),
+			expAttached: true,
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor: getGatewayParentRef(gwNsname), // only one ancestor per Gateway
+				},
+			},
+		},
+		{
+			name: "attachment; existing gateway from policy status processed first",
+			policy: &Policy{
+				Source:             createPolicyWithExistingGatewayStatus(gwNsname, "ctlr"),
+				InvalidForGateways: map[types.NamespacedName]struct{}{},
+			},
+			svc: &ReferencedService{
+				GatewayNsNames: map[types.NamespacedName]struct{}{
+					gwNsname:  {}, // This gateway exists in policy status (existing)
+					gw2Nsname: {}, // This gateway is new
+				},
+			},
+			gws: map[types.NamespacedName]*Gateway{
+				gwNsname: {
+					Source: &v1.Gateway{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      gwNsname.Name,
+							Namespace: gwNsname.Namespace,
+						},
+					},
+					Valid: true,
+				},
+				gw2Nsname: {
+					Source: &v1.Gateway{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      gw2Nsname.Name,
+							Namespace: gw2Nsname.Namespace,
+						},
+					},
+					Valid: true,
+				},
+			},
+			expAttached: true,
+			// Only new gateway should be added to ancestors, existing one already exists in policy status
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor: getGatewayParentRef(gw2Nsname), // Only new gateway gets added
+				},
+			},
+		},
+		{
+			name: "attachment; ancestor doesn't exist so add it",
+			policy: &Policy{
+				Source: newPolicyMock(),
+				Ancestors: []PolicyAncestor{
+					{
+						Ancestor: getGatewayParentRef(gw2Nsname),
+					},
+				},
+				InvalidForGateways: map[types.NamespacedName]struct{}{},
+			},
+			svc: &ReferencedService{
+				GatewayNsNames: map[types.NamespacedName]struct{}{
+					gw2Nsname: {},
+					gwNsname:  {},
+				},
+			},
+			gws:         getGateway(true /*valid*/),
+			expAttached: true,
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor: getGatewayParentRef(gw2Nsname),
+				},
+				{
+					Ancestor: getGatewayParentRef(gwNsname),
+				},
+			},
+		},
+		{
+			name:   "no attachment; gateway is invalid",
+			policy: &Policy{Source: newPolicyMock(), InvalidForGateways: map[types.NamespacedName]struct{}{}},
+			svc: &ReferencedService{
+				GatewayNsNames: map[types.NamespacedName]struct{}{
+					gwNsname: {},
+				},
+			},
+			gws:         getGateway(false /*invalid*/),
+			expAttached: false,
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor:   getGatewayParentRef(gwNsname),
+					Conditions: []conditions.Condition{conditions.NewPolicyTargetNotFound("The Parent Gateway is invalid")},
+				},
+			},
+		},
+		{
+			name:   "no attachment; max ancestor",
+			policy: &Policy{Source: createTestPolicyWithAncestors(16), InvalidForGateways: map[types.NamespacedName]struct{}{}},
+			svc: &ReferencedService{
+				GatewayNsNames: map[types.NamespacedName]struct{}{
+					gwNsname: {},
+				},
+			},
+			gws:          getGateway(true /*valid*/),
+			expAttached:  false,
+			expAncestors: nil,
+		},
+		{
+			name:   "no attachment; does not belong to gateway",
+			policy: &Policy{Source: newPolicyMock(), InvalidForGateways: map[types.NamespacedName]struct{}{}},
+			svc: &ReferencedService{
+				GatewayNsNames: map[types.NamespacedName]struct{}{
+					gw2Nsname: {},
+				},
+			},
+			gws:          getGateway(true /*valid*/),
+			expAttached:  false,
+			expAncestors: nil,
+		},
+		{
+			name: "no attachment; gateway is invalid",
+			policy: &Policy{
+				Source: newPolicyMock(),
+				InvalidForGateways: map[types.NamespacedName]struct{}{
+					gwNsname: {},
+				},
+				Ancestors: []PolicyAncestor{
+					{
+						Ancestor: getGatewayParentRef(gwNsname),
+					},
+				},
+			},
+			svc: &ReferencedService{
+				GatewayNsNames: map[types.NamespacedName]struct{}{
+					gwNsname: {},
+				},
+			},
+			gws:         getGateway(false),
+			expAttached: false,
+			expAncestors: []PolicyAncestor{
+				{
+					Ancestor: getGatewayParentRef(gwNsname),
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			attachPolicyToService(test.policy, test.svc, test.gws, "ctlr", logr.Discard())
+			if test.expAttached {
+				g.Expect(test.svc.Policies).To(HaveLen(1))
+			} else {
+				g.Expect(test.svc.Policies).To(BeEmpty())
+			}
+
+			g.Expect(test.policy.Ancestors).To(BeEquivalentTo(test.expAncestors))
+		})
+	}
+}
+
+func TestProcessPolicies(t *testing.T) {
+	t.Parallel()
+	policyGVK := schema.GroupVersionKind{Group: "Group", Version: "Version", Kind: "MyPolicy"}
+
+	// These refs reference objects that belong to NGF.
+	// Policies that contain these refs should be processed.
+	hrRef := createTestRef(kinds.HTTPRoute, v1.GroupName, "hr")
+	grpcRef := createTestRef(kinds.GRPCRoute, v1.GroupName, "grpc")
+	gatewayRef := createTestRef(kinds.Gateway, v1.GroupName, "gw")
+	gatewayRef2 := createTestRef(kinds.Gateway, v1.GroupName, "gw2")
+	svcRef := createTestRef(kinds.Service, "core", "svc")
+
+	// These refs reference objects that do not belong to NGF.
+	// Policies that contain these refs should NOT be processed.
+	hrDoesNotExistRef := createTestRef(kinds.HTTPRoute, v1.GroupName, "dne")
+	hrWrongGroup := createTestRef(kinds.HTTPRoute, "WrongGroup", "hr")
+	gatewayWrongGroupRef := createTestRef(kinds.Gateway, "WrongGroup", "gw")
+	nonNGFGatewayRef := createTestRef(kinds.Gateway, v1.GroupName, "not-ours")
+	svcDoesNotExistRef := createTestRef(kinds.Service, "core", "dne")
+
+	pol1, pol1Key := createTestPolicyAndKey(policyGVK, "pol1", hrRef)
+	pol2, pol2Key := createTestPolicyAndKey(policyGVK, "pol2", grpcRef)
+	pol3, pol3Key := createTestPolicyAndKey(policyGVK, "pol3", gatewayRef)
+	pol4, pol4Key := createTestPolicyAndKey(policyGVK, "pol4", gatewayRef2)
+	pol5, pol5Key := createTestPolicyAndKey(policyGVK, "pol5", hrDoesNotExistRef)
+	pol6, pol6Key := createTestPolicyAndKey(policyGVK, "pol6", hrWrongGroup)
+	pol7, pol7Key := createTestPolicyAndKey(policyGVK, "pol7", gatewayWrongGroupRef)
+	pol8, pol8Key := createTestPolicyAndKey(policyGVK, "pol8", nonNGFGatewayRef)
+	pol9, pol9Key := createTestPolicyAndKey(policyGVK, "pol9", svcDoesNotExistRef)
+	pol10, pol10Key := createTestPolicyAndKey(policyGVK, "pol10", svcRef)
+
+	pol1Conflict, pol1ConflictKey := createTestPolicyAndKey(policyGVK, "pol1-conflict", hrRef)
+
+	allValidValidator := &policiesfakes.FakeValidator{}
+
+	tests := []struct {
+		validator            validation.PolicyValidator
+		policies             map[PolicyKey]policies.Policy
+		expProcessedPolicies map[PolicyKey]*Policy
+		name                 string
+	}{
+		{
+			name:                 "nil policies",
+			expProcessedPolicies: nil,
+		},
+		{
+			name:      "mix of relevant and irrelevant policies",
+			validator: allValidValidator,
+			policies: map[PolicyKey]policies.Policy{
+				pol1Key:  pol1,
+				pol2Key:  pol2,
+				pol3Key:  pol3,
+				pol4Key:  pol4,
+				pol5Key:  pol5,
+				pol6Key:  pol6,
+				pol7Key:  pol7,
+				pol8Key:  pol8,
+				pol9Key:  pol9,
+				pol10Key: pol10,
+			},
+			expProcessedPolicies: map[PolicyKey]*Policy{
+				pol1Key: {
+					Source: pol1,
+					TargetRefs: []PolicyTargetRef{
+						{
+							Nsname: types.NamespacedName{Namespace: testNs, Name: "hr"},
+							Kind:   kinds.HTTPRoute,
+							Group:  v1.GroupName,
+						},
+					},
+					Ancestors:          []PolicyAncestor{},
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+					Valid:              true,
+				},
+				pol2Key: {
+					Source: pol2,
+					TargetRefs: []PolicyTargetRef{
+						{
+							Nsname: types.NamespacedName{Namespace: testNs, Name: "grpc"},
+							Kind:   kinds.GRPCRoute,
+							Group:  v1.GroupName,
+						},
+					},
+					Ancestors:          []PolicyAncestor{},
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+					Valid:              true,
+				},
+				pol3Key: {
+					Source: pol3,
+					TargetRefs: []PolicyTargetRef{
+						{
+							Nsname: types.NamespacedName{Namespace: testNs, Name: "gw"},
+							Kind:   kinds.Gateway,
+							Group:  v1.GroupName,
+						},
+					},
+					Ancestors:          []PolicyAncestor{},
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+					Valid:              true,
+				},
+				pol4Key: {
+					Source: pol4,
+					TargetRefs: []PolicyTargetRef{
+						{
+							Nsname: types.NamespacedName{Namespace: testNs, Name: "gw2"},
+							Kind:   kinds.Gateway,
+							Group:  v1.GroupName,
+						},
+					},
+					Ancestors:          []PolicyAncestor{},
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+					Valid:              true,
+				},
+				pol10Key: {
+					Source: pol10,
+					TargetRefs: []PolicyTargetRef{
+						{
+							Nsname: types.NamespacedName{Namespace: testNs, Name: "svc"},
+							Kind:   kinds.Service,
+							Group:  "core",
+						},
+					},
+					Ancestors:          []PolicyAncestor{},
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+					Valid:              true,
+				},
+			},
+		},
+		{
+			name: "invalid and valid policies",
+			validator: &policiesfakes.FakeValidator{
+				ValidateStub: func(policy policies.Policy) []conditions.Condition {
+					if policy.GetName() == "pol1" {
+						return []conditions.Condition{conditions.NewPolicyInvalid("Invalid error")}
+					}
+
+					return nil
+				},
+			},
+			policies: map[PolicyKey]policies.Policy{
+				pol1Key: pol1,
+				pol2Key: pol2,
+			},
+			expProcessedPolicies: map[PolicyKey]*Policy{
+				pol1Key: {
+					Source: pol1,
+					TargetRefs: []PolicyTargetRef{
+						{
+							Nsname: types.NamespacedName{Namespace: testNs, Name: "hr"},
+							Kind:   kinds.HTTPRoute,
+							Group:  v1.GroupName,
+						},
+					},
+					Conditions: []conditions.Condition{
+						conditions.NewPolicyInvalid("Invalid error"),
+					},
+					Ancestors:          []PolicyAncestor{},
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+					Valid:              false,
+				},
+				pol2Key: {
+					Source: pol2,
+					TargetRefs: []PolicyTargetRef{
+						{
+							Nsname: types.NamespacedName{Namespace: testNs, Name: "grpc"},
+							Kind:   kinds.GRPCRoute,
+							Group:  v1.GroupName,
+						},
+					},
+					Ancestors:          []PolicyAncestor{},
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+					Valid:              true,
+				},
+			},
+		},
+		{
+			name: "conflicted policies",
+			validator: &policiesfakes.FakeValidator{
+				ConflictsStub: func(_ policies.Policy, _ policies.Policy) bool {
+					return true
+				},
+			},
+			policies: map[PolicyKey]policies.Policy{
+				pol1Key:         pol1,
+				pol1ConflictKey: pol1Conflict,
+			},
+			expProcessedPolicies: map[PolicyKey]*Policy{
+				pol1Key: {
+					Source: pol1,
+					TargetRefs: []PolicyTargetRef{
+						{
+							Nsname: types.NamespacedName{Namespace: testNs, Name: "hr"},
+							Kind:   kinds.HTTPRoute,
+							Group:  v1.GroupName,
+						},
+					},
+					Ancestors:          []PolicyAncestor{},
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+					Valid:              true,
+				},
+				pol1ConflictKey: {
+					Source: pol1Conflict,
+					TargetRefs: []PolicyTargetRef{
+						{
+							Nsname: types.NamespacedName{Namespace: testNs, Name: "hr"},
+							Kind:   kinds.HTTPRoute,
+							Group:  v1.GroupName,
+						},
+					},
+					Conditions: []conditions.Condition{
+						conditions.NewPolicyConflicted("Conflicts with another MyPolicy"),
+					},
+					Ancestors:          []PolicyAncestor{},
+					InvalidForGateways: map[types.NamespacedName]struct{}{},
+					Valid:              false,
+				},
+			},
+		},
+	}
+
+	gateways := map[types.NamespacedName]*Gateway{
+		{Namespace: testNs, Name: "gw"}: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "gw",
+					Namespace: testNs,
+				},
+			},
+			Valid: true,
+		},
+		{Namespace: testNs, Name: "gw2"}: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "gw2",
+					Namespace: testNs,
+				},
+			},
+			Valid: true,
+		},
+	}
+
+	routes := map[RouteKey]*L7Route{
+		{RouteType: RouteTypeHTTP, NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr"}}: {
+			Source: &v1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "hr",
+					Namespace: testNs,
+				},
+			},
+		},
+		{RouteType: RouteTypeGRPC, NamespacedName: types.NamespacedName{Namespace: testNs, Name: "grpc"}}: {
+			Source: &v1.GRPCRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "grpc",
+					Namespace: testNs,
+				},
+			},
+		},
+	}
+
+	services := map[types.NamespacedName]*ReferencedService{
+		{Namespace: testNs, Name: "svc"}: {},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			processed, _ := processPolicies(
+				t.Context(),
+				logr.Discard(),
+				test.policies,
+				test.validator,
+				routes,
+				services,
+				gateways,
+				nil,
+				nil,
+			)
+			g.Expect(processed).To(BeEquivalentTo(test.expProcessedPolicies))
+		})
+	}
+}
+
+func TestProcessPolicies_RouteOverlap(t *testing.T) {
+	t.Parallel()
+	hrRefCoffee := createTestRef(kinds.HTTPRoute, v1.GroupName, "hr-coffee")
+	hrRefCoffeeTea := createTestRef(kinds.HTTPRoute, v1.GroupName, "hr-coffee-tea")
+
+	policyGVK := schema.GroupVersionKind{Group: "Group", Version: "Version", Kind: "MyPolicy"}
+	pol1, pol1Key := createTestPolicyAndKey(policyGVK, "pol1", hrRefCoffee)
+	pol2, pol2Key := createTestPolicyAndKey(policyGVK, "pol2", hrRefCoffee, hrRefCoffeeTea)
+	pol3, pol3Key := createTestPolicyAndKey(policyGVK, "pol3", hrRefCoffeeTea)
+
+	tests := []struct {
+		validator     validation.PolicyValidator
+		policies      map[PolicyKey]policies.Policy
+		routes        map[RouteKey]*L7Route
+		name          string
+		expConditions []conditions.Condition
+		valid         bool
+	}{
+		{
+			name:      "no overlap",
+			validator: &policiesfakes.FakeValidator{},
+			policies: map[PolicyKey]policies.Policy{
+				pol1Key: pol1,
+			},
+			routes: map[RouteKey]*L7Route{
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee"},
+				}: createTestRouteWithPaths("hr-coffee", "/coffee"),
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr2"},
+				}: createTestRouteWithPaths("hr2", "/tea"),
+			},
+			valid: true,
+		},
+		{
+			name:      "no overlap two policies",
+			validator: &policiesfakes.FakeValidator{},
+			policies: map[PolicyKey]policies.Policy{
+				pol1Key: pol1,
+				pol3Key: pol3,
+			},
+			routes: map[RouteKey]*L7Route{
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee"},
+				}: createTestRouteWithPaths("hr-coffee", "/coffee"),
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee-tea"},
+				}: createTestRouteWithPaths("hr-coffee-tea", "/coffee-tea"),
+			},
+			valid: true,
+		},
+		{
+			name:      "policy references route that overlaps a non-referenced route",
+			validator: &policiesfakes.FakeValidator{},
+			policies: map[PolicyKey]policies.Policy{
+				pol1Key: pol1,
+			},
+			routes: map[RouteKey]*L7Route{
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee"},
+				}: createTestRouteWithPaths("hr-coffee", "/coffee"),
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr2"},
+				}: createTestRouteWithPaths("hr2", "/coffee"),
+			},
+			valid: false,
+			expConditions: []conditions.Condition{
+				{
+					Type:   "Accepted",
+					Status: "False",
+					Reason: "TargetConflict",
+					Message: "Policy cannot be applied to target \"test/hr-coffee\" since another Route " +
+						"\"test/hr2\" shares a namespace/gateway-name:hostname:port/path combination with this target",
+				},
+			},
+		},
+		{
+			name:      "policy references route with equivalent hostnames in a different order",
+			validator: &policiesfakes.FakeValidator{},
+			policies: map[PolicyKey]policies.Policy{
+				pol1Key: pol1,
+			},
+			routes: map[RouteKey]*L7Route{
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee"},
+				}: createTestRouteWithHostnames(
+					"hr-coffee",
+					[]string{"foo.example.com", "bar.example.com"},
+					"/coffee",
+				),
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr2"},
+				}: createTestRouteWithHostnames(
+					"hr2",
+					[]string{"bar.example.com", "foo.example.com"},
+					"/coffee",
+				),
+			},
+			valid: false,
+			expConditions: []conditions.Condition{
+				{
+					Type:   "Accepted",
+					Status: "False",
+					Reason: "TargetConflict",
+					Message: "Policy cannot be applied to target \"test/hr-coffee\" since another Route " +
+						"\"test/hr2\" shares a namespace/gateway-name:hostname:port/path combination with this target",
+				},
+			},
+		},
+		{
+			name:      "policy references route with a partially overlapping hostname set",
+			validator: &policiesfakes.FakeValidator{},
+			policies: map[PolicyKey]policies.Policy{
+				pol1Key: pol1,
+			},
+			routes: map[RouteKey]*L7Route{
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee"},
+				}: createTestRouteWithHostnames(
+					"hr-coffee",
+					[]string{"foo.example.com", "cafe.example.com"},
+					"/coffee",
+				),
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr2"},
+				}: createTestRouteWithHostnames(
+					"hr2",
+					[]string{"cafe.example.com"},
+					"/coffee",
+				),
+			},
+			valid: false,
+			expConditions: []conditions.Condition{
+				{
+					Type:   "Accepted",
+					Status: "False",
+					Reason: "TargetConflict",
+					Message: "Policy cannot be applied to target \"test/hr-coffee\" since another Route " +
+						"\"test/hr2\" shares a namespace/gateway-name:hostname:port/path combination with this target",
+				},
+			},
+		},
+		{
+			name:      "policy references 2 routes that overlap",
+			validator: &policiesfakes.FakeValidator{},
+			policies: map[PolicyKey]policies.Policy{
+				pol2Key: pol2,
+			},
+			routes: map[RouteKey]*L7Route{
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee"},
+				}: createTestRouteWithPaths("hr-coffee", "/coffee"),
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee-tea"},
+				}: createTestRouteWithPaths("hr-coffee-tea", "/coffee", "/tea"),
+			},
+			valid: true,
+		},
+		{
+			name:      "policy references 2 routes that overlap with non-referenced route",
+			validator: &policiesfakes.FakeValidator{},
+			policies: map[PolicyKey]policies.Policy{
+				pol2Key: pol2,
+			},
+			routes: map[RouteKey]*L7Route{
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee"},
+				}: createTestRouteWithPaths("hr-coffee", "/coffee"),
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee-tea"},
+				}: createTestRouteWithPaths("hr-coffee-tea", "/coffee", "/tea"),
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee-latte"},
+				}: createTestRouteWithPaths("hr-coffee-latte", "/coffee", "/latte"),
+			},
+			valid: false,
+			expConditions: []conditions.Condition{
+				{
+					Type:   "Accepted",
+					Status: "False",
+					Reason: "TargetConflict",
+					Message: "Policy cannot be applied to target \"test/hr-coffee\" since another Route " +
+						"\"test/hr-coffee-latte\" shares a namespace/gateway-name:hostname:port/path combination with this target",
+				},
+				{
+					Type:   "Accepted",
+					Status: "False",
+					Reason: "TargetConflict",
+					Message: "Policy cannot be applied to target \"test/hr-coffee-tea\" since another Route " +
+						"\"test/hr-coffee-latte\" shares a namespace/gateway-name:hostname:port/path combination with this target",
+				},
+			},
+		},
+		{
+			name:      "multiple routes with multiple gateways, no overlap",
+			validator: &policiesfakes.FakeValidator{},
+			policies: map[PolicyKey]policies.Policy{
+				pol1Key: pol1,
+			},
+			routes: map[RouteKey]*L7Route{
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee"},
+				}: createTestRouteWithMultipleGateways("hr", []string{"private-gateway", "public-gateway"}, "/coffee"),
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-tea"},
+				}: createTestRouteWithMultipleGateways("hr-tea", []string{"private-gateway", "public-gateway"}, "/tea"),
+			},
+			valid: true,
+		},
+		{
+			name:      "non-targeted route with same path appearing multiple times in its matches",
+			validator: &policiesfakes.FakeValidator{},
+			policies: map[PolicyKey]policies.Policy{
+				pol1Key: pol1,
+			},
+			routes: map[RouteKey]*L7Route{
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee"},
+				}: createTestRouteWithPaths("hr-coffee", "/coffee"),
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-other"},
+				}: createTestRouteWithPaths("hr-other", "/tea", "/tea"),
+			},
+			valid: true,
+		},
+		{
+			// Regression test for: two non-targeted routes that overlap with EACH OTHER
+			// (same gateway:hostname:port/path) must not produce a false-positive TargetConflict
+			// on an unrelated policy whose target route is on a completely different gateway.
+			name:      "two non-targeted routes overlap each other but not the policy target; no conflict",
+			validator: &policiesfakes.FakeValidator{},
+			policies: map[PolicyKey]policies.Policy{
+				pol1Key: pol1,
+			},
+			routes: map[RouteKey]*L7Route{
+				// Targeted route: hr-coffee on gw (the policy target).
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee"},
+				}: createTestRouteWithPaths("hr-coffee", "/coffee"),
+				// Two non-targeted routes on a *different* gateway sharing the same path.
+				// These two routes overlap with each other, but neither overlaps with hr-coffee.
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "foreign-route-1"},
+				}: createTestRouteWithGateway("foreign-route-1", "other-gw", "/"),
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "foreign-route-2"},
+				}: createTestRouteWithGateway("foreign-route-2", "other-gw", "/"),
+			},
+			valid: true,
+		},
+		{
+			// Regression test for: routes in different namespaces that share the same
+			// gateway:hostname:port/path must not trigger TargetConflict for each other.
+			name:      "targeted and non-targeted routes in different namespaces do not conflict",
+			validator: &policiesfakes.FakeValidator{},
+			policies: map[PolicyKey]policies.Policy{
+				pol1Key: pol1,
+			},
+			routes: map[RouteKey]*L7Route{
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr-coffee"},
+				}: createTestRouteWithPaths("hr-coffee", "/coffee"),
+				{
+					RouteType:      RouteTypeHTTP,
+					NamespacedName: types.NamespacedName{Namespace: "other", Name: "hr-coffee"},
+				}: createNamespacedTestRouteWithPaths("other", "hr-coffee", "/coffee"),
+			},
+			valid: true,
+		},
+	}
+
+	gateways := map[types.NamespacedName]*Gateway{
+		{Namespace: testNs, Name: "gw"}: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "gw",
+					Namespace: testNs,
+				},
+			},
+			Valid: true,
+		},
+		{Namespace: testNs, Name: "other-gw"}: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "other-gw",
+					Namespace: testNs,
+				},
+			},
+			Valid: true,
+		},
+		{Namespace: testNs, Name: "private-gateway"}: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "private-gateway",
+					Namespace: testNs,
+				},
+			},
+			Valid: true,
+		},
+		{Namespace: testNs, Name: "public-gateway"}: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "public-gateway",
+					Namespace: testNs,
+				},
+			},
+			Valid: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			processed, _ := processPolicies(
+				t.Context(),
+				logr.Discard(),
+				test.policies,
+				test.validator,
+				test.routes,
+				nil,
+				gateways,
+				nil,
+				nil,
+			)
+			g.Expect(processed).To(HaveLen(len(test.policies)))
+
+			for _, pol := range processed {
+				g.Expect(pol.Valid).To(Equal(test.valid))
+				g.Expect(pol.Conditions).To(ConsistOf(test.expConditions))
+			}
+		})
+	}
+}
+
+func TestMarkConflictedPolicies(t *testing.T) {
+	t.Parallel()
+	hrRef := createTestRef(kinds.HTTPRoute, v1.GroupName, "hr")
+	hrTargetRef := PolicyTargetRef{
+		Kind:   hrRef.Kind,
+		Group:  hrRef.Group,
+		Nsname: types.NamespacedName{Namespace: testNs, Name: string(hrRef.Name)},
+	}
+
+	grpcRef := createTestRef(kinds.GRPCRoute, v1.GroupName, "grpc")
+	grpcTargetRef := PolicyTargetRef{
+		Kind:   grpcRef.Kind,
+		Group:  grpcRef.Group,
+		Nsname: types.NamespacedName{Namespace: testNs, Name: string(grpcRef.Name)},
+	}
+
+	orangeGVK := schema.GroupVersionKind{Group: "Fruits", Version: "Fresh", Kind: "OrangePolicy"}
+	appleGVK := schema.GroupVersionKind{Group: "Fruits", Version: "Fresh", Kind: "ApplePolicy"}
+
+	tests := []struct {
+		name                  string
+		policies              map[PolicyKey]*Policy
+		fakeValidator         *policiesfakes.FakeValidator
+		conflictedNames       []string
+		expConflictToBeCalled bool
+	}{
+		{
+			name: "different policy types can not conflict",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(orangeGVK, "orange"): {
+					Source:     createTestPolicy(orangeGVK, "orange", hrRef),
+					TargetRefs: []PolicyTargetRef{hrTargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(appleGVK, "apple"): {
+					Source:     createTestPolicy(appleGVK, "apple", hrRef),
+					TargetRefs: []PolicyTargetRef{hrTargetRef},
+					Valid:      true,
+				},
+			},
+			fakeValidator:         &policiesfakes.FakeValidator{},
+			expConflictToBeCalled: false,
+		},
+		{
+			name: "policies of the same type but with different target refs can not conflict",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(orangeGVK, "orange1"): {
+					Source:     createTestPolicy(orangeGVK, "orange1", hrRef),
+					TargetRefs: []PolicyTargetRef{hrTargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(orangeGVK, "orange2"): {
+					Source:     createTestPolicy(orangeGVK, "orange2", grpcRef),
+					TargetRefs: []PolicyTargetRef{grpcTargetRef},
+					Valid:      true,
+				},
+			},
+			fakeValidator:         &policiesfakes.FakeValidator{},
+			expConflictToBeCalled: false,
+		},
+		{
+			name: "invalid policies can not conflict",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(orangeGVK, "valid"): {
+					Source:     createTestPolicy(orangeGVK, "valid", hrRef),
+					TargetRefs: []PolicyTargetRef{hrTargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(orangeGVK, "invalid"): {
+					Source:     createTestPolicy(orangeGVK, "invalid", hrRef),
+					TargetRefs: []PolicyTargetRef{hrTargetRef},
+					Valid:      false,
+				},
+			},
+			fakeValidator:         &policiesfakes.FakeValidator{},
+			expConflictToBeCalled: false,
+		},
+		{
+			name: "when a policy conflicts with a policy that has greater precedence it's marked as invalid and a" +
+				" condition is added",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(orangeGVK, "orange1"): {
+					Source:     createTestPolicy(orangeGVK, "orange1", hrRef),
+					TargetRefs: []PolicyTargetRef{hrTargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(orangeGVK, "orange2"): {
+					Source:     createTestPolicy(orangeGVK, "orange2", hrRef),
+					TargetRefs: []PolicyTargetRef{hrTargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(orangeGVK, "orange3-conflicts-with-1"): {
+					Source:     createTestPolicy(orangeGVK, "orange3-conflicts-with-1", hrRef),
+					TargetRefs: []PolicyTargetRef{hrTargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(orangeGVK, "orange4"): {
+					Source:     createTestPolicy(orangeGVK, "orange4", hrRef),
+					TargetRefs: []PolicyTargetRef{hrTargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(orangeGVK, "orange5-conflicts-with-4"): {
+					Source:     createTestPolicy(orangeGVK, "orange5-conflicts-with-4", hrRef),
+					TargetRefs: []PolicyTargetRef{hrTargetRef},
+					Valid:      true,
+				},
+			},
+			fakeValidator: &policiesfakes.FakeValidator{
+				ConflictsStub: func(policy policies.Policy, policy2 policies.Policy) bool {
+					pol1Name := policy.GetName()
+					pol2Name := policy2.GetName()
+
+					if pol1Name == "orange1" && pol2Name == "orange3-conflicts-with-1" {
+						return true
+					}
+
+					if pol1Name == "orange4" && pol2Name == "orange5-conflicts-with-4" {
+						return true
+					}
+
+					return false
+				},
+			},
+			conflictedNames:       []string{"orange3-conflicts-with-1", "orange5-conflicts-with-4"},
+			expConflictToBeCalled: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			markConflictedPolicies(test.policies, test.fakeValidator)
+
+			if !test.expConflictToBeCalled {
+				g.Expect(test.fakeValidator.ConflictsCallCount()).To(BeZero())
+			} else {
+				g.Expect(test.fakeValidator.ConflictsCallCount()).To(Not(BeZero()))
+				expConflictCond := conditions.NewPolicyConflicted("Conflicts with another OrangePolicy")
+
+				for key, policy := range test.policies {
+					if slices.Contains(test.conflictedNames, key.NsName.Name) {
+						g.Expect(policy.Valid).To(BeFalse())
+						g.Expect(policy.Conditions).To(ConsistOf(expConflictCond))
+					} else {
+						g.Expect(policy.Valid).To(BeTrue())
+						g.Expect(policy.Conditions).To(BeEmpty())
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestRefGroupKind(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		group     v1.Group
+		kind      v1.Kind
+		expString string
+	}{
+		{
+			name:      "explicit group core",
+			group:     "core",
+			kind:      kinds.Service,
+			expString: "core/Service",
+		},
+		{
+			name:      "implicit group core",
+			group:     "",
+			kind:      kinds.Service,
+			expString: "core/Service",
+		},
+		{
+			name:      "gateway group",
+			group:     v1.GroupName,
+			kind:      kinds.HTTPRoute,
+			expString: "gateway.networking.k8s.io/HTTPRoute",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			g.Expect(refGroupKind(test.group, test.kind)).To(Equal(test.expString))
+		})
+	}
+}
+
+func createTestPolicyWithAncestors(numAncestors int) policies.Policy {
+	policy := &policiesfakes.PolicyMock{
+		GetNameFunc:       func() string { return "policy" },
+		GetNamespaceFunc:  func() string { return testNs },
+		GetObjectKindFunc: func() schema.ObjectKind { return nil },
+	}
+
+	ancestors := make([]v1.PolicyAncestorStatus, numAncestors)
+
+	for i := range numAncestors {
+		ancestors[i] = v1.PolicyAncestorStatus{ControllerName: "some-other-controller"}
+	}
+
+	policy.GetPolicyStatusFunc = func() v1.PolicyStatus {
+		return v1.PolicyStatus{Ancestors: ancestors}
+	}
+	return policy
+}
+
+func createTestPolicyAndKey(
+	gvk schema.GroupVersionKind,
+	name string,
+	refs ...v1.LocalPolicyTargetReference,
+) (policies.Policy, PolicyKey) {
+	pol := createTestPolicy(gvk, name, refs...)
+	key := createTestPolicyKey(gvk, name)
+
+	return pol, key
+}
+
+func createTestPolicy(
+	gvk schema.GroupVersionKind,
+	name string,
+	refs ...v1.LocalPolicyTargetReference,
+) policies.Policy {
+	return &policiesfakes.PolicyMock{
+		GetNameFunc: func() string {
+			return name
+		},
+		GetNamespaceFunc: func() string {
+			return testNs
+		},
+		GetTargetRefsFunc: func() []v1.LocalPolicyTargetReference {
+			return refs
+		},
+		GetPolicyStatusFunc: func() v1.PolicyStatus {
+			return v1.PolicyStatus{}
+		},
+		GetCreationTimestampFunc: func() metav1.Time {
+			return metav1.Time{}
+		},
+		GetObjectKindFunc: func() schema.ObjectKind {
+			return &policiesfakes.ObjectKindMock{
+				GroupVersionKindFunc: func() schema.GroupVersionKind {
+					return gvk
+				},
+			}
+		},
+	}
+}
+
+func createTestPolicyKey(gvk schema.GroupVersionKind, name string) PolicyKey {
+	return PolicyKey{
+		NsName: types.NamespacedName{Namespace: testNs, Name: name},
+		GVK:    gvk,
+	}
+}
+
+func createTestRef(kind v1.Kind, group v1.Group, name string) v1.LocalPolicyTargetReference {
+	return v1.LocalPolicyTargetReference{
+		Group: group,
+		Kind:  kind,
+		Name:  v1.ObjectName(name),
+	}
+}
+
+func createTestPolicyTargetRef(kind v1.Kind, nsname types.NamespacedName) PolicyTargetRef {
+	return PolicyTargetRef{
+		Kind:   kind,
+		Group:  v1.GroupName,
+		Nsname: nsname,
+	}
+}
+
+func createTestRouteWithPaths(name string, paths ...string) *L7Route {
+	return createNamespacedTestRouteWithPaths(testNs, name, paths...)
+}
+
+func createNamespacedTestRouteWithPaths(namespace, name string, paths ...string) *L7Route {
+	routeMatches := make([]v1.HTTPRouteMatch, 0, len(paths))
+
+	for _, path := range paths {
+		routeMatches = append(routeMatches, v1.HTTPRouteMatch{
+			Path: &v1.HTTPPathMatch{
+				Type:  helpers.GetPointer(v1.PathMatchExact),
+				Value: helpers.GetPointer(path),
+			},
+		})
+	}
+
+	gwNsName := types.NamespacedName{Namespace: testNs, Name: "gw"}
+	route := &L7Route{
+		Source: &v1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+			},
+		},
+		Spec: L7RouteSpec{
+			Rules: []RouteRule{
+				{Matches: routeMatches},
+			},
+		},
+		ParentRefs: []ParentRef{
+			{
+				Kind:           kinds.Gateway,
+				NamespacedName: gwNsName,
+				GatewayNsName:  gwNsName,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners: []ListenerAttachmentStatus{
+						{
+							Key:               "listener-1",
+							Port:              80,
+							AcceptedHostnames: []string{"foo.example.com"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	return route
+}
+
+func createTestRouteWithHostnames(name string, hostnames []string, paths ...string) *L7Route {
+	route := createTestRouteWithPaths(name, paths...)
+	route.ParentRefs[0].Attachment.Listeners[0] = ListenerAttachmentStatus{
+		Key:               "listener-1",
+		Port:              80,
+		AcceptedHostnames: hostnames,
+	}
+
+	return route
+}
+
+func createTestRouteWithGateway(name, gatewayName, path string) *L7Route {
+	routeMatches := []v1.HTTPRouteMatch{
+		{
+			Path: &v1.HTTPPathMatch{
+				Type:  helpers.GetPointer(v1.PathMatchPathPrefix),
+				Value: helpers.GetPointer(path),
+			},
+		},
+	}
+
+	gwNsName := types.NamespacedName{Namespace: testNs, Name: gatewayName}
+	return &L7Route{
+		Source: &v1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: testNs,
+			},
+		},
+		Spec: L7RouteSpec{
+			Rules: []RouteRule{
+				{Matches: routeMatches},
+			},
+		},
+		ParentRefs: []ParentRef{
+			{
+				Kind:           kinds.Gateway,
+				NamespacedName: gwNsName,
+				GatewayNsName:  gwNsName,
+				Attachment: &ParentRefAttachmentStatus{
+					Listeners: []ListenerAttachmentStatus{
+						{
+							Key:               "listener-1",
+							Port:              80,
+							AcceptedHostnames: []string{"foo.example.com"},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func createTestRouteWithMultipleGateways(name string, gatewayNames []string, path string) *L7Route {
+	routeMatches := []v1.HTTPRouteMatch{
+		{
+			Path: &v1.HTTPPathMatch{
+				Type:  helpers.GetPointer(v1.PathMatchExact),
+				Value: helpers.GetPointer(path),
+			},
+		},
+	}
+
+	parentRefs := make([]ParentRef, 0, len(gatewayNames))
+	for _, gwName := range gatewayNames {
+		gwNsName := types.NamespacedName{Namespace: testNs, Name: gwName}
+		parentRefs = append(parentRefs, ParentRef{
+			Kind:           kinds.Gateway,
+			NamespacedName: gwNsName,
+			GatewayNsName:  gwNsName,
+			Attachment: &ParentRefAttachmentStatus{
+				Listeners: []ListenerAttachmentStatus{
+					{
+						Key:               "listener-1",
+						Port:              80,
+						AcceptedHostnames: []string{"foo.example.com"},
+					},
+				},
+			},
+		})
+	}
+
+	route := &L7Route{
+		Source: &v1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: testNs,
+			},
+		},
+		Spec: L7RouteSpec{
+			Rules: []RouteRule{
+				{Matches: routeMatches},
+			},
+		},
+		ParentRefs: parentRefs,
+	}
+
+	return route
+}
+
+func getGatewayParentRef(gwNsName types.NamespacedName) v1.ParentReference {
+	return v1.ParentReference{
+		Group:     helpers.GetPointer[v1.Group](v1.GroupName),
+		Kind:      helpers.GetPointer[v1.Kind](kinds.Gateway),
+		Namespace: (*v1.Namespace)(&gwNsName.Namespace),
+		Name:      v1.ObjectName(gwNsName.Name),
+	}
+}
+
+func createGatewayMap(gwNsNames ...types.NamespacedName) map[types.NamespacedName]*Gateway {
+	gatewayMap := make(map[types.NamespacedName]*Gateway, len(gwNsNames))
+	for _, gwNsName := range gwNsNames {
+		gatewayMap[gwNsName] = &Gateway{
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      gwNsName.Name,
+					Namespace: gwNsName.Namespace,
+				},
+			},
+			Valid: true,
+		}
+	}
+
+	return gatewayMap
+}
+
+func TestAddPolicyAffectedStatusOnTargetRefs(t *testing.T) {
+	t.Parallel()
+
+	cspGVK := schema.GroupVersionKind{Group: "Group", Version: "Version", Kind: "ClientSettingsPolicy"}
+	opGVK := schema.GroupVersionKind{Group: "Group", Version: "Version", Kind: "ObservabilityPolicy"}
+	snipGVK := schema.GroupVersionKind{Group: "Group", Version: "Version", Kind: "SnippetsPolicy"}
+	wafGVK := schema.GroupVersionKind{
+		Group:   "Group",
+		Version: "Version",
+		Kind:    "WAFPolicy",
+	}
+
+	gw1Ref := createTestRef(kinds.Gateway, v1.GroupName, "gw1")
+	gw1TargetRef := createTestPolicyTargetRef(
+		kinds.Gateway,
+		types.NamespacedName{Namespace: testNs, Name: "gw1"},
+	)
+	gw2Ref := createTestRef(kinds.Gateway, v1.GroupName, "gw2")
+	gw2TargetRef := createTestPolicyTargetRef(
+		kinds.Gateway,
+		types.NamespacedName{Namespace: testNs, Name: "gw2"},
+	)
+	gw3Ref := createTestRef(kinds.Gateway, v1.GroupName, "gw3")
+	gw3TargetRef := createTestPolicyTargetRef(
+		kinds.Gateway,
+		types.NamespacedName{Namespace: testNs, Name: "gw3"},
+	)
+	gwSnipRef := createTestRef(kinds.Gateway, v1.GroupName, "gw-snip")
+	gwSnipTargetRef := createTestPolicyTargetRef(
+		kinds.Gateway,
+		types.NamespacedName{Namespace: testNs, Name: "gw-snip"},
+	)
+
+	hr1Ref := createTestRef(kinds.HTTPRoute, v1.GroupName, "hr1")
+	hr1TargetRef := createTestPolicyTargetRef(
+		kinds.HTTPRoute,
+		types.NamespacedName{Namespace: testNs, Name: "hr1"},
+	)
+	hr2Ref := createTestRef(kinds.HTTPRoute, v1.GroupName, "hr2")
+	hr2TargetRef := createTestPolicyTargetRef(
+		kinds.HTTPRoute,
+		types.NamespacedName{Namespace: testNs, Name: "hr2"},
+	)
+	hr3Ref := createTestRef(kinds.HTTPRoute, v1.GroupName, "hr3")
+	hr3TargetRef := createTestPolicyTargetRef(
+		kinds.HTTPRoute,
+		types.NamespacedName{Namespace: testNs, Name: "hr3"},
+	)
+
+	gr1Ref := createTestRef(kinds.GRPCRoute, v1.GroupName, "gr1")
+	gr1TargetRef := createTestPolicyTargetRef(
+		kinds.GRPCRoute,
+		types.NamespacedName{Namespace: testNs, Name: "gr1"},
+	)
+	gr2Ref := createTestRef(kinds.GRPCRoute, v1.GroupName, "gr2")
+	gr2TargetRef := createTestPolicyTargetRef(
+		kinds.GRPCRoute,
+		types.NamespacedName{Namespace: testNs, Name: "gr2"},
+	)
+
+	invalidRef := createTestRef(kinds.HTTPRoute, v1.GroupName, "invalid")
+	invalidTargetRef := createTestPolicyTargetRef(
+		"invalidKind",
+		types.NamespacedName{Namespace: testNs, Name: "invalid"},
+	)
+
+	tests := []struct {
+		policies           map[PolicyKey]*Policy
+		gws                map[types.NamespacedName]*Gateway
+		routes             map[RouteKey]*L7Route
+		expectedConditions map[types.NamespacedName][]conditions.Condition
+		name               string
+		missingKeys        bool
+	}{
+		{
+			name:     "no policies",
+			policies: nil,
+			gws:      nil,
+			routes:   nil,
+		},
+		{
+			name: "csp policy with gateway target ref",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(cspGVK, "csp1"): {
+					Source:     createTestPolicy(cspGVK, "csp1", gw1Ref),
+					TargetRefs: []PolicyTargetRef{gw1TargetRef},
+					Valid:      true,
+				},
+			},
+			gws:    createGatewayMap(types.NamespacedName{Namespace: testNs, Name: "gw1"}),
+			routes: nil,
+			expectedConditions: map[types.NamespacedName][]conditions.Condition{
+				{Namespace: testNs, Name: "gw1"}: {
+					conditions.NewClientSettingsPolicyAffected(),
+				},
+			},
+		},
+		{
+			name: "gateway attached to csp, op and waf policy",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(cspGVK, "csp1"): {
+					Source:     createTestPolicy(cspGVK, "csp1", gw2Ref),
+					TargetRefs: []PolicyTargetRef{gw2TargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(opGVK, "observabilityPolicy1"): {
+					Source:     createTestPolicy(opGVK, "observabilityPolicy1", gw2Ref),
+					TargetRefs: []PolicyTargetRef{gw2TargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(snipGVK, "snippetsPolicy1"): {
+					Source:     createTestPolicy(snipGVK, "snippetsPolicy1", gwSnipRef),
+					TargetRefs: []PolicyTargetRef{gwSnipTargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(wafGVK, "WAFPolicy1"): {
+					Source:     createTestPolicy(wafGVK, "WAFPolicy1", gw2Ref),
+					TargetRefs: []PolicyTargetRef{gw2TargetRef},
+					Valid:      true,
+				},
+			},
+			gws: createGatewayMap(
+				types.NamespacedName{Namespace: testNs, Name: "gw2"},
+				types.NamespacedName{Namespace: testNs, Name: "gw-snip"},
+			),
+			routes: nil,
+			expectedConditions: map[types.NamespacedName][]conditions.Condition{
+				{Namespace: testNs, Name: "gw2"}: {
+					conditions.NewClientSettingsPolicyAffected(),
+					conditions.NewObservabilityPolicyAffected(),
+					conditions.NewWAFPolicyAffected(),
+				},
+				{Namespace: testNs, Name: "gw-snip"}: {
+					conditions.NewSnippetsPolicyAffected(),
+				},
+			},
+		},
+		{
+			name: "policies with l7 routes target ref",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(opGVK, "observabilityPolicy1"): {
+					Source:     createTestPolicy(opGVK, "observabilityPolicy1", hr1Ref),
+					TargetRefs: []PolicyTargetRef{hr1TargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(cspGVK, "csp1"): {
+					Source:     createTestPolicy(cspGVK, "csp1", gr1Ref),
+					TargetRefs: []PolicyTargetRef{gr1TargetRef},
+					Valid:      true,
+				},
+			},
+			routes: map[RouteKey]*L7Route{
+				{RouteType: RouteTypeHTTP, NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr1"}}: {
+					Source: &v1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "hr1",
+							Namespace: testNs,
+						},
+					},
+				},
+				{RouteType: RouteTypeGRPC, NamespacedName: types.NamespacedName{Namespace: testNs, Name: "gr1"}}: {
+					Source: &v1.GRPCRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "gr1",
+							Namespace: testNs,
+						},
+					},
+				},
+			},
+			expectedConditions: map[types.NamespacedName][]conditions.Condition{
+				{Namespace: testNs, Name: "hr1"}: {
+					conditions.NewObservabilityPolicyAffected(),
+				},
+				{Namespace: testNs, Name: "gr1"}: {
+					conditions.NewClientSettingsPolicyAffected(),
+				},
+			},
+		},
+		{
+			name: "policies with multiple target refs of different kinds",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(cspGVK, "csp1"): {
+					Source:     createTestPolicy(cspGVK, "csp1", gw3Ref, hr2Ref),
+					TargetRefs: []PolicyTargetRef{gw3TargetRef, hr2TargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(opGVK, "observabilityPolicy1"): {
+					Source:     createTestPolicy(opGVK, "observabilityPolicy1", hr2Ref, gr2Ref),
+					TargetRefs: []PolicyTargetRef{hr2TargetRef, gr2TargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(opGVK, "observabilityPolicy2"): {
+					Source:     createTestPolicy(opGVK, "observabilityPolicy2", gw3Ref, gr2Ref),
+					TargetRefs: []PolicyTargetRef{gw3TargetRef, gr2TargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(wafGVK, "WAFPolicy1"): {
+					Source:     createTestPolicy(wafGVK, "WAFPolicy1", gw3Ref, hr2Ref),
+					TargetRefs: []PolicyTargetRef{gw3TargetRef, hr2TargetRef},
+					Valid:      true,
+				},
+			},
+			gws: createGatewayMap(
+				types.NamespacedName{Namespace: testNs, Name: "gw3"},
+			),
+			routes: map[RouteKey]*L7Route{
+				{RouteType: RouteTypeHTTP, NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr2"}}: {
+					Source: &v1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "hr2",
+							Namespace: testNs,
+						},
+					},
+				},
+				{RouteType: RouteTypeGRPC, NamespacedName: types.NamespacedName{Namespace: testNs, Name: "gr2"}}: {
+					Source: &v1.GRPCRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "gr2",
+							Namespace: testNs,
+						},
+					},
+				},
+			},
+			expectedConditions: map[types.NamespacedName][]conditions.Condition{
+				{Namespace: testNs, Name: "gw3"}: {
+					conditions.NewClientSettingsPolicyAffected(),
+					conditions.NewObservabilityPolicyAffected(),
+					conditions.NewWAFPolicyAffected(),
+				},
+				{Namespace: testNs, Name: "hr2"}: {
+					conditions.NewObservabilityPolicyAffected(),
+					conditions.NewClientSettingsPolicyAffected(),
+					conditions.NewWAFPolicyAffected(),
+				},
+				{Namespace: testNs, Name: "gr2"}: {
+					conditions.NewObservabilityPolicyAffected(),
+				},
+				{Namespace: testNs, Name: "gw-snip"}: {
+					conditions.NewSnippetsPolicyAffected(),
+				},
+			},
+		},
+		{
+			name: "multiple policies with same target ref, only one condition should be added",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(cspGVK, "csp1"): {
+					Source:     createTestPolicy(cspGVK, "csp1", hr3Ref),
+					TargetRefs: []PolicyTargetRef{hr3TargetRef},
+					Valid:      true,
+				},
+				createTestPolicyKey(cspGVK, "csp2"): {
+					Source:     createTestPolicy(cspGVK, "csp2", hr3Ref),
+					TargetRefs: []PolicyTargetRef{hr3TargetRef},
+					Valid:      true,
+				},
+			},
+			routes: map[RouteKey]*L7Route{
+				{RouteType: RouteTypeHTTP, NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr3"}}: {
+					Source: &v1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "hr3",
+							Namespace: testNs,
+						},
+					},
+				},
+			},
+			expectedConditions: map[types.NamespacedName][]conditions.Condition{
+				{Namespace: testNs, Name: "hr3"}: {
+					conditions.NewClientSettingsPolicyAffected(),
+				},
+			},
+		},
+		{
+			name: "no condition added for invalid policy",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(cspGVK, "csp1"): {
+					Source:     createTestPolicy(cspGVK, "csp1", gw1Ref),
+					TargetRefs: []PolicyTargetRef{gw1TargetRef},
+					Valid:      false,
+				},
+			},
+			gws: createGatewayMap(types.NamespacedName{Namespace: testNs, Name: "gw1"}),
+			expectedConditions: map[types.NamespacedName][]conditions.Condition{
+				{Namespace: testNs, Name: "gw1"}: {},
+			},
+			missingKeys: true,
+		},
+		{
+			name: "no condition added for invalid target ref kind",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(cspGVK, "csp1"): {
+					Source:     createTestPolicy(cspGVK, "csp1", invalidRef),
+					TargetRefs: []PolicyTargetRef{invalidTargetRef},
+					Valid:      true,
+				},
+			},
+			routes: map[RouteKey]*L7Route{
+				{RouteType: RouteTypeHTTP, NamespacedName: types.NamespacedName{Namespace: testNs, Name: "invalid"}}: {
+					Source: &v1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "invalid",
+							Namespace: testNs,
+						},
+					},
+				},
+			},
+			expectedConditions: map[types.NamespacedName][]conditions.Condition{
+				{Namespace: testNs, Name: "invalid"}: {},
+			},
+		},
+		{
+			name: "no condition added when target ref gateway is not present in the graph",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(cspGVK, "csp1"): {
+					Source:     createTestPolicy(cspGVK, "csp1", gw1Ref),
+					TargetRefs: []PolicyTargetRef{gw1TargetRef},
+					Valid:      true,
+				},
+			},
+			gws: createGatewayMap(
+				types.NamespacedName{Namespace: testNs, Name: "gw2"},
+			),
+			expectedConditions: map[types.NamespacedName][]conditions.Condition{
+				{Namespace: testNs, Name: "gw1"}: {},
+			},
+			missingKeys: true,
+		},
+		{
+			name: "no condition added when target ref gateway is nil",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(cspGVK, "csp1"): {
+					Source:     createTestPolicy(cspGVK, "csp1", gw1Ref),
+					TargetRefs: []PolicyTargetRef{gw1TargetRef},
+					Valid:      true,
+				},
+			},
+			gws: map[types.NamespacedName]*Gateway{
+				{Namespace: testNs, Name: "gw1"}: nil,
+			},
+			expectedConditions: map[types.NamespacedName][]conditions.Condition{
+				{Namespace: testNs, Name: "gw1"}: {},
+			},
+			missingKeys: true,
+		},
+		{
+			name: "no condition added when target ref route is not present in the graph",
+			policies: map[PolicyKey]*Policy{
+				createTestPolicyKey(opGVK, "observabilityPolicy1"): {
+					Source:     createTestPolicy(opGVK, "observabilityPolicy1", hr1Ref),
+					TargetRefs: []PolicyTargetRef{hr1TargetRef},
+					Valid:      true,
+				},
+			},
+			routes: map[RouteKey]*L7Route{
+				{RouteType: RouteTypeHTTP, NamespacedName: types.NamespacedName{Namespace: testNs, Name: "hr3"}}: {
+					Source: &v1.HTTPRoute{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "hr3",
+							Namespace: testNs,
+						},
+					},
+				},
+			},
+			expectedConditions: map[types.NamespacedName][]conditions.Condition{
+				{Namespace: testNs, Name: "hr1"}: {},
+			},
+			missingKeys: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			addPolicyAffectedStatusToTargetRefs(test.policies, test.routes, test.gws)
+
+			for _, pols := range test.policies {
+				for _, targetRefs := range pols.TargetRefs {
+					switch targetRefs.Kind {
+					case kinds.Gateway:
+						if !test.missingKeys {
+							g.Expect(test.gws).To(HaveKey(targetRefs.Nsname))
+							gateway := test.gws[targetRefs.Nsname]
+							g.Expect(gateway.Conditions).To(ContainElements(test.expectedConditions[targetRefs.Nsname]))
+						} else {
+							g.Expect(test.expectedConditions[types.NamespacedName{Namespace: testNs, Name: "gw1"}]).To(BeEmpty())
+						}
+
+					case kinds.HTTPRoute, kinds.GRPCRoute:
+						routeKey := routeKeyForKind(targetRefs.Kind, targetRefs.Nsname)
+						if !test.missingKeys {
+							g.Expect(test.routes).To(HaveKey(routeKey))
+							route := test.routes[routeKeyForKind(targetRefs.Kind, targetRefs.Nsname)]
+							g.Expect(route.Conditions).To(ContainElements(test.expectedConditions[targetRefs.Nsname]))
+						} else {
+							g.Expect(test.expectedConditions[types.NamespacedName{Namespace: testNs, Name: "hr1"}]).To(BeEmpty())
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestAddStatusToTargetRefs(t *testing.T) {
+	t.Parallel()
+
+	g := NewWithT(t)
+
+	policyKind := kinds.ObservabilityPolicy
+
+	g.Expect(func() {
+		addStatusToTargetRefs(policyKind, nil)
+	}).ToNot(Panic())
+}
+
+func TestAddStatusToTargetRefsPayloadProcessor(t *testing.T) {
+	t.Parallel()
+
+	g := NewWithT(t)
+
+	var condsList []conditions.Condition
+
+	// Appends the PolicyAffected condition for PayloadProcessor.
+	addStatusToTargetRefs(kinds.PayloadProcessor, &condsList)
+	g.Expect(condsList).To(Equal([]conditions.Condition{conditions.NewPayloadProcessorPolicyAffected()}))
+
+	// Does not duplicate the condition when called again.
+	addStatusToTargetRefs(kinds.PayloadProcessor, &condsList)
+	g.Expect(condsList).To(Equal([]conditions.Condition{conditions.NewPayloadProcessorPolicyAffected()}))
+}
+
+func TestNGFPolicyAncestorsFullFunc(t *testing.T) {
+	t.Parallel()
+
+	createPolicyWithAncestors := func(ancestors []v1.PolicyAncestorStatus) *Policy {
+		fakePolicy := &policiesfakes.PolicyMock{
+			GetPolicyStatusFunc: func() v1.PolicyStatus {
+				return v1.PolicyStatus{
+					Ancestors: ancestors,
+				}
+			},
+		}
+		return &Policy{
+			Source:    fakePolicy,
+			Ancestors: []PolicyAncestor{}, // Updated ancestors list (starts empty)
+		}
+	}
+
+	getAncestorRef := func(ctlrName, parentName string) v1.PolicyAncestorStatus {
+		return v1.PolicyAncestorStatus{
+			ControllerName: v1.GatewayController(ctlrName),
+			AncestorRef: v1.ParentReference{
+				Name:      v1.ObjectName(parentName),
+				Namespace: helpers.GetPointer(v1.Namespace("test")),
+				Group:     helpers.GetPointer[v1.Group](v1.GroupName),
+				Kind:      helpers.GetPointer[v1.Kind](kinds.Gateway),
+			},
+		}
+	}
+
+	tests := []struct {
+		name                string
+		currentAncestors    []v1.PolicyAncestorStatus
+		updatedAncestorsLen int
+		expectFull          bool
+	}{
+		{
+			name:                "empty current ancestors, no updated ancestors",
+			currentAncestors:    []v1.PolicyAncestorStatus{},
+			updatedAncestorsLen: 0,
+			expectFull:          false,
+		},
+		{
+			name: "less than 16 total (current + updated)",
+			currentAncestors: []v1.PolicyAncestorStatus{
+				getAncestorRef("other-controller", "gateway1"),
+				getAncestorRef("other-controller", "gateway2"),
+			},
+			updatedAncestorsLen: 2,
+			expectFull:          false,
+		},
+		{
+			name: "exactly 16 non-NGF ancestors, no updated ancestors",
+			currentAncestors: func() []v1.PolicyAncestorStatus {
+				ancestors := make([]v1.PolicyAncestorStatus, 16)
+				for i := range 16 {
+					ancestors[i] = getAncestorRef("other-controller", "gateway")
+				}
+				return ancestors
+			}(),
+			updatedAncestorsLen: 1, // Trying to add 1 NGF ancestor
+			expectFull:          true,
+		},
+		{
+			name: "15 non-NGF + 1 NGF ancestor, adding 1 more NGF ancestor",
+			currentAncestors: func() []v1.PolicyAncestorStatus {
+				ancestors := make([]v1.PolicyAncestorStatus, 16)
+				for i := range 15 {
+					ancestors[i] = getAncestorRef("other-controller", "gateway")
+				}
+				ancestors[15] = getAncestorRef("nginx-gateway", "our-gateway")
+				return ancestors
+			}(),
+			updatedAncestorsLen: 1,
+			expectFull:          true, // Full because 15 non-NGF + 1 new NGF = 16 which is the limit
+		},
+		{
+			name: "10 non-NGF ancestors, trying to add 7 NGF ancestors (would exceed 16)",
+			currentAncestors: func() []v1.PolicyAncestorStatus {
+				ancestors := make([]v1.PolicyAncestorStatus, 10)
+				for i := range 10 {
+					ancestors[i] = getAncestorRef("other-controller", "gateway")
+				}
+				return ancestors
+			}(),
+			updatedAncestorsLen: 7,
+			expectFull:          true,
+		},
+		{
+			name: "5 non-NGF + 5 NGF ancestors, trying to add 6 more NGF ancestors",
+			currentAncestors: func() []v1.PolicyAncestorStatus {
+				ancestors := make([]v1.PolicyAncestorStatus, 10)
+				for i := range 5 {
+					ancestors[i] = getAncestorRef("other-controller", "gateway")
+				}
+				for i := 5; i < 10; i++ {
+					ancestors[i] = getAncestorRef("nginx-gateway", "our-gateway")
+				}
+				return ancestors
+			}(),
+			updatedAncestorsLen: 6,
+			expectFull:          false, // 5 non-NGF + 6 new NGF = 11 total (within limit)
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			policy := createPolicyWithAncestors(test.currentAncestors)
+
+			// Simulate the updated ancestors list
+			for range test.updatedAncestorsLen {
+				policy.Ancestors = append(policy.Ancestors, PolicyAncestor{
+					Ancestor: createParentReference(v1.GroupName, kinds.Gateway,
+						types.NamespacedName{Namespace: "test", Name: "new-gateway"}),
+				})
+			}
+
+			result := ngfPolicyAncestorsFull(policy, "nginx-gateway")
+			g.Expect(result).To(Equal(test.expectFull))
+		})
+	}
+}
+
+func TestNGFPolicyAncestorLimitHandling(t *testing.T) {
+	t.Parallel()
+
+	// Create a test logger that captures log output
+	var logBuf bytes.Buffer
+	testLogger := logr.New(&testNGFLogSink{buffer: &logBuf})
+
+	policyGVK := schema.GroupVersionKind{Group: "Group", Version: "Version", Kind: "TestPolicy"}
+
+	// Helper function to create ancestor references
+	getAncestorRef := func(ctlrName, parentName string) v1.PolicyAncestorStatus {
+		return v1.PolicyAncestorStatus{
+			ControllerName: v1.GatewayController(ctlrName),
+			AncestorRef: v1.ParentReference{
+				Name:      v1.ObjectName(parentName),
+				Namespace: helpers.GetPointer(v1.Namespace("test")),
+				Group:     helpers.GetPointer[v1.Group](v1.GroupName),
+				Kind:      helpers.GetPointer[v1.Kind](kinds.Gateway),
+			},
+		}
+	}
+
+	// Create 16 ancestors from different controllers to simulate full list
+	fullAncestors := make([]v1.PolicyAncestorStatus, 16)
+	for i := range 16 {
+		fullAncestors[i] = getAncestorRef("other-controller", "other-gateway")
+	}
+
+	policyWithFullAncestors := &policiesfakes.PolicyMock{
+		GetNameFunc: func() string {
+			return "policy-full-ancestors"
+		},
+		GetNamespaceFunc: func() string {
+			return "test"
+		},
+		GetPolicyStatusFunc: func() v1.PolicyStatus {
+			return v1.PolicyStatus{
+				Ancestors: fullAncestors,
+			}
+		},
+		GetObjectKindFunc: func() schema.ObjectKind {
+			return &policiesfakes.ObjectKindMock{
+				GroupVersionKindFunc: func() schema.GroupVersionKind {
+					return policyGVK
+				},
+			}
+		},
+		GetTargetRefsFunc: func() []v1.LocalPolicyTargetReference {
+			return []v1.LocalPolicyTargetReference{
+				{
+					Group: v1.GroupName,
+					Kind:  kinds.Gateway,
+					Name:  v1.ObjectName("gateway1"),
+				},
+			}
+		},
+	}
+
+	// Create a policy with fewer ancestors (normal case)
+	normalPolicy := &policiesfakes.PolicyMock{
+		GetNameFunc: func() string {
+			return "policy-normal"
+		},
+		GetNamespaceFunc: func() string {
+			return "test"
+		},
+		GetPolicyStatusFunc: func() v1.PolicyStatus {
+			return v1.PolicyStatus{
+				Ancestors: []v1.PolicyAncestorStatus{}, // Empty ancestors list
+			}
+		},
+		GetObjectKindFunc: func() schema.ObjectKind {
+			return &policiesfakes.ObjectKindMock{
+				GroupVersionKindFunc: func() schema.GroupVersionKind {
+					return policyGVK
+				},
+			}
+		},
+		GetTargetRefsFunc: func() []v1.LocalPolicyTargetReference {
+			return []v1.LocalPolicyTargetReference{
+				{
+					Group: v1.GroupName,
+					Kind:  kinds.Gateway,
+					Name:  v1.ObjectName("gateway2"),
+				},
+			}
+		},
+	}
+
+	// Create gateways
+	gateways := map[types.NamespacedName]*Gateway{
+		{Namespace: "test", Name: "gateway1"}: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gateway1", Namespace: "test"},
+			},
+			Conditions: []conditions.Condition{}, // Start with empty conditions
+		},
+		{Namespace: "test", Name: "gateway2"}: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: "gateway2", Namespace: "test"},
+			},
+			Conditions: []conditions.Condition{}, // Start with empty conditions
+		},
+	}
+
+	// Create test policies map
+	testPolicies := map[PolicyKey]policies.Policy{
+		{
+			NsName: types.NamespacedName{Namespace: "test", Name: "policy-full-ancestors"},
+			GVK:    policyGVK,
+		}: policyWithFullAncestors,
+		{
+			NsName: types.NamespacedName{Namespace: "test", Name: "policy-normal"},
+			GVK:    policyGVK,
+		}: normalPolicy,
+	}
+
+	// Create fake validator
+	validator := &policiesfakes.FakeValidator{
+		ValidateStub: func(_ policies.Policy) []conditions.Condition {
+			return nil
+		},
+		ConflictsStub: func(_, _ policies.Policy) bool {
+			return false
+		},
+	}
+
+	// Create empty routes and services for the test
+	routes := map[RouteKey]*L7Route{}
+	referencedServices := map[types.NamespacedName]*ReferencedService{}
+
+	g := NewWithT(t)
+
+	// Process policies which should trigger ancestor limit handling
+	processedPolicies, _ := processPolicies(
+		t.Context(), logr.Discard(), testPolicies, validator, routes, referencedServices, gateways, nil, nil,
+	)
+
+	// Create a graph and attach policies to trigger ancestor limit handling
+	graph := &Graph{
+		Gateways:    gateways,
+		NGFPolicies: processedPolicies,
+	}
+
+	// Call attachPolicies to trigger the ancestor limit logic
+	graph.attachPolicies(validator, "nginx-gateway", testLogger)
+
+	// Verify that the policy with full ancestors has no actual ancestors assigned
+	policyFullKey := PolicyKey{
+		NsName: types.NamespacedName{Namespace: "test", Name: "policy-full-ancestors"},
+		GVK:    policyGVK,
+	}
+	policyFull := graph.NGFPolicies[policyFullKey]
+	g.Expect(policyFull.Ancestors).To(BeEmpty(), "Policy with full ancestors should have no ancestors assigned")
+
+	// Verify that the normal policy gets its ancestor assigned
+	policyNormalKey := PolicyKey{NsName: types.NamespacedName{Namespace: "test", Name: "policy-normal"}, GVK: policyGVK}
+	policyNormal := graph.NGFPolicies[policyNormalKey]
+	g.Expect(policyNormal.Ancestors).To(HaveLen(1), "Normal policy should have ancestor assigned")
+
+	// Verify that gateway1 received the ancestor limit condition
+	gateway1 := gateways[types.NamespacedName{Namespace: "test", Name: "gateway1"}]
+	g.Expect(gateway1.Conditions).To(HaveLen(1), "Gateway should have received ancestor limit condition")
+
+	condition := gateway1.Conditions[0]
+	g.Expect(condition.Type).To(Equal(string(v1.PolicyConditionAccepted)))
+	g.Expect(condition.Status).To(Equal(metav1.ConditionFalse))
+	g.Expect(condition.Reason).To(Equal(string(conditions.PolicyReasonAncestorLimitReached)))
+	g.Expect(condition.Message).To(ContainSubstring("ancestor status list has reached the maximum size"))
+
+	// Verify that gateway2 did not receive any conditions (normal case)
+	gateway2 := gateways[types.NamespacedName{Namespace: "test", Name: "gateway2"}]
+	g.Expect(gateway2.Conditions).To(BeEmpty(), "Normal gateway should not have conditions")
+
+	// Verify logging occurred
+	logOutput := logBuf.String()
+	g.Expect(logOutput).To(ContainSubstring("Policy ancestor limit reached"))
+	g.Expect(logOutput).To(ContainSubstring("test/policy-full-ancestors"))
+	g.Expect(logOutput).To(ContainSubstring("policyKind=TestPolicy"))
+	g.Expect(logOutput).To(ContainSubstring("ancestor=test/gateway1"))
+}
+
+// testNGFLogSink implements logr.LogSink for testing NGF policies.
+type testNGFLogSink struct {
+	buffer *bytes.Buffer
+}
+
+func (s *testNGFLogSink) Init(_ logr.RuntimeInfo) {}
+
+func (s *testNGFLogSink) Enabled(_ int) bool {
+	return true
+}
+
+func (s *testNGFLogSink) Info(_ int, msg string, keysAndValues ...any) {
+	s.buffer.WriteString(msg)
+	for i := 0; i < len(keysAndValues); i += 2 {
+		if i+1 < len(keysAndValues) {
+			s.buffer.WriteString(" ")
+			if key, ok := keysAndValues[i].(string); ok {
+				s.buffer.WriteString(key)
+			}
+			s.buffer.WriteString("=")
+			if value, ok := keysAndValues[i+1].(string); ok {
+				s.buffer.WriteString(value)
+			}
+		}
+	}
+	s.buffer.WriteString("\n")
+}
+
+func (s *testNGFLogSink) Error(err error, msg string, _ ...any) {
+	s.buffer.WriteString("ERROR: ")
+	s.buffer.WriteString(msg)
+	s.buffer.WriteString(" error=")
+	s.buffer.WriteString(err.Error())
+	s.buffer.WriteString("\n")
+}
+
+func (s *testNGFLogSink) WithValues(_ ...any) logr.LogSink {
+	return s
+}
+
+func (s *testNGFLogSink) WithName(_ string) logr.LogSink {
+	return s
+}
+
+// createPolicyWithExistingGatewayStatus creates a fake policy with a gateway in its status ancestors.
+func createPolicyWithExistingGatewayStatus(gatewayNsName types.NamespacedName, controllerName string) policies.Policy {
+	ancestors := []v1.PolicyAncestorStatus{
+		{
+			ControllerName: v1.GatewayController(controllerName),
+			AncestorRef: v1.ParentReference{
+				Group:     helpers.GetPointer[v1.Group](v1.GroupName),
+				Kind:      helpers.GetPointer[v1.Kind](kinds.Gateway),
+				Namespace: (*v1.Namespace)(&gatewayNsName.Namespace),
+				Name:      v1.ObjectName(gatewayNsName.Name),
+			},
+		},
+	}
+	return createFakePolicyWithAncestors("test-policy", "test", ancestors)
+}
+
+// createFakePolicy creates a basic fake policy with common defaults.
+func createFakePolicy(name, namespace string) *policiesfakes.PolicyMock {
+	return &policiesfakes.PolicyMock{
+		GetNameFunc:      func() string { return name },
+		GetNamespaceFunc: func() string { return namespace },
+		GetPolicyStatusFunc: func() v1.PolicyStatus {
+			return v1.PolicyStatus{}
+		},
+		GetTargetRefsFunc: func() []v1.LocalPolicyTargetReference {
+			return []v1.LocalPolicyTargetReference{}
+		},
+	}
+}
+
+// createFakePolicyWithAncestors creates a fake policy with specific ancestors.
+func createFakePolicyWithAncestors(
+	name, namespace string,
+	ancestors []v1.PolicyAncestorStatus,
+) *policiesfakes.PolicyMock {
+	policy := createFakePolicy(name, namespace)
+	policy.GetPolicyStatusFunc = func() v1.PolicyStatus {
+		return v1.PolicyStatus{Ancestors: ancestors}
+	}
+	return policy
+}
+
+func TestSnippetsPolicyPropagation(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	snippetsGVK := schema.GroupVersionKind{Group: v1.GroupName, Version: "v1alpha1", Kind: kinds.SnippetsPolicy}
+	otherGVK := schema.GroupVersionKind{Group: v1.GroupName, Version: "v1alpha1", Kind: "OtherPolicy"}
+
+	gwNsName := types.NamespacedName{Namespace: testNs, Name: "gateway"}
+	otherGwNsName := types.NamespacedName{Namespace: testNs, Name: "other-gateway"}
+
+	// Create SnippetsPolicy
+	snippetsPolicy := &Policy{
+		Source: createTestPolicy(snippetsGVK, "snippets-policy", v1.LocalPolicyTargetReference{
+			Group: v1.GroupName,
+			Kind:  kinds.Gateway,
+			Name:  v1.ObjectName(gwNsName.Name),
+		}),
+		TargetRefs: []PolicyTargetRef{
+			{
+				Kind:   kinds.Gateway,
+				Group:  v1.GroupName,
+				Nsname: gwNsName,
+			},
+		},
+		InvalidForGateways: make(map[types.NamespacedName]struct{}),
+	}
+
+	// Create OtherPolicy
+	otherPolicy := &Policy{
+		Source: createTestPolicy(otherGVK, "other-policy", v1.LocalPolicyTargetReference{
+			Group: v1.GroupName,
+			Kind:  kinds.Gateway,
+			Name:  v1.ObjectName(gwNsName.Name),
+		}),
+		TargetRefs: []PolicyTargetRef{
+			{
+				Kind:   kinds.Gateway,
+				Group:  v1.GroupName,
+				Nsname: gwNsName,
+			},
+		},
+		InvalidForGateways: make(map[types.NamespacedName]struct{}),
+	}
+
+	// Create Gateways
+	gateways := map[types.NamespacedName]*Gateway{
+		gwNsName: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: gwNsName.Name, Namespace: gwNsName.Namespace},
+			},
+			Valid: true,
+		},
+		otherGwNsName: {
+			Source: &v1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: otherGwNsName.Name, Namespace: otherGwNsName.Namespace},
+			},
+			Valid: true,
+		},
+	}
+
+	// Create Routes
+	// Route 1: Attached to target gateway
+	route1Key := RouteKey{
+		NamespacedName: types.NamespacedName{Namespace: testNs, Name: "route1"},
+		RouteType:      RouteTypeHTTP,
+	}
+	route1 := &L7Route{
+		Source: &v1.HTTPRoute{ObjectMeta: metav1.ObjectMeta{Name: "route1", Namespace: testNs}},
+		ParentRefs: []ParentRef{
+			{
+				Kind:           kinds.Gateway,
+				NamespacedName: gwNsName,
+				GatewayNsName:  gwNsName,
+			},
+		},
+	}
+
+	// Route 2: Attached to other gateway
+	route2Key := RouteKey{
+		NamespacedName: types.NamespacedName{Namespace: testNs, Name: "route2"},
+		RouteType:      RouteTypeHTTP,
+	}
+	route2 := &L7Route{
+		Source: &v1.HTTPRoute{ObjectMeta: metav1.ObjectMeta{Name: "route2", Namespace: testNs}},
+		ParentRefs: []ParentRef{
+			{
+				Kind:           kinds.Gateway,
+				NamespacedName: otherGwNsName,
+				GatewayNsName:  otherGwNsName,
+			},
+		},
+	}
+
+	// Route 3: Attached to both gateways
+	route3Key := RouteKey{
+		NamespacedName: types.NamespacedName{Namespace: testNs, Name: "route3"},
+		RouteType:      RouteTypeHTTP,
+	}
+	route3 := &L7Route{
+		Source: &v1.HTTPRoute{ObjectMeta: metav1.ObjectMeta{Name: "route3", Namespace: testNs}},
+		ParentRefs: []ParentRef{
+			{
+				Kind:           kinds.Gateway,
+				NamespacedName: gwNsName,
+				GatewayNsName:  gwNsName,
+			},
+			{
+				Kind:           kinds.Gateway,
+				NamespacedName: otherGwNsName,
+				GatewayNsName:  otherGwNsName,
+			},
+		},
+	}
+
+	routes := map[RouteKey]*L7Route{
+		route1Key: route1,
+		route2Key: route2,
+		route3Key: route3,
+	}
+
+	// Test 1: SnippetsPolicy Propagation
+	attachPolicyToGateway(
+		snippetsPolicy,
+		snippetsPolicy.TargetRefs[0],
+		gateways, routes,
+		"nginx-gateway",
+		logr.Discard(),
+		&policiesfakes.FakeValidator{},
+	)
+
+	// Verify Gateway attachment
+	g.Expect(gateways[gwNsName].Policies).To(ContainElement(snippetsPolicy))
+
+	// Verify Route Propagation
+	g.Expect(route1.Policies).To(ContainElement(snippetsPolicy), "Route1 attached to gateway should have policy")
+	g.Expect(route2.Policies).To(
+		Not(ContainElement(snippetsPolicy)),
+		"Route2 attached to other gateway should NOT have policy",
+	)
+	g.Expect(route3.Policies).To(ContainElement(snippetsPolicy), "Route3 attached to gateway should have policy")
+
+	// Test 2: Other Policy (Non-Snippets) Propagation
+	attachPolicyToGateway(
+		otherPolicy,
+		otherPolicy.TargetRefs[0],
+		gateways,
+		routes,
+		"nginx-gateway",
+		logr.Discard(),
+		&policiesfakes.FakeValidator{},
+	)
+
+	// Verify Gateway attachment
+	g.Expect(gateways[gwNsName].Policies).To(ContainElement(otherPolicy))
+
+	// Verify NO Route Propagation
+	g.Expect(route1.Policies).To(Not(ContainElement(otherPolicy)), "Route1 should NOT have other policy")
+	g.Expect(route3.Policies).To(Not(ContainElement(otherPolicy)), "Route3 should NOT have other policy")
+}
+
+func TestProcessWAFPolicies(t *testing.T) {
+	t.Parallel()
+
+	wafGVK := schema.GroupVersionKind{
+		Group:   ngfAPIv1alpha1.GroupName,
+		Version: "v1alpha1",
+		Kind:    kinds.WAFPolicy,
+	}
+	otherGVK := schema.GroupVersionKind{Group: "Group", Version: "Version", Kind: "OtherPolicy"}
+
+	policyNs := "test-ns"
+	policyName := "my-waf-policy"
+	bundleURL := "https://example.com/bundle.tgz"
+	logBundleURL := "https://example.com/log-bundle.tgz"
+	authSecretName := "auth-secret"
+	tlsSecretName := "tls-secret"
+
+	authSecretNsName := types.NamespacedName{Namespace: policyNs, Name: authSecretName}
+	tlsSecretNsName := types.NamespacedName{Namespace: policyNs, Name: tlsSecretName}
+
+	// Use the default HTTP source spec to compute the source-based bundle key.
+	defaultHTTPSpec := ngfAPIv1alpha1.WAFPolicySpec{
+		Type: ngfAPIv1alpha1.PolicySourceTypeHTTP,
+		PolicySource: &ngfAPIv1alpha1.PolicySource{
+			HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: bundleURL},
+		},
+	}
+	bundleKey := PolicyBundleKey(defaultHTTPSpec)
+	logBundleKey := LogBundleKey(
+		&ngfAPIv1alpha1.LogSource{
+			HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: logBundleURL},
+		},
+	)
+
+	fetchedData := []byte("bundle-data")
+	fetchedChecksum := "abc123"
+
+	makeWAFPolicy := func(name string, withAuth, withTLS, withLogURL bool) *ngfAPIv1alpha1.WAFPolicy {
+		p := &ngfAPIv1alpha1.WAFPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: policyNs},
+			Spec: ngfAPIv1alpha1.WAFPolicySpec{
+				Type: ngfAPIv1alpha1.PolicySourceTypeHTTP,
+				PolicySource: &ngfAPIv1alpha1.PolicySource{
+					HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: bundleURL},
+				},
+			},
+		}
+
+		if withAuth {
+			p.Spec.PolicySource.Auth = &ngfAPIv1alpha1.BundleAuth{
+				SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: authSecretName},
+			}
+		}
+
+		if withTLS {
+			p.Spec.PolicySource.TLSSecretRef = &ngfAPIv1alpha1.LocalObjectReference{Name: tlsSecretName}
+		}
+
+		if withLogURL {
+			p.Spec.SecurityLogs = []ngfAPIv1alpha1.WAFSecurityLog{
+				{
+					LogSource: &ngfAPIv1alpha1.LogSource{
+						HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: logBundleURL},
+					},
+					Destination: ngfAPIv1alpha1.SecurityLogDestination{
+						Type: ngfAPIv1alpha1.SecurityLogDestinationTypeStderr,
+					},
+				},
+			}
+		}
+
+		return p
+	}
+
+	makePolicyEntry := func(wafPolicy *ngfAPIv1alpha1.WAFPolicy, valid bool) (PolicyKey, *Policy) {
+		key := PolicyKey{
+			GVK:    wafGVK,
+			NsName: types.NamespacedName{Namespace: policyNs, Name: wafPolicy.Name},
+		}
+		pol := &Policy{
+			Source: wafPolicy,
+			Valid:  valid,
+		}
+		return key, pol
+	}
+
+	tokenSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: authSecretName, Namespace: policyNs},
+		Data:       map[string][]byte{secrets.BundleTokenKey: []byte("my-token")},
+	}
+
+	tlsSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: tlsSecretName, Namespace: policyNs},
+		Data:       map[string][]byte{"ca.crt": []byte("ca-data")},
+	}
+
+	// multiLogURL1 is defined at table scope so it can be referenced in both the
+	// processedPolicies closure and the expBundles map of the multi-log test case.
+	multiLogURL1 := "https://example.com/log1.tgz"
+
+	tests := []struct {
+		processedPolicies func() map[PolicyKey]*Policy
+		wafInput          func() *WAFProcessingInput
+		expBundles        map[WAFBundleKey]*WAFBundleData
+		expSecrets        map[types.NamespacedName]*corev1.Secret
+		expConditions     func(pol *Policy) []conditions.Condition
+		name              string
+		expValid          bool
+		expBundlePending  bool
+	}{
+		{
+			name: "nil wafInput returns nil",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, false, false)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput { return nil },
+		},
+		{
+			name: "non-WAFPolicy kind is skipped",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				return map[PolicyKey]*Policy{
+					{GVK: otherGVK, NsName: types.NamespacedName{Namespace: policyNs, Name: "other"}}: {
+						Source: &policiesfakes.PolicyMock{},
+						Valid:  true,
+					},
+				}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{},
+		},
+		{
+			name: "An invalid policy is skipped during ceiling evaluation.",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, false, false)
+				key, pol := makePolicyEntry(wafPolicy, false)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{},
+			expValid:   false,
+		},
+		{
+			name: "successful fetch stores bundle in output",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, false, false)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				bundleKey: {Data: fetchedData, Checksum: fetchedChecksum},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{},
+			expValid:   true,
+		},
+		{
+			name: "fetch error with no previous bundle sets policy pending (fail-closed)",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, false, false)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{}, fmt.Errorf("fetch failed")
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{}, fmt.Errorf("fetch failed")
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{},
+			expConditions: func(_ *Policy) []conditions.Condition {
+				return []conditions.Condition{conditions.NewPolicyNotProgrammedBundlePending("fetch failed")}
+			},
+			expValid:         true,
+			expBundlePending: true,
+		},
+		{
+			name: "fetch error with previous bundle uses stale bundle and adds warning condition",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, false, false)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{}, fmt.Errorf("fetch failed")
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{}, fmt.Errorf("fetch failed")
+				}
+				prevData := &WAFBundleData{Data: []byte("old-data"), Checksum: "old-checksum"}
+				return &WAFProcessingInput{
+					Fetcher: fetcher,
+					Secrets: map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{
+						bundleKey: prevData,
+					},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				bundleKey: {Data: []byte("old-data"), Checksum: "old-checksum"},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{},
+			expConditions: func(_ *Policy) []conditions.Condition {
+				return []conditions.Condition{
+					conditions.NewPolicyProgrammedStaleBundleWarning("policy bundle", "fetch failed"),
+				}
+			},
+			expValid: true,
+		},
+		{
+			name: "auth secret missing marks policy invalid",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, true, false, false)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{authSecretNsName: nil},
+			expConditions: func(_ *Policy) []conditions.Condition {
+				return []conditions.Condition{
+					conditions.NewPolicyRefsNotResolved(
+						fmt.Sprintf("auth secret %q not found", authSecretNsName),
+					),
+				}
+			},
+			expValid: false,
+		},
+		{
+			name: "auth secret present is resolved and stored in output",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, true, false, false)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{authSecretNsName: tokenSecret},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				bundleKey: {Data: fetchedData, Checksum: fetchedChecksum},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{authSecretNsName: tokenSecret},
+			expValid:   true,
+		},
+		{
+			name: "TLS secret missing marks policy invalid",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, true, false)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{tlsSecretNsName: nil},
+			expConditions: func(_ *Policy) []conditions.Condition {
+				return []conditions.Condition{
+					conditions.NewPolicyRefsNotResolved(
+						fmt.Sprintf("TLS CA secret %q not found", tlsSecretNsName),
+					),
+				}
+			},
+			expValid: false,
+		},
+		{
+			name: "TLS secret with empty ca.crt marks policy invalid",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, true, false)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				emptyTLSSecret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: tlsSecretName, Namespace: policyNs},
+					Data:       map[string][]byte{secrets.CAKey: {}},
+				}
+				return &WAFProcessingInput{
+					Fetcher:         &fetchfakes.FetcherMock{},
+					Secrets:         map[types.NamespacedName]*corev1.Secret{tlsSecretNsName: emptyTLSSecret},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{},
+			expConditions: func(_ *Policy) []conditions.Condition {
+				return []conditions.Condition{
+					conditions.NewPolicyRefsNotResolved(
+						fmt.Sprintf("TLS CA secret %q has empty %q key", tlsSecretNsName, secrets.CAKey),
+					),
+				}
+			},
+			expValid: false,
+		},
+		{
+			name: "TLS secret with whitespace-only ca.crt marks policy invalid",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, true, false)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				whitespaceTLSSecret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: tlsSecretName, Namespace: policyNs},
+					Data:       map[string][]byte{secrets.CAKey: []byte("   \n  ")},
+				}
+				return &WAFProcessingInput{
+					Fetcher:         &fetchfakes.FetcherMock{},
+					Secrets:         map[types.NamespacedName]*corev1.Secret{tlsSecretNsName: whitespaceTLSSecret},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{},
+			expConditions: func(_ *Policy) []conditions.Condition {
+				return []conditions.Condition{
+					conditions.NewPolicyRefsNotResolved(
+						fmt.Sprintf("TLS CA secret %q has empty %q key", tlsSecretNsName, secrets.CAKey),
+					),
+				}
+			},
+			expValid: false,
+		},
+		{
+			name: "TLS secret present is resolved and stored in output",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, true, false)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{tlsSecretNsName: tlsSecret},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				bundleKey: {Data: fetchedData, Checksum: fetchedChecksum},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{tlsSecretNsName: tlsSecret},
+			expValid:   true,
+		},
+		{
+			name: "security log with URL fetches log bundle",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, false, true)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				bundleKey:    {Data: fetchedData, Checksum: fetchedChecksum},
+				logBundleKey: {Data: fetchedData, Checksum: fetchedChecksum},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{},
+			expValid:   true,
+		},
+		{
+			name: "security log fetch error with no previous bundle sets policy pending (fail-closed)",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, false, true)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				// first call (policy bundle) succeeds; second call (log bundle) fails
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{}, fmt.Errorf("log fetch failed")
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				bundleKey: {Data: fetchedData, Checksum: fetchedChecksum},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{},
+			expConditions: func(_ *Policy) []conditions.Condition {
+				return []conditions.Condition{conditions.NewPolicyNotProgrammedBundlePending("log fetch failed")}
+			},
+			expValid:         true,
+			expBundlePending: true,
+		},
+		{
+			name: "NIM managed source sets PolicyName on fetch request",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, false, false)
+				wafPolicy.Spec.Type = ngfAPIv1alpha1.PolicySourceTypeNIM
+				wafPolicy.Spec.PolicySource.HTTPSource = nil
+				wafPolicy.Spec.PolicySource.NIMSource = &ngfAPIv1alpha1.NIMBundleSource{
+					URL:        bundleURL,
+					PolicyName: helpers.GetPointer("my-nim-policy"),
+				}
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				PolicyBundleKey(ngfAPIv1alpha1.WAFPolicySpec{
+					Type: ngfAPIv1alpha1.PolicySourceTypeNIM,
+					PolicySource: &ngfAPIv1alpha1.PolicySource{
+						NIMSource: &ngfAPIv1alpha1.NIMBundleSource{
+							URL:        bundleURL,
+							PolicyName: helpers.GetPointer("my-nim-policy"),
+						},
+					},
+				}): {Data: fetchedData, Checksum: fetchedChecksum},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{},
+			expValid:   true,
+		},
+		{
+			name: "N1C managed source sets N1CNamespace and swaps BearerToken to APIToken",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, true, false, false)
+				wafPolicy.Spec.Type = ngfAPIv1alpha1.PolicySourceTypeN1C
+				n1cNs := "my-n1c-namespace"
+				wafPolicy.Spec.PolicySource.HTTPSource = nil
+				wafPolicy.Spec.PolicySource.N1CSource = &ngfAPIv1alpha1.N1CBundleSource{
+					URL:        bundleURL,
+					PolicyName: helpers.GetPointer("my-n1c-policy"),
+					Namespace:  n1cNs,
+				}
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{authSecretNsName: tokenSecret},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				PolicyBundleKey(ngfAPIv1alpha1.WAFPolicySpec{
+					Type: ngfAPIv1alpha1.PolicySourceTypeN1C,
+					PolicySource: &ngfAPIv1alpha1.PolicySource{
+						N1CSource: &ngfAPIv1alpha1.N1CBundleSource{
+							URL:        bundleURL,
+							PolicyName: helpers.GetPointer("my-n1c-policy"),
+							Namespace:  "my-n1c-namespace",
+						},
+						Auth: &ngfAPIv1alpha1.BundleAuth{
+							SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: authSecretName},
+						},
+					},
+				}): {Data: fetchedData, Checksum: fetchedChecksum},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{authSecretNsName: tokenSecret},
+			expValid:   true,
+		},
+		{
+			name: "security log auth secret missing marks policy invalid and continues",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, false, false)
+				wafPolicy.Spec.SecurityLogs = []ngfAPIv1alpha1.WAFSecurityLog{
+					{
+						LogSource: &ngfAPIv1alpha1.LogSource{
+							HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: logBundleURL},
+							Auth: &ngfAPIv1alpha1.BundleAuth{
+								SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: authSecretName},
+							},
+						},
+						Destination: ngfAPIv1alpha1.SecurityLogDestination{
+							Type: ngfAPIv1alpha1.SecurityLogDestinationTypeStderr,
+						},
+					},
+				}
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				// policy bundle fetch succeeds; log auth secret is missing so log fetch never runs
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				bundleKey: {Data: fetchedData, Checksum: fetchedChecksum},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{authSecretNsName: nil},
+			expConditions: func(_ *Policy) []conditions.Condition {
+				return []conditions.Condition{
+					conditions.NewPolicyRefsNotResolved(
+						fmt.Sprintf("auth secret %q not found", authSecretNsName),
+					),
+				}
+			},
+			expValid: false,
+		},
+		{
+			name: "security log TLS secret missing marks policy invalid and continues",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, false, false)
+				wafPolicy.Spec.SecurityLogs = []ngfAPIv1alpha1.WAFSecurityLog{
+					{
+						LogSource: &ngfAPIv1alpha1.LogSource{
+							HTTPSource:   &ngfAPIv1alpha1.HTTPBundleSource{URL: logBundleURL},
+							TLSSecretRef: &ngfAPIv1alpha1.LocalObjectReference{Name: tlsSecretName},
+						},
+						Destination: ngfAPIv1alpha1.SecurityLogDestination{
+							Type: ngfAPIv1alpha1.SecurityLogDestinationTypeStderr,
+						},
+					},
+				}
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				bundleKey: {Data: fetchedData, Checksum: fetchedChecksum},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{tlsSecretNsName: nil},
+			expConditions: func(_ *Policy) []conditions.Condition {
+				return []conditions.Condition{
+					conditions.NewPolicyRefsNotResolved(
+						fmt.Sprintf("TLS CA secret %q not found", tlsSecretNsName),
+					),
+				}
+			},
+			expValid: false,
+		},
+		{
+			name: "security log fetch error with previous bundle uses stale bundle",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, false, true)
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{}, fmt.Errorf("log fetch failed")
+				}
+				prevLogBundle := &WAFBundleData{Data: []byte("old-log-data"), Checksum: "old-log-checksum"}
+				return &WAFProcessingInput{
+					Fetcher: fetcher,
+					Secrets: map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{
+						logBundleKey: prevLogBundle,
+					},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				bundleKey:    {Data: fetchedData, Checksum: fetchedChecksum},
+				logBundleKey: {Data: []byte("old-log-data"), Checksum: "old-log-checksum"},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{},
+			expConditions: func(_ *Policy) []conditions.Condition {
+				return []conditions.Condition{
+					conditions.NewPolicyProgrammedStaleBundleWarning(
+						"security log bundle (URL: "+logBundleURL+")",
+						"log fetch failed",
+					),
+				}
+			},
+			expValid: true,
+		},
+		{
+			name: "multiple security logs: first fails auth, second succeeds",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				wafPolicy := makeWAFPolicy(policyName, false, false, false)
+				logURL0 := "https://example.com/log0.tgz"
+				logURL1 := multiLogURL1
+				wafPolicy.Spec.SecurityLogs = []ngfAPIv1alpha1.WAFSecurityLog{
+					{
+						LogSource: &ngfAPIv1alpha1.LogSource{
+							HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: logURL0},
+							Auth: &ngfAPIv1alpha1.BundleAuth{
+								SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: authSecretName},
+							},
+						},
+						Destination: ngfAPIv1alpha1.SecurityLogDestination{
+							Type: ngfAPIv1alpha1.SecurityLogDestinationTypeStderr,
+						},
+					},
+					{
+						LogSource: &ngfAPIv1alpha1.LogSource{
+							HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: logURL1},
+						},
+						Destination: ngfAPIv1alpha1.SecurityLogDestination{
+							Type: ngfAPIv1alpha1.SecurityLogDestinationTypeStderr,
+						},
+					},
+				}
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				// call 0: policy bundle; call 1: log[1] bundle (log[0] skipped due to auth error)
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				bundleKey: {Data: fetchedData, Checksum: fetchedChecksum},
+				LogBundleKey(
+					&ngfAPIv1alpha1.LogSource{HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: multiLogURL1}},
+				): {
+					Data: fetchedData, Checksum: fetchedChecksum,
+				},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{authSecretNsName: nil},
+			expConditions: func(_ *Policy) []conditions.Condition {
+				return []conditions.Condition{
+					conditions.NewPolicyRefsNotResolved(
+						fmt.Sprintf("auth secret %q not found", authSecretNsName),
+					),
+				}
+			},
+			expValid: false,
+		},
+		{
+			name: "duplicate security log URLs: bundle fetched once, second entry reuses result",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				logURL := multiLogURL1
+				wafPolicy := makeWAFPolicy(policyName, false, false, false)
+				wafPolicy.Spec.SecurityLogs = []ngfAPIv1alpha1.WAFSecurityLog{
+					{
+						LogSource: &ngfAPIv1alpha1.LogSource{
+							HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{
+								URL: logURL,
+							},
+						},
+						Destination: ngfAPIv1alpha1.SecurityLogDestination{
+							Type: ngfAPIv1alpha1.SecurityLogDestinationTypeStderr,
+						},
+					},
+					{
+						// Same URL as above — must not trigger a second fetch.
+						LogSource: &ngfAPIv1alpha1.LogSource{
+							HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{
+								URL: logURL,
+							},
+						},
+						Destination: ngfAPIv1alpha1.SecurityLogDestination{
+							Type: ngfAPIv1alpha1.SecurityLogDestinationTypeStderr,
+						},
+					},
+				}
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				// call 0: policy bundle; call 1: log bundle (second log entry must not cause call 2)
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetchCount := 0
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					fetchCount++
+					if fetchCount == 1 {
+						return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+					}
+					return fetch.Result{}, fmt.Errorf("unexpected fetch call for duplicate log URL")
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				bundleKey: {Data: fetchedData, Checksum: fetchedChecksum},
+				WAFBundleKey(fmt.Sprintf("log_%s", helpers.URLHash(multiLogURL1))): {
+					Data: fetchedData, Checksum: fetchedChecksum,
+				},
+			},
+			expSecrets:    map[types.NamespacedName]*corev1.Secret{},
+			expConditions: func(_ *Policy) []conditions.Condition { return nil },
+			expValid:      true,
+		},
+		{
+			name: "security log with default profile skips bundle fetch",
+			processedPolicies: func() map[PolicyKey]*Policy {
+				defaultProfile := ngfAPIv1alpha1.DefaultLogProfileDefault
+				wafPolicy := makeWAFPolicy(policyName, false, false, false)
+				wafPolicy.Spec.SecurityLogs = []ngfAPIv1alpha1.WAFSecurityLog{
+					{
+						LogSource: &ngfAPIv1alpha1.LogSource{
+							DefaultProfile: &defaultProfile,
+						},
+						Destination: ngfAPIv1alpha1.SecurityLogDestination{
+							Type: ngfAPIv1alpha1.SecurityLogDestinationTypeStderr,
+						},
+					},
+				}
+				key, pol := makePolicyEntry(wafPolicy, true)
+				return map[PolicyKey]*Policy{key: pol}
+			},
+			wafInput: func() *WAFProcessingInput {
+				fetcher := &fetchfakes.FetcherMock{}
+				fetcher.FetchPolicyBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+					return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+				}
+				return &WAFProcessingInput{
+					Fetcher:         fetcher,
+					Secrets:         map[types.NamespacedName]*corev1.Secret{},
+					PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				}
+			},
+			expBundles: map[WAFBundleKey]*WAFBundleData{
+				// only the policy bundle, no log bundle
+				bundleKey: {Data: fetchedData, Checksum: fetchedChecksum},
+			},
+			expSecrets: map[types.NamespacedName]*corev1.Secret{},
+			expValid:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			processedPolicies := tc.processedPolicies()
+			wafInput := tc.wafInput()
+
+			output := processWAFPolicies(t.Context(), logr.Discard(), processedPolicies, wafInput)
+
+			if wafInput == nil {
+				g.Expect(output).To(BeNil())
+				return
+			}
+
+			g.Expect(output).NotTo(BeNil())
+			g.Expect(output.Bundles).To(Equal(tc.expBundles))
+			g.Expect(output.ReferencedWAFSecrets).To(Equal(tc.expSecrets))
+
+			for _, pol := range processedPolicies {
+				if pol.Source == nil {
+					continue
+				}
+				if _, ok := pol.Source.(*ngfAPIv1alpha1.WAFPolicy); !ok {
+					continue
+				}
+				if tc.expConditions != nil {
+					g.Expect(pol.Conditions).To(Equal(tc.expConditions(pol)))
+				} else {
+					g.Expect(pol.Conditions).To(BeEmpty())
+				}
+				if tc.expValid {
+					g.Expect(pol.Valid).To(BeTrue())
+				} else if pol.Conditions != nil {
+					g.Expect(pol.Valid).To(BeFalse())
+				}
+				if pol.WAFState != nil {
+					g.Expect(pol.WAFState.BundlePending).To(Equal(tc.expBundlePending))
+				}
+			}
+		})
+	}
+}
+
+func TestResolvePLMSecrets(t *testing.T) {
+	t.Parallel()
+
+	sharedSecretName := types.NamespacedName{Namespace: "nginx-gateway", Name: "shared-plm-secret"}
+	credentialsSecretName := types.NamespacedName{Namespace: "nginx-gateway", Name: "credentials-secret"}
+
+	tests := []struct {
+		clusterSecrets  map[types.NamespacedName]*corev1.Secret
+		expectedCreds   *s3fetch.Credentials
+		expectedTLSConf *s3fetch.TLSConfig
+		name            string
+		expErrSubstring string
+	}{
+		{
+			name: "resolves shared secret roles",
+			clusterSecrets: map[types.NamespacedName]*corev1.Secret{
+				sharedSecretName: {
+					Data: map[string][]byte{
+						"ca.crt":  cert,
+						"tls.crt": cert,
+						"tls.key": key,
+					},
+				},
+				credentialsSecretName: {
+					Data: map[string][]byte{
+						"seaweedfs_admin_secret": []byte("secret-key"),
+					},
+				},
+			},
+			expectedCreds: &s3fetch.Credentials{
+				AccessKeyID:     "adminKey",
+				SecretAccessKey: "secret-key",
+			},
+			expectedTLSConf: &s3fetch.TLSConfig{
+				CAData:   cert,
+				CertData: cert,
+				KeyData:  key,
+			},
+		},
+		{
+			name: "keeps configured TLS data when keys are present",
+			clusterSecrets: map[types.NamespacedName]*corev1.Secret{
+				sharedSecretName: {
+					Data: map[string][]byte{
+						"ca.crt":  []byte("invalid-ca"),
+						"tls.crt": []byte("invalid-cert"),
+						"tls.key": []byte("invalid-key"),
+					},
+				},
+				credentialsSecretName: {
+					Data: map[string][]byte{
+						"seaweedfs_admin_secret": []byte("secret-key"),
+					},
+				},
+			},
+			expectedCreds: &s3fetch.Credentials{
+				AccessKeyID:     "adminKey",
+				SecretAccessKey: "secret-key",
+			},
+			expectedTLSConf: &s3fetch.TLSConfig{
+				CAData:   []byte("invalid-ca"),
+				CertData: []byte("invalid-cert"),
+				KeyData:  []byte("invalid-key"),
+			},
+		},
+		{
+			name: "missing configured secret records resolution error",
+			clusterSecrets: map[types.NamespacedName]*corev1.Secret{
+				sharedSecretName: {
+					Data: map[string][]byte{
+						"ca.crt":  cert,
+						"tls.crt": cert,
+						"tls.key": key,
+					},
+				},
+			},
+			expectedTLSConf: &s3fetch.TLSConfig{
+				CAData:   cert,
+				CertData: cert,
+				KeyData:  key,
+			},
+			expErrSubstring: "not found",
+		},
+		{
+			name: "invalid configured secret records resolution error",
+			clusterSecrets: map[types.NamespacedName]*corev1.Secret{
+				sharedSecretName: {
+					Data: map[string][]byte{
+						"ca.crt":  cert,
+						"tls.crt": cert,
+						"tls.key": key,
+					},
+				},
+				credentialsSecretName: {
+					Data: map[string][]byte{
+						"seaweedfs_admin_secret": []byte("   "),
+					},
+				},
+			},
+			expectedTLSConf: &s3fetch.TLSConfig{
+				CAData:   cert,
+				CertData: cert,
+				KeyData:  key,
+			},
+			expErrSubstring: "invalid",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			g := NewWithT(t)
+			resolved := resolvePLMSecrets(
+				logr.Discard(),
+				test.clusterSecrets,
+				map[types.NamespacedName][]PLMRole{
+					sharedSecretName:      {PLMRoleCA, PLMRoleClientSSL},
+					credentialsSecretName: {PLMRoleCredentials},
+				},
+			)
+
+			g.Expect(resolved).ToNot(BeNil())
+			g.Expect(resolved.Credentials).To(Equal(test.expectedCreds))
+			g.Expect(resolved.TLS).To(Equal(test.expectedTLSConf))
+			if test.expErrSubstring != "" {
+				g.Expect(resolved.ResolutionError).To(HaveOccurred())
+				g.Expect(resolved.ResolutionError.Error()).To(ContainSubstring(test.expErrSubstring))
+			} else {
+				g.Expect(resolved.ResolutionError).ToNot(HaveOccurred())
+			}
+		})
+	}
+}
+
+func TestResolveBundleAuth(t *testing.T) {
+	t.Parallel()
+
+	policyNs := "test-ns"
+	secretName := "auth-secret"
+	secretNsName := types.NamespacedName{Namespace: policyNs, Name: secretName}
+
+	bundleAuth := &ngfAPIv1alpha1.BundleAuth{
+		SecretRef: ngfAPIv1alpha1.LocalObjectReference{Name: secretName},
+	}
+
+	makeInput := func(secret *corev1.Secret) (*WAFProcessingInput, *WAFProcessingOutput) {
+		s := map[types.NamespacedName]*corev1.Secret{}
+		if secret != nil {
+			s[secretNsName] = secret
+		}
+		input := &WAFProcessingInput{
+			Secrets:         s,
+			PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+		}
+		output := &WAFProcessingOutput{
+			Bundles:              make(map[WAFBundleKey]*WAFBundleData),
+			ReferencedWAFSecrets: make(map[types.NamespacedName]*corev1.Secret),
+		}
+		return input, output
+	}
+
+	tests := []struct {
+		secret  *corev1.Secret
+		expAuth *fetch.BundleAuth
+		expCond *conditions.Condition
+		name    string
+	}{
+		{
+			name:   "secret not found",
+			secret: nil,
+			expCond: helpers.GetPointer(conditions.NewPolicyRefsNotResolved(
+				fmt.Sprintf("auth secret %q not found", secretNsName),
+			)),
+		},
+		{
+			name: "token key present and non-empty",
+			secret: &corev1.Secret{
+				Data: map[string][]byte{secrets.BundleTokenKey: []byte("my-token")},
+			},
+			expAuth: &fetch.BundleAuth{BearerToken: "my-token"},
+		},
+		{
+			name: "token key present but empty after trimming",
+			secret: &corev1.Secret{
+				Data: map[string][]byte{secrets.BundleTokenKey: []byte("   ")},
+			},
+			expCond: helpers.GetPointer(conditions.NewPolicyRefsNotResolved(
+				fmt.Sprintf("auth secret %q has empty %q key", secretNsName, secrets.BundleTokenKey),
+			)),
+		},
+		{
+			name: "username and password present",
+			secret: &corev1.Secret{
+				Data: map[string][]byte{
+					secrets.BundleUsernameKey: []byte("user"),
+					secrets.BundlePasswordKey: []byte("pass"),
+				},
+			},
+			expAuth: &fetch.BundleAuth{Username: "user", Password: "pass"},
+		},
+		{
+			name: "username present but password empty",
+			secret: &corev1.Secret{
+				Data: map[string][]byte{
+					secrets.BundleUsernameKey: []byte("user"),
+					secrets.BundlePasswordKey: []byte(""),
+				},
+			},
+			expCond: helpers.GetPointer(conditions.NewPolicyRefsNotResolved(fmt.Sprintf(
+				"auth secret %q must contain either %q or both %q and %q",
+				secretNsName, secrets.BundleTokenKey, secrets.BundleUsernameKey, secrets.BundlePasswordKey,
+			))),
+		},
+		{
+			name: "both username and password empty",
+			secret: &corev1.Secret{
+				Data: map[string][]byte{},
+			},
+			expCond: helpers.GetPointer(conditions.NewPolicyRefsNotResolved(fmt.Sprintf(
+				"auth secret %q must contain either %q or both %q and %q",
+				secretNsName, secrets.BundleTokenKey, secrets.BundleUsernameKey, secrets.BundlePasswordKey,
+			))),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			input, output := makeInput(tc.secret)
+
+			got, cond := resolveBundleAuth(bundleAuth, policyNs, input, output)
+
+			if tc.expCond != nil {
+				g.Expect(cond).To(Equal(tc.expCond))
+				g.Expect(got).To(BeNil())
+			} else {
+				g.Expect(cond).To(BeNil())
+				g.Expect(got).To(Equal(tc.expAuth))
+			}
+
+			g.Expect(output.ReferencedWAFSecrets).To(HaveKey(secretNsName))
+		})
+	}
+}
+
+func TestBuildPolicyFetchRequest(t *testing.T) {
+	t.Parallel()
+
+	baseURL := "https://example.com/bundle.tgz"
+	nimPolicyName := "my-nim-policy"
+	n1cNamespace := "my-n1c-ns"
+	bearerToken := "my-token"
+	caData := []byte("ca-cert-data")
+
+	tests := []struct {
+		auth         *fetch.BundleAuth
+		policySource *ngfAPIv1alpha1.PolicySource
+		name         string
+		policyType   ngfAPIv1alpha1.PolicySourceType
+		tlsCA        []byte
+		expRequest   fetch.Request
+	}{
+		{
+			name:         "nil policySource returns empty request",
+			policySource: nil,
+			policyType:   ngfAPIv1alpha1.PolicySourceTypeHTTP,
+			expRequest:   fetch.Request{},
+		},
+		{
+			name:       "HTTP type",
+			policyType: ngfAPIv1alpha1.PolicySourceTypeHTTP,
+			policySource: &ngfAPIv1alpha1.PolicySource{
+				HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: baseURL},
+			},
+			expRequest: fetch.Request{
+				URL:           baseURL,
+				RetryAttempts: 3,
+			},
+		},
+		{
+			name:       "HTTP type with checksum verification enabled",
+			policyType: ngfAPIv1alpha1.PolicySourceTypeHTTP,
+			policySource: &ngfAPIv1alpha1.PolicySource{
+				HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: baseURL},
+				Validation: &ngfAPIv1alpha1.BundleValidation{VerifyChecksum: true},
+			},
+			expRequest: fetch.Request{
+				URL:            baseURL,
+				VerifyChecksum: true,
+				RetryAttempts:  3,
+			},
+		},
+		{
+			name:       "NIM type with expected checksum",
+			policyType: ngfAPIv1alpha1.PolicySourceTypeNIM,
+			policySource: &ngfAPIv1alpha1.PolicySource{
+				NIMSource: &ngfAPIv1alpha1.NIMBundleSource{
+					URL:        baseURL,
+					PolicyName: helpers.GetPointer(nimPolicyName),
+				},
+				Validation: &ngfAPIv1alpha1.BundleValidation{
+					ExpectedChecksum: helpers.GetPointer("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+				},
+			},
+			expRequest: fetch.Request{
+				URL:              baseURL,
+				PolicyName:       nimPolicyName,
+				ExpectedChecksum: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				RetryAttempts:    3,
+			},
+		},
+		{
+			name:       "HTTP type with TLS CA data",
+			policyType: ngfAPIv1alpha1.PolicySourceTypeHTTP,
+			policySource: &ngfAPIv1alpha1.PolicySource{
+				HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: baseURL},
+			},
+			tlsCA: caData,
+			expRequest: fetch.Request{
+				URL:           baseURL,
+				TLSCAData:     caData,
+				RetryAttempts: 3,
+			},
+		},
+		{
+			name:       "NIM type sets PolicyName",
+			policyType: ngfAPIv1alpha1.PolicySourceTypeNIM,
+			policySource: &ngfAPIv1alpha1.PolicySource{
+				NIMSource: &ngfAPIv1alpha1.NIMBundleSource{
+					URL:        baseURL,
+					PolicyName: helpers.GetPointer(nimPolicyName),
+				},
+			},
+			expRequest: fetch.Request{
+				URL:           baseURL,
+				PolicyName:    nimPolicyName,
+				RetryAttempts: 3,
+			},
+		},
+		{
+			name:       "N1C type sets PolicyName and N1CNamespace",
+			policyType: ngfAPIv1alpha1.PolicySourceTypeN1C,
+			policySource: &ngfAPIv1alpha1.PolicySource{
+				N1CSource: &ngfAPIv1alpha1.N1CBundleSource{
+					URL:        baseURL,
+					PolicyName: helpers.GetPointer(nimPolicyName),
+					Namespace:  n1cNamespace,
+				},
+			},
+			expRequest: fetch.Request{
+				URL:        baseURL,
+				PolicyName: nimPolicyName,
+				N1C: fetch.N1CRequest{
+					Namespace: n1cNamespace,
+				},
+				RetryAttempts: 3,
+			},
+		},
+		{
+			name:       "N1C type swaps BearerToken to APIToken",
+			policyType: ngfAPIv1alpha1.PolicySourceTypeN1C,
+			policySource: &ngfAPIv1alpha1.PolicySource{
+				N1CSource: &ngfAPIv1alpha1.N1CBundleSource{
+					URL:        baseURL,
+					PolicyName: helpers.GetPointer(nimPolicyName),
+					Namespace:  n1cNamespace,
+				},
+			},
+			auth: &fetch.BundleAuth{BearerToken: bearerToken},
+			expRequest: fetch.Request{
+				URL:        baseURL,
+				PolicyName: nimPolicyName,
+				N1C: fetch.N1CRequest{
+					Namespace: n1cNamespace,
+				},
+				Auth:          &fetch.BundleAuth{APIToken: bearerToken},
+				RetryAttempts: 3,
+			},
+		},
+		{
+			name:       "N1C type with no BearerToken does not set APIToken",
+			policyType: ngfAPIv1alpha1.PolicySourceTypeN1C,
+			policySource: &ngfAPIv1alpha1.PolicySource{
+				N1CSource: &ngfAPIv1alpha1.N1CBundleSource{
+					URL:        baseURL,
+					PolicyName: helpers.GetPointer(nimPolicyName),
+					Namespace:  n1cNamespace,
+				},
+			},
+			auth: &fetch.BundleAuth{Username: "user", Password: "pass"},
+			expRequest: fetch.Request{
+				URL:        baseURL,
+				PolicyName: nimPolicyName,
+				N1C: fetch.N1CRequest{
+					Namespace: n1cNamespace,
+				},
+				Auth:          &fetch.BundleAuth{Username: "user", Password: "pass"},
+				RetryAttempts: 3,
+			},
+		},
+		{
+			name:       "N1C type with nil auth does not panic",
+			policyType: ngfAPIv1alpha1.PolicySourceTypeN1C,
+			policySource: &ngfAPIv1alpha1.PolicySource{
+				N1CSource: &ngfAPIv1alpha1.N1CBundleSource{
+					URL:        baseURL,
+					PolicyName: helpers.GetPointer(nimPolicyName),
+					Namespace:  n1cNamespace,
+				},
+			},
+			expRequest: fetch.Request{
+				URL:        baseURL,
+				PolicyName: nimPolicyName,
+				N1C: fetch.N1CRequest{
+					Namespace: n1cNamespace,
+				},
+				RetryAttempts: 3,
+			},
+		},
+		{
+			name:       "NIM type does not set N1CNamespace",
+			policyType: ngfAPIv1alpha1.PolicySourceTypeNIM,
+			policySource: &ngfAPIv1alpha1.PolicySource{
+				NIMSource: &ngfAPIv1alpha1.NIMBundleSource{
+					URL:        baseURL,
+					PolicyName: helpers.GetPointer(nimPolicyName),
+				},
+			},
+			expRequest: fetch.Request{
+				URL:           baseURL,
+				PolicyName:    nimPolicyName,
+				RetryAttempts: 3,
+			},
+		},
+		{
+			name:       "HTTP type with retry attempts",
+			policyType: ngfAPIv1alpha1.PolicySourceTypeHTTP,
+			policySource: &ngfAPIv1alpha1.PolicySource{
+				HTTPSource:    &ngfAPIv1alpha1.HTTPBundleSource{URL: baseURL},
+				RetryAttempts: helpers.GetPointer[int32](2),
+			},
+			expRequest: fetch.Request{
+				URL:           baseURL,
+				RetryAttempts: 2,
+			},
+		},
+		{
+			name:       "HTTP type with zero retry attempts disables retries",
+			policyType: ngfAPIv1alpha1.PolicySourceTypeHTTP,
+			policySource: &ngfAPIv1alpha1.PolicySource{
+				HTTPSource:    &ngfAPIv1alpha1.HTTPBundleSource{URL: baseURL},
+				RetryAttempts: helpers.GetPointer[int32](0),
+			},
+			expRequest: fetch.Request{
+				URL:           baseURL,
+				RetryAttempts: 0,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			got := BuildPolicyFetchRequest(tc.policySource, tc.policyType, tc.auth, tc.tlsCA)
+			g.Expect(got).To(Equal(tc.expRequest))
+		})
+	}
+}
+
+func TestLogBundleKey(t *testing.T) {
+	t.Parallel()
+
+	nimURL := "https://nim.example.com"
+	n1cURL := "https://n1c.example.com"
+	httpURL := "https://http.example.com"
+
+	profileObjectID := "lp_abc123"
+	profileName := "my-log-profile"
+
+	tests := []struct {
+		name      string
+		logSource *ngfAPIv1alpha1.LogSource
+		expKey    WAFBundleKey
+	}{
+		{
+			name:      "nil logSource returns empty key",
+			logSource: nil,
+			expKey:    WAFBundleKey(""),
+		},
+		{
+			name:      "logSource with all sub-sources nil returns empty key",
+			logSource: &ngfAPIv1alpha1.LogSource{},
+			expKey:    WAFBundleKey(""),
+		},
+		{
+			name: "NIM source",
+			logSource: &ngfAPIv1alpha1.LogSource{
+				NIMSource: &ngfAPIv1alpha1.NIMLogProfileBundleSource{
+					URL:         nimURL,
+					ProfileName: profileName,
+				},
+			},
+			expKey: WAFBundleKey(fmt.Sprintf("log_%s_%s", helpers.URLHash(nimURL), helpers.URLHash(profileName))),
+		},
+		{
+			name: "N1C source with ProfileObjectID",
+			logSource: &ngfAPIv1alpha1.LogSource{
+				N1CSource: &ngfAPIv1alpha1.N1CLogProfileBundleSource{
+					URL:             n1cURL,
+					Namespace:       "n1c-ns",
+					ProfileObjectID: &profileObjectID,
+				},
+			},
+			expKey: WAFBundleKey(fmt.Sprintf("log_%s_%s", helpers.URLHash(n1cURL), helpers.URLHash("n1c-ns/"+profileObjectID))),
+		},
+		{
+			name: "N1C source with ProfileName (no ObjectID)",
+			logSource: &ngfAPIv1alpha1.LogSource{
+				N1CSource: &ngfAPIv1alpha1.N1CLogProfileBundleSource{
+					URL:         n1cURL,
+					Namespace:   "n1c-ns",
+					ProfileName: &profileName,
+				},
+			},
+			expKey: WAFBundleKey(fmt.Sprintf("log_%s_%s", helpers.URLHash(n1cURL), helpers.URLHash("n1c-ns/"+profileName))),
+		},
+		{
+			name: "N1C source with neither ProfileObjectID nor ProfileName",
+			logSource: &ngfAPIv1alpha1.LogSource{
+				N1CSource: &ngfAPIv1alpha1.N1CLogProfileBundleSource{
+					URL:       n1cURL,
+					Namespace: "n1c-ns",
+				},
+			},
+			expKey: WAFBundleKey(fmt.Sprintf("log_%s_%s", helpers.URLHash(n1cURL), helpers.URLHash("n1c-ns/"))),
+		},
+		{
+			name: "HTTP source",
+			logSource: &ngfAPIv1alpha1.LogSource{
+				HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{
+					URL: httpURL,
+				},
+			},
+			expKey: WAFBundleKey(fmt.Sprintf("log_%s", helpers.URLHash(httpURL))),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			got := LogBundleKey(tc.logSource)
+			g.Expect(got).To(Equal(tc.expKey))
+		})
+	}
+}
+
+func TestBuildLogFetchRequest(t *testing.T) {
+	t.Parallel()
+
+	baseURL := "https://example.com/log.tgz"
+	caData := []byte("ca-cert-data")
+
+	tests := []struct {
+		auth       *fetch.BundleAuth
+		logSource  *ngfAPIv1alpha1.LogSource
+		name       string
+		tlsCA      []byte
+		expRequest fetch.Request
+	}{
+		{
+			name:       "nil logSource returns empty request",
+			logSource:  nil,
+			expRequest: fetch.Request{},
+		},
+		{
+			name: "basic log fetch",
+			logSource: &ngfAPIv1alpha1.LogSource{
+				HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: baseURL},
+			},
+			expRequest: fetch.Request{
+				URL:           baseURL,
+				RetryAttempts: 3,
+			},
+		},
+		{
+			name: "log fetch with 0 retry attempts",
+			logSource: &ngfAPIv1alpha1.LogSource{
+				HTTPSource:    &ngfAPIv1alpha1.HTTPBundleSource{URL: baseURL},
+				RetryAttempts: helpers.GetPointer[int32](0),
+			},
+			expRequest: fetch.Request{
+				URL:           baseURL,
+				RetryAttempts: 0,
+			},
+		},
+		{
+			name: "log fetch with TLS CA",
+			logSource: &ngfAPIv1alpha1.LogSource{
+				HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: baseURL},
+			},
+			tlsCA: caData,
+			expRequest: fetch.Request{
+				URL:           baseURL,
+				TLSCAData:     caData,
+				RetryAttempts: 3,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			got := BuildLogFetchRequest(tc.logSource, tc.auth, tc.tlsCA)
+			g.Expect(got).To(Equal(tc.expRequest))
+		})
+	}
+}
+
+func TestLogBundleDescription(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		src    *ngfAPIv1alpha1.LogSource
+		expStr string
+	}{
+		{
+			name:   "nil src returns default description",
+			src:    nil,
+			expStr: "security log bundle",
+		},
+		{
+			name: "NIMSource set",
+			src: &ngfAPIv1alpha1.LogSource{
+				NIMSource: &ngfAPIv1alpha1.NIMLogProfileBundleSource{
+					ProfileName: "my-nim-profile",
+				},
+			},
+			expStr: "security log bundle (profile: my-nim-profile)",
+		},
+		{
+			name: "N1CSource with ProfileName",
+			src: &ngfAPIv1alpha1.LogSource{
+				N1CSource: &ngfAPIv1alpha1.N1CLogProfileBundleSource{
+					ProfileName: helpers.GetPointer("my-n1c-profile"),
+				},
+			},
+			expStr: "security log bundle (profile: my-n1c-profile)",
+		},
+		{
+			name: "N1CSource with ProfileObjectID",
+			src: &ngfAPIv1alpha1.LogSource{
+				N1CSource: &ngfAPIv1alpha1.N1CLogProfileBundleSource{
+					ProfileObjectID: helpers.GetPointer("lp_abc123"),
+				},
+			},
+			expStr: "security log bundle (profile: lp_abc123)",
+		},
+		{
+			name: "N1CSource with neither name nor ID",
+			src: &ngfAPIv1alpha1.LogSource{
+				N1CSource: &ngfAPIv1alpha1.N1CLogProfileBundleSource{},
+			},
+			expStr: "security log bundle",
+		},
+		{
+			name: "HTTPSource set",
+			src: &ngfAPIv1alpha1.LogSource{
+				HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{
+					URL: "https://logs.example.com/bundle.tgz",
+				},
+			},
+			expStr: "security log bundle (URL: https://logs.example.com/bundle.tgz)",
+		},
+		{
+			name:   "all sub-sources nil returns default description",
+			src:    &ngfAPIv1alpha1.LogSource{},
+			expStr: "security log bundle",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			got := LogBundleDescription(tc.src)
+			g.Expect(got).To(Equal(tc.expStr))
+		})
+	}
+}
+
+// makeUnstructuredAPResource builds an unstructured APPolicy or APLogConf with the given status fields.
+// Pass "APPolicy" or "APLogConf" as kind.
+func makeUnstructuredAPResource(
+	kind, ns, name, state, location, sha256 string,
+	includeStatus bool,
+) *unstructured.Unstructured {
+	obj := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "appprotect.f5.com/v1",
+			"kind":       kind,
+			"metadata": map[string]any{
+				"name":      name,
+				"namespace": ns,
+			},
+		},
+	}
+
+	if includeStatus {
+		obj.Object["status"] = map[string]any{
+			"bundle": map[string]any{
+				"state":    state,
+				"location": location,
+				"sha256":   sha256,
+			},
+		}
+	}
+
+	return obj
+}
+
+// newPLMPolicy creates a fresh Policy with an initialized WAFState for use in PLM tests.
+func newPLMPolicy(wafPolicy *ngfAPIv1alpha1.WAFPolicy) *Policy {
+	return &Policy{
+		Source: wafPolicy,
+		Valid:  true,
+		WAFState: &PolicyWAFState{
+			Bundles: make(map[WAFBundleKey]*WAFBundleData),
+		},
+	}
+}
+
+// newPLMOutput creates a fresh WAFProcessingOutput for use in PLM tests.
+func newPLMOutput() *WAFProcessingOutput {
+	return &WAFProcessingOutput{
+		Bundles:              make(map[WAFBundleKey]*WAFBundleData),
+		ReferencedAPPolicies: make(map[types.NamespacedName]*unstructured.Unstructured),
+		ReferencedAPLogConfs: make(map[types.NamespacedName]*unstructured.Unstructured),
+		ReferencedWAFSecrets: make(map[types.NamespacedName]*corev1.Secret),
+	}
+}
+
+// expectConditionSubstring asserts that at least one condition contains the given substring
+// across its Type, Reason, and Message fields.
+func expectConditionSubstring(g Gomega, conds []conditions.Condition, substr string) {
+	g.ExpectWithOffset(1, conds).ToNot(BeEmpty(), "expected at least one condition")
+	for _, c := range conds {
+		condStr := fmt.Sprintf("%s %s %s", c.Type, c.Reason, c.Message)
+		if strings.Contains(condStr, substr) {
+			return
+		}
+	}
+	g.ExpectWithOffset(1, false).To(BeTrue(),
+		fmt.Sprintf("no condition containing %q found in %v", substr, conds))
+}
+
+// fakePLMFetcher creates an S3 fetcher pointed at a non-existent endpoint.
+// Used in tests where the actual S3 call is expected to fail.
+func fakePLMFetcher() *s3fetch.Fetcher {
+	return s3fetch.NewFetcher(logr.Discard(), "https://fake:9999", true)
+}
+
+// emptyRefGrantResolver returns a referenceGrantResolver that denies all cross-namespace refs.
+func emptyRefGrantResolver() *referenceGrantResolver {
+	return &referenceGrantResolver{allowed: make(map[allowedReference]struct{})}
+}
+
+func TestFetchPLMPolicyBundle(t *testing.T) {
+	t.Parallel()
+
+	const (
+		policyNs     = "test-ns"
+		policyName   = "my-plm-waf"
+		apPolicyName = "my-ap-policy"
+		otherNs      = "other-ns"
+	)
+
+	apPolicyNsName := types.NamespacedName{Namespace: policyNs, Name: apPolicyName}
+	bundleKey := PLMPolicyBundleKey(apPolicyNsName)
+
+	makeWAFPolicy := func(ref *ngfAPIv1alpha1.APPolicyReference) *ngfAPIv1alpha1.WAFPolicy {
+		return &ngfAPIv1alpha1.WAFPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: policyName, Namespace: policyNs},
+			Spec: ngfAPIv1alpha1.WAFPolicySpec{
+				Type:      ngfAPIv1alpha1.PolicySourceTypePLM,
+				PolicyRef: &ngfAPIv1alpha1.PolicyRef{APPolicyRef: ref},
+			},
+		}
+	}
+
+	readyAPPolicy := func(ns, name string) *unstructured.Unstructured {
+		return makeUnstructuredAPResource("APPolicy", ns, name, "ready", "s3://bucket/policy.tgz", "sha-abc", true)
+	}
+
+	defaultRef := &ngfAPIv1alpha1.APPolicyReference{Name: apPolicyName}
+
+	tests := []struct {
+		wafPolicy        *ngfAPIv1alpha1.WAFPolicy
+		wafInput         *WAFProcessingInput
+		name             string
+		expCondSubstring string
+		expValid         bool
+		expBundlePending bool
+		expBundleStored  bool
+	}{
+		{
+			name:             "PLM fetcher nil sets NotAccepted condition",
+			wafPolicy:        makeWAFPolicy(defaultRef),
+			wafInput:         &WAFProcessingInput{PLMFetcher: nil},
+			expValid:         false,
+			expCondSubstring: "PLM",
+		},
+		{
+			name:      "nil APPolicyRef is a no-op",
+			wafPolicy: makeWAFPolicy(nil),
+			wafInput:  &WAFProcessingInput{PLMFetcher: fakePLMFetcher()},
+			expValid:  true,
+		},
+		{
+			name: "cross-namespace ref denied",
+			wafPolicy: makeWAFPolicy(&ngfAPIv1alpha1.APPolicyReference{
+				Namespace: helpers.GetPointer(otherNs),
+				Name:      apPolicyName,
+			}),
+			wafInput: &WAFProcessingInput{
+				PLMFetcher: fakePLMFetcher(),
+				APPolicies: map[types.NamespacedName]*unstructured.Unstructured{
+					{Namespace: otherNs, Name: apPolicyName}: readyAPPolicy(otherNs, apPolicyName),
+				},
+				RefGrantResolver: emptyRefGrantResolver(),
+			},
+			expValid:         false,
+			expCondSubstring: "not permitted",
+		},
+		{
+			name:      "APPolicy not found",
+			wafPolicy: makeWAFPolicy(defaultRef),
+			wafInput: &WAFProcessingInput{
+				PLMFetcher: fakePLMFetcher(),
+				APPolicies: map[types.NamespacedName]*unstructured.Unstructured{},
+			},
+			expValid:         false,
+			expCondSubstring: "not found",
+		},
+		{
+			name:      "APPolicy without status sets BundlePending",
+			wafPolicy: makeWAFPolicy(defaultRef),
+			wafInput: &WAFProcessingInput{
+				PLMFetcher: fakePLMFetcher(),
+				APPolicies: map[types.NamespacedName]*unstructured.Unstructured{
+					apPolicyNsName: makeUnstructuredAPResource("APPolicy", policyNs, apPolicyName, "", "", "", false),
+				},
+			},
+			expValid:         true,
+			expBundlePending: true,
+			expCondSubstring: "failed to parse",
+		},
+		{
+			name:      "APPolicy bundle not ready sets BundlePending",
+			wafPolicy: makeWAFPolicy(defaultRef),
+			wafInput: &WAFProcessingInput{
+				PLMFetcher: fakePLMFetcher(),
+				APPolicies: map[types.NamespacedName]*unstructured.Unstructured{
+					apPolicyNsName: makeUnstructuredAPResource("APPolicy", policyNs, apPolicyName, "pending", "", "", true),
+				},
+			},
+			expValid:         true,
+			expBundlePending: true,
+			expCondSubstring: "not ready",
+		},
+		{
+			name:      "APPolicy bundle invalid marks policy invalid",
+			wafPolicy: makeWAFPolicy(defaultRef),
+			wafInput: &WAFProcessingInput{
+				PLMFetcher: fakePLMFetcher(),
+				APPolicies: map[types.NamespacedName]*unstructured.Unstructured{
+					apPolicyNsName: makeUnstructuredAPResource("APPolicy", policyNs, apPolicyName, "invalid", "", "", true),
+				},
+			},
+			expValid:         false,
+			expCondSubstring: "invalid",
+		},
+		{
+			name:      "PLM secret resolution error sets BundlePending",
+			wafPolicy: makeWAFPolicy(defaultRef),
+			wafInput: &WAFProcessingInput{
+				PLMFetcher: fakePLMFetcher(),
+				APPolicies: map[types.NamespacedName]*unstructured.Unstructured{
+					apPolicyNsName: readyAPPolicy(policyNs, apPolicyName),
+				},
+				PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+				PLMResolvedSecrets: &PLMResolvedSecrets{
+					ResolutionError: fmt.Errorf("configured credentials secret is invalid"),
+				},
+			},
+			expValid:         true,
+			expBundlePending: true,
+			expCondSubstring: "configured credentials secret is invalid",
+		},
+		{
+			name:      "S3 fetch failure without previous bundle sets BundlePending",
+			wafPolicy: makeWAFPolicy(defaultRef),
+			wafInput: &WAFProcessingInput{
+				PLMFetcher: fakePLMFetcher(),
+				APPolicies: map[types.NamespacedName]*unstructured.Unstructured{
+					apPolicyNsName: readyAPPolicy(policyNs, apPolicyName),
+				},
+				PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+			},
+			expValid:         true,
+			expBundlePending: true,
+		},
+		{
+			name:      "S3 fetch failure with previous bundle falls back to stale",
+			wafPolicy: makeWAFPolicy(defaultRef),
+			wafInput: &WAFProcessingInput{
+				PLMFetcher: fakePLMFetcher(),
+				APPolicies: map[types.NamespacedName]*unstructured.Unstructured{
+					apPolicyNsName: readyAPPolicy(policyNs, apPolicyName),
+				},
+				PreviousBundles: map[WAFBundleKey]*WAFBundleData{
+					bundleKey: {Data: []byte("stale"), Checksum: "stale-checksum"},
+				},
+			},
+			expValid:         true,
+			expBundleStored:  true,
+			expCondSubstring: "StaleBundleWarning",
+		},
+		{
+			name: "same-namespace ref skips ReferenceGrant check",
+			wafPolicy: makeWAFPolicy(&ngfAPIv1alpha1.APPolicyReference{
+				Namespace: helpers.GetPointer(policyNs),
+				Name:      apPolicyName,
+			}),
+			wafInput: &WAFProcessingInput{
+				PLMFetcher: fakePLMFetcher(),
+				APPolicies: map[types.NamespacedName]*unstructured.Unstructured{
+					apPolicyNsName: readyAPPolicy(policyNs, apPolicyName),
+				},
+				PreviousBundles:  map[WAFBundleKey]*WAFBundleData{},
+				RefGrantResolver: emptyRefGrantResolver(),
+			},
+			expValid:         true,
+			expBundlePending: true, // S3 fetch fails (fake endpoint)
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			policy := newPLMPolicy(tc.wafPolicy)
+			output := newPLMOutput()
+
+			fetchPLMPolicyBundle(t.Context(), logr.Discard(), tc.wafPolicy, policy, tc.wafInput, output)
+
+			g.Expect(policy.Valid).To(Equal(tc.expValid))
+			g.Expect(policy.WAFState.BundlePending).To(Equal(tc.expBundlePending))
+
+			if tc.expCondSubstring != "" {
+				expectConditionSubstring(g, policy.Conditions, tc.expCondSubstring)
+			}
+			if tc.expBundleStored {
+				g.Expect(output.Bundles).To(HaveKey(bundleKey))
+				g.Expect(policy.WAFState.Bundles).To(HaveKey(bundleKey))
+			}
+		})
+	}
+}
+
+func TestFetchPLMPolicyBundle_AlreadyFetched(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	const (
+		policyNs     = "test-ns"
+		apPolicyName = "my-ap-policy"
+	)
+
+	apPolicyNsName := types.NamespacedName{Namespace: policyNs, Name: apPolicyName}
+	bundleKey := PLMPolicyBundleKey(apPolicyNsName)
+
+	wafPolicy := &ngfAPIv1alpha1.WAFPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "second-plm-waf", Namespace: policyNs},
+		Spec: ngfAPIv1alpha1.WAFPolicySpec{
+			Type:      ngfAPIv1alpha1.PolicySourceTypePLM,
+			PolicyRef: &ngfAPIv1alpha1.PolicyRef{APPolicyRef: &ngfAPIv1alpha1.APPolicyReference{Name: apPolicyName}},
+		},
+	}
+
+	existingBundle := &WAFBundleData{Data: []byte("already-fetched"), Checksum: "existing-checksum"}
+
+	policy := newPLMPolicy(wafPolicy)
+	output := newPLMOutput()
+	// Pre-populate the output with an already-fetched bundle for the same key.
+	output.Bundles[bundleKey] = existingBundle
+
+	wafInput := &WAFProcessingInput{
+		PLMFetcher: fakePLMFetcher(),
+		APPolicies: map[types.NamespacedName]*unstructured.Unstructured{
+			apPolicyNsName: makeUnstructuredAPResource(
+				"APPolicy", policyNs, apPolicyName, "ready", "s3://bucket/policy.tgz", "sha-abc", true,
+			),
+		},
+		PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+	}
+
+	fetchPLMPolicyBundle(t.Context(), logr.Discard(), wafPolicy, policy, wafInput, output)
+
+	// The existing bundle should be reused, not overwritten.
+	g.Expect(output.Bundles[bundleKey]).To(Equal(existingBundle))
+	g.Expect(policy.WAFState.Bundles[bundleKey]).To(Equal(existingBundle))
+	g.Expect(policy.Valid).To(BeTrue())
+	g.Expect(policy.Conditions).To(BeEmpty())
+	g.Expect(policy.WAFState.BundlePending).To(BeFalse())
+}
+
+func TestFetchPLMSecurityLogBundle_AlreadyFetched(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	const (
+		policyNs    = "test-ns"
+		logConfName = "my-log-conf"
+	)
+
+	ref := &ngfAPIv1alpha1.APLogConfReference{Name: logConfName}
+	bundleKey := PLMLogBundleKey(policyNs, ref)
+
+	wafPolicy := &ngfAPIv1alpha1.WAFPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "second-plm-waf", Namespace: policyNs},
+	}
+
+	existingBundle := &WAFBundleData{Data: []byte("already-fetched"), Checksum: "existing-checksum"}
+
+	policy := newPLMPolicy(wafPolicy)
+	output := newPLMOutput()
+	// Pre-populate the output with an already-fetched bundle for the same key, simulating a
+	// different WAFPolicy having already fetched it.
+	output.Bundles[bundleKey] = existingBundle
+
+	wafInput := &WAFProcessingInput{
+		PLMFetcher:      fakePLMFetcher(),
+		PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+	}
+
+	fetchPLMSecurityLogBundle(t.Context(), logr.Discard(), wafPolicy, policy, wafInput, output, ref)
+
+	// The existing bundle should be reused, not overwritten...
+	g.Expect(output.Bundles[bundleKey]).To(Equal(existingBundle))
+	// ...and, critically, it must also be recorded on THIS policy's own WAFState so that any
+	// Gateway targeted only by this policy still receives the bundle data.
+	g.Expect(policy.WAFState.Bundles[bundleKey]).To(Equal(existingBundle))
+	g.Expect(policy.Valid).To(BeTrue())
+}
+
+func TestFetchPolicyBundle_AlreadyFetched(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	const (
+		policyNs  = "test-ns"
+		bundleURL = "https://example.com/bundle.tgz"
+	)
+
+	wafPolicy := &ngfAPIv1alpha1.WAFPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "second-waf", Namespace: policyNs},
+		Spec: ngfAPIv1alpha1.WAFPolicySpec{
+			Type: ngfAPIv1alpha1.PolicySourceTypeHTTP,
+			PolicySource: &ngfAPIv1alpha1.PolicySource{
+				HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: bundleURL},
+			},
+		},
+	}
+
+	bundleKey := PolicyBundleKey(wafPolicy.Spec)
+	existingBundle := &WAFBundleData{Data: []byte("already-fetched"), Checksum: "existing-checksum"}
+
+	policy := &Policy{
+		Source: wafPolicy,
+		Valid:  true,
+		WAFState: &PolicyWAFState{
+			Bundles: make(map[WAFBundleKey]*WAFBundleData),
+		},
+	}
+
+	output := &WAFProcessingOutput{
+		Bundles:              map[WAFBundleKey]*WAFBundleData{bundleKey: existingBundle},
+		ReferencedWAFSecrets: make(map[types.NamespacedName]*corev1.Secret),
+	}
+
+	// The fetcher should never be called since the bundle is already fetched.
+	fetcher := &fetchfakes.FetcherMock{}
+	wafInput := &WAFProcessingInput{
+		Fetcher:         fetcher,
+		Secrets:         map[types.NamespacedName]*corev1.Secret{},
+		PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+	}
+
+	fetchPolicyBundle(t.Context(), logr.Discard(), wafPolicy, policy, wafInput, output)
+
+	// The existing bundle should be reused, not overwritten.
+	g.Expect(output.Bundles[bundleKey]).To(Equal(existingBundle))
+	g.Expect(policy.WAFState.Bundles[bundleKey]).To(Equal(existingBundle))
+	g.Expect(policy.Valid).To(BeTrue())
+	g.Expect(policy.Conditions).To(BeEmpty())
+	g.Expect(policy.WAFState.BundlePending).To(BeFalse())
+	// Verify the fetcher was never called.
+	g.Expect(fetcher.FetchPolicyBundleCalls()).To(BeEmpty())
+}
+
+func TestValidatePLMAPLogConfReference(t *testing.T) {
+	t.Parallel()
+
+	const (
+		policyNs = "test-ns"
+		otherNs  = "other-ns"
+	)
+
+	tests := []struct {
+		refGrantResolver *referenceGrantResolver
+		nsName           types.NamespacedName
+		name             string
+		expAllowed       bool
+		expValid         bool
+	}{
+		{
+			name:             "same namespace always allowed",
+			nsName:           types.NamespacedName{Namespace: policyNs, Name: "log-conf"},
+			refGrantResolver: emptyRefGrantResolver(),
+			expAllowed:       true,
+			expValid:         true,
+		},
+		{
+			name:             "nil RefGrantResolver allows cross-namespace",
+			nsName:           types.NamespacedName{Namespace: otherNs, Name: "log-conf"},
+			refGrantResolver: nil,
+			expAllowed:       true,
+			expValid:         true,
+		},
+		{
+			name:             "cross-namespace denied",
+			nsName:           types.NamespacedName{Namespace: otherNs, Name: "log-conf"},
+			refGrantResolver: emptyRefGrantResolver(),
+			expAllowed:       false,
+			expValid:         false,
+		},
+		{
+			name:   "cross-namespace allowed by ReferenceGrant",
+			nsName: types.NamespacedName{Namespace: otherNs, Name: "log-conf"},
+			refGrantResolver: &referenceGrantResolver{
+				allowed: map[allowedReference]struct{}{
+					{
+						to:   toAPLogConf(types.NamespacedName{Namespace: otherNs, Name: "log-conf"}),
+						from: fromWAFPolicy(policyNs),
+					}: {},
+				},
+			},
+			expAllowed: true,
+			expValid:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			wafPolicy := &ngfAPIv1alpha1.WAFPolicy{ObjectMeta: metav1.ObjectMeta{Namespace: policyNs}}
+			policy := newPLMPolicy(wafPolicy)
+			wafInput := &WAFProcessingInput{RefGrantResolver: tc.refGrantResolver}
+
+			result := validatePLMAPLogConfReference(wafPolicy, policy, wafInput, tc.nsName)
+
+			g.Expect(result).To(Equal(tc.expAllowed))
+			g.Expect(policy.Valid).To(Equal(tc.expValid))
+
+			if !tc.expValid {
+				expectConditionSubstring(g, policy.Conditions, "not permitted")
+			} else {
+				g.Expect(policy.Conditions).To(BeEmpty())
+			}
+		})
+	}
+}
+
+func TestGetPLMAPLogConfStatus(t *testing.T) {
+	t.Parallel()
+
+	const (
+		logConfNs   = "test-ns"
+		logConfName = "my-log-conf"
+	)
+	nsName := types.NamespacedName{Namespace: logConfNs, Name: logConfName}
+
+	tests := []struct {
+		apLogConfs       map[types.NamespacedName]*unstructured.Unstructured
+		name             string
+		expCondSubstring string
+		expOK            bool
+		expBundlePending bool
+		expValid         bool
+	}{
+		{
+			name:             "not found",
+			apLogConfs:       map[types.NamespacedName]*unstructured.Unstructured{},
+			expValid:         false,
+			expCondSubstring: "not found",
+		},
+		{
+			name: "no status field (parse error)",
+			apLogConfs: map[types.NamespacedName]*unstructured.Unstructured{
+				nsName: makeUnstructuredAPResource("APLogConf", logConfNs, logConfName, "", "", "", false),
+			},
+			expValid:         true,
+			expBundlePending: true,
+			expCondSubstring: "failed to parse",
+		},
+		{
+			name: "bundle pending",
+			apLogConfs: map[types.NamespacedName]*unstructured.Unstructured{
+				nsName: makeUnstructuredAPResource("APLogConf", logConfNs, logConfName, "pending", "", "", true),
+			},
+			expValid:         true,
+			expBundlePending: true,
+			expCondSubstring: "not ready",
+		},
+		{
+			name: "bundle invalid marks policy invalid",
+			apLogConfs: map[types.NamespacedName]*unstructured.Unstructured{
+				nsName: makeUnstructuredAPResource("APLogConf", logConfNs, logConfName, "invalid", "", "", true),
+			},
+			expValid:         false,
+			expCondSubstring: "invalid",
+		},
+		{
+			name: "bundle ready",
+			apLogConfs: map[types.NamespacedName]*unstructured.Unstructured{
+				nsName: makeUnstructuredAPResource("APLogConf", logConfNs, logConfName, "ready", "s3://b/l.tgz", "sha-l", true),
+			},
+			expOK:    true,
+			expValid: true,
+		},
+		{
+			name: "status present but bundle nil",
+			apLogConfs: map[types.NamespacedName]*unstructured.Unstructured{
+				nsName: {Object: map[string]any{
+					"apiVersion": "appprotect.f5.com/v1",
+					"kind":       "APLogConf",
+					"metadata":   map[string]any{"name": logConfName, "namespace": logConfNs},
+					"status":     map[string]any{},
+				}},
+			},
+			expValid:         true,
+			expBundlePending: true,
+			expCondSubstring: "not ready",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			policy := newPLMPolicy(&ngfAPIv1alpha1.WAFPolicy{})
+			wafInput := &WAFProcessingInput{APLogConfs: tc.apLogConfs}
+
+			status, ok := getPLMAPLogConfStatus(policy, wafInput, nsName)
+
+			g.Expect(ok).To(Equal(tc.expOK))
+			g.Expect(policy.Valid).To(Equal(tc.expValid))
+			g.Expect(policy.WAFState.BundlePending).To(Equal(tc.expBundlePending))
+
+			if tc.expOK {
+				g.Expect(status).ToNot(BeNil())
+				g.Expect(status.Bundle.State).To(Equal(wafv1.BundleStateReady))
+			}
+			if tc.expCondSubstring != "" {
+				expectConditionSubstring(g, policy.Conditions, tc.expCondSubstring)
+			}
+		})
+	}
+}
+
+func TestFetchPLMLogBundleData(t *testing.T) {
+	t.Parallel()
+
+	const (
+		policyNs   = "test-ns"
+		policyName = "my-plm-waf"
+	)
+	logConfNsName := types.NamespacedName{Namespace: policyNs, Name: "my-log-conf"}
+	ref := &ngfAPIv1alpha1.APLogConfReference{Name: "my-log-conf"}
+	bundleKey := PLMLogBundleKey(policyNs, ref)
+
+	status := &wafv1.APLogConfStatus{
+		Bundle: &wafv1.BundleStatus{
+			State: wafv1.BundleStateReady, Location: "s3://bucket/log.tgz", SHA256: "sha-log",
+		},
+	}
+
+	tests := []struct {
+		plmResolvedSecrets *PLMResolvedSecrets
+		previousBundles    map[WAFBundleKey]*WAFBundleData
+		name               string
+		expCondSubstring   string
+		expOK              bool
+		expBundlePending   bool
+	}{
+		{
+			name:             "no previous bundle sets BundlePending",
+			previousBundles:  map[WAFBundleKey]*WAFBundleData{},
+			expBundlePending: true,
+		},
+		{
+			name:            "previous bundle falls back to stale",
+			previousBundles: map[WAFBundleKey]*WAFBundleData{bundleKey: {Data: []byte("stale"), Checksum: "stale-ck"}},
+			expOK:           true,
+		},
+		{
+			name: "PLM secret resolution error falls back to stale",
+			plmResolvedSecrets: &PLMResolvedSecrets{
+				ResolutionError: fmt.Errorf("configured clientssl secret is invalid"),
+			},
+			previousBundles:  map[WAFBundleKey]*WAFBundleData{bundleKey: {Data: []byte("stale"), Checksum: "stale-ck"}},
+			expOK:            true,
+			expCondSubstring: "configured clientssl secret is invalid",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			wafPolicy := &ngfAPIv1alpha1.WAFPolicy{ObjectMeta: metav1.ObjectMeta{Name: policyName, Namespace: policyNs}}
+			policy := newPLMPolicy(wafPolicy)
+			wafInput := &WAFProcessingInput{
+				PLMFetcher:         fakePLMFetcher(),
+				PreviousBundles:    tc.previousBundles,
+				PLMResolvedSecrets: tc.plmResolvedSecrets,
+			}
+
+			bundleData, ok := fetchPLMLogBundleData(
+				t.Context(), logr.Discard(), wafPolicy, policy, wafInput, logConfNsName, bundleKey, status,
+			)
+
+			g.Expect(ok).To(Equal(tc.expOK))
+			g.Expect(policy.WAFState.BundlePending).To(Equal(tc.expBundlePending))
+			if tc.expOK {
+				g.Expect(bundleData).ToNot(BeNil())
+			}
+			if tc.expCondSubstring != "" {
+				expectConditionSubstring(g, policy.Conditions, tc.expCondSubstring)
+			}
+		})
+	}
+}
+
+func TestFetchPLMSecurityLogBundles(t *testing.T) {
+	t.Parallel()
+
+	const (
+		policyNs    = "test-ns"
+		policyName  = "my-plm-waf"
+		logConfName = "my-log-conf"
+	)
+	logConfNsName := types.NamespacedName{Namespace: policyNs, Name: logConfName}
+
+	makeSecurityLogs := func(refs ...*ngfAPIv1alpha1.APLogConfReference) []ngfAPIv1alpha1.WAFSecurityLog {
+		logs := make([]ngfAPIv1alpha1.WAFSecurityLog, 0, len(refs))
+		for _, r := range refs {
+			logs = append(logs, ngfAPIv1alpha1.WAFSecurityLog{
+				LogRef: &ngfAPIv1alpha1.LogRef{APLogConfRef: r},
+			})
+		}
+		return logs
+	}
+
+	tests := []struct {
+		wafInput         *WAFProcessingInput
+		name             string
+		securityLogs     []ngfAPIv1alpha1.WAFSecurityLog
+		expConditions    int
+		expBundlePending bool
+		expValid         bool
+	}{
+		{
+			name:         "nil APLogConfRef entries are skipped",
+			securityLogs: makeSecurityLogs(nil, nil),
+			wafInput:     &WAFProcessingInput{PLMFetcher: fakePLMFetcher()},
+			expValid:     true,
+		},
+		{
+			name:         "PLMFetcher nil with ref logs error and continues",
+			securityLogs: makeSecurityLogs(&ngfAPIv1alpha1.APLogConfReference{Name: logConfName}),
+			wafInput:     &WAFProcessingInput{PLMFetcher: nil},
+			expValid:     true,
+		},
+		{
+			name:         "APLogConf not found sets condition",
+			securityLogs: makeSecurityLogs(&ngfAPIv1alpha1.APLogConfReference{Name: logConfName}),
+			wafInput: &WAFProcessingInput{
+				PLMFetcher: fakePLMFetcher(),
+				APLogConfs: map[types.NamespacedName]*unstructured.Unstructured{},
+			},
+			expValid:      false,
+			expConditions: 1,
+		},
+		{
+			name:         "ready APLogConf with S3 fetch failure sets BundlePending",
+			securityLogs: makeSecurityLogs(&ngfAPIv1alpha1.APLogConfReference{Name: logConfName}),
+			wafInput: &WAFProcessingInput{
+				PLMFetcher: fakePLMFetcher(),
+				APLogConfs: map[types.NamespacedName]*unstructured.Unstructured{
+					logConfNsName: makeUnstructuredAPResource(
+						"APLogConf", policyNs, logConfName, "ready", "s3://b/l.tgz", "sha", true,
+					),
+				},
+				PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+			},
+			expValid:         true,
+			expBundlePending: true,
+			expConditions:    1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			wafPolicy := &ngfAPIv1alpha1.WAFPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: policyName, Namespace: policyNs},
+				Spec:       ngfAPIv1alpha1.WAFPolicySpec{Type: ngfAPIv1alpha1.PolicySourceTypePLM, SecurityLogs: tc.securityLogs},
+			}
+			policy := newPLMPolicy(wafPolicy)
+			output := newPLMOutput()
+
+			fetchPLMSecurityLogBundles(t.Context(), logr.Discard(), wafPolicy, policy, tc.wafInput, output)
+
+			g.Expect(policy.Valid).To(Equal(tc.expValid))
+			g.Expect(policy.Conditions).To(HaveLen(tc.expConditions))
+			g.Expect(policy.WAFState.BundlePending).To(Equal(tc.expBundlePending))
+		})
+	}
+}
+
+func TestFetchPLMSecurityLogBundle(t *testing.T) {
+	t.Parallel()
+
+	const (
+		policyNs    = "test-ns"
+		policyName  = "my-plm-waf"
+		logConfName = "my-log-conf"
+		otherNs     = "other-ns"
+	)
+	logConfNsName := types.NamespacedName{Namespace: policyNs, Name: logConfName}
+	sameNsRef := &ngfAPIv1alpha1.APLogConfReference{Name: logConfName}
+	bundleKey := PLMLogBundleKey(policyNs, sameNsRef)
+
+	readyLogConf := makeUnstructuredAPResource("APLogConf", policyNs, logConfName, "ready", "s3://b/l.tgz", "sha", true)
+
+	tests := []struct {
+		ref             *ngfAPIv1alpha1.APLogConfReference
+		wafInput        *WAFProcessingInput
+		preFetchedKey   *WAFBundleKey
+		name            string
+		expConditions   int
+		expValid        bool
+		expBundleStored bool
+	}{
+		{
+			name: "cross-namespace denied",
+			ref: &ngfAPIv1alpha1.APLogConfReference{
+				Namespace: helpers.GetPointer(otherNs),
+				Name:      logConfName,
+			},
+			wafInput: &WAFProcessingInput{
+				PLMFetcher:       fakePLMFetcher(),
+				RefGrantResolver: emptyRefGrantResolver(),
+			},
+			expValid:      false,
+			expConditions: 1,
+		},
+		{
+			name: "already fetched bundle is skipped",
+			ref:  sameNsRef,
+			wafInput: &WAFProcessingInput{
+				PLMFetcher:      fakePLMFetcher(),
+				APLogConfs:      map[types.NamespacedName]*unstructured.Unstructured{logConfNsName: readyLogConf},
+				PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+			},
+			preFetchedKey:   &bundleKey,
+			expValid:        true,
+			expBundleStored: true,
+		},
+		{
+			name: "stale bundle fallback on S3 failure",
+			ref:  sameNsRef,
+			wafInput: &WAFProcessingInput{
+				PLMFetcher:      fakePLMFetcher(),
+				APLogConfs:      map[types.NamespacedName]*unstructured.Unstructured{logConfNsName: readyLogConf},
+				PreviousBundles: map[WAFBundleKey]*WAFBundleData{bundleKey: {Data: []byte("stale"), Checksum: "ck"}},
+			},
+			expValid:        true,
+			expBundleStored: true,
+			expConditions:   1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			wafPolicy := &ngfAPIv1alpha1.WAFPolicy{ObjectMeta: metav1.ObjectMeta{Name: policyName, Namespace: policyNs}}
+			policy := newPLMPolicy(wafPolicy)
+			output := newPLMOutput()
+
+			if tc.preFetchedKey != nil {
+				output.Bundles[*tc.preFetchedKey] = &WAFBundleData{Data: []byte("pre"), Checksum: "pre-ck"}
+			}
+
+			fetchPLMSecurityLogBundle(
+				t.Context(), logr.Discard(), wafPolicy, policy, tc.wafInput, output, tc.ref,
+			)
+
+			g.Expect(policy.Valid).To(Equal(tc.expValid))
+			g.Expect(policy.Conditions).To(HaveLen(tc.expConditions))
+
+			if tc.expBundleStored {
+				g.Expect(output.Bundles).To(HaveKey(bundleKey))
+				g.Expect(policy.WAFState.Bundles).To(HaveKey(bundleKey))
+				g.Expect(policy.WAFState.Bundles[bundleKey]).To(Equal(output.Bundles[bundleKey]))
+			}
+		})
+	}
+}
+
+func TestFetchSecurityLogBundles_SharedAcrossPolicies(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	const (
+		policyNs = "test-ns"
+		logURL   = "https://example.com/shared-log.tgz"
+	)
+
+	makeWAFPolicy := func(name string) *ngfAPIv1alpha1.WAFPolicy {
+		return &ngfAPIv1alpha1.WAFPolicy{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: policyNs},
+			Spec: ngfAPIv1alpha1.WAFPolicySpec{
+				Type: ngfAPIv1alpha1.PolicySourceTypeHTTP,
+				SecurityLogs: []ngfAPIv1alpha1.WAFSecurityLog{
+					{
+						LogSource: &ngfAPIv1alpha1.LogSource{
+							HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: logURL},
+						},
+						Destination: ngfAPIv1alpha1.SecurityLogDestination{
+							Type: ngfAPIv1alpha1.SecurityLogDestinationTypeStderr,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	logBundleKey := LogBundleKey(&ngfAPIv1alpha1.LogSource{
+		HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: logURL},
+	})
+
+	firstPolicy := &Policy{
+		Source: makeWAFPolicy("waf-policy-a"),
+		Valid:  true,
+		WAFState: &PolicyWAFState{
+			Bundles: make(map[WAFBundleKey]*WAFBundleData),
+		},
+	}
+	secondPolicy := &Policy{
+		Source: makeWAFPolicy("waf-policy-b"),
+		Valid:  true,
+		WAFState: &PolicyWAFState{
+			Bundles: make(map[WAFBundleKey]*WAFBundleData),
+		},
+	}
+
+	fetchedData := []byte("log-bundle-data")
+	fetchedChecksum := "checksum-1"
+
+	fetcher := &fetchfakes.FetcherMock{}
+	fetchCount := 0
+	fetcher.FetchLogProfileBundleFunc = func(context.Context, fetch.Request) (fetch.Result, error) {
+		fetchCount++
+		if fetchCount == 1 {
+			return fetch.Result{Data: fetchedData, Checksum: fetchedChecksum}, nil
+		}
+		return fetch.Result{}, fmt.Errorf("unexpected second fetch for shared log URL")
+	}
+
+	wafInput := &WAFProcessingInput{
+		Fetcher:         fetcher,
+		Secrets:         map[types.NamespacedName]*corev1.Secret{},
+		PreviousBundles: map[WAFBundleKey]*WAFBundleData{},
+	}
+
+	output := &WAFProcessingOutput{
+		Bundles:              make(map[WAFBundleKey]*WAFBundleData),
+		ReferencedWAFSecrets: make(map[types.NamespacedName]*corev1.Secret),
+	}
+
+	// Simulate processWAFPolicies processing the first policy (fetches the bundle),
+	// then the second policy (must reuse the already-fetched bundle).
+	firstSource, ok := firstPolicy.Source.(*ngfAPIv1alpha1.WAFPolicy)
+	g.Expect(ok).To(BeTrue())
+
+	secondSource, ok := secondPolicy.Source.(*ngfAPIv1alpha1.WAFPolicy)
+	g.Expect(ok).To(BeTrue())
+
+	fetchSecurityLogBundles(
+		t.Context(), logr.Discard(), firstSource, firstPolicy, wafInput, output,
+	)
+	fetchSecurityLogBundles(
+		t.Context(), logr.Discard(), secondSource, secondPolicy, wafInput, output,
+	)
+
+	expectedBundle := &WAFBundleData{Data: fetchedData, Checksum: fetchedChecksum}
+
+	g.Expect(output.Bundles[logBundleKey]).To(Equal(expectedBundle))
+	g.Expect(firstPolicy.WAFState.Bundles[logBundleKey]).To(Equal(expectedBundle))
+	g.Expect(secondPolicy.WAFState.Bundles[logBundleKey]).To(Equal(expectedBundle))
+
+	g.Expect(fetcher.FetchLogProfileBundleCalls()).To(HaveLen(1))
+}
+
+func TestPolicyBundleKey(t *testing.T) {
+	t.Parallel()
+
+	httpURL := "http://example.com/policy.tgz"
+	nimURL := "https://nim.example.com"
+	n1cURL := "https://n1c.example.com"
+
+	policyName := "my-policy"
+	policyUID := "uid-123"
+	policyObjectID := "obj-456"
+
+	tests := []struct {
+		name   string
+		expKey WAFBundleKey
+		spec   ngfAPIv1alpha1.WAFPolicySpec
+	}{
+		{
+			name:   "nil PolicySource returns empty key",
+			spec:   ngfAPIv1alpha1.WAFPolicySpec{PolicySource: nil},
+			expKey: WAFBundleKey(""),
+		},
+		{
+			name:   "PolicySource with all sub-sources nil returns empty key",
+			spec:   ngfAPIv1alpha1.WAFPolicySpec{PolicySource: &ngfAPIv1alpha1.PolicySource{}},
+			expKey: WAFBundleKey(""),
+		},
+		{
+			name: "HTTP source",
+			spec: ngfAPIv1alpha1.WAFPolicySpec{
+				PolicySource: &ngfAPIv1alpha1.PolicySource{
+					HTTPSource: &ngfAPIv1alpha1.HTTPBundleSource{URL: httpURL},
+				},
+			},
+			expKey: WAFBundleKey(helpers.URLHash(httpURL)),
+		},
+		{
+			name: "NIM source with PolicyUID",
+			spec: ngfAPIv1alpha1.WAFPolicySpec{
+				PolicySource: &ngfAPIv1alpha1.PolicySource{
+					NIMSource: &ngfAPIv1alpha1.NIMBundleSource{
+						URL:       nimURL,
+						PolicyUID: &policyUID,
+					},
+				},
+			},
+			expKey: WAFBundleKey(fmt.Sprintf("%s_%s", helpers.URLHash(nimURL), helpers.URLHash(policyUID))),
+		},
+		{
+			name: "NIM source with PolicyName (no UID)",
+			spec: ngfAPIv1alpha1.WAFPolicySpec{
+				PolicySource: &ngfAPIv1alpha1.PolicySource{
+					NIMSource: &ngfAPIv1alpha1.NIMBundleSource{
+						URL:        nimURL,
+						PolicyName: &policyName,
+					},
+				},
+			},
+			expKey: WAFBundleKey(fmt.Sprintf("%s_%s", helpers.URLHash(nimURL), helpers.URLHash(policyName))),
+		},
+		{
+			name: "N1C source with PolicyObjectID",
+			spec: ngfAPIv1alpha1.WAFPolicySpec{
+				PolicySource: &ngfAPIv1alpha1.PolicySource{
+					N1CSource: &ngfAPIv1alpha1.N1CBundleSource{
+						URL:            n1cURL,
+						Namespace:      "n1c-ns",
+						PolicyObjectID: &policyObjectID,
+					},
+				},
+			},
+			expKey: WAFBundleKey(fmt.Sprintf("%s_%s", helpers.URLHash(n1cURL), helpers.URLHash("n1c-ns/"+policyObjectID))),
+		},
+		{
+			name: "N1C source with PolicyName (no ObjectID)",
+			spec: ngfAPIv1alpha1.WAFPolicySpec{
+				PolicySource: &ngfAPIv1alpha1.PolicySource{
+					N1CSource: &ngfAPIv1alpha1.N1CBundleSource{
+						URL:        n1cURL,
+						Namespace:  "n1c-ns",
+						PolicyName: &policyName,
+					},
+				},
+			},
+			expKey: WAFBundleKey(fmt.Sprintf("%s_%s", helpers.URLHash(n1cURL), helpers.URLHash("n1c-ns/"+policyName))),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			got := PolicyBundleKey(tc.spec)
+			g.Expect(got).To(Equal(tc.expKey))
+		})
+	}
+}
+
+func TestValidateWAFPollingConsistency(t *testing.T) {
+	t.Parallel()
+
+	pollNow := metav1.Now()
+	pollEarlier := metav1.NewTime(pollNow.Add(-time.Hour))
+	wafPolicyGVK := schema.GroupVersionKind{
+		Group:   ngfAPIv1alpha1.GroupName,
+		Version: "v1alpha1",
+		Kind:    kinds.WAFPolicy,
+	}
+
+	pollPolicyKey := func(name, ns string) PolicyKey {
+		return PolicyKey{
+			NsName: types.NamespacedName{Namespace: ns, Name: name},
+			GVK:    wafPolicyGVK,
+		}
+	}
+
+	pollWAFSource := func(name, ns, polSource string, ts metav1.Time, polling bool) *ngfAPIv1alpha1.WAFPolicy {
+		wp := &ngfAPIv1alpha1.WAFPolicy{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       kinds.WAFPolicy,
+				APIVersion: ngfAPIv1alpha1.GroupName + "/v1alpha1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name, Namespace: ns, CreationTimestamp: ts,
+			},
+			Spec: ngfAPIv1alpha1.WAFPolicySpec{
+				Type: ngfAPIv1alpha1.PolicySourceTypeNIM,
+				PolicySource: &ngfAPIv1alpha1.PolicySource{
+					NIMSource: &ngfAPIv1alpha1.NIMBundleSource{
+						URL:        "https://nim.example.com",
+						PolicyName: helpers.GetPointer(polSource),
+					},
+				},
+			},
+		}
+		if polling {
+			wp.Spec.PolicySource.Polling = &ngfAPIv1alpha1.BundlePolling{Enabled: true}
+		}
+		return wp
+	}
+
+	later := metav1.NewTime(pollNow.Add(time.Hour))
+
+	type expPolicyStatus struct {
+		name           string
+		condSubstrings []string
+		expectCondLen  int
+		expectValid    bool
+	}
+
+	tests := []struct {
+		name      string
+		policies  map[PolicyKey]*Policy
+		expStatus []expPolicyStatus
+	}{
+		{
+			name: "no conflict when both have polling enabled",
+			policies: map[PolicyKey]*Policy{
+				pollPolicyKey("a", "default"): {
+					Source: pollWAFSource("a", "default", "same-policy", pollEarlier, true), Valid: true,
+				},
+				pollPolicyKey("b", "default"): {
+					Source: pollWAFSource("b", "default", "same-policy", pollNow, true), Valid: true,
+				},
+			},
+			expStatus: []expPolicyStatus{
+				{name: "a", expectValid: true},
+				{name: "b", expectValid: true},
+			},
+		},
+		{
+			name: "no conflict when both have polling disabled",
+			policies: map[PolicyKey]*Policy{
+				pollPolicyKey("a", "default"): {
+					Source: pollWAFSource("a", "default", "same-policy", pollEarlier, false), Valid: true,
+				},
+				pollPolicyKey("b", "default"): {
+					Source: pollWAFSource("b", "default", "same-policy", pollNow, false), Valid: true,
+				},
+			},
+			expStatus: []expPolicyStatus{
+				{name: "a", expectValid: true},
+				{name: "b", expectValid: true},
+			},
+		},
+		{
+			name: "conflict where older non-polling policy wins",
+			policies: map[PolicyKey]*Policy{
+				pollPolicyKey("a", "default"): {
+					Source: pollWAFSource("a", "default", "same-policy", pollEarlier, false), Valid: true,
+				},
+				pollPolicyKey("b", "default"): {
+					Source: pollWAFSource("b", "default", "same-policy", pollNow, true), Valid: true,
+				},
+			},
+			expStatus: []expPolicyStatus{
+				{
+					name:        "a",
+					expectValid: true,
+				},
+				{
+					name:           "b",
+					expectValid:    false,
+					expectCondLen:  1,
+					condSubstrings: []string{"polling configuration", "default/a"},
+				},
+			},
+		},
+		{
+			name: "conflict where older polling policy wins",
+			policies: map[PolicyKey]*Policy{
+				pollPolicyKey("a", "default"): {
+					Source: pollWAFSource("a", "default", "same-policy", pollEarlier, true), Valid: true,
+				},
+				pollPolicyKey("b", "default"): {
+					Source: pollWAFSource("b", "default", "same-policy", pollNow, false), Valid: true,
+				},
+			},
+			expStatus: []expPolicyStatus{
+				{name: "a", expectValid: true},
+				{name: "b", expectValid: false, expectCondLen: 1, condSubstrings: []string{"polling configuration"}},
+			},
+		},
+		{
+			name: "different bundle keys do not conflict",
+			policies: map[PolicyKey]*Policy{
+				pollPolicyKey("a", "default"): {
+					Source: pollWAFSource("a", "default", "same-policy", pollEarlier, true), Valid: true,
+				},
+				pollPolicyKey("b", "default"): {
+					Source: pollWAFSource("b", "default", "diff-policy", pollNow, false), Valid: true,
+				},
+			},
+			expStatus: []expPolicyStatus{
+				{name: "a", expectValid: true},
+				{name: "b", expectValid: true},
+			},
+		},
+		{
+			name: "already invalid policy is skipped",
+			policies: map[PolicyKey]*Policy{
+				pollPolicyKey("a", "default"): {
+					Source: pollWAFSource("a", "default", "same-policy", pollEarlier, true), Valid: true,
+				},
+				pollPolicyKey("b", "default"): {
+					Source: pollWAFSource("b", "default", "same-policy", pollNow, false), Valid: false,
+				},
+			},
+			expStatus: []expPolicyStatus{
+				{name: "a", expectValid: true},
+				{name: "b", expectValid: false, expectCondLen: 0},
+			},
+		},
+		{
+			name: "three policies with conflict invalidates all losing policies",
+			policies: map[PolicyKey]*Policy{
+				pollPolicyKey("a", "default"): {
+					Source: pollWAFSource("a", "default", "same-policy", pollEarlier, false), Valid: true,
+				},
+				pollPolicyKey("b", "default"): {
+					Source: pollWAFSource("b", "default", "same-policy", pollNow, true), Valid: true,
+				},
+				pollPolicyKey("c", "default"): {
+					Source: pollWAFSource("c", "default", "same-policy", later, true), Valid: true,
+				},
+			},
+			expStatus: []expPolicyStatus{
+				{name: "a", expectValid: true},
+				{name: "b", expectValid: false, expectCondLen: 1, condSubstrings: []string{"polling configuration"}},
+				{name: "c", expectValid: false, expectCondLen: 1, condSubstrings: []string{"polling configuration"}},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			validateWAFPollingConsistency(test.policies)
+
+			for _, exp := range test.expStatus {
+				policy := test.policies[pollPolicyKey(exp.name, "default")]
+				g.Expect(policy.Valid).To(Equal(exp.expectValid), "policy %s validity", exp.name)
+
+				if exp.expectCondLen > 0 {
+					g.Expect(policy.Conditions).To(HaveLen(exp.expectCondLen), "policy %s condition count", exp.name)
+					for _, substr := range exp.condSubstrings {
+						g.Expect(policy.Conditions[0].Message).To(
+							ContainSubstring(substr), "policy %s condition message", exp.name,
+						)
+					}
+				} else if !exp.expectValid {
+					g.Expect(policy.Conditions).To(BeEmpty(), "policy %s should have no conditions", exp.name)
+				}
+			}
+		})
+	}
+}

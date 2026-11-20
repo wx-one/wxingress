@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest an idea or an improvement for wxingress.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Not sure whether something is a feature or how it should look? Start a
+        thread in [Discussions](https://github.com/wx-one/wxingress/discussions) first.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How you would like it to work - an annotation, a CRD field, a Helm value, a Gateway API feature.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you use now, or how other ingress controllers solve it.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context

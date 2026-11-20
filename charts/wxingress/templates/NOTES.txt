@@ -1,0 +1,29 @@
+wxingress {{ .Chart.AppVersion }} has been installed.
+
+{{ if .Release.IsUpgrade -}}
+If you are upgrading from a version of the chart that uses older Custom Resource Definitions (CRD) it is necessary to manually upgrade the CRDs as this is not managed by Helm.
+To update to the latest version of the CRDs, apply deploy/crds.yaml of the wxingress source of this version:
+  $ kubectl apply -f deploy/crds.yaml
+{{- end -}}
+{{- if .Values.controller.gatewayAPI.installCRDs }}
+{{- $skipped := list }}
+{{- range $doc := regexSplit "(?m)^---[ \t]*$" ($.Files.Get "gateway-api-crds.yaml") -1 }}
+{{- $obj := fromYaml $doc }}
+{{- if and $obj $obj.kind }}
+{{- if not (include "wxingress.mayRender" (dict "apiVersion" $obj.apiVersion "kind" $obj.kind "namespace" "" "name" $obj.metadata.name "root" $)) }}
+{{- $skipped = append $skipped (printf "%s %s" $obj.kind $obj.metadata.name) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if $skipped }}
+
+The cluster has these objects of the Gateway API from elsewhere (another
+release, kubectl or the distribution); this release leaves them as they are:
+{{- range $skipped }}
+  {{ . }}
+{{- end }}
+To take them over, annotate them with this release:
+  kubectl annotate <kind> <name> --overwrite meta.helm.sh/release-name={{ .Release.Name }} meta.helm.sh/release-namespace={{ .Release.Namespace }}
+and upgrade the release.
+{{- end }}
+{{- end }}

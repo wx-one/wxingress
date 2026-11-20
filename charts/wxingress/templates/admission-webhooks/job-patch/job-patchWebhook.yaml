@@ -1,0 +1,99 @@
+{{- if and (dig "admissionWebhooks" "enabled" false .Values.controller) .Values.controller.admissionWebhooks.patch.enabled (not .Values.controller.admissionWebhooks.certManager.enabled) -}}
+{{- $aw := .Values.controller.admissionWebhooks -}}
+{{- $job := $aw.patchWebhookJob -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "nginx-ingress.admissionWebhooks.patchWebhookJob.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    {{- with $aw.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  labels:
+    {{- include "nginx-ingress.labels" . | nindent 4 }}
+    app.kubernetes.io/component: admission-webhook
+    {{- with $aw.patch.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ttlSecondsAfterFinished: 0
+  {{- if gt (int $job.activeDeadlineSeconds) 0 }}
+  activeDeadlineSeconds: {{ $job.activeDeadlineSeconds }}
+  {{- end }}
+  template:
+    metadata:
+      name: {{ include "nginx-ingress.admissionWebhooks.patchWebhookJob.fullname" . }}
+      {{- with $aw.patch.podAnnotations }}
+      annotations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- /* not the controller's name and instance: its Services select by those */}}
+        app.kubernetes.io/name: {{ include "nginx-ingress.name" . }}-admission-webhook
+        app.kubernetes.io/part-of: {{ .Release.Name }}
+        app.kubernetes.io/component: admission-webhook
+        {{- with $aw.patch.labels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with $aw.patch.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with $aw.patch.runtimeClassName }}
+      runtimeClassName: {{ . | quote }}
+      {{- end }}
+      {{- if or .Values.controller.serviceAccount.imagePullSecretName .Values.controller.serviceAccount.imagePullSecretsNames }}
+      imagePullSecrets:
+      {{- with .Values.controller.serviceAccount.imagePullSecretName }}
+        - name: {{ . }}
+      {{- end }}
+      {{- range .Values.controller.serviceAccount.imagePullSecretsNames }}
+        - name: {{ . }}
+      {{- end }}
+      {{- end }}
+      containers:
+        - name: patch
+          image: {{ include "nginx-ingress.admissionWebhooks.patch.image" . }}
+          imagePullPolicy: {{ $aw.patch.image.pullPolicy }}
+          args:
+            - patch
+            - --webhook-name={{ include "nginx-ingress.admissionWebhooks.fullname" . }}
+            - --namespace=$(POD_NAMESPACE)
+            - --patch-mutating=false
+            - --secret-name={{ include "nginx-ingress.admissionWebhooks.fullname" . }}
+            - --patch-failure-policy={{ .Values.controller.admissionWebhooks.failurePolicy }}
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          {{- with $aw.extraEnvs }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $job.securityContext }}
+          securityContext: {{ toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $job.resources }}
+          resources: {{ toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $job.volumeMounts }}
+          volumeMounts: {{- toYaml . | nindent 12 }}
+          {{- end }}
+      restartPolicy: OnFailure
+      serviceAccountName: {{ include "nginx-ingress.admissionWebhooks.patch.serviceAccountName" . }}
+      automountServiceAccountToken: {{ $aw.patch.serviceAccount.automountServiceAccountToken }}
+      {{- with $aw.patch.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $aw.patch.tolerations }}
+      tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $aw.patch.securityContext }}
+      securityContext: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $job.volumes }}
+      volumes: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

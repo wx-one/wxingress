@@ -1,0 +1,302 @@
+from ssl import SSLError
+
+import pytest
+import requests
+from requests.exceptions import ConnectionError
+from settings import TEST_DATA
+from suite.utils.custom_assertions import wait_and_assert_status_code
+from suite.utils.resources_utils import (
+    create_ingress,
+    create_secret_from_yaml,
+    delete_ingress,
+    delete_secret,
+    ensure_connection,
+    is_secret_present,
+    replace_secret,
+    wait_before_test,
+)
+from suite.utils.ssl_utils import get_server_certificate_subject
+
+
+def assert_cn(endpoint, cn):
+    host = "random"  # any host would work
+    subject_dict = get_server_certificate_subject(endpoint.public_ip, host, endpoint.port_ssl)
+    assert subject_dict[b"CN"] == cn.encode("ascii")
+
+
+def assert_unrecognized_name_error(endpoint):
+    try:
+        host = "random"  # any host would work
+        get_server_certificate_subject(endpoint.public_ip, host, endpoint.port_ssl)
+        pytest.fail("We expected an SSLError here, but didn't get it or got another error. Exiting...")
+    except SSLError as e:
+        assert "SSL" in e.library
+        assert "TLSV1_UNRECOGNIZED_NAME" in e.reason
+
+
+secret_path = f"{TEST_DATA}/common/default-server-secret.yaml"
+test_data_path = f"{TEST_DATA}/default-server"
+invalid_secret_path = f"{test_data_path}/invalid-tls-secret.yaml"
+new_secret_path = f"{test_data_path}/new-tls-secret.yaml"
+opaque_secret_path = f"{test_data_path}/opaque-tls-secret.yaml"
+secret_name = "default-server-secret"
+secret_namespace = "nginx-ingress"
+
+
+@pytest.fixture(scope="class")
+def default_server_setup(ingress_controller_endpoint, ingress_controller):
+    ensure_connection(f"http://{ingress_controller_endpoint.public_ip}:{ingress_controller_endpoint.port}/")
+
+
+@pytest.fixture(scope="class")
+def default_server_setup_custom_port(ingress_controller_endpoint, ingress_controller):
+    ensure_connection(f"http://{ingress_controller_endpoint.public_ip}:{ingress_controller_endpoint.custom_http}/")
+    ensure_connection(f"https://{ingress_controller_endpoint.public_ip}:{ingress_controller_endpoint.custom_https}/")
+
+
+@pytest.fixture(scope="class")
+def deploy_empty_host_ingress(request, kube_apis, ingress_controller, test_namespace):
+    if not request.param:
+        return
+
+    ingress_name = create_ingress(
+        kube_apis.networking_v1,
+        test_namespace,
+        {
+            "apiVersion": "networking.k8s.io/v1",
+            "kind": "Ingress",
+            "metadata": {
+                "name": "empty-host-ingress",
+                "annotations": {
+                    "nginx.org/ssl-redirect": "false",
+                },
+            },
+            "spec": {
+                "ingressClassName": "nginx",
+                "rules": [{"host": ""}],
+            },
+        },
+    )
+    wait_before_test()
+
+    def fin():
+        if request.config.getoption("--skip-fixture-teardown") == "no":
+            delete_ingress(kube_apis.networking_v1, ingress_name, test_namespace)
+
+    request.addfinalizer(fin)
+
+
+@pytest.fixture(scope="class")
+def secret_setup(request, kube_apis):
+    def fin():
+        if request.config.getoption("--skip-fixture-teardown") == "no":
+            if is_secret_present(kube_apis.v1, secret_name, secret_namespace):
+                print("cleaning up secret!")
+                delete_secret(kube_apis.v1, secret_name, secret_namespace)
+                # restore the original secret created in ingress_controller_prerequisites fixture
+                create_secret_from_yaml(kube_apis.v1, secret_namespace, secret_path)
+
+    request.addfinalizer(fin)
+
+
+@pytest.mark.ingresses
+@pytest.mark.parametrize(
+    "deploy_empty_host_ingress",
+    [
+        pytest.param(False, id="default-server"),
+        pytest.param(True, id="empty-host-ingress"),
+    ],
+    indirect=True,
+)
+class TestDefaultServer:
+    @pytest.mark.parametrize(
+        "ingress_controller",
+        [
+            {
+                "extra_args": [
+                    "-allow-empty-ingress-host",
+                ],
+            },
+        ],
+        indirect=True,
+    )
+    def test_with_default_tls_secret(
+        self,
+        kube_apis,
+        ingress_controller_endpoint,
+        secret_setup,
+        default_server_setup,
+        deploy_empty_host_ingress,
+    ):
+        print("Step 1: ensure CN of the default server TLS cert")
+        assert_cn(ingress_controller_endpoint, "NGINXIngressController")
+
+        print("Step 2: ensure CN of the default server TLS cert after removing the secret")
+        delete_secret(kube_apis.v1, secret_name, secret_namespace)
+        wait_before_test(1)
+        # Ingress Controller retains the previous valid secret
+        assert_cn(ingress_controller_endpoint, "NGINXIngressController")
+
+        print("Step 3: ensure CN of the default TLS cert after creating an updated secret")
+        create_secret_from_yaml(kube_apis.v1, secret_namespace, new_secret_path)
+        wait_before_test(1)
+        assert_cn(ingress_controller_endpoint, "cafe.example.com")
+
+        print("Step 4: ensure CN of the default TLS cert after making the secret invalid")
+        replace_secret(kube_apis.v1, secret_name, secret_namespace, invalid_secret_path)
+        wait_before_test(1)
+        # Ingress Controller retains the previous valid secret
+        assert_cn(ingress_controller_endpoint, "cafe.example.com")
+
+        print("Step 5: ensure CN of the default TLS cert after restoring the secret")
+        replace_secret(kube_apis.v1, secret_name, secret_namespace, secret_path)
+        wait_before_test(1)
+        assert_cn(ingress_controller_endpoint, "NGINXIngressController")
+
+    @pytest.mark.parametrize(
+        "ingress_controller",
+        [
+            {
+                "extra_args": [
+                    "-allow-empty-ingress-host",
+                ],
+            },
+        ],
+        indirect=True,
+    )
+    def test_with_opaque_default_tls_secret(
+        self,
+        kube_apis,
+        ingress_controller_endpoint,
+        secret_setup,
+        default_server_setup,
+        deploy_empty_host_ingress,
+    ):
+        """
+        The default server TLS secret is served from an Opaque secret carrying the same
+        tls.crt/tls.key keys.
+
+        Asserts on the certificate actually served on the wire rather than on an event, because
+        a secret NIC fails to apply still produces a SecretUpdated event while serving the stale
+        certificate.
+        """
+        print("Step 1: swap the default server secret for an Opaque one")
+        delete_secret(kube_apis.v1, secret_name, secret_namespace)
+        # Secret type is immutable, so the swap must be delete-then-create.
+        create_secret_from_yaml(kube_apis.v1, secret_namespace, opaque_secret_path)
+        wait_before_test(1)
+        assert_cn(ingress_controller_endpoint, "NGINXIngressController")
+
+        print("Step 2: restore the typed secret")
+        delete_secret(kube_apis.v1, secret_name, secret_namespace)
+        create_secret_from_yaml(kube_apis.v1, secret_namespace, secret_path)
+        wait_before_test(1)
+        assert_cn(ingress_controller_endpoint, "NGINXIngressController")
+
+    @pytest.mark.parametrize(
+        "ingress_controller",
+        [
+            {
+                "extra_args": [
+                    "-default-server-tls-secret=",
+                    "-allow-empty-ingress-host",
+                ],
+            },
+        ],
+        indirect=True,
+    )
+    def test_without_default_tls_secret(
+        self,
+        ingress_controller_endpoint,
+        default_server_setup,
+        deploy_empty_host_ingress,
+    ):
+        print("Ensure connection to HTTPS cannot be established")
+        assert_unrecognized_name_error(ingress_controller_endpoint)
+
+    @pytest.mark.parametrize(
+        "ingress_controller",
+        [
+            {
+                "extra_args": [
+                    "-default-http-listener-port=8085",
+                    "-default-https-listener-port=8445",
+                    "-allow-empty-ingress-host",
+                ],
+            },
+        ],
+        indirect=True,
+    )
+    def test_disable_default_listeners_true(
+        self,
+        ingress_controller_endpoint,
+        ingress_controller,
+        deploy_empty_host_ingress,
+    ):
+        print("Ensure ports 80 and 443 return result in an ERR_CONNECTION_REFUSED")
+        request_url_80 = f"http://{ingress_controller_endpoint.public_ip}:{ingress_controller_endpoint.port}/"
+        with pytest.raises(ConnectionError, match="Connection refused") as e:
+            requests.get(request_url_80, headers={})
+
+        request_url_443 = f"https://{ingress_controller_endpoint.public_ip}:{ingress_controller_endpoint.port_ssl}/"
+        with pytest.raises(ConnectionError, match="Connection refused") as e:
+            requests.get(request_url_443, headers={}, verify=False)
+
+    @pytest.mark.parametrize(
+        "ingress_controller",
+        [
+            {
+                "extra_args": [
+                    "-default-http-listener-port=8085",
+                    "-default-https-listener-port=8445",
+                    "-allow-empty-ingress-host",
+                ],
+            },
+        ],
+        indirect=True,
+    )
+    def test_custom_default_listeners(
+        self,
+        kube_apis,
+        ingress_controller_endpoint,
+        ingress_controller,
+        default_server_setup_custom_port,
+        deploy_empty_host_ingress,
+    ):
+        print("Ensure custom ports for default listeners return 404")
+        request_url_http = f"http://{ingress_controller_endpoint.public_ip}:{ingress_controller_endpoint.custom_http}/"
+        wait_and_assert_status_code(404, request_url_http, allow_redirects=False)
+
+        request_url_https = (
+            f"https://{ingress_controller_endpoint.public_ip}:{ingress_controller_endpoint.custom_https}/"
+        )
+        wait_and_assert_status_code(404, request_url_https, verify=False)
+
+    @pytest.mark.parametrize(
+        "ingress_controller",
+        [
+            {
+                "extra_args": [
+                    "-health-status=true",
+                    "-allow-empty-ingress-host",
+                ],
+            },
+        ],
+        indirect=True,
+    )
+    def test_health_status_bypasses_ssl_redirect(
+        self,
+        ingress_controller_endpoint,
+        default_server_setup,
+        deploy_empty_host_ingress,
+    ):
+        print("Step 1: ensure the health URI stays reachable over HTTP")
+        health_url = f"http://{ingress_controller_endpoint.public_ip}:{ingress_controller_endpoint.port}/nginx-health"
+        wait_and_assert_status_code(200, health_url)
+
+        print("Step 2: ensure non-health traffic keeps its normal default-server behavior")
+        request_url = f"http://{ingress_controller_endpoint.public_ip}:{ingress_controller_endpoint.port}/"
+
+        expected_root_status = 404
+
+        wait_and_assert_status_code(expected_root_status, request_url, allow_redirects=False)

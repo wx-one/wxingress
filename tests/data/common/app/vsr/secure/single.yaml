@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend2
+  namespace: backend2-namespace
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend2
+  template:
+    metadata:
+      labels:
+        app: backend2
+    spec:
+      containers:
+      - name: backend2
+        image: nginx
+        ports:
+        - containerPort: 80
+        volumeMounts:
+          - name: secret
+            mountPath: "/etc/nginx/ssl"
+            readOnly: true
+          - name: config-volume
+            mountPath: /etc/nginx/conf.d
+      volumes:
+      - name: secret
+        secret:
+          secretName: app-tls-secret
+      - name: config-volume
+        configMap:
+          name: secure-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend2-svc
+  namespace: backend2-namespace
+spec:
+  ports:
+  - port: 80
+    targetPort: 443
+    protocol: TCP
+    name: https
+  selector:
+    app: backend2
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secure-config
+  namespace: backend2-namespace
+data:
+  app.conf: |-
+    server {
+      listen 443 ssl;
+      listen [::]:443 ssl;
+
+      server_name app.example.com;
+
+      ssl_certificate /etc/nginx/ssl/tls.crt;
+      ssl_certificate_key /etc/nginx/ssl/tls.key;
+
+      default_type text/plain;
+
+      location / {
+        return 200 "here is your response via ssl port $server_port with X-Forwarded-Port $http_x_forwarded_port\n";
+      }
+    }

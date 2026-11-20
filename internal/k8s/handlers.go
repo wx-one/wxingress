@@ -1,0 +1,261 @@
+package k8s
+
+import (
+	"fmt"
+	"log/slog"
+	"reflect"
+
+	nl "github.com/wx-one/wxingress/internal/logger"
+	v1 "k8s.io/api/core/v1"
+	networking "k8s.io/api/networking/v1"
+	"k8s.io/client-go/tools/cache"
+
+	conf_v1 "github.com/wx-one/wxingress/pkg/apis/configuration/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+)
+
+// createIngressHandlers builds the handler funcs for ingresses
+func createIngressHandlers(lbc *LoadBalancerController) cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			ingress := obj.(*networking.Ingress)
+			nl.Debugf(lbc.Logger.With(logNamespaceKey, ingress.GetNamespace(), logKindKey, ingressKind, logNameKey, ingress.GetName()), "Adding Ingress: %v", ingress.Name)
+			lbc.AddSyncQueue(obj)
+		},
+		DeleteFunc: func(obj interface{}) {
+			ingress, isIng := obj.(*networking.Ingress)
+			if !isIng {
+				deletedState, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					nl.Debugf(lbc.Logger, "Error received unexpected object: %v", obj)
+					return
+				}
+				ingress, ok = deletedState.Obj.(*networking.Ingress)
+				if !ok {
+					nl.Debugf(lbc.Logger, "Error DeletedFinalStateUnknown contained non-Ingress object: %v", deletedState.Obj)
+					return
+				}
+			}
+			l := lbc.Logger.With(logNamespaceKey, ingress.GetNamespace(), logKindKey, ingressKind, logNameKey, ingress.GetName())
+			nl.Debugf(l, "Removing Ingress: %v", ingress.Name)
+			lbc.AddSyncQueue(ingress)
+		},
+		UpdateFunc: func(old, current interface{}) {
+			c := current.(*networking.Ingress)
+			o := old.(*networking.Ingress)
+			if hasChanges(o, c) {
+				nl.Debugf(lbc.Logger.With(logNamespaceKey, c.GetNamespace(), logKindKey, ingressKind, logNameKey, c.GetName()), "Ingress %v changed, syncing", c.Name)
+				lbc.AddSyncQueue(c)
+			}
+		},
+	}
+}
+
+// createSecretHandlers builds the handler funcs for secrets
+func createSecretHandlers(lbc *LoadBalancerController) cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			secret := obj.(*v1.Secret)
+			l := lbc.Logger.With(logNamespaceKey, secret.GetNamespace(), logKindKey, secretKind, logNameKey, secret.GetName())
+			nl.Debugf(l, "Adding Secret: %v", secret.Name)
+			lbc.AddSyncQueue(obj)
+		},
+		DeleteFunc: func(obj interface{}) {
+			secret, isSecr := obj.(*v1.Secret)
+			if !isSecr {
+				deletedState, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					nl.Debugf(lbc.Logger, "Error received unexpected object: %v", obj)
+					return
+				}
+				secret, ok = deletedState.Obj.(*v1.Secret)
+				if !ok {
+					nl.Debugf(lbc.Logger, "Error DeletedFinalStateUnknown contained non-Secret object: %v", deletedState.Obj)
+					return
+				}
+			}
+			l := lbc.Logger.With(logNamespaceKey, secret.GetNamespace(), logKindKey, secretKind, logNameKey, secret.GetName())
+			nl.Debugf(l, "Removing Secret: %v", secret.Name)
+			lbc.AddSyncQueue(secret)
+		},
+		UpdateFunc: func(old, cur interface{}) {
+			// We only compare .Data: Secret.Type is irrelevant under role-based
+			// validation, and metadata-only changes (labels, annotations,
+			// resourceVersion, managedFields) do not affect NGINX configuration.
+			// This avoids reconciliation storms from noisy metadata churn.
+			oldSecret := old.(*v1.Secret)
+			curSecret := cur.(*v1.Secret)
+			l := lbc.Logger.With(logNamespaceKey, curSecret.GetNamespace(), logKindKey, secretKind, logNameKey, curSecret.GetName())
+
+			if !reflect.DeepEqual(oldSecret.Data, curSecret.Data) {
+				nl.Debugf(l, "Secret %v changed, syncing", cur.(*v1.Secret).Name)
+				lbc.AddSyncQueue(cur)
+			}
+		},
+	}
+}
+
+// createPLMCredentialsSecretHandlers re-enqueues PLM bundle consumers when the
+// configured opaque S3 credentials Secret changes.
+func createPLMCredentialsSecretHandlers(lbc *LoadBalancerController, credentialsKey string) cache.ResourceEventHandlerFuncs {
+	enqueue := func(obj interface{}) {
+		secret := obj.(*v1.Secret)
+		if secret.Namespace+"/"+secret.Name == credentialsKey {
+			lbc.enqueuePoliciesUsingPLMStorage(credentialsKey)
+		}
+	}
+
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: enqueue,
+		UpdateFunc: func(old, cur interface{}) {
+			if !reflect.DeepEqual(old, cur) {
+				enqueue(cur)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			secret, ok := obj.(*v1.Secret)
+			if !ok {
+				deletedState, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					return
+				}
+				secret, ok = deletedState.Obj.(*v1.Secret)
+				if !ok {
+					return
+				}
+			}
+			enqueue(secret)
+		},
+	}
+}
+
+func createVirtualServerHandlers(lbc *LoadBalancerController) cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			vs := obj.(*conf_v1.VirtualServer)
+			l := lbc.Logger.With(logNamespaceKey, vs.GetNamespace(), logKindKey, virtualServerKind, logNameKey, vs.GetName())
+			nl.Debugf(l, "Adding VirtualServer: %v", vs.Name)
+			lbc.AddSyncQueue(vs)
+		},
+		DeleteFunc: func(obj interface{}) {
+			vs, isVs := obj.(*conf_v1.VirtualServer)
+			if !isVs {
+				deletedState, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					nl.Debugf(lbc.Logger, "Error received unexpected object: %v", obj)
+					return
+				}
+				vs, ok = deletedState.Obj.(*conf_v1.VirtualServer)
+				if !ok {
+					nl.Debugf(lbc.Logger, "Error DeletedFinalStateUnknown contained non-VirtualServer object: %v", deletedState.Obj)
+					return
+				}
+			}
+			nl.Debugf(lbc.Logger.With(logNamespaceKey, vs.GetNamespace(), logKindKey, virtualServerKind, logNameKey, vs.GetName()), "Removing VirtualServer: %v", vs.Name)
+			lbc.AddSyncQueue(vs)
+		},
+		UpdateFunc: func(old, cur interface{}) {
+			curVs := cur.(*conf_v1.VirtualServer)
+			oldVs := old.(*conf_v1.VirtualServer)
+			l := lbc.Logger.With(logNamespaceKey, curVs.GetNamespace(), logKindKey, virtualServerKind, logNameKey, curVs.GetName())
+
+			if !reflect.DeepEqual(oldVs.Spec, curVs.Spec) {
+				nl.Debugf(l, "VirtualServer %v changed, syncing", curVs.Name)
+				lbc.AddSyncQueue(curVs)
+			}
+		},
+	}
+}
+
+func createVirtualServerRouteHandlers(lbc *LoadBalancerController) cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			vsr := obj.(*conf_v1.VirtualServerRoute)
+			nl.Debugf(lbc.Logger.With(logNamespaceKey, vsr.GetNamespace(), logKindKey, virtualServerRouteKind, logNameKey, vsr.GetName()), "Adding VirtualServerRoute: %v", vsr.Name)
+			lbc.AddSyncQueue(vsr)
+		},
+		DeleteFunc: func(obj interface{}) {
+			vsr, isVsr := obj.(*conf_v1.VirtualServerRoute)
+			if !isVsr {
+				deletedState, ok := obj.(cache.DeletedFinalStateUnknown)
+				if !ok {
+					nl.Debugf(lbc.Logger, "Error received unexpected object: %v", obj)
+					return
+				}
+				vsr, ok = deletedState.Obj.(*conf_v1.VirtualServerRoute)
+				if !ok {
+					nl.Debugf(lbc.Logger, "Error DeletedFinalStateUnknown contained non-VirtualServerRoute object: %v", deletedState.Obj)
+					return
+				}
+			}
+			nl.Debugf(lbc.Logger.With(logNamespaceKey, vsr.GetNamespace(), logKindKey, virtualServerRouteKind, logNameKey, vsr.GetName()), "Removing VirtualServerRoute: %v", vsr.Name)
+			lbc.AddSyncQueue(vsr)
+		},
+		UpdateFunc: func(old, cur interface{}) {
+			curVsr := cur.(*conf_v1.VirtualServerRoute)
+			oldVsr := old.(*conf_v1.VirtualServerRoute)
+
+			l := lbc.Logger.With(logNamespaceKey, curVsr.GetNamespace(), logKindKey, virtualServerRouteKind, logNameKey, curVsr.GetName())
+
+			if !reflect.DeepEqual(oldVsr.Spec, curVsr.Spec) || !reflect.DeepEqual(oldVsr.Labels, curVsr.Labels) {
+				nl.Debugf(l, "VirtualServerRoute %v changed, syncing", curVsr.Name)
+				lbc.AddSyncQueue(curVsr)
+			}
+		},
+	}
+}
+
+// areResourcesDifferent returns true if the resources are different based on their spec.
+func areResourcesDifferent(l *slog.Logger, oldresource, resource *unstructured.Unstructured) (bool, error) {
+	oldSpec, found, err := unstructured.NestedMap(oldresource.Object, "spec")
+	if !found {
+		nl.Debugf(l, "Warning, oldspec has unexpected format")
+	}
+	if err != nil {
+		return false, err
+	}
+	spec, found, err := unstructured.NestedMap(resource.Object, "spec")
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, fmt.Errorf("spec has unexpected format")
+	}
+	eq := reflect.DeepEqual(oldSpec, spec)
+	if eq {
+		nl.Debugf(l, "New spec of %v same as old spec", oldresource.GetName())
+	}
+	return !eq, nil
+}
+
+func zeroOutVirtualServerSplitWeights(vs *conf_v1.VirtualServer) {
+	for _, route := range vs.Spec.Routes {
+		for _, match := range route.Matches {
+			if len(match.Splits) == 2 {
+				match.Splits[0].Weight = 0
+				match.Splits[1].Weight = 0
+			}
+		}
+
+		if len(route.Splits) == 2 {
+			route.Splits[0].Weight = 0
+			route.Splits[1].Weight = 0
+		}
+	}
+}
+
+func zeroOutVirtualServerRouteSplitWeights(vs *conf_v1.VirtualServerRoute) {
+	for _, route := range vs.Spec.Subroutes {
+		for _, match := range route.Matches {
+			if len(match.Splits) == 2 {
+				match.Splits[0].Weight = 0
+				match.Splits[1].Weight = 0
+			}
+		}
+
+		if len(route.Splits) == 2 {
+			route.Splits[0].Weight = 0
+			route.Splits[1].Weight = 0
+		}
+	}
+}

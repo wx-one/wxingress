@@ -1,0 +1,628 @@
+package dataplane
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	v1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPI "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha1"
+	ngfAPIv1alpha2 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha2"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/nginx/config/http"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/graph/shared/secrets"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/mirror"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+)
+
+func convertMatch(m v1.HTTPRouteMatch) Match {
+	match := Match{}
+
+	if m.Method != nil {
+		method := string(*m.Method)
+		match.Method = &method
+	}
+
+	if len(m.Headers) != 0 {
+		match.Headers = make([]HTTPHeaderMatch, 0, len(m.Headers))
+		for _, h := range m.Headers {
+			match.Headers = append(match.Headers, HTTPHeaderMatch{
+				Name:  string(h.Name),
+				Value: h.Value,
+				Type:  convertMatchType(h.Type),
+			})
+		}
+	}
+
+	if len(m.QueryParams) != 0 {
+		match.QueryParams = make([]HTTPQueryParamMatch, 0, len(m.QueryParams))
+		for _, q := range m.QueryParams {
+			match.QueryParams = append(match.QueryParams, HTTPQueryParamMatch{
+				Name:  string(q.Name),
+				Value: q.Value,
+				Type:  convertMatchType(q.Type),
+			})
+		}
+	}
+
+	return match
+}
+
+func convertHTTPRequestRedirectFilter(filter *v1.HTTPRequestRedirectFilter) *HTTPRequestRedirectFilter {
+	return &HTTPRequestRedirectFilter{
+		Scheme:     filter.Scheme,
+		Hostname:   (*string)(filter.Hostname),
+		Port:       filter.Port,
+		StatusCode: filter.StatusCode,
+		Path:       convertPathModifier(filter.Path),
+	}
+}
+
+func convertHTTPURLRewriteFilter(filter *v1.HTTPURLRewriteFilter) *HTTPURLRewriteFilter {
+	return &HTTPURLRewriteFilter{
+		Hostname: (*string)(filter.Hostname),
+		Path:     convertPathModifier(filter.Path),
+	}
+}
+
+func convertHTTPRequestMirrorFilter(
+	filter *v1.HTTPRequestMirrorFilter,
+	ruleIdx int,
+	routeNsName types.NamespacedName,
+) *HTTPRequestMirrorFilter {
+	if filter.BackendRef.Name == "" {
+		return &HTTPRequestMirrorFilter{}
+	}
+
+	result := &HTTPRequestMirrorFilter{
+		Name: helpers.GetPointer(string(filter.BackendRef.Name)),
+	}
+
+	namespace := (*string)(filter.BackendRef.Namespace)
+	if namespace != nil && len(*namespace) > 0 {
+		result.Namespace = namespace
+	}
+
+	result.Target = mirror.BackendPath(ruleIdx, namespace, *result.Name, routeNsName)
+	switch {
+	case filter.Percent != nil:
+		result.Percent = helpers.GetPointer(float64(*filter.Percent))
+	case filter.Fraction != nil:
+		denominator := int32(100)
+		if filter.Fraction.Denominator != nil {
+			denominator = *filter.Fraction.Denominator
+		}
+		result.Percent = helpers.GetPointer(float64(filter.Fraction.Numerator*100) / float64(denominator))
+	default:
+		result.Percent = helpers.GetPointer(float64(100))
+	}
+
+	if *result.Percent > 100.0 {
+		result.Percent = helpers.GetPointer(100.0)
+	}
+
+	return result
+}
+
+func convertHTTPHeaderFilter(filter *v1.HTTPHeaderFilter) *HTTPHeaderFilter {
+	result := &HTTPHeaderFilter{
+		Remove: filter.Remove,
+	}
+
+	if len(filter.Set) != 0 {
+		result.Set = make([]HTTPHeader, 0, len(filter.Set))
+		for _, s := range filter.Set {
+			result.Set = append(result.Set, HTTPHeader{Name: string(s.Name), Value: s.Value})
+		}
+	}
+
+	if len(filter.Add) != 0 {
+		result.Add = make([]HTTPHeader, 0, len(filter.Add))
+		for _, a := range filter.Add {
+			result.Add = append(result.Add, HTTPHeader{Name: string(a.Name), Value: a.Value})
+		}
+	}
+
+	return result
+}
+
+func convertPathType(pathType v1.PathMatchType) PathType {
+	switch pathType {
+	case v1.PathMatchPathPrefix:
+		return PathTypePrefix
+	case v1.PathMatchExact:
+		return PathTypeExact
+	case v1.PathMatchRegularExpression:
+		return PathTypeRegularExpression
+	default:
+		panic(fmt.Sprintf("unsupported path type: %s", pathType))
+	}
+}
+
+func convertMatchType[T ~string](matchType *T) MatchType {
+	switch *matchType {
+	case T(v1.HeaderMatchExact), T(v1.QueryParamMatchExact):
+		return MatchTypeExact
+	case T(v1.HeaderMatchRegularExpression), T(v1.QueryParamMatchRegularExpression):
+		return MatchTypeRegularExpression
+	default:
+		panic(fmt.Sprintf("unsupported match type: %v", *matchType))
+	}
+}
+
+func convertPathModifier(path *v1.HTTPPathModifier) *HTTPPathModifier {
+	if path != nil {
+		switch path.Type {
+		case v1.FullPathHTTPPathModifier:
+			return &HTTPPathModifier{
+				Type:        ReplaceFullPath,
+				Replacement: *path.ReplaceFullPath,
+			}
+		case v1.PrefixMatchHTTPPathModifier:
+			return &HTTPPathModifier{
+				Type:        ReplacePrefixMatch,
+				Replacement: *path.ReplacePrefixMatch,
+			}
+		}
+	}
+
+	return nil
+}
+
+func convertSnippetsFilter(filter *graph.SnippetsFilter) SnippetsFilter {
+	result := SnippetsFilter{}
+
+	if snippet, ok := filter.Snippets[ngfAPI.NginxContextHTTPServer]; ok {
+		result.ServerSnippet = &Snippet{
+			Name:     createSnippetName(ngfAPI.NginxContextHTTPServer, client.ObjectKeyFromObject(filter.Source)),
+			Contents: snippet,
+		}
+	}
+
+	if snippet, ok := filter.Snippets[ngfAPI.NginxContextHTTPServerLocation]; ok {
+		result.LocationSnippet = &Snippet{
+			Name: createSnippetName(
+				ngfAPI.NginxContextHTTPServerLocation,
+				client.ObjectKeyFromObject(filter.Source),
+			),
+			Contents: snippet,
+		}
+	}
+
+	return result
+}
+
+func convertAuthenticationFilter(
+	filter *graph.AuthenticationFilter,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+) *AuthenticationFilter {
+	result := &AuthenticationFilter{}
+
+	// Do not convert invalid filters; graph validation will have emitted a condition.
+	if filter == nil || !filter.Valid {
+		return result
+	}
+
+	switch filter.Source.Spec.Type {
+	case ngfAPI.AuthTypeBasic:
+		result.Basic = convertAuthenticationFilterBasicAuth(filter, referencedSecrets)
+	case ngfAPI.AuthTypeOIDC:
+		result.OIDC = convertAuthenticationFilterOIDC(filter, referencedSecrets)
+	case ngfAPI.AuthTypeJWT:
+		result.JWT = convertAuthenticationFilterJwtAuth(filter, referencedSecrets)
+	}
+
+	return result
+}
+
+func convertAuthenticationFilterBasicAuth(
+	filter *graph.AuthenticationFilter,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+) *AuthBasic {
+	var result *AuthBasic
+	if specBasic := filter.Source.Spec.Basic; specBasic != nil {
+		referencedSecret, isReferenced := referencedSecrets[types.NamespacedName{
+			Namespace: filter.Source.Namespace,
+			Name:      specBasic.SecretRef.Name,
+		}]
+
+		if isReferenced && referencedSecret.Source != nil {
+			result = &AuthBasic{
+				SecretName:      specBasic.SecretRef.Name,
+				SecretNamespace: referencedSecret.Source.Namespace,
+				Data:            referencedSecret.Source.Data[secrets.AuthKey],
+				Realm:           specBasic.Realm,
+			}
+		}
+	}
+
+	return result
+}
+
+func convertAuthenticationFilterOIDC(
+	filter *graph.AuthenticationFilter,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+) *AuthOIDC {
+	if filter.Source.Spec.OIDC == nil {
+		return nil
+	}
+	specOIDC := filter.Source.Spec.OIDC
+
+	referencedClientSecret, isReferenced := referencedSecrets[types.NamespacedName{
+		Namespace: filter.Source.Namespace,
+		Name:      specOIDC.ClientSecretRef.Name,
+	}]
+
+	if !isReferenced || referencedClientSecret.Source == nil {
+		return nil
+	}
+
+	providerName := fmt.Sprintf("%s_%s", filter.Source.Namespace, filter.Source.Name)
+
+	redirectURI := fmt.Sprintf("%s_%s_%s", oidcCallBack, filter.Source.Namespace, filter.Source.Name)
+	if specOIDC.RedirectURI != nil {
+		redirectURI = *specOIDC.RedirectURI
+	}
+
+	oidc := &OIDCProvider{
+		Name:         providerName,
+		Issuer:       specOIDC.Issuer,
+		ClientID:     specOIDC.ClientID,
+		ClientSecret: string(referencedClientSecret.Source.Data[secrets.ClientSecretKey]),
+		RedirectURI:  redirectURI,
+		ConfigURL:    specOIDC.ConfigURL,
+		PKCE:         specOIDC.PKCE,
+	}
+
+	setOIDCCACert(oidc, specOIDC.CACertificateRefs, filter.Source.Namespace, referencedSecrets)
+
+	if specOIDC.CRLSecretRef != nil {
+		setOIDCCRLCert(oidc, specOIDC.CRLSecretRef.Name, filter.Source.Namespace, referencedSecrets)
+	}
+
+	oidc.ExtraAuthArgs = buildSortedExtraAuthArgs(specOIDC.ExtraAuthArgs)
+
+	if specOIDC.Session != nil {
+		oidc.CookieName = specOIDC.Session.CookieName
+		if specOIDC.Session.Timeout != nil {
+			t := string(*specOIDC.Session.Timeout)
+			oidc.Timeout = &t
+		}
+	}
+
+	if specOIDC.Logout != nil {
+		oidc.LogoutURI = specOIDC.Logout.URI
+		oidc.PostLogoutURI = specOIDC.Logout.PostLogoutURI
+		oidc.FrontChannelLogoutURI = specOIDC.Logout.FrontChannelLogoutURI
+		oidc.TokenHint = specOIDC.Logout.TokenHint
+	}
+
+	result := &AuthOIDC{
+		Provider: oidc,
+	}
+
+	// Populate authorization fields (auth_jwt_require + proxy_set_header) from the AuthZConfig
+	if specOIDC.Authorization != nil {
+		filterNsName := strings.Join([]string{filter.Source.Namespace, filter.Source.Name}, "_")
+		filterPrefix := sanitizeVariablePrefix(filterNsName)
+		authZConfig := buildAuthZConfigFromAuthZSpec(filterPrefix, specOIDC.Authorization)
+		if authZConfig != nil {
+			result.AuthRequireVariable = authZConfig.RequireVariable
+			result.AuthZProxySetHeaders = authZConfig.ProxySetHeaders
+		}
+	}
+
+	return result
+}
+
+func convertAuthenticationFilterJwtAuth(
+	filter *graph.AuthenticationFilter,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+) *AuthJWT {
+	var result *AuthJWT
+	if specJWT := filter.Source.Spec.JWT; specJWT != nil {
+		if specJWT.Source == ngfAPI.JWTKeySourceFile && specJWT.File != nil {
+			// Handle File-based JWT (local JWKS)
+			referencedSecret, isReferenced := referencedSecrets[types.NamespacedName{
+				Namespace: filter.Source.Namespace,
+				Name:      specJWT.File.SecretRef.Name,
+			}]
+
+			if isReferenced && referencedSecret.Source != nil {
+				result = &AuthJWT{
+					SecretName:      specJWT.File.SecretRef.Name,
+					SecretNamespace: referencedSecret.Source.Namespace,
+					Data:            referencedSecret.Source.Data[secrets.AuthKey],
+					Realm:           specJWT.Realm,
+					KeyCache:        specJWT.KeyCache,
+				}
+			}
+		} else if specJWT.Source == ngfAPI.JWTKeySourceRemote && specJWT.Remote != nil {
+			// Handle Remote JWT (remote JWKS)
+			remote := convertRemoteJWTJwtAuthFilter(specJWT, filter, referencedSecrets)
+
+			result = &AuthJWT{
+				Realm:    specJWT.Realm,
+				KeyCache: specJWT.KeyCache,
+				Remote:   remote,
+			}
+		}
+
+		// Populate authorization fields (auth_jwt_require + proxy_set_header) from the AuthZConfig
+		if result != nil {
+			result.Leeway = specJWT.Leeway
+			if specJWT.Authorization != nil {
+				filterNsName := strings.Join([]string{filter.Source.Namespace, filter.Source.Name}, "_")
+				filterPrefix := sanitizeVariablePrefix(filterNsName)
+				authZConfig := buildAuthZConfigFromAuthZSpec(filterPrefix, specJWT.Authorization)
+				if authZConfig != nil {
+					result.AuthRequireVariable = authZConfig.RequireVariable
+					result.AuthZProxySetHeaders = authZConfig.ProxySetHeaders
+				}
+			}
+		}
+	}
+
+	return result
+}
+
+func convertRemoteJWTJwtAuthFilter(
+	specJWT *ngfAPI.JWTAuth,
+	filter *graph.AuthenticationFilter,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+) *AuthJWTRemote {
+	remote := &AuthJWTRemote{
+		URI: specJWT.Remote.URI,
+		Path: fmt.Sprintf(
+			"%s-%s_%s_jwks_uri",
+			http.InternalRoutePathPrefix,
+			filter.Source.Namespace,
+			filter.Source.Name,
+		),
+	}
+
+	if len(specJWT.Remote.CACertificateRefs) > 0 {
+		for _, ref := range specJWT.Remote.CACertificateRefs {
+			referencedSecret, isReferenced := referencedSecrets[types.NamespacedName{
+				Namespace: filter.Source.Namespace,
+				Name:      ref.Name,
+			}]
+
+			if isReferenced && referencedSecret.Source != nil && referencedSecret.Source.Data[secrets.CAKey] != nil {
+				remote.CACertBundlePath = generateJWTRemoteTLSCABundleID(filter.Source.Namespace, ref.Name)
+				break
+			}
+		}
+	}
+
+	return remote
+}
+
+func convertDNSResolverAddresses(addresses []ngfAPIv1alpha2.DNSResolverAddress) []string {
+	if len(addresses) == 0 {
+		return nil
+	}
+
+	result := make([]string, 0, len(addresses))
+	for _, addr := range addresses {
+		result = append(result, addr.Value)
+	}
+	return result
+}
+
+func convertWAFBundles(graphBundles map[graph.WAFBundleKey]*graph.WAFBundleData) map[WAFBundleID]WAFBundle {
+	result := make(map[WAFBundleID]WAFBundle, len(graphBundles))
+
+	for key, value := range graphBundles {
+		dataplaneKey := WAFBundleID(key)
+
+		var dataplaneValue WAFBundle
+		if value != nil {
+			dataplaneValue = WAFBundle(value.Data)
+		}
+
+		result[dataplaneKey] = dataplaneValue
+	}
+
+	return result
+}
+
+func convertHTTPCORSFilter(filter *v1.HTTPCORSFilter) *HTTPCORSFilter {
+	if filter == nil {
+		return nil
+	}
+
+	result := &HTTPCORSFilter{
+		AllowCredentials: filter.AllowCredentials != nil && *filter.AllowCredentials,
+	}
+
+	if len(filter.AllowOrigins) > 0 {
+		result.AllowOrigins = make([]string, len(filter.AllowOrigins))
+		for i, origin := range filter.AllowOrigins {
+			result.AllowOrigins[i] = string(origin)
+		}
+	}
+
+	if len(filter.AllowMethods) > 0 {
+		result.AllowMethods = make([]string, len(filter.AllowMethods))
+		for i, method := range filter.AllowMethods {
+			result.AllowMethods[i] = string(method)
+		}
+	}
+
+	if len(filter.AllowHeaders) > 0 {
+		result.AllowHeaders = make([]string, len(filter.AllowHeaders))
+		for i, header := range filter.AllowHeaders {
+			result.AllowHeaders[i] = string(header)
+		}
+	}
+
+	if len(filter.ExposeHeaders) > 0 {
+		result.ExposeHeaders = make([]string, len(filter.ExposeHeaders))
+		for i, header := range filter.ExposeHeaders {
+			result.ExposeHeaders[i] = string(header)
+		}
+	}
+
+	result.MaxAge = filter.MaxAge
+
+	return result
+}
+
+func setOIDCCACert(
+	oidc *OIDCProvider,
+	refs []ngfAPI.LocalObjectReference,
+	namespace string,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+) {
+	for _, caCertRef := range refs {
+		nsName := types.NamespacedName{Namespace: namespace, Name: caCertRef.Name}
+		if secret, exists := referencedSecrets[nsName]; exists && secret.Source != nil {
+			oidc.CACertBundleID = generateCertBundleID(nsName)
+			oidc.CACertData = secret.Source.Data[secrets.CAKey]
+			return
+		}
+	}
+}
+
+func setOIDCCRLCert(
+	oidc *OIDCProvider,
+	secretName string,
+	namespace string,
+	referencedSecrets map[types.NamespacedName]*secrets.Secret,
+) {
+	nsName := types.NamespacedName{Namespace: namespace, Name: secretName}
+	if secret, exists := referencedSecrets[nsName]; exists && secret.Source != nil {
+		oidc.CRLBundleID = generateCRLBundleID(nsName)
+		oidc.CRLData = secret.Source.Data[secrets.CRLKey]
+	}
+}
+
+func convertHTTPExternalAuthFilter(
+	filter *v1.HTTPExternalAuthFilter,
+	resolvedBackendRef graph.BackendRef,
+	routeNsName types.NamespacedName,
+	ruleIdx int,
+	gwNsName types.NamespacedName,
+) *HTTPExternalAuthFilter {
+	if filter == nil {
+		return nil
+	}
+
+	result := &HTTPExternalAuthFilter{
+		UpstreamName: resolvedBackendRef.ServicePortReference(),
+		InternalPath: generateExternalAuthInternalPath(routeNsName, ruleIdx),
+		VerifyTLS:    convertBackendTLS(resolvedBackendRef.BackendTLSPolicy, gwNsName),
+	}
+
+	if filter.HTTPAuthConfig != nil {
+		result.PathPrefix = filter.HTTPAuthConfig.Path
+		result.AllowedRequestHeaders = filter.HTTPAuthConfig.AllowedRequestHeaders
+		result.AllowedResponseHeaders = filter.HTTPAuthConfig.AllowedResponseHeaders
+	}
+
+	if filter.ForwardBody != nil && filter.ForwardBody.MaxSize > 0 {
+		result.ForwardBody = true
+		result.MaxBodySize = filter.ForwardBody.MaxSize
+	}
+
+	return result
+}
+
+func generateExternalAuthInternalPath(routeNsName types.NamespacedName, ruleIdx int) string {
+	return fmt.Sprintf("%s-ext-auth-%s_%s_rule%d",
+		http.InternalRoutePathPrefix, routeNsName.Namespace, routeNsName.Name, ruleIdx)
+}
+
+func buildSortedExtraAuthArgs(extraAuthArgs map[string]string) string {
+	if len(extraAuthArgs) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(extraAuthArgs))
+	for k := range extraAuthArgs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	pairs := make([]string, 0, len(keys))
+	for _, k := range keys {
+		pairs = append(pairs, k+"="+extraAuthArgs[k])
+	}
+	return strings.Join(pairs, "&")
+}
+
+// convertGraphGuardrails converts a route's effective PayloadProcessor state into a dataplane
+// GuardrailsConfig. Returns nil when the route has no valid, resolved PayloadProcessor.
+func convertGraphGuardrails(
+	route *graph.L7Route,
+	gwNsName types.NamespacedName,
+	routeNsName types.NamespacedName,
+	ruleIdx int,
+) *GuardrailsConfig {
+	if route == nil {
+		return nil
+	}
+
+	policy := route.EffectivePayloadProcessors[gwNsName]
+	if policy == nil || !policy.Valid || policy.PayloadProcessorState == nil {
+		return nil
+	}
+
+	state := policy.PayloadProcessorState
+	if state.APIURL == "" {
+		return nil
+	}
+
+	// convertBackendTLS is the single, per-Gateway source of truth for whether an in-cluster backend is
+	// verified over TLS for THIS Gateway: it returns non-nil only when a BackendTLSPolicy targets the
+	// backend Service and is effective for gwNsName. Derive the URL scheme from that result so an
+	// in-cluster backend is only upgraded to https on Gateways for which the policy is effective.
+	//
+	// ExternalName backends are deliberately excluded.
+	var verifyTLS *VerifyTLS
+	if !state.BackendIsExternalName {
+		verifyTLS = convertBackendTLS(state.BackendTLSPolicy, gwNsName)
+	}
+
+	gc := &GuardrailsConfig{
+		Enabled:      true,
+		APIURL:       getGuardrailsAPIURLForGateway(state, verifyTLS),
+		InternalPath: generateGuardrailsInternalPath(routeNsName, ruleIdx),
+		VerifyTLS:    verifyTLS,
+	}
+
+	if state.AuthTokenSecret != nil {
+		gc.APITokenAuthFileID = GenerateGuardrailsTokenFileID(
+			state.AuthTokenSecret.Namespace,
+			state.AuthTokenSecret.Name,
+		)
+	}
+
+	return gc
+}
+
+// getGuardrailsAPIURLForGateway returns the guardrails backend URL for a specific Gateway, upgrading the
+// graph's plaintext-http base to https when the backend is verified over TLS for this Gateway.
+//
+// The graph resolves in-cluster (ClusterIP) backends to a plaintext http base and ExternalName
+// backends to https (ExternalName is always system-trust https with no per-Gateway variance).
+// verifyTLS is non-nil only when a BackendTLSPolicy targets the backend Service and is effective for
+// this Gateway; in that case an in-cluster backend must be called over https. ExternalName backends
+// (state.BackendIsExternalName) are already https and are never re-derived here.
+func getGuardrailsAPIURLForGateway(state *graph.PolicyPayloadProcessorState, verifyTLS *VerifyTLS) string {
+	if state.BackendIsExternalName || verifyTLS == nil {
+		return state.APIURL
+	}
+	// In-cluster backend fronted by a BackendTLSPolicy effective for this Gateway: upgrade http -> https.
+	return strings.Replace(state.APIURL, "http://", "https://", 1)
+}
+
+// generateGuardrailsInternalPath builds the NGINX internal location path for a route's guardrails
+// inspection subrequest. Mirrors generateExternalAuthInternalPath so the path is unique per route
+// rule and dedupable across matches that share it.
+func generateGuardrailsInternalPath(routeNsName types.NamespacedName, ruleIdx int) string {
+	return fmt.Sprintf("%s-guardrails-%s_%s_rule%d",
+		http.InternalRoutePathPrefix, routeNsName.Namespace, routeNsName.Name, ruleIdx)
+}

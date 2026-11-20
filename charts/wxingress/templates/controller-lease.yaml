@@ -1,0 +1,26 @@
+{{- /*
+The Lease of the leader election. It is kept on uninstall: helm deleted it
+while the leader still ran, the leader made it again at its next renewal,
+and an install of the same name right after failed on it ("leases ...
+already exists"). The leader gives it up when it stops (holderIdentity
+empty), so that the next leader need not wait for it to expire. A Lease of
+the name from another release, or made by the controller itself, is left
+alone (wxingress.mayRender): the controller uses it as it is.
+*/}}
+{{- if .Values.controller.reportIngressStatus.enableLeaderElection }}
+{{- $name := include "nginx-ingress.leaderElectionName" . }}
+{{- if include "wxingress.mayRender" (dict "apiVersion" "coordination.k8s.io/v1" "kind" "Lease" "namespace" .Release.Namespace "name" $name "root" .) }}
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nginx-ingress.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/resource-policy: keep
+{{- if .Values.controller.reportIngressStatus.annotations }}
+{{ toYaml .Values.controller.reportIngressStatus.annotations | indent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}

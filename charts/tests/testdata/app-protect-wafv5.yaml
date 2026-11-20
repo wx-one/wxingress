@@ -1,0 +1,32 @@
+controller:
+  nginxplus: true
+  appprotect:
+    enable: true
+    v5: true
+    volumes:
+      - name: app-protect-bd-config
+        emptyDir: {}
+      - name: app-protect-config
+        emptyDir: {}
+      - name: app-protect-bundles
+        emptyDir: {}
+
+    enforcer:
+      host: "localhost"
+      port: 50001
+      image:
+        repository: my.private.reg/nap/waf-enforcer
+    configManager:
+      image:
+        repository: my.private.reg/nap/waf-config-mgr
+    ipIntelligence:
+      enable: true
+      image:
+        repository: my.private.reg/nap/waf-ip-intelligence
+      securityContext:
+        allowPrivilegeEscalation: false
+        runAsUser: 101
+        runAsNonRoot: true
+        capabilities:
+          drop:
+            - all

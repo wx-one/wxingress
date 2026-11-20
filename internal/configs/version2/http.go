@@ -1,0 +1,716 @@
+package version2
+
+import (
+	"bytes"
+	"fmt"
+	"strings"
+)
+
+// UpstreamLabels describes the Prometheus labels for an NGINX upstream.
+type UpstreamLabels struct {
+	Service           string
+	ResourceType      string
+	ResourceName      string
+	ResourceNamespace string
+}
+
+// VirtualServerConfig holds NGINX configuration for a VirtualServer.
+type VirtualServerConfig struct {
+	HTTPSnippets            []string
+	TwoWaySplitClients      []TwoWaySplitClients
+	KeyValZones             []KeyValZone
+	KeyVals                 []KeyVal
+	LimitReqZones           []LimitReqZone
+	Maps                    []Map
+	AuthJWTClaimSets        []AuthJWTClaimSet
+	OIDCProviders           []OIDCProvider
+	CacheZones              []CacheZone
+	Server                  Server
+	SplitClients            []SplitClient
+	StatusMatches           []StatusMatch
+	Upstreams               []Upstream
+	DynamicSSLReloadEnabled bool
+	StaticSSLPath           string
+	// DefaultCertificate is the certificate the server names when the
+	// certificates of hosts come from the wxingress module (-dynamic-upstreams):
+	// the one a handshake gets whose name has none there.
+	DefaultCertificate string
+	// AppProtectLoadModule mirrors the controller's -enable-app-protect flag so
+	// templates can safely emit app_protect_enable off; in internal sub-request
+	// locations only when the WAF module is actually loaded.
+	AppProtectLoadModule bool
+	// ModuleVariables: NGINX OSS with the wxingress module, which computes
+	// what njs did (the APIKey check), so that no njs is loaded.
+	ModuleVariables bool
+	// HTTP2 mirrors the http2 ConfigMap key, which is set in the http context. Servers with
+	// HTTP/2 off only render http2 off; when this is on.
+	HTTP2 bool
+}
+
+// AuthJWTClaimSet defines the values for the `auth_jwt_claim_set` directive
+type AuthJWTClaimSet struct {
+	Variable string
+	Claim    string
+}
+
+// Upstream defines an upstream.
+type Upstream struct {
+	Name             string
+	Servers          []UpstreamServer
+	LBMethod         string
+	Resolve          bool
+	Keepalive        int
+	MaxFails         int
+	MaxConns         int
+	SlowStart        string
+	FailTimeout      string
+	UpstreamZoneSize string
+	// Zone is the shared memory zone of the upstream when it is not its own (SharedUpstreamZone)
+	Zone           string
+	Queue          *Queue
+	SessionCookie  *SessionCookie
+	UpstreamLabels UpstreamLabels
+	NTLM           bool
+	BackupServers  []UpstreamServer
+	// MetaBalancer has the wxingress module choose the server of each
+	// request by the balancer rule the controller gave it for the upstream
+	// (-dynamic-upstreams), as for an Ingress's upstream.
+	MetaBalancer bool
+}
+
+// UpstreamServer defines an upstream server.
+type UpstreamServer struct {
+	Address string
+}
+
+// Server defines a server.
+type Server struct {
+	ServerName                string
+	StatusZone                string
+	CustomListeners           bool
+	HTTPIPv4                  string
+	HTTPIPv6                  string
+	HTTPSIPv4                 string
+	HTTPSIPv6                 string
+	HTTPPort                  int
+	HTTPSPort                 int
+	ProxyProtocol             bool
+	SSL                       *SSL
+	ServerTokens              string
+	RealIPHeader              string
+	SetRealIPFrom             []string
+	RealIPRecursive           bool
+	Snippets                  []string
+	InternalRedirectLocations []InternalRedirectLocation
+	Locations                 []Location
+	ErrorPageLocations        []ErrorPageLocation
+	ReturnLocations           []ReturnLocation
+	HealthChecks              []HealthCheck
+	TLSRedirect               *TLSRedirect
+	TLSPassthrough            bool
+	Allow                     []string
+	Deny                      []string
+	LimitReqOptions           LimitReqOptions
+	LimitReqs                 []LimitReq
+	JWTAuth                   *JWTAuth
+	JWTAuthList               map[string]*JWTAuth
+	JWKSAuthEnabled           bool
+	ExternalAuth              *ExternalAuth
+	HSTS                      *HSTS
+	ErrorPages                []ErrorPage
+	BasicAuth                 *BasicAuth
+	IngressMTLS               *IngressMTLS
+	EgressMTLS                *EgressMTLS
+	OIDC                      *OIDC
+	OIDCProviderName          string
+	APIKey                    *APIKey
+	APIKeyEnabled             bool
+	WAF                       *WAF
+	Dos                       *Dos
+	Cache                     *Cache
+	PoliciesErrorReturn       *Return
+	VSNamespace               string
+	VSName                    string
+	DisableIPV6               bool
+	Gunzip                    bool
+	HTTP2                     bool
+	NGINXDebugLevel           string
+	AddHeaderInherit          string
+	// ACMEChallengeActive is true when the server has at least one ACME HTTP-01 challenge location.
+	ACMEChallengeActive bool
+}
+
+// SSL defines SSL configuration for a server.
+type SSL struct {
+	Certificate     string
+	CertificateKey  string
+	RejectHandshake bool
+}
+
+// IngressMTLS defines TLS configuration for a server. This is a subset of TLS specifically for clients auth.
+type IngressMTLS struct {
+	ClientCert   string
+	ClientCrl    string
+	VerifyClient string
+	VerifyDepth  int
+}
+
+// EgressMTLS defines upstream TLS configuration applied at server or location scope.
+type EgressMTLS struct {
+	Certificate    string
+	CertificateKey string
+	VerifyServer   bool
+	VerifyDepth    int
+	Ciphers        string
+	Protocols      string
+	TrustedCert    string
+	SessionReuse   bool
+	ServerName     bool
+	SSLName        string
+}
+
+// OIDC holds OIDC configuration data.
+type OIDC struct {
+	// Issuer is a wxingress extension: the iss of the ID tokens, and where
+	// the endpoints that are not given are discovered.
+	Issuer                string
+	AuthEndpoint          string
+	ClientID              string
+	ClientSecret          string
+	JwksURI               string
+	Scope                 string
+	TokenEndpoint         string
+	EndSessionEndpoint    string
+	RedirectURI           string
+	PostLogoutRedirectURI string
+	ZoneSyncLeeway        int
+	AuthExtraArgs         string
+	AccessTokenEnable     bool
+	PKCEEnable            bool
+	TLSVerify             bool
+	VerifyDepth           int
+	CAFile                string
+	PolicyName            string
+	// AppProtectLoadModule mirrors the controller's --enable-app-protect flag so
+	// oidc.tmpl can emit app_protect_enable off; on its internal sub-request
+	// locations only when the WAF module is actually loaded.
+	AppProtectLoadModule bool
+}
+
+// APIKey holds API key configuration.
+type APIKey struct {
+	Header  []string
+	Query   []string
+	MapName string
+}
+
+// WAF defines WAF configuration.
+type WAF struct {
+	Enable              string
+	ApPolicy            string
+	ApBundle            string
+	ApSecurityLogEnable bool
+	ApLogConf           []string
+}
+
+// Dos defines Dos configuration.
+type Dos struct {
+	Enable                 string
+	Name                   string
+	AllowListPath          string
+	ApDosPolicy            string
+	ApDosSecurityLogEnable bool
+	ApDosLogConf           string
+	ApDosMonitorURI        string
+	ApDosMonitorProtocol   string
+	ApDosMonitorTimeout    uint64
+	ApDosAccessLogDest     string
+}
+
+// Location defines a location.
+type Location struct {
+	Path     string
+	Internal bool
+	// DisableWAF marks subrequest targets; splits/matches internal locations carry client traffic and must keep WAF.
+	DisableWAF                 bool
+	Snippets                   []string
+	ProxyConnectTimeout        string
+	ProxyReadTimeout           string
+	ProxySendTimeout           string
+	ClientMaxBodySize          string
+	ClientBodyBufferSize       string
+	ProxyMaxTempFileSize       string
+	ProxyBuffering             bool
+	ProxyBuffers               string
+	ProxyBufferSize            string
+	ProxyBusyBuffersSize       string
+	ProxyPass                  string
+	ProxyNextUpstream          string
+	ProxyNextUpstreamTimeout   string
+	ProxyNextUpstreamTries     int
+	ProxyInterceptErrors       bool
+	ProxyPassRequestHeaders    bool
+	ProxyPassRequestBody       string
+	ProxySetHeaders            []Header
+	ProxyHideHeaders           []string
+	ProxyPassHeaders           []string
+	ProxyIgnoreHeaders         string
+	ProxyPassRewrite           string
+	AddHeaders                 []AddHeader
+	Rewrites                   []string
+	HasKeepalive               bool
+	ErrorPages                 []ErrorPage
+	ProxySSLName               string
+	InternalProxyPass          string
+	Allow                      []string
+	Deny                       []string
+	LimitReqOptions            LimitReqOptions
+	LimitReqs                  []LimitReq
+	JWTAuth                    *JWTAuth
+	OIDCProviderName           string
+	AuthRequestOff             bool
+	ExternalAuth               *ExternalAuth
+	BasicAuth                  *BasicAuth
+	EgressMTLS                 *EgressMTLS
+	HSTS                       *HSTS
+	OIDC                       bool
+	APIKey                     *APIKey
+	WAF                        *WAF
+	Dos                        *Dos
+	PoliciesErrorReturn        *Return
+	Cache                      *Cache
+	ServiceName                string
+	IsVSR                      bool
+	VSRName                    string
+	VSRNamespace               string
+	GRPCPass                   string
+	CORSEnabled                bool
+	DisableForwardedHeaders    bool
+	UseForwardedHeaders        bool
+	AddHeaderInherit           string
+	ProxySSLVerify             bool
+	ProxySSLVerifyDepth        int
+	ProxySSLTrustedCertificate string
+	ProxyHTTPVersion           string
+	// ACMEChallenge marks a location that serves a cert-manager ACME HTTP-01 challenge.
+	ACMEChallenge bool
+}
+
+// ReturnLocation defines a location for returning a fixed response.
+type ReturnLocation struct {
+	Name        string
+	DefaultType string
+	Return      Return
+	Headers     []Header
+}
+
+// SplitClient defines a split_clients.
+type SplitClient struct {
+	Source        string
+	Variable      string
+	Distributions []Distribution
+}
+
+// Return defines a Return directive used for redirects and canned responses.
+type Return struct {
+	Code int
+	Text string
+}
+
+// ErrorPage defines an error_page of a location.
+type ErrorPage struct {
+	Name         string
+	Codes        string
+	ResponseCode int
+}
+
+// ErrorPageLocation defines a named location for an error_page directive.
+type ErrorPageLocation struct {
+	Name        string
+	DefaultType string
+	Return      *Return
+	Headers     []Header
+}
+
+// Header defines a header to use with add_header directive.
+type Header struct {
+	Name  string
+	Value string
+}
+
+// AddHeader defines a header to use with add_header directive with an optional Always field.
+type AddHeader struct {
+	Header
+	Always bool
+}
+
+// HealthCheck defines a HealthCheck for an upstream in a Server.
+type HealthCheck struct {
+	Name                string
+	URI                 string
+	Interval            string
+	Jitter              string
+	Fails               int
+	Passes              int
+	Port                int
+	ProxyPass           string
+	ProxyConnectTimeout string
+	ProxyReadTimeout    string
+	ProxySendTimeout    string
+	Headers             map[string]string
+	Match               string
+	GRPCPass            string
+	GRPCStatus          *int
+	GRPCService         string
+	Mandatory           bool
+	Persistent          bool
+	KeepaliveTime       string
+	IsGRPC              bool
+}
+
+// TLSRedirect defines a redirect in a Server.
+type TLSRedirect struct {
+	Code    int
+	BasedOn string
+}
+
+// SessionCookie defines a session cookie for an upstream.
+type SessionCookie struct {
+	Enable   bool
+	Name     string
+	Path     string
+	Expires  string
+	Domain   string
+	HTTPOnly bool
+	Secure   bool
+	SameSite string
+}
+
+// Distribution maps weight to a value in a SplitClient.
+type Distribution struct {
+	Weight string
+	Value  string
+}
+
+// InternalRedirectLocation defines a location for internally redirecting requests to named locations.
+type InternalRedirectLocation struct {
+	Path        string
+	Destination string
+}
+
+// Map defines a map.
+type Map struct {
+	Source     string
+	Variable   string
+	Parameters []Parameter
+}
+
+func (m *Map) String() string {
+	buf := &bytes.Buffer{}
+	fmt.Fprintf(buf, "Source: %s\n", m.Source)
+	fmt.Fprintf(buf, "Variable: %s\n", m.Variable)
+	for _, v := range m.Parameters {
+		fmt.Fprintf(buf, "\t%s: %s\n", v.Value, v.Result)
+	}
+	return buf.String()
+}
+
+// Parameter defines a Parameter in a Map.
+type Parameter struct {
+	Value  string
+	Result string
+}
+
+// StatusMatch defines a Match block for status codes.
+type StatusMatch struct {
+	Name string
+	Code string
+}
+
+// Queue defines a queue in upstream.
+type Queue struct {
+	Size    int
+	Timeout string
+}
+
+// OIDCProvider defines an OIDC provider for the native ngx_http_oidc_module.
+type OIDCProvider struct {
+	Name                  string
+	PolicyKey             string
+	Issuer                string
+	ClientID              string
+	ClientSecret          string //nolint:gosec // G117: internal field carrying the resolved OIDC client secret; not a credential match
+	ConfigURL             string
+	CookieName            string
+	ExtraAuthArgs         string
+	PKCE                  string
+	RedirectURI           string
+	LogoutURI             string
+	PostLogoutURI         string
+	FrontChannelLogoutURI string
+	LogoutTokenHint       bool
+	Scope                 string
+	SessionStore          string
+	SessionTimeout        string
+	SSLCrl                string
+	SSLTrustedCert        string
+	SSLVerify             bool
+	SSLName               string
+	SSLVerifyDepth        int
+	Sync                  bool
+	UserInfoEnable        bool
+	// ProxyLocation is the internal NGINX location that acts as a proxy to the IdP.
+	// The oidc_provider block references it, and a matching `location = <path>` is generated in the server block.
+	ProxyLocation string
+	// ProxyBufferSize controls proxy_buffer_size and the size of each buffer in proxy_buffers on the proxy location.
+	ProxyBufferSize string
+	// ProxyTrustedCertPath is the path to the CA cert to use for proxy_ssl_trusted_certificate on the proxy location.
+	// Empty when TLS verification is disabled or no trusted cert is provided.
+	ProxyTrustedCertPath string
+	// PostLogoutLocation, when non-nil, describes an auto-generated unauthenticated location
+	// serving a static response after logout. Nil when no such location should be generated.
+	PostLogoutLocation *AuthOIDCReturnLocation
+}
+
+// AuthOIDCReturnLocation describes an OIDC-generated location that returns a canned response
+// with auth_oidc off. Used for post-logout confirmation pages.
+type AuthOIDCReturnLocation struct {
+	Path        string
+	DefaultType string
+	Return      Return
+}
+
+// LimitReqZone defines a rate limit shared memory zone.
+type LimitReqZone struct {
+	Key           string
+	ZoneName      string
+	ZoneSize      string
+	Rate          string
+	GroupValue    string
+	GroupVariable string
+	PolicyValue   string
+	PolicyResult  string
+	GroupDefault  bool
+	GroupSource   string
+	Sync          bool
+}
+
+func (rlz LimitReqZone) String() string {
+	return fmt.Sprintf(
+		"{Key %q, ZoneName %q, ZoneSize %v, Rate %q, GroupValue %q, PolicyValue %q, GroupVariable %q, PolicyResult %q, GroupDefault %t, GroupSource %q, Sync %t}",
+		rlz.Key,
+		rlz.ZoneName,
+		rlz.ZoneSize,
+		rlz.Rate,
+		rlz.GroupValue,
+		rlz.PolicyValue,
+		rlz.GroupVariable,
+		rlz.PolicyResult,
+		rlz.GroupDefault,
+		rlz.GroupSource,
+		rlz.Sync,
+	)
+}
+
+// LimitReq defines a rate limit.
+type LimitReq struct {
+	ZoneName string
+	Burst    int
+	NoDelay  bool
+	Delay    int
+}
+
+func (rl LimitReq) String() string {
+	return fmt.Sprintf("{ZoneName %q, Burst %d, NoDelay %v, Delay %d}", rl.ZoneName, rl.Burst, rl.NoDelay, rl.Delay)
+}
+
+// LimitReqOptions defines rate limit options.
+type LimitReqOptions struct {
+	DryRun     bool
+	LogLevel   string
+	RejectCode int
+}
+
+func (rl LimitReqOptions) String() string {
+	return fmt.Sprintf("{DryRun %v, LogLevel %q, RejectCode %d}", rl.DryRun, rl.LogLevel, rl.RejectCode)
+}
+
+// JWTAuth holds JWT authentication configuration.
+type JWTAuth struct {
+	Key      string
+	Secret   string
+	Realm    string
+	Token    string
+	KeyCache string
+	JwksURI  JwksURI
+}
+
+// JwksURI defines the components of a JwksURI
+type JwksURI struct {
+	JwksScheme     string
+	JwksHost       string
+	JwksPort       string
+	JwksPath       string
+	JwksSNIName    string
+	JwksSNIEnabled bool
+	SSLVerify      bool
+	TrustedCert    string
+	SSLVerifyDepth int
+}
+
+// URL is the JWKS URI again, as the wxingress module fetches it; "" for none.
+func (j JwksURI) URL() string {
+	if j.JwksHost == "" {
+		return ""
+	}
+	host := j.JwksHost
+	if j.JwksPort != "" {
+		host += ":" + j.JwksPort
+	}
+	return j.JwksScheme + "://" + host + j.JwksPath
+}
+
+// TokenVariable is the variable the token is in, without its '$' - what the
+// wxingress module reads it from; "" for Authorization: Bearer.
+func (j JWTAuth) TokenVariable() string {
+	return strings.TrimPrefix(j.Token, "$")
+}
+
+// ExternalAuth holds external authentication configuration.
+type ExternalAuth struct {
+	URI                    *AuthURI
+	SigninURL              string
+	Snippets               string
+	ServicePorts           []int
+	SigninRedirectBasePath string // Base path for OAuth2/signin redirect location, defaults to /oauth2
+	SSLEnabled             bool
+	SSLVerify              bool
+	SSLVerifyDepth         int
+	SSLTrustedCert         string // Path to the CA certificate file for upstream verification
+	SNIName                string // Server name for SNI and certificate verification
+}
+
+// HSTS defines HTTP Strict Transport Security configuration.
+type HSTS struct {
+	MaxAge            int
+	IncludeSubDomains bool
+	BehindProxy       bool
+	Preload           bool
+}
+
+// AuthURI defines the components of an AuthURI
+type AuthURI struct {
+	Service      string
+	Upstream     string
+	Port         string
+	Path         string
+	InternalPath string
+}
+
+// BasicAuth refers to basic HTTP authentication mechanism options
+type BasicAuth struct {
+	Secret string
+	Realm  string
+}
+
+// KeyValZone defines a keyval zone.
+type KeyValZone struct {
+	Name    string
+	Size    string
+	State   string
+	Sync    bool
+	Timeout string
+}
+
+// KeyVal defines a keyval.
+type KeyVal struct {
+	Key      string
+	Variable string
+	ZoneName string
+}
+
+// TwoWaySplitClients defines split clients for two way split
+type TwoWaySplitClients struct {
+	Key               string
+	Variable          string
+	ZoneName          string
+	Weights           []int
+	SplitClientsIndex int
+}
+
+// Variable defines an nginx variable.
+type Variable struct {
+	Name  string
+	Value string
+}
+
+// CacheZone defines a proxy cache zone configuration.
+type CacheZone struct {
+	Name             string
+	Size             string
+	Path             string
+	Levels           string // Optional. Directory hierarchy for cache files (e.g., "1:2", "2:2", "1:2:2")
+	Inactive         string // Optional. Time after which inactive cached data is removed
+	UseTempPath      bool   // Optional. Whether to use temporary path (use_temp_path=off when false)
+	MaxSize          string // Optional. Maximum size of the cache
+	MinFree          string // Optional. Minimum free space required
+	ManagerFiles     *int
+	ManagerSleep     string
+	ManagerThreshold string
+}
+
+// Cache defines cache configuration for locations.
+type Cache struct {
+	// proxy_cache directive
+	ZoneName string // Required. The name of the cache zone
+	ZoneSize string // Required. The size of the cache zone
+
+	// proxy_cache_path directive
+	Levels           string // Optional. Directory hierarchy for cache files (e.g., "1:2", "2:2", "1:2:2")
+	Inactive         string // Optional. Time after which inactive cached data is removed
+	UseTempPath      bool   // Optional. Whether to use temporary path (use_temp_path=off when false)
+	MaxSize          string // Optional. Maximum size of the cache
+	MinFree          string // Optional. Minimum free space required
+	ManagerFiles     *int   // Optional. Number of files manager can handle
+	ManagerSleep     string // Optional. Sleep time between manager runs
+	ManagerThreshold string // Optional. Manager threshold for cache operations
+
+	// proxy_cache_key directive
+	CacheKey string // Optional. Custom cache key
+
+	// proxy_ignore_headers directive
+	OverrideUpstreamCache bool // Controls whether to override upstream cache headers
+
+	// proxy_cache_valid directive
+	Time  string            // Optional. Default cache validity time
+	Valid map[string]string // Optional. Cache validity map for codes to time
+
+	// proxy_cache_methods directive
+	AllowedMethods []string // Optional. HTTP methods to cache
+
+	// proxy_cache_use_stale directive
+	CacheUseStale []string // Optional. Conditions under which stale cached responses may be served
+
+	// proxy_cache_revalidate directive
+	CacheRevalidate bool // Optional. Enables revalidation of expired cache items
+
+	// proxy_cache_background_update directive
+	CacheBackgroundUpdate bool // Optional. Enables background updating of expired items while serving stale content
+
+	// proxy_cache_min_uses directive
+	CacheMinUses *int // Optional. Minimum number of uses before a response is cached
+
+	// proxy_cache_purge directive
+	CachePurgeAllow []string // Optional. IPs/CIDRs allowed to purge cache (Plus only)
+
+	// proxy_cache_lock directive
+	CacheLock        bool   // Optional. Whether to enable cache locking
+	CacheLockTimeout string // Optional. Timeout for cache lock
+	CacheLockAge     string // Optional. Age for cache lock
+
+	// proxy_no_cache directive
+	NoCacheConditions []string // Optional. Conditions under which responses should not be cached
+
+	// proxy_cache_bypass directive
+	CacheBypassConditions []string // Optional. Conditions under which cache should be bypassed for requests
+}

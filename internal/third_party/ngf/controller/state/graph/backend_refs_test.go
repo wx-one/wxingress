@@ -1,0 +1,2533 @@
+package graph
+
+import (
+	"testing"
+	"time"
+
+	. "github.com/onsi/gomega"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	inference "sigs.k8s.io/gateway-api-inference-extension/api/v1"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	ngfAPIv1alpha2 "github.com/wx-one/wxingress/internal/third_party/ngf/apis/v1alpha2"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/controller/state/conditions"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/controller"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/helpers"
+	"github.com/wx-one/wxingress/internal/third_party/ngf/framework/kinds"
+)
+
+func getNormalRef() gatewayv1.BackendRef {
+	return gatewayv1.BackendRef{
+		BackendObjectReference: gatewayv1.BackendObjectReference{
+			Kind:      helpers.GetPointer[gatewayv1.Kind]("Service"),
+			Name:      "service1",
+			Namespace: helpers.GetPointer[gatewayv1.Namespace]("test"),
+			Port:      helpers.GetPointer[gatewayv1.PortNumber](80),
+		},
+		Weight: helpers.GetPointer[int32](5),
+	}
+}
+
+func getModifiedRef(mod func(ref gatewayv1.BackendRef) gatewayv1.BackendRef) gatewayv1.BackendRef {
+	return mod(getNormalRef())
+}
+
+func getNormalRouteBackendRef() RouteBackendRef {
+	return RouteBackendRef{
+		BackendRef: gatewayv1.BackendRef{
+			BackendObjectReference: gatewayv1.BackendObjectReference{
+				Kind:      helpers.GetPointer[gatewayv1.Kind]("Service"),
+				Name:      "service1",
+				Namespace: helpers.GetPointer[gatewayv1.Namespace]("test"),
+				Port:      helpers.GetPointer[gatewayv1.PortNumber](80),
+			},
+			Weight: helpers.GetPointer[int32](5),
+		},
+	}
+}
+
+func getModifiedRouteBackendRef(mod func(ref RouteBackendRef) RouteBackendRef) RouteBackendRef {
+	return mod(getNormalRouteBackendRef())
+}
+
+func TestValidateRouteBackendRef(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		routeType         RouteType
+		expectedCondition conditions.Condition
+		name              string
+		ref               RouteBackendRef
+		expectedValid     bool
+	}{
+		{
+			name:      "normal case",
+			routeType: RouteTypeHTTP,
+			ref: RouteBackendRef{
+				BackendRef: getNormalRef(),
+				Filters:    nil,
+			},
+			expectedValid: true,
+		},
+		{
+			name:      "normal case grpc",
+			routeType: RouteTypeGRPC,
+			ref: RouteBackendRef{
+				BackendRef: getNormalRef(),
+				Filters:    nil,
+			},
+			expectedValid: true,
+		},
+		{
+			name:      "normal case; inferencepool backend",
+			routeType: RouteTypeHTTP,
+			ref: RouteBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.BackendObjectReference = gatewayv1.BackendObjectReference{
+						Group: helpers.GetPointer[gatewayv1.Group](inferenceAPIGroup),
+						Kind:  helpers.GetPointer[gatewayv1.Kind](kinds.InferencePool),
+						Name:  "ipool",
+					}
+					return backend
+				}),
+			},
+			expectedValid: true,
+		},
+		{
+			name:      "normal case; headless Service inferencepool backend",
+			routeType: RouteTypeHTTP,
+			ref: RouteBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Name = gatewayv1.ObjectName(controller.CreateInferencePoolServiceName("ipool"))
+					return backend
+				}),
+				IsInferencePool:   true,
+				InferencePoolName: "ipool",
+			},
+			expectedValid: true,
+		},
+		{
+			name:      "filters not supported",
+			routeType: RouteTypeHTTP,
+			ref: RouteBackendRef{
+				BackendRef: getNormalRef(),
+				Filters: []any{
+					[]gatewayv1.HTTPRouteFilter{
+						{
+							Type: gatewayv1.HTTPRouteFilterRequestHeaderModifier,
+						},
+					},
+				},
+			},
+			expectedValid: false,
+			expectedCondition: conditions.NewRouteBackendRefUnsupportedValue(
+				"test.filters: Too many: 1: must have at most 0 items",
+			),
+		},
+		{
+			name:      "invalid base ref",
+			routeType: RouteTypeHTTP,
+			ref: RouteBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Kind = helpers.GetPointer[gatewayv1.Kind]("NotService")
+					return backend
+				}),
+			},
+			expectedValid: false,
+			expectedCondition: conditions.NewRouteBackendRefInvalidKind(
+				`test.kind: Unsupported value: "NotService": supported values: "Service", "InferencePool"`,
+			),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			alwaysTrueRefGrantResolver := func(_ toResource) bool { return true }
+
+			valid, cond := validateRouteBackendRef(
+				test.routeType,
+				test.ref,
+				"test",
+				alwaysTrueRefGrantResolver,
+				field.NewPath("test"),
+			)
+
+			g.Expect(valid).To(Equal(test.expectedValid))
+			g.Expect(cond).To(Equal(test.expectedCondition))
+		})
+	}
+}
+
+func TestValidateBackendRef(t *testing.T) {
+	t.Parallel()
+	alwaysFalseRefGrantResolver := func(_ toResource) bool { return false }
+	alwaysTrueRefGrantResolver := func(_ toResource) bool { return true }
+
+	tests := []struct {
+		ref               gatewayv1.BackendRef
+		refGrantResolver  func(resource toResource) bool
+		expectedCondition conditions.Condition
+		name              string
+		expectedValid     bool
+	}{
+		{
+			name:             "normal case",
+			ref:              getNormalRef(),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    true,
+		},
+		{
+			name: "normal case with implicit namespace",
+			ref: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+				backend.Namespace = nil
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    true,
+		},
+		{
+			name: "normal case with implicit kind Service",
+			ref: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+				backend.Kind = nil
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    true,
+		},
+		{
+			name: "normal case with backend ref allowed by reference grant",
+			ref: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+				backend.Namespace = helpers.GetPointer[gatewayv1.Namespace]("cross-ns")
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    true,
+		},
+		{
+			name: "invalid group",
+			ref: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+				backend.Group = helpers.GetPointer[gatewayv1.Group]("invalid")
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefInvalidKind(
+				`test.group: Unsupported value: "invalid": supported values: "core", ""`,
+			),
+		},
+		{
+			name: "invalid kind",
+			ref: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+				backend.Kind = helpers.GetPointer[gatewayv1.Kind]("NotService")
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefInvalidKind(
+				`test.kind: Unsupported value: "NotService": supported values: "Service"`,
+			),
+		},
+		{
+			name: "backend ref not allowed by reference grant",
+			ref: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+				backend.Namespace = helpers.GetPointer[gatewayv1.Namespace]("invalid")
+				return backend
+			}),
+			refGrantResolver: alwaysFalseRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefRefNotPermitted(
+				"test.namespace: Forbidden: Backend ref to Service invalid/service1 not permitted by any ReferenceGrant",
+			),
+		},
+		{
+			name: "invalid weight",
+			ref: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+				backend.Weight = helpers.GetPointer[int32](-1)
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefUnsupportedValue(
+				"test.weight: Invalid value: -1: must be in the range [0, 1000000]",
+			),
+		},
+		{
+			name: "nil port",
+			ref: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+				backend.Port = nil
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefUnsupportedValue(
+				"test.port: Required value: port cannot be nil",
+			),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			valid, cond := validateBackendRef(test.ref, "test", test.refGrantResolver, field.NewPath("test"))
+
+			g.Expect(valid).To(Equal(test.expectedValid))
+			g.Expect(cond).To(Equal(test.expectedCondition))
+		})
+	}
+}
+
+func TestValidateBackendRefHTTPRoute(t *testing.T) {
+	t.Parallel()
+
+	alwaysFalseRefGrantResolver := func(_ toResource) bool { return false }
+	alwaysTrueRefGrantResolver := func(_ toResource) bool { return true }
+
+	tests := []struct {
+		refGrantResolver  func(resource toResource) bool
+		expectedCondition conditions.Condition
+		name              string
+		ref               RouteBackendRef
+		expectedValid     bool
+	}{
+		{
+			name:             "normal case",
+			ref:              getNormalRouteBackendRef(),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    true,
+		},
+		{
+			name: "normal case with implicit namespace",
+			ref: getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+				backend.Namespace = nil
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    true,
+		},
+		{
+			name: "normal case with implicit kind Service",
+			ref: getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+				backend.Kind = nil
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    true,
+		},
+		{
+			name: "normal case with InferencePool",
+			ref: getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+				backend.Group = helpers.GetPointer[gatewayv1.Group](inferenceAPIGroup)
+				backend.Kind = helpers.GetPointer[gatewayv1.Kind](kinds.InferencePool)
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    true,
+		},
+		{
+			name: "group is inference group but kind is not InferencePool",
+			ref: getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+				backend.Group = helpers.GetPointer[gatewayv1.Group](inferenceAPIGroup)
+				backend.Kind = helpers.GetPointer[gatewayv1.Kind](kinds.Service)
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefInvalidKind(
+				`test.kind: Invalid value: "Service": kind must be InferencePool when group is inference.networking.k8s.io`,
+			),
+		},
+		{
+			name: "kind is InferencePool but group is not inference",
+			ref: getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+				backend.Kind = helpers.GetPointer[gatewayv1.Kind](kinds.InferencePool)
+				backend.Group = helpers.GetPointer[gatewayv1.Group]("core")
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefInvalidKind(
+				`test.group: Invalid value: "core": group must be inference.networking.k8s.io when kind is InferencePool`,
+			),
+		},
+		{
+			name: "normal case with backend ref allowed by reference grant",
+			ref: getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+				backend.Namespace = helpers.GetPointer[gatewayv1.Namespace]("cross-ns")
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    true,
+		},
+		{
+			name: "inferencepool backend ref not allowed by reference grant",
+			ref: RouteBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.BackendObjectReference = gatewayv1.BackendObjectReference{
+						Group:     helpers.GetPointer[gatewayv1.Group](inferenceAPIGroup),
+						Kind:      helpers.GetPointer[gatewayv1.Kind](kinds.InferencePool),
+						Name:      "ipool",
+						Namespace: helpers.GetPointer[gatewayv1.Namespace]("invalid"),
+					}
+					return backend
+				}),
+			},
+			refGrantResolver: alwaysFalseRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefRefNotPermitted(
+				"test.namespace: Forbidden: Backend ref to InferencePool invalid/ipool not permitted by any ReferenceGrant",
+			),
+		},
+		{
+			name: "headless Service inferencepool backend ref not allowed by reference grant",
+			ref: RouteBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Name = gatewayv1.ObjectName(controller.CreateInferencePoolServiceName("ipool"))
+					backend.Namespace = helpers.GetPointer[gatewayv1.Namespace]("invalid")
+					return backend
+				}),
+				IsInferencePool:   true,
+				InferencePoolName: "ipool",
+			},
+			refGrantResolver: alwaysFalseRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefRefNotPermitted(
+				"test.namespace: Forbidden: Backend ref to InferencePool invalid/ipool not permitted by any ReferenceGrant",
+			),
+		},
+		{
+			name: "invalid group",
+			ref: getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+				backend.Group = helpers.GetPointer[gatewayv1.Group]("invalid")
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefInvalidKind(
+				`test.group: Unsupported value: "invalid": supported values: "core", "", "inference.networking.k8s.io"`,
+			),
+		},
+		{
+			name: "invalid kind",
+			ref: getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+				backend.Kind = helpers.GetPointer[gatewayv1.Kind]("NotService")
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefInvalidKind(
+				`test.kind: Unsupported value: "NotService": supported values: "Service", "InferencePool"`,
+			),
+		},
+		{
+			name: "backend ref not allowed by reference grant",
+			ref: getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+				backend.Namespace = helpers.GetPointer[gatewayv1.Namespace]("invalid")
+				return backend
+			}),
+			refGrantResolver: alwaysFalseRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefRefNotPermitted(
+				"test.namespace: Forbidden: Backend ref to Service invalid/service1 not permitted by any ReferenceGrant",
+			),
+		},
+		{
+			name: "invalid weight",
+			ref: getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+				backend.Weight = helpers.GetPointer[int32](-1)
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefUnsupportedValue(
+				"test.weight: Invalid value: -1: must be in the range [0, 1000000]",
+			),
+		},
+		{
+			name: "nil port",
+			ref: getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+				backend.Port = nil
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    false,
+			expectedCondition: conditions.NewRouteBackendRefUnsupportedValue(
+				"test.port: Required value: port cannot be nil",
+			),
+		},
+		{
+			name: "nil port allowed for InferencePool kind",
+			ref: getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+				backend.Kind = helpers.GetPointer[gatewayv1.Kind](kinds.InferencePool)
+				backend.Group = helpers.GetPointer[gatewayv1.Group](inferenceAPIGroup)
+				backend.Port = nil
+				return backend
+			}),
+			refGrantResolver: alwaysTrueRefGrantResolver,
+			expectedValid:    true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			valid, cond := validateBackendRefHTTPRoute(test.ref, "test", test.refGrantResolver, field.NewPath("test"))
+
+			g.Expect(valid).To(Equal(test.expectedValid))
+			g.Expect(cond).To(Equal(test.expectedCondition))
+		})
+	}
+}
+
+func TestValidateWeight(t *testing.T) {
+	t.Parallel()
+	validWeights := []int32{0, 1, 1000000}
+	invalidWeights := []int32{-1, 1000001}
+
+	g := NewWithT(t)
+
+	for _, w := range validWeights {
+		err := validateWeight(w)
+		g.Expect(err).ToNot(HaveOccurred(), "Expected weight %d to be valid", w)
+	}
+	for _, w := range invalidWeights {
+		err := validateWeight(w)
+		g.Expect(err).To(HaveOccurred(), "Expected weight %d to be invalid", w)
+	}
+}
+
+func TestGetPortFromRef(t *testing.T) {
+	t.Parallel()
+	svc1 := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "service1",
+			Namespace: "test",
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Port: 80,
+				},
+			},
+			IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
+		},
+	}
+
+	svc2 := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "service2",
+			Namespace: "test",
+		},
+	}
+
+	tests := []struct {
+		ref            gatewayv1.BackendRef
+		svcNsName      types.NamespacedName
+		name           string
+		expServicePort v1.ServicePort
+		expErr         bool
+	}{
+		{
+			name:           "normal case",
+			ref:            getNormalRef(),
+			expServicePort: v1.ServicePort{Port: 80},
+			svcNsName:      types.NamespacedName{Namespace: "test", Name: "service1"},
+		},
+		{
+			name: "service does not exist",
+			ref: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+				backend.Name = "does-not-exist"
+				return backend
+			}),
+			expErr:         true,
+			expServicePort: v1.ServicePort{},
+			svcNsName:      types.NamespacedName{Namespace: "test", Name: "does-not-exist"},
+		},
+		{
+			name: "no matching port for service and port",
+			ref: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+				backend.Port = helpers.GetPointer[gatewayv1.PortNumber](504)
+				return backend
+			}),
+			expErr:         true,
+			expServicePort: v1.ServicePort{},
+			svcNsName:      types.NamespacedName{Namespace: "test", Name: "service1"},
+		},
+	}
+
+	services := map[types.NamespacedName]*v1.Service{
+		{Namespace: "test", Name: "service1"}: svc1,
+		{Namespace: "test", Name: "service2"}: svc2,
+	}
+
+	refPath := field.NewPath("test")
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			servicePort, err := getPortFromRef(test.ref, test.svcNsName, services, refPath)
+
+			g.Expect(err != nil).To(Equal(test.expErr))
+			g.Expect(servicePort).To(Equal(test.expServicePort))
+		})
+	}
+}
+
+func TestAddBackendRefsToRules(t *testing.T) {
+	t.Parallel()
+
+	sectionNameRefs := []ParentRef{
+		{
+			Kind:           kinds.Gateway,
+			NamespacedName: types.NamespacedName{Namespace: "test", Name: "gateway"},
+			GatewayNsName:  types.NamespacedName{Namespace: "test", Name: "gateway"},
+			Idx:            0,
+			Attachment: &ParentRefAttachmentStatus{
+				Attached: true,
+			},
+		},
+	}
+	createRoute := func(
+		name string,
+		routeType RouteType,
+		kind gatewayv1.Kind,
+		refsPerBackend int,
+		serviceNames ...string,
+	) *L7Route {
+		route := &L7Route{
+			Source: &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "test",
+					Name:      name,
+				},
+			},
+			RouteType:  routeType,
+			ParentRefs: sectionNameRefs,
+			Valid:      true,
+		}
+
+		createRouteBackendRef := func(svcName string, port gatewayv1.PortNumber, weight *int32) RouteBackendRef {
+			return RouteBackendRef{
+				BackendRef: gatewayv1.BackendRef{
+					BackendObjectReference: gatewayv1.BackendObjectReference{
+						Kind:      helpers.GetPointer(kind),
+						Name:      gatewayv1.ObjectName(svcName),
+						Namespace: helpers.GetPointer[gatewayv1.Namespace]("test"),
+						Port:      helpers.GetPointer(port),
+					},
+					Weight: weight,
+				},
+			}
+		}
+
+		route.Spec.Rules = make([]RouteRule, len(serviceNames))
+
+		for idx, svcName := range serviceNames {
+			refs := []RouteBackendRef{
+				createRouteBackendRef(svcName, 80, nil),
+			}
+			if refsPerBackend == 2 {
+				refs = append(refs, createRouteBackendRef(svcName, 81, helpers.GetPointer[int32](5)))
+			}
+			if refsPerBackend != 1 && refsPerBackend != 2 {
+				panic("invalid refsPerBackend")
+			}
+
+			route.Spec.Rules[idx] = RouteRule{
+				RouteBackendRefs: refs,
+				ValidMatches:     true,
+				Filters: RouteRuleFilters{
+					Filters: []Filter{},
+					Valid:   true,
+				},
+			}
+		}
+		return route
+	}
+
+	modRoute := func(route *L7Route, mod func(*L7Route) *L7Route) *L7Route {
+		return mod(route)
+	}
+
+	getSvc := func(name string) *v1.Service {
+		return &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "test",
+				Name:      name,
+			},
+			Spec: v1.ServiceSpec{
+				Ports: []v1.ServicePort{
+					{
+						Port: 80,
+					},
+					{
+						Port: 81,
+					},
+				},
+			},
+		}
+	}
+
+	getSvcWithAppProtocol := func(name, appProtocol string) *v1.Service {
+		return &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "test",
+				Name:      name,
+			},
+			Spec: v1.ServiceSpec{
+				Ports: []v1.ServicePort{
+					{
+						Port:        80,
+						AppProtocol: &appProtocol,
+					},
+				},
+			},
+		}
+	}
+
+	svc1 := getSvc("svc1")
+	svc1NsName := types.NamespacedName{
+		Namespace: "test",
+		Name:      "svc1",
+	}
+
+	svc2 := getSvc("svc2")
+	svc2NsName := types.NamespacedName{
+		Namespace: "test",
+		Name:      "svc2",
+	}
+
+	svcH2c := getSvcWithAppProtocol("svcH2c", AppProtocolTypeH2C)
+	svcH2cNsName := types.NamespacedName{
+		Namespace: "test",
+		Name:      "svcH2c",
+	}
+
+	svcWS := getSvcWithAppProtocol("svcWS", AppProtocolTypeWS)
+	svcWSNsName := types.NamespacedName{
+		Namespace: "test",
+		Name:      "svcWS",
+	}
+
+	svcWSS := getSvcWithAppProtocol("svcWSS", AppProtocolTypeWSS)
+	svcWSSNsName := types.NamespacedName{
+		Namespace: "test",
+		Name:      "svcWSS",
+	}
+
+	svcGRPC := getSvcWithAppProtocol("svcGRPC", "grpc")
+	svcGRPCNsName := types.NamespacedName{
+		Namespace: "test",
+		Name:      "svcGRPC",
+	}
+
+	svcInferenceName := controller.CreateInferencePoolServiceName("ipool")
+	svcInference := getSvc(svcInferenceName)
+	svcInferenceNsName := types.NamespacedName{
+		Namespace: "test",
+		Name:      svcInferenceName,
+	}
+
+	services := map[types.NamespacedName]*v1.Service{
+		svc1NsName:         svc1,
+		svc2NsName:         svc2,
+		svcH2cNsName:       svcH2c,
+		svcWSNsName:        svcWS,
+		svcWSSNsName:       svcWSS,
+		svcGRPCNsName:      svcGRPC,
+		svcInferenceNsName: svcInference,
+	}
+	emptyPolicies := map[types.NamespacedName]*BackendTLSPolicy{}
+
+	getPolicy := func(name, svcName, cmName string) *BackendTLSPolicy {
+		return &BackendTLSPolicy{
+			Valid: true,
+			Source: &gatewayv1.BackendTLSPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: "test",
+				},
+				Spec: gatewayv1.BackendTLSPolicySpec{
+					TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+						{
+							LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+								Group: "",
+								Kind:  "Service",
+								Name:  gatewayv1.ObjectName(svcName),
+							},
+						},
+					},
+					Validation: gatewayv1.BackendTLSPolicyValidation{
+						Hostname: "foo.example.com",
+						CACertificateRefs: []gatewayv1.LocalObjectReference{
+							{
+								Group: "",
+								Kind:  "ConfigMap",
+								Name:  gatewayv1.ObjectName(cmName),
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	policiesMatching := map[types.NamespacedName]*BackendTLSPolicy{
+		{Namespace: "test", Name: "btp1"}:   getPolicy("btp1", "svc1", "test"),
+		{Namespace: "test", Name: "btp2"}:   getPolicy("btp2", "svc2", "test"),
+		{Namespace: "test", Name: "btpWSS"}: getPolicy("btpWSS", "svcWSS", "test"),
+	}
+	policiesNotMatching := map[types.NamespacedName]*BackendTLSPolicy{
+		{Namespace: "test", Name: "btp1"}: getPolicy("btp1", "svc1", "test1"),
+		{Namespace: "test", Name: "btp2"}: getPolicy("btp2", "svc2", "test2"),
+	}
+
+	getBtp := func(name string, svcName string, cmName string) *BackendTLSPolicy {
+		return &BackendTLSPolicy{
+			Source: &gatewayv1.BackendTLSPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test"},
+				Spec: gatewayv1.BackendTLSPolicySpec{
+					TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+						{
+							LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+								Group: "",
+								Kind:  "Service",
+								Name:  gatewayv1.ObjectName(svcName),
+							},
+						},
+					},
+					Validation: gatewayv1.BackendTLSPolicyValidation{
+						Hostname: "foo.example.com",
+						CACertificateRefs: []gatewayv1.LocalObjectReference{
+							{
+								Group: "",
+								Kind:  "ConfigMap",
+								Name:  gatewayv1.ObjectName(cmName),
+							},
+						},
+					},
+				},
+			},
+			Conditions: []conditions.Condition{
+				{
+					Type:    "Accepted",
+					Status:  "True",
+					Reason:  "Accepted",
+					Message: "The Policy is accepted",
+				},
+			},
+			Valid:        true,
+			IsReferenced: true,
+		}
+	}
+
+	btp1 := getBtp("btp1", "svc1", "test1")
+	btp2 := getBtp("btp2", "svc2", "test2")
+	btp3 := getBtp("btp1", "svc1", "test")
+	btp3.Conditions = append(btp3.Conditions, conditions.Condition{
+		Type:    "Accepted",
+		Status:  "True",
+		Reason:  "Accepted",
+		Message: "The Policy is accepted",
+	},
+	)
+	btpWSS := getBtp("btpWSS", "svcWSS", "test")
+
+	tests := []struct {
+		route               *L7Route
+		policies            map[types.NamespacedName]*BackendTLSPolicy
+		name                string
+		expectedBackendRefs []BackendRef
+		expectedConditions  []conditions.Condition
+	}{
+		{
+			route: createRoute("hr1", RouteTypeHTTP, "Service", 1, "svc1"),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svc1NsName,
+					ServicePort:        svc1.Spec.Ports[0],
+					Valid:              true,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: nil,
+			policies:           emptyPolicies,
+			name:               "normal case with one rule with one backend",
+		},
+		{
+			route: createRoute("hr2", RouteTypeHTTP, "Service", 2, "svc1"),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svc1NsName,
+					ServicePort:        svc1.Spec.Ports[0],
+					Valid:              true,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+				{
+					SvcNsName:          svc1NsName,
+					ServicePort:        svc1.Spec.Ports[1],
+					Valid:              true,
+					Weight:             5,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: nil,
+			policies:           emptyPolicies,
+			name:               "normal case with one rule with two backends",
+		},
+		{
+			route: createRoute("hr2", RouteTypeHTTP, "Service", 2, "svc1"),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svc1NsName,
+					ServicePort:        svc1.Spec.Ports[0],
+					Valid:              true,
+					Weight:             1,
+					BackendTLSPolicy:   btp3,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+				{
+					SvcNsName:          svc1NsName,
+					ServicePort:        svc1.Spec.Ports[1],
+					Valid:              true,
+					Weight:             5,
+					BackendTLSPolicy:   btp3,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: nil,
+			policies:           policiesMatching,
+			name:               "normal case with one rule with two backends and matching policies",
+		},
+		{
+			route: createRoute("hr1", RouteTypeHTTP, "Service", 1, "svcH2c"),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svcH2cNsName,
+					ServicePort:        svcH2c.Spec.Ports[0],
+					Valid:              true,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: nil,
+			policies:           emptyPolicies,
+			name:               "valid backendRef with service port appProtocol h2c and Route type http",
+		},
+		{
+			route: createRoute("hr1", RouteTypeHTTP, "Service", 1, "svcWS"),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svcWSNsName,
+					ServicePort:        svcWS.Spec.Ports[0],
+					Valid:              true,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: nil,
+			policies:           emptyPolicies,
+			name:               "valid backendRef with service port appProtocol ws and Route type http",
+		},
+		{
+			route: createRoute("hr1", RouteTypeHTTP, "Service", 1, "svcWSS"),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svcWSSNsName,
+					ServicePort:        svcWSS.Spec.Ports[0],
+					Valid:              true,
+					Weight:             1,
+					BackendTLSPolicy:   btpWSS,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: nil,
+			policies:           policiesMatching,
+			name: "valid backendRef with service port appProtocol wss," +
+				" The Route type http, and corresponding BackendTLSPolicy",
+		},
+		{
+			route: createRoute("hr1", RouteTypeHTTP, "Service", 1, "svcWSS"),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svcWSSNsName,
+					ServicePort:        svcWSS.Spec.Ports[0],
+					Valid:              false,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefUnsupportedProtocol(
+					"The Route type http does not support service port appProtocol kubernetes.io/wss;" +
+						" missing corresponding BackendTLSPolicy",
+				),
+			},
+			policies: emptyPolicies,
+			name:     "invalid backendRef with service port appProtocol wss, Route type http, but missing BackendTLSPolicy",
+		},
+		{
+			route: createRoute("gr1", RouteTypeGRPC, "Service", 1, "svcH2c"),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svcH2cNsName,
+					ServicePort:        svcH2c.Spec.Ports[0],
+					Valid:              true,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: nil,
+			policies:           emptyPolicies,
+			name:               "valid backendRef with service port appProtocol h2c and Route type grpc",
+		},
+		{
+			route: createRoute("gr1", RouteTypeGRPC, "Service", 1, "svcWS"),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svcWSNsName,
+					ServicePort:        svcWS.Spec.Ports[0],
+					Valid:              false,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefUnsupportedProtocol(
+					"The Route type grpc does not support service port appProtocol kubernetes.io/ws",
+				),
+			},
+			policies: emptyPolicies,
+			name:     "invalid backendRef with service port appProtocol ws and Route type grpc",
+		},
+		{
+			route: createRoute("gr1", RouteTypeGRPC, "Service", 1, "svcWSS"),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svcWSSNsName,
+					ServicePort:        svcWSS.Spec.Ports[0],
+					Valid:              false,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefUnsupportedProtocol(
+					"The Route type grpc does not support service port appProtocol kubernetes.io/wss",
+				),
+			},
+			policies: emptyPolicies,
+			name:     "invalid backendRef with service port appProtocol wss and Route type grpc",
+		},
+		{
+			route: createRoute("hr1", RouteTypeHTTP, "Service", 1, "svcGRPC"),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svcGRPCNsName,
+					ServicePort:        svcGRPC.Spec.Ports[0],
+					Valid:              true,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: nil,
+			policies:           emptyPolicies,
+			name: "valid backendRef with non-Kubernetes Standard Application Protocol" +
+				" service port appProtocol and Route type http",
+		},
+		{
+			route: createRoute("gr1", RouteTypeGRPC, "Service", 1, "svcGRPC"),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svcGRPCNsName,
+					ServicePort:        svcGRPC.Spec.Ports[0],
+					Valid:              true,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: nil,
+			policies:           emptyPolicies,
+			name: "valid backendRef with non-Kubernetes Standard Application Protocol" +
+				" service port appProtocol and Route type grpc",
+		},
+		{
+			route: modRoute(createRoute("hr1", RouteTypeHTTP, "Service", 1, "svc1"), func(route *L7Route) *L7Route {
+				route.Valid = false
+				return route
+			}),
+			expectedBackendRefs: nil,
+			expectedConditions:  nil,
+			policies:            emptyPolicies,
+			name:                "invalid route",
+		},
+		{
+			route: modRoute(createRoute("hr1", RouteTypeHTTP, "Service", 1, "svc1"), func(route *L7Route) *L7Route {
+				route.Spec.Rules[0].ValidMatches = false
+				return route
+			}),
+			expectedBackendRefs: nil,
+			expectedConditions:  nil,
+			policies:            emptyPolicies,
+			name:                "invalid matches",
+		},
+		{
+			route: modRoute(createRoute("hr1", RouteTypeHTTP, "Service", 1, "svc1"), func(route *L7Route) *L7Route {
+				route.Spec.Rules[0].Filters = RouteRuleFilters{Valid: false}
+				return route
+			}),
+			expectedBackendRefs: nil,
+			expectedConditions:  nil,
+			policies:            emptyPolicies,
+			name:                "invalid filters",
+		},
+		{
+			route: createRoute("hr3", RouteTypeHTTP, "NotService", 1, "svc1"),
+			expectedBackendRefs: []BackendRef{
+				{
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefInvalidKind(
+					`spec.rules[0].backendRefs[0].kind: Unsupported value: "NotService": supported values: "Service", "InferencePool"`,
+				),
+			},
+			policies: emptyPolicies,
+			name:     "invalid backendRef",
+		},
+		{
+			route: modRoute(createRoute("hr2", RouteTypeHTTP, "Service", 2, "svc1"), func(route *L7Route) *L7Route {
+				route.Spec.Rules[0].RouteBackendRefs[1].Name = "svc2"
+				return route
+			}),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName:          svc1NsName,
+					ServicePort:        svc1.Spec.Ports[0],
+					Valid:              false,
+					Weight:             1,
+					BackendTLSPolicy:   btp1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+				{
+					SvcNsName:          svc2NsName,
+					ServicePort:        svc2.Spec.Ports[1],
+					Valid:              false,
+					Weight:             5,
+					BackendTLSPolicy:   btp2,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				},
+			},
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefUnsupportedValue(
+					`Backend TLS policies do not match for all backends`,
+				),
+			},
+			policies: policiesNotMatching,
+			name:     "invalid backendRef - backend TLS policies do not match for all backends",
+		},
+		{
+			route: modRoute(createRoute("hr4", RouteTypeHTTP, "Service", 1, "svc1"), func(route *L7Route) *L7Route {
+				route.Spec.Rules[0].RouteBackendRefs = nil
+				return route
+			}),
+			expectedBackendRefs: nil,
+			expectedConditions:  nil,
+			name:                "zero backendRefs",
+		},
+		{
+			route: func() *L7Route {
+				route := createRoute("hr-inference", RouteTypeHTTP, "Service", 1, svcInferenceName)
+				// Mark the backend ref as IsInferencePool and set the port to nil (simulate InferencePool logic)
+				route.Spec.Rules[0].RouteBackendRefs[0].IsInferencePool = true
+				route.Spec.Rules[0].RouteBackendRefs[0].InferencePoolName = "ipool"
+				route.Spec.Rules[0].RouteBackendRefs[0].Port = nil
+				return route
+			}(),
+			expectedBackendRefs: []BackendRef{
+				{
+					SvcNsName: types.NamespacedName{Namespace: "test", Name: svcInferenceName},
+					ServicePort: v1.ServicePort{
+						Port: 80,
+					},
+					Valid:              true,
+					Weight:             1,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+					IsInferencePool:    true,
+					EndpointPickerConfig: EndpointPickerConfig{
+						NsName:            svcInferenceNsName.Namespace,
+						EndpointPickerRef: nil,
+					},
+				},
+			},
+			expectedConditions: nil,
+			policies:           emptyPolicies,
+			name:               "headless Service for InferencePool gets port set correctly",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			g := NewWithT(t)
+			resolver := newReferenceGrantResolver(nil)
+
+			referencedInferencePools := map[types.NamespacedName]*ReferencedInferencePool{
+				{Namespace: "test", Name: "ipool"}: {
+					Source: &inference.InferencePool{
+						Spec: inference.InferencePoolSpec{
+							TargetPorts: []inference.Port{
+								{
+									Number: 80,
+								},
+							},
+						},
+					},
+					Valid: true,
+				},
+			}
+
+			addBackendRefsToRules(test.route, resolver, services, referencedInferencePools, test.policies)
+
+			var actual []BackendRef
+			if test.route.Spec.Rules != nil {
+				actual = test.route.Spec.Rules[0].BackendRefs
+			}
+
+			g.Expect(helpers.Diff(test.expectedBackendRefs, actual)).To(BeEmpty())
+			g.Expect(test.route.Conditions).To(Equal(test.expectedConditions))
+		})
+	}
+}
+
+func TestResolveInferencePoolRefEndpointPickerBackendTLS(t *testing.T) {
+	t.Parallel()
+
+	getBtp := func(valid bool) *BackendTLSPolicy {
+		policy := &BackendTLSPolicy{
+			Source: &gatewayv1.BackendTLSPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "epp-tls", Namespace: "test"},
+				Spec: gatewayv1.BackendTLSPolicySpec{
+					TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+						{
+							LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+								Group: "",
+								Kind:  gatewayv1.Kind("Service"),
+								Name:  gatewayv1.ObjectName("epp"),
+							},
+						},
+					},
+					Validation: gatewayv1.BackendTLSPolicyValidation{
+						Hostname: "epp.example.com",
+						CACertificateRefs: []gatewayv1.LocalObjectReference{
+							{
+								Group: "",
+								Kind:  "ConfigMap",
+								Name:  gatewayv1.ObjectName("ca-cert"),
+							},
+						},
+					},
+				},
+			},
+			Valid: valid,
+		}
+		if !valid {
+			policy.Conditions = []conditions.Condition{
+				conditions.NewPolicyInvalid("invalid EPP TLS policy"),
+			}
+		}
+		return policy
+	}
+
+	resolveRef := func(
+		pool *inference.InferencePool,
+		poolValid bool,
+		services map[types.NamespacedName]*v1.Service,
+		policies map[types.NamespacedName]*BackendTLSPolicy,
+	) (RouteBackendRef, *L7Route, bool) {
+		route := &L7Route{RouteType: RouteTypeHTTP}
+		ref := getModifiedRouteBackendRef(func(backend RouteBackendRef) RouteBackendRef {
+			backend.Name = "pool"
+			backend.InferencePoolName = "pool"
+			backend.IsInferencePool = true
+			backend.Port = nil
+			return backend
+		})
+		referencedInferencePools := make(map[types.NamespacedName]*ReferencedInferencePool)
+		if pool != nil {
+			referencedInferencePools[types.NamespacedName{Namespace: "test", Name: "pool"}] = &ReferencedInferencePool{
+				Source: pool,
+				Valid:  poolValid,
+			}
+		}
+		returnRef, ok := resolveInferencePoolRef(
+			route,
+			ref,
+			"test",
+			referencedInferencePools,
+			services,
+			policies,
+		)
+		return returnRef, route, ok
+	}
+
+	basePool := func(port *inference.Port) *inference.InferencePool {
+		return &inference.InferencePool{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "test",
+				Name:      "pool",
+			},
+			Spec: inference.InferencePoolSpec{
+				TargetPorts: []inference.Port{{Number: 80}},
+				EndpointPickerRef: &inference.EndpointPickerRef{
+					Name: "epp",
+					Port: port,
+				},
+			},
+		}
+	}
+
+	tests := []struct {
+		pool               *inference.InferencePool
+		services           map[types.NamespacedName]*v1.Service
+		policies           map[types.NamespacedName]*BackendTLSPolicy
+		expectedEPPPort    *inference.PortNumber
+		name               string
+		expectedConditions []conditions.Condition
+		poolValid          bool
+		expectedOK         bool
+		expectedPolicy     bool
+	}{
+		{
+			name:      "matching policy with explicit endpoint picker port",
+			pool:      basePool(&inference.Port{Number: 8443}),
+			poolValid: true,
+			services: map[types.NamespacedName]*v1.Service{
+				{Namespace: "test", Name: "epp"}: {
+					Spec: v1.ServiceSpec{Ports: []v1.ServicePort{
+						{Name: "http", Port: 8080},
+						{Name: "https", Port: 8443},
+					}},
+				},
+			},
+			policies: map[types.NamespacedName]*BackendTLSPolicy{
+				{Namespace: "test", Name: "epp-tls"}: func() *BackendTLSPolicy {
+					policy := getBtp(true)
+					policy.Source.Spec.TargetRefs[0].SectionName = helpers.GetPointer(gatewayv1.SectionName("https"))
+					return policy
+				}(),
+			},
+			expectedOK:      true,
+			expectedPolicy:  true,
+			expectedEPPPort: helpers.GetPointer[inference.PortNumber](8443),
+		},
+		{
+			name:      "matching policy with port inferred from service when unset",
+			pool:      basePool(nil),
+			poolValid: true,
+			services: map[types.NamespacedName]*v1.Service{
+				{Namespace: "test", Name: "epp"}: {
+					Spec: v1.ServiceSpec{Ports: []v1.ServicePort{
+						{Name: "https", Port: 8443},
+					}},
+				},
+			},
+			policies: map[types.NamespacedName]*BackendTLSPolicy{
+				{Namespace: "test", Name: "epp-tls"}: getBtp(true),
+			},
+			expectedOK:      true,
+			expectedPolicy:  true,
+			expectedEPPPort: helpers.GetPointer[inference.PortNumber](8443),
+		},
+		{
+			name:      "conflicting policies targeting the same EPP service",
+			pool:      basePool(nil),
+			poolValid: true,
+			services: map[types.NamespacedName]*v1.Service{
+				{Namespace: "test", Name: "epp"}: {Spec: v1.ServiceSpec{Ports: []v1.ServicePort{{Port: 8080}}}},
+			},
+			policies: map[types.NamespacedName]*BackendTLSPolicy{
+				{Namespace: "test", Name: "epp-tls-1"}: func() *BackendTLSPolicy {
+					p := getBtp(true)
+					p.Source.Name = "epp-tls-1"
+					p.Source.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Hour))
+					return p
+				}(),
+				{Namespace: "test", Name: "epp-tls-2"}: func() *BackendTLSPolicy {
+					p := getBtp(true)
+					p.Source.Name = "epp-tls-2"
+					p.Source.CreationTimestamp = metav1.NewTime(time.Now())
+					return p
+				}(),
+			},
+			expectedOK:      true,
+			expectedPolicy:  true,
+			expectedEPPPort: helpers.GetPointer[inference.PortNumber](8080),
+		},
+		{
+			name:      "missing EPP service",
+			pool:      basePool(nil),
+			poolValid: true,
+			services:  map[types.NamespacedName]*v1.Service{},
+			policies:  map[types.NamespacedName]*BackendTLSPolicy{},
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefUnsupportedValue(
+					"EndpointPicker Service test/epp referenced by InferencePool test/pool does not exist",
+				),
+			},
+			expectedOK: false,
+		},
+		{
+			name:      "zero EPP service ports",
+			pool:      basePool(nil),
+			poolValid: true,
+			services: map[types.NamespacedName]*v1.Service{
+				{Namespace: "test", Name: "epp"}: {},
+			},
+			policies: map[types.NamespacedName]*BackendTLSPolicy{},
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefUnsupportedValue(
+					"EndpointPicker Service test/epp must have one port when EndpointPickerRef.port is unset",
+				),
+			},
+			expectedOK: false,
+		},
+		{
+			name:      "multiple EPP service ports without explicit port",
+			pool:      basePool(nil),
+			poolValid: true,
+			services: map[types.NamespacedName]*v1.Service{
+				{Namespace: "test", Name: "epp"}: {
+					Spec: v1.ServiceSpec{Ports: []v1.ServicePort{{Port: 8080}, {Port: 8443}}},
+				},
+			},
+			policies: map[types.NamespacedName]*BackendTLSPolicy{},
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefUnsupportedValue(
+					"EndpointPicker Service test/epp must have one port when EndpointPickerRef.port is unset",
+				),
+			},
+			expectedOK: false,
+		},
+		{
+			name:      "invalid policy",
+			pool:      basePool(nil),
+			poolValid: true,
+			services: map[types.NamespacedName]*v1.Service{
+				{Namespace: "test", Name: "epp"}: {Spec: v1.ServiceSpec{Ports: []v1.ServicePort{{Port: 8080}}}},
+			},
+			policies: map[types.NamespacedName]*BackendTLSPolicy{
+				{Namespace: "test", Name: "epp-tls"}: getBtp(false),
+			},
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefUnsupportedValue(
+					"The BackendTLSPolicy is invalid: invalid EPP TLS policy",
+				),
+			},
+			expectedOK: false,
+		},
+		{
+			name:      "no policy fallback",
+			pool:      basePool(nil),
+			poolValid: true,
+			services: map[types.NamespacedName]*v1.Service{
+				{Namespace: "test", Name: "epp"}: {Spec: v1.ServiceSpec{Ports: []v1.ServicePort{{Port: 8080}}}},
+			},
+			policies: map[types.NamespacedName]*BackendTLSPolicy{},
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteEndpointPickerTLSVerificationSkipped(),
+			},
+			expectedOK:      true,
+			expectedEPPPort: helpers.GetPointer[inference.PortNumber](8080),
+		},
+		{
+			name:      "referenced InferencePool is invalid",
+			pool:      basePool(nil),
+			poolValid: false,
+			services: map[types.NamespacedName]*v1.Service{
+				{Namespace: "test", Name: "epp"}: {Spec: v1.ServiceSpec{Ports: []v1.ServicePort{{Port: 8080}}}},
+			},
+			policies: map[types.NamespacedName]*BackendTLSPolicy{},
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefInvalidInferencePool(
+					"Referenced InferencePool test/pool is invalid",
+				),
+			},
+			expectedOK: false,
+		},
+		{
+			name:      "InferencePool not found in referencedInferencePools",
+			pool:      nil,
+			poolValid: false,
+			services: map[types.NamespacedName]*v1.Service{
+				{Namespace: "test", Name: "epp"}: {Spec: v1.ServiceSpec{Ports: []v1.ServicePort{{Port: 8080}}}},
+			},
+			policies:   map[types.NamespacedName]*BackendTLSPolicy{},
+			expectedOK: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			ref, route, ok := resolveRef(test.pool, test.poolValid, test.services, test.policies)
+
+			g.Expect(ok).To(Equal(test.expectedOK))
+			if test.expectedOK && test.pool != nil {
+				g.Expect(ref.Port).To(Equal(helpers.GetPointer[gatewayv1.PortNumber](80)))
+				g.Expect(ref.EndpointPickerConfig.NsName).To(Equal("test"))
+			}
+			g.Expect(route.Conditions).To(Equal(test.expectedConditions))
+			if test.expectedEPPPort != nil {
+				g.Expect(ref.EndpointPickerConfig.EndpointPickerRef).ToNot(BeNil())
+				g.Expect(ref.EndpointPickerConfig.EndpointPickerRef.Port).ToNot(BeNil())
+				g.Expect(ref.EndpointPickerConfig.EndpointPickerRef.Port.Number).To(Equal(*test.expectedEPPPort))
+			}
+			if test.expectedPolicy {
+				g.Expect(ref.EndpointPickerConfig.BackendTLSPolicy).ToNot(BeNil())
+				g.Expect(ref.EndpointPickerConfig.BackendTLSPolicy.Conditions).To(
+					ContainElement(conditions.NewPolicyAccepted()),
+				)
+			} else {
+				g.Expect(ref.EndpointPickerConfig.BackendTLSPolicy).To(BeNil())
+			}
+			if test.name == "conflicting policies targeting the same EPP service" {
+				loser := test.policies[types.NamespacedName{Namespace: "test", Name: "epp-tls-2"}]
+				g.Expect(loser.IsReferenced).To(BeTrue())
+				g.Expect(loser.Conditions).To(ContainElement(
+					conditions.NewPolicyConflicted(
+						"Conflicts with another BackendTLSPolicy targeting the same Service",
+					),
+				))
+			}
+		})
+	}
+}
+
+func TestCreateBackend(t *testing.T) {
+	t.Parallel()
+	createService := func(name string) *v1.Service {
+		return &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: "test",
+			},
+			Spec: v1.ServiceSpec{
+				Ports: []v1.ServicePort{
+					{
+						Port: 80,
+					},
+				},
+				IPFamilies: []v1.IPFamily{v1.IPv4Protocol},
+			},
+		}
+	}
+	svc1 := createService("service1")
+	svc2 := createService("service2")
+	svc3 := createService("service3")
+
+	// Create an ExternalName service for testing DNS resolver validation
+	externalSvc := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "external-service",
+			Namespace: "test",
+		},
+		Spec: v1.ServiceSpec{
+			Type:         v1.ServiceTypeExternalName,
+			ExternalName: "example.com",
+			Ports: []v1.ServicePort{
+				{
+					Port: 80,
+				},
+			},
+		},
+	}
+
+	// Create an ExternalName service with empty externalName field for testing validation
+	externalSvcEmpty := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "external-service-empty",
+			Namespace: "test",
+		},
+		Spec: v1.ServiceSpec{
+			Type:         v1.ServiceTypeExternalName,
+			ExternalName: "", // Empty external name
+			Ports: []v1.ServicePort{
+				{
+					Port: 80,
+				},
+			},
+		},
+	}
+
+	// Create an ExternalName service with whitespace-only externalName field for testing validation
+	externalSvcWhitespace := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "external-service-whitespace",
+			Namespace: "test",
+		},
+		Spec: v1.ServiceSpec{
+			Type:         v1.ServiceTypeExternalName,
+			ExternalName: "   \t\n   ", // Whitespace-only external name
+			Ports: []v1.ServicePort{
+				{
+					Port: 80,
+				},
+			},
+		},
+	}
+
+	svc1NamespacedName := types.NamespacedName{Namespace: "test", Name: "service1"}
+	svc2NamespacedName := types.NamespacedName{Namespace: "test", Name: "service2"}
+	svc3NamespacedName := types.NamespacedName{Namespace: "test", Name: "service3"}
+
+	btp := BackendTLSPolicy{
+		Source: &gatewayv1.BackendTLSPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "btp",
+				Namespace: "test",
+			},
+			Spec: gatewayv1.BackendTLSPolicySpec{
+				TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+					{
+						LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+							Group: "",
+							Kind:  "Service",
+							Name:  "service2",
+						},
+					},
+				},
+				Validation: gatewayv1.BackendTLSPolicyValidation{
+					Hostname:                "foo.example.com",
+					WellKnownCACertificates: helpers.GetPointer(gatewayv1.WellKnownCACertificatesSystem),
+				},
+			},
+		},
+		Valid: true,
+	}
+
+	btp2 := BackendTLSPolicy{
+		Source: &gatewayv1.BackendTLSPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "btp2",
+				Namespace: "test",
+			},
+			Spec: gatewayv1.BackendTLSPolicySpec{
+				TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+					{
+						LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+							Group: "",
+							Kind:  "Service",
+							Name:  "service3",
+						},
+					},
+				},
+				Validation: gatewayv1.BackendTLSPolicyValidation{
+					Hostname:                "foo.example.com",
+					WellKnownCACertificates: helpers.GetPointer(gatewayv1.WellKnownCACertificatesType("unknown")),
+				},
+			},
+		},
+		Valid: false,
+		Conditions: []conditions.Condition{
+			conditions.NewPolicyInvalid("Unsupported value"),
+		},
+	}
+
+	expectedSPConfig := SessionPersistenceConfig{
+		Name:   "test-persistence",
+		Idx:    "test-persistence-idx",
+		Valid:  true,
+		Expiry: "10m",
+		Path:   "/test-path",
+	}
+
+	tests := []struct {
+		nginxProxySpec               *EffectiveNginxProxy
+		parentRefKind                string
+		name                         string
+		expectedServicePortReference string
+		ref                          gatewayv1.HTTPBackendRef
+		expectedConditions           []conditions.Condition
+		expectedBackend              BackendRef
+	}{
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getNormalRef(),
+			},
+			expectedBackend: BackendRef{
+				SvcNsName:          svc1NamespacedName,
+				ServicePort:        svc1.Spec.Ports[0],
+				Weight:             5,
+				Valid:              true,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				SessionPersistence: &expectedSPConfig,
+			},
+			expectedServicePortReference: "test_service1_80_test-persistence-idx",
+			expectedConditions:           nil,
+			name:                         "normal case",
+		},
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Weight = nil
+					return backend
+				}),
+			},
+			expectedBackend: BackendRef{
+				SvcNsName:          svc1NamespacedName,
+				ServicePort:        svc1.Spec.Ports[0],
+				Weight:             1,
+				Valid:              true,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				SessionPersistence: &expectedSPConfig,
+			},
+			expectedServicePortReference: "test_service1_80_test-persistence-idx",
+			expectedConditions:           nil,
+			name:                         "normal with nil weight",
+		},
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Weight = helpers.GetPointer[int32](-1)
+					return backend
+				}),
+			},
+			expectedBackend: BackendRef{
+				SvcNsName:          types.NamespacedName{},
+				ServicePort:        v1.ServicePort{},
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				Weight:             0,
+				Valid:              false,
+			},
+			expectedServicePortReference: "",
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefUnsupportedValue(
+					"test.weight: Invalid value: -1: must be in the range [0, 1000000]",
+				),
+			},
+			name: "invalid weight",
+		},
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Kind = helpers.GetPointer[gatewayv1.Kind]("NotService")
+					return backend
+				}),
+			},
+			expectedBackend: BackendRef{
+				SvcNsName:          types.NamespacedName{},
+				ServicePort:        v1.ServicePort{},
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				Weight:             5,
+				Valid:              false,
+			},
+			expectedServicePortReference: "",
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefInvalidKind(
+					`test.kind: Unsupported value: "NotService": supported values: "Service", "InferencePool"`,
+				),
+			},
+			name: "invalid kind",
+		},
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Name = "not-exist"
+					return backend
+				}),
+			},
+			expectedBackend: BackendRef{
+				Weight: 5,
+				Valid:  false,
+				SvcNsName: types.NamespacedName{
+					Namespace: "test",
+					Name:      "not-exist",
+				},
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+			},
+			expectedServicePortReference: "",
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefRefBackendNotFound(`test.name: Not found: "not-exist"`),
+			},
+			name: "service doesn't exist",
+		},
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Name = "service2"
+					return backend
+				}),
+			},
+			expectedBackend: BackendRef{
+				SvcNsName:          svc2NamespacedName,
+				ServicePort:        svc1.Spec.Ports[0],
+				Weight:             5,
+				Valid:              true,
+				BackendTLSPolicy:   &btp,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				SessionPersistence: &expectedSPConfig,
+			},
+			expectedServicePortReference: "test_service2_80_test-persistence-idx",
+			expectedConditions:           nil,
+			name:                         "normal case with policy",
+		},
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Name = "service3"
+					return backend
+				}),
+			},
+			expectedBackend: BackendRef{
+				SvcNsName:          svc3NamespacedName,
+				ServicePort:        svc1.Spec.Ports[0],
+				Weight:             5,
+				Valid:              false,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+			},
+			expectedServicePortReference: "",
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefUnsupportedValue(
+					"The BackendTLSPolicy is invalid: Unsupported value",
+				),
+			},
+			name: "invalid policy",
+		},
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Name = "external-service"
+					return backend
+				}),
+			},
+			expectedBackend: BackendRef{
+				SvcNsName:   types.NamespacedName{Namespace: "test", Name: "external-service"},
+				ServicePort: v1.ServicePort{Port: 80},
+				Weight:      5,
+				Valid:       true,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{
+					{Namespace: "test", Name: "gateway"}: conditions.NewRouteBackendRefUnsupportedValue(
+						"ExternalName service requires DNS resolver configuration in Gateway's NginxProxy",
+					),
+				},
+				SessionPersistence: &expectedSPConfig,
+			},
+			expectedServicePortReference: "test_external-service_80_test-persistence-idx",
+			expectedConditions:           nil,
+			name:                         "ExternalName service without DNS resolver",
+		},
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Name = "external-service"
+					return backend
+				}),
+			},
+			nginxProxySpec: &EffectiveNginxProxy{
+				DNSResolver: &ngfAPIv1alpha2.DNSResolver{
+					Addresses: []ngfAPIv1alpha2.DNSResolverAddress{
+						{Type: ngfAPIv1alpha2.DNSResolverIPAddressType, Value: "8.8.8.8"},
+					},
+				},
+			},
+			expectedBackend: BackendRef{
+				SvcNsName:          types.NamespacedName{Namespace: "test", Name: "external-service"},
+				ServicePort:        v1.ServicePort{Port: 80},
+				Weight:             5,
+				Valid:              true,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				SessionPersistence: &expectedSPConfig,
+			},
+			expectedServicePortReference: "test_external-service_80_test-persistence-idx",
+			expectedConditions:           nil,
+			name:                         "ExternalName service with DNS resolver",
+		},
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Name = "external-service"
+					return backend
+				}),
+			},
+			expectedBackend: BackendRef{
+				SvcNsName:   types.NamespacedName{Namespace: "test", Name: "external-service"},
+				ServicePort: v1.ServicePort{Port: 80},
+				Weight:      5,
+				Valid:       true,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{
+					{Namespace: "test", Name: "gateway2"}: conditions.NewRouteBackendRefUnsupportedValue(
+						"ExternalName service requires DNS resolver configuration in Gateway's NginxProxy",
+					),
+				},
+				SessionPersistence: &expectedSPConfig,
+			},
+			expectedServicePortReference: "test_external-service_80_test-persistence-idx",
+			expectedConditions:           nil,
+			name:                         "ExternalName service with multiple gateways - mixed DNS resolver config",
+		},
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Name = "external-service-empty"
+					return backend
+				}),
+			},
+			expectedBackend: BackendRef{
+				SvcNsName:   types.NamespacedName{Namespace: "test", Name: "external-service-empty"},
+				ServicePort: v1.ServicePort{Port: 80},
+				Weight:      5,
+				Valid:       false,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{
+					{Namespace: "test", Name: "gateway"}: conditions.NewRouteBackendRefUnsupportedValue(
+						"ExternalName service requires DNS resolver configuration in Gateway's NginxProxy",
+					),
+				},
+			},
+			expectedServicePortReference: "",
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefUnsupportedValue(
+					"ExternalName service has empty or invalid externalName field",
+				),
+			},
+			name: "ExternalName service with empty externalName field",
+		},
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Name = "external-service-whitespace"
+					return backend
+				}),
+			},
+			expectedBackend: BackendRef{
+				SvcNsName:   types.NamespacedName{Namespace: "test", Name: "external-service-whitespace"},
+				ServicePort: v1.ServicePort{Port: 80},
+				Weight:      5,
+				Valid:       false,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{
+					{Namespace: "test", Name: "gateway"}: conditions.NewRouteBackendRefUnsupportedValue(
+						"ExternalName service requires DNS resolver configuration in Gateway's NginxProxy",
+					),
+				},
+			},
+			expectedServicePortReference: "",
+			expectedConditions: []conditions.Condition{
+				conditions.NewRouteBackendRefUnsupportedValue(
+					"ExternalName service has empty or invalid externalName field",
+				),
+			},
+			name: "ExternalName service with whitespace-only externalName field",
+		},
+		{
+			ref: gatewayv1.HTTPBackendRef{
+				BackendRef: getModifiedRef(func(backend gatewayv1.BackendRef) gatewayv1.BackendRef {
+					backend.Name = "external-service"
+					return backend
+				}),
+			},
+			parentRefKind: kinds.ListenerSet, // Special case for ListenerSet
+			expectedBackend: BackendRef{
+				SvcNsName:   types.NamespacedName{Namespace: "test", Name: "external-service"},
+				ServicePort: v1.ServicePort{Port: 80},
+				Weight:      5,
+				Valid:       true,
+				InvalidForGateways: map[types.NamespacedName]conditions.Condition{
+					{Namespace: "test", Name: "gateway"}: conditions.NewRouteBackendRefUnsupportedValue(
+						"ExternalName service requires DNS resolver configuration in Gateway's NginxProxy",
+					),
+				},
+				SessionPersistence: &expectedSPConfig,
+			},
+			expectedServicePortReference: "test_external-service_80_test-persistence-idx",
+			expectedConditions:           nil,
+			name: "ExternalName service with ListenerSet parentRef" +
+				" - DNS resolver validation via parent Gateway",
+		},
+	}
+
+	services := map[types.NamespacedName]*v1.Service{
+		client.ObjectKeyFromObject(svc1):                  svc1,
+		client.ObjectKeyFromObject(svc2):                  svc2,
+		client.ObjectKeyFromObject(svc3):                  svc3,
+		client.ObjectKeyFromObject(externalSvc):           externalSvc,
+		client.ObjectKeyFromObject(externalSvcEmpty):      externalSvcEmpty,
+		client.ObjectKeyFromObject(externalSvcWhitespace): externalSvcWhitespace,
+	}
+	policies := map[types.NamespacedName]*BackendTLSPolicy{
+		client.ObjectKeyFromObject(btp.Source):  &btp,
+		client.ObjectKeyFromObject(btp2.Source): &btp2,
+	}
+
+	refPath := field.NewPath("test")
+
+	alwaysTrueRefGrantResolver := func(_ toResource) bool { return true }
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			rbr := RouteBackendRef{
+				MirrorBackendIdx: nil,
+				IsInferencePool:  false,
+				BackendRef:       test.ref.BackendRef,
+				Filters:          []any{},
+				SessionPersistence: &SessionPersistenceConfig{
+					Name:   "test-persistence",
+					Idx:    "test-persistence-idx",
+					Valid:  true,
+					Expiry: "10m",
+					Path:   "/test-path",
+				},
+			}
+			route := &L7Route{
+				RouteType: RouteTypeHTTP,
+				Source: &gatewayv1.HTTPRoute{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "test",
+					},
+				},
+				ParentRefs: []ParentRef{
+					{
+						Kind:                kinds.Gateway,
+						NamespacedName:      types.NamespacedName{Namespace: "test", Name: "gateway"},
+						GatewayNsName:       types.NamespacedName{Namespace: "test", Name: "gateway"},
+						EffectiveNginxProxy: test.nginxProxySpec,
+					},
+				},
+			}
+
+			// Handle ListenerSet parentRef case
+			if test.parentRefKind == kinds.ListenerSet {
+				route.ParentRefs = []ParentRef{
+					{
+						Kind:           kinds.ListenerSet,
+						NamespacedName: types.NamespacedName{Namespace: "test", Name: "listener-set"},
+						GatewayNsName:  types.NamespacedName{Namespace: "test", Name: "gateway"},
+					},
+				}
+			}
+
+			// Special case: for the multiple gateways test, add a second gateway
+			if test.name == "ExternalName service with multiple gateways - mixed DNS resolver config" {
+				route.ParentRefs = append(route.ParentRefs, ParentRef{
+					Kind:           kinds.Gateway,
+					NamespacedName: types.NamespacedName{Namespace: "test", Name: "gateway2"},
+					GatewayNsName:  types.NamespacedName{Namespace: "test", Name: "gateway2"},
+				})
+				// For this test, the first gateway should have DNS resolver
+				route.ParentRefs[0].EffectiveNginxProxy = &EffectiveNginxProxy{
+					DNSResolver: &ngfAPIv1alpha2.DNSResolver{
+						Addresses: []ngfAPIv1alpha2.DNSResolverAddress{
+							{Type: ngfAPIv1alpha2.DNSResolverIPAddressType, Value: "8.8.8.8"},
+						},
+					},
+				}
+			}
+
+			backend, conds := createBackendRef(
+				rbr,
+				route,
+				alwaysTrueRefGrantResolver,
+				services,
+				refPath,
+				policies,
+			)
+
+			g.Expect(helpers.Diff(test.expectedBackend, backend)).To(BeEmpty())
+			g.Expect(conds).To(Equal(test.expectedConditions))
+
+			servicePortRef := backend.ServicePortReference()
+			g.Expect(servicePortRef).To(Equal(test.expectedServicePortReference))
+		})
+	}
+
+	// test mirror backend case
+	g := NewWithT(t)
+	ref := RouteBackendRef{
+		MirrorBackendIdx: helpers.GetPointer(0),
+		IsInferencePool:  false,
+		BackendRef:       getNormalRef(),
+		Filters:          []any{},
+	}
+
+	route := &L7Route{
+		RouteType: RouteTypeHTTP,
+		Source: &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "test",
+			},
+		},
+		ParentRefs: []ParentRef{
+			{
+				Kind:           kinds.Gateway,
+				NamespacedName: types.NamespacedName{Namespace: "test", Name: "gateway"},
+				GatewayNsName:  types.NamespacedName{Namespace: "test", Name: "gateway"},
+			},
+		},
+	}
+
+	backend, conds := createBackendRef(
+		ref,
+		route,
+		alwaysTrueRefGrantResolver,
+		services,
+		refPath,
+		policies,
+	)
+
+	g.Expect(conds).To(BeNil())
+	g.Expect(backend.IsMirrorBackend).To(BeTrue())
+}
+
+func TestGetServicePort(t *testing.T) {
+	t.Parallel()
+	svc := &v1.Service{
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{
+				{
+					Port: 80,
+				},
+				{
+					Port: 81,
+				},
+				{
+					Port: 82,
+				},
+			},
+		},
+	}
+	g := NewWithT(t)
+	// ports exist
+	for _, p := range []int32{80, 81, 82} {
+		port, err := getServicePort(svc, p)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(port.Port).To(Equal(p))
+	}
+
+	// port doesn't exist
+	port, err := getServicePort(svc, 83)
+	g.Expect(err).Should(HaveOccurred())
+	g.Expect(port.Port).To(Equal(int32(0)))
+}
+
+func TestValidateBackendTLSPolicyMatchingAllBackends(t *testing.T) {
+	t.Parallel()
+	getBtp := func(name, caCertName string) *BackendTLSPolicy {
+		return &BackendTLSPolicy{
+			Source: &gatewayv1.BackendTLSPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      name,
+					Namespace: "test",
+				},
+				Spec: gatewayv1.BackendTLSPolicySpec{
+					Validation: gatewayv1.BackendTLSPolicyValidation{
+						Hostname: "foo.example.com",
+						CACertificateRefs: []gatewayv1.LocalObjectReference{
+							{
+								Group: "",
+								Kind:  "ConfigMap",
+								Name:  gatewayv1.ObjectName(caCertName),
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	backendRefsNoPolicies := []BackendRef{
+		{
+			SvcNsName: types.NamespacedName{Namespace: "test", Name: "svc1"},
+		},
+		{
+			SvcNsName: types.NamespacedName{Namespace: "test", Name: "svc2"},
+		},
+	}
+
+	backendRefsWithMatchingPolicies := []BackendRef{
+		{
+			SvcNsName:        types.NamespacedName{Namespace: "test", Name: "svc1"},
+			BackendTLSPolicy: getBtp("btp1", "ca1"),
+		},
+		{
+			SvcNsName:        types.NamespacedName{Namespace: "test", Name: "svc2"},
+			BackendTLSPolicy: getBtp("btp2", "ca1"),
+		},
+	}
+	backendRefsWithNotMatchingPolicies := []BackendRef{
+		{
+			SvcNsName:        types.NamespacedName{Namespace: "test", Name: "svc1"},
+			BackendTLSPolicy: getBtp("btp1", "ca1"),
+		},
+		{
+			SvcNsName:        types.NamespacedName{Namespace: "test", Name: "svc2"},
+			BackendTLSPolicy: getBtp("btp2", "ca2"),
+		},
+	}
+	backendRefsOnePolicy := []BackendRef{
+		{
+			SvcNsName:        types.NamespacedName{Namespace: "test", Name: "svc1"},
+			BackendTLSPolicy: getBtp("btp1", "ca1"),
+		},
+		{
+			SvcNsName: types.NamespacedName{Namespace: "test", Name: "svc2"},
+		},
+	}
+	msg := "Backend TLS policies do not match for all backends"
+	tests := []struct {
+		expectedCondition *conditions.Condition
+		name              string
+		backendRefs       []BackendRef
+	}{
+		{
+			name:              "no policies",
+			backendRefs:       backendRefsNoPolicies,
+			expectedCondition: nil,
+		},
+		{
+			name:              "matching policies",
+			backendRefs:       backendRefsWithMatchingPolicies,
+			expectedCondition: nil,
+		},
+		{
+			name:              "not matching policies",
+			backendRefs:       backendRefsWithNotMatchingPolicies,
+			expectedCondition: helpers.GetPointer(conditions.NewRouteBackendRefUnsupportedValue(msg)),
+		},
+		{
+			name:              "only one policy",
+			backendRefs:       backendRefsOnePolicy,
+			expectedCondition: helpers.GetPointer(conditions.NewRouteBackendRefUnsupportedValue(msg)),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			cond := validateBackendTLSPolicyMatchingAllBackends(test.backendRefs)
+
+			g.Expect(cond).To(Equal(test.expectedCondition))
+		})
+	}
+}
+
+func TestFindBackendTLSPolicyForService(t *testing.T) {
+	t.Parallel()
+	oldCreationTimestamp := metav1.NewTime(time.Now().Add(-time.Hour))
+	newCreationTimestamp := metav1.NewTime(time.Now())
+	getBtp := func(name string, timestamp metav1.Time) *BackendTLSPolicy {
+		return &BackendTLSPolicy{
+			Valid: true,
+			Source: &gatewayv1.BackendTLSPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              name,
+					Namespace:         "test",
+					CreationTimestamp: timestamp,
+				},
+				Spec: gatewayv1.BackendTLSPolicySpec{
+					TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+						{
+							LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+								Group: "",
+								Kind:  "Service",
+								Name:  "svc1",
+							},
+						},
+					},
+				},
+			},
+		}
+	}
+
+	ref := gatewayv1.HTTPBackendRef{
+		BackendRef: gatewayv1.BackendRef{
+			BackendObjectReference: gatewayv1.BackendObjectReference{
+				Kind:      helpers.GetPointer[gatewayv1.Kind]("Service"),
+				Name:      "svc1",
+				Namespace: helpers.GetPointer[gatewayv1.Namespace]("test"),
+			},
+		},
+	}
+
+	getBTPMap := func(nameAndTimestamp map[string]metav1.Time) map[types.NamespacedName]*BackendTLSPolicy {
+		m := make(map[types.NamespacedName]*BackendTLSPolicy, len(nameAndTimestamp))
+		for n, ts := range nameAndTimestamp {
+			btp := getBtp(n, ts)
+			m[client.ObjectKeyFromObject(btp.Source)] = btp
+		}
+		return m
+	}
+
+	tests := []struct {
+		name               string
+		backendTLSPolicies map[types.NamespacedName]*BackendTLSPolicy
+		expectedBtpName    string
+	}{
+		{
+			name: "oldest wins",
+			backendTLSPolicies: getBTPMap(
+				map[string]metav1.Time{
+					"newest": newCreationTimestamp,
+					"oldest": oldCreationTimestamp,
+				},
+			),
+			expectedBtpName: "oldest",
+		},
+		{
+			name: "alphabetically first wins",
+			backendTLSPolicies: getBTPMap(
+				map[string]metav1.Time{
+					"alphabeticallyfirst": oldCreationTimestamp,
+					"newest":              newCreationTimestamp,
+					"oldest":              oldCreationTimestamp,
+				},
+			),
+			expectedBtpName: "alphabeticallyfirst",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+
+			btp, err := findBackendTLSPolicyForService(
+				test.backendTLSPolicies,
+				ref.Namespace,
+				string(ref.Name),
+				"test",
+				v1.ServicePort{Name: "https", Port: 443},
+			)
+
+			g.Expect(btp.Source.Name).To(Equal(test.expectedBtpName))
+			g.Expect(err).ToNot(HaveOccurred())
+		})
+	}
+}
+
+func TestFindBackendTLSPolicyForService_IgnoresNonServiceKind(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	// BackendTLSPolicy targeting a non-Service Kind (e.g. ConfigMap) with the same name
+	// should not match when looking up policies for a Service.
+	btp := &BackendTLSPolicy{
+		Valid: true,
+		Source: &gatewayv1.BackendTLSPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "btp",
+				Namespace: "test",
+			},
+			Spec: gatewayv1.BackendTLSPolicySpec{
+				TargetRefs: []gatewayv1.LocalPolicyTargetReferenceWithSectionName{
+					{
+						LocalPolicyTargetReference: gatewayv1.LocalPolicyTargetReference{
+							Group: "",
+							Kind:  "ConfigMap",
+							Name:  "svc1",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	backendTLSPolicies := map[types.NamespacedName]*BackendTLSPolicy{
+		{Namespace: "test", Name: "btp"}: btp,
+	}
+
+	result, err := findBackendTLSPolicyForService(
+		backendTLSPolicies,
+		helpers.GetPointer[gatewayv1.Namespace]("test"),
+		"svc1",
+		"test",
+		v1.ServicePort{Name: "https", Port: 443},
+	)
+
+	g.Expect(result).To(BeNil(), "policy targeting ConfigMap kind should not match a Service lookup")
+	g.Expect(err).ToNot(HaveOccurred())
+}
+
+func TestGetRefGrantFromResourceForRoute(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name            string
+		routeType       RouteType
+		ns              string
+		expFromResource fromResource
+	}{
+		{
+			name:            "HTTPRoute",
+			routeType:       RouteTypeHTTP,
+			ns:              "hr",
+			expFromResource: fromHTTPRoute("hr"),
+		},
+		{
+			name:            "GRPCRoute",
+			routeType:       RouteTypeGRPC,
+			ns:              "gr",
+			expFromResource: fromGRPCRoute("gr"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			g := NewWithT(t)
+			g.Expect(getRefGrantFromResourceForRoute(test.routeType, test.ns)).To(Equal(test.expFromResource))
+		})
+	}
+}
+
+func TestGetRefGrantFromResourceForRoute_Panics(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	get := func() {
+		getRefGrantFromResourceForRoute("unknown", "ns")
+	}
+
+	g.Expect(get).To(Panic())
+}
+
+func TestInvalidateRuleIfExternalAuthBackendUnresolved(t *testing.T) {
+	t.Parallel()
+
+	port := gatewayv1.PortNumber(80)
+
+	makeRoute := func(filters []Filter, filtersValid bool, backendRefs []BackendRef) *L7Route {
+		return &L7Route{
+			Spec: L7RouteSpec{
+				Rules: []RouteRule{
+					{
+						Filters: RouteRuleFilters{
+							Valid:   filtersValid,
+							Filters: filters,
+						},
+						BackendRefs: backendRefs,
+					},
+				},
+			},
+		}
+	}
+
+	extAuthFilter := Filter{
+		FilterType: FilterExternalAuth,
+		ExternalAuth: &gatewayv1.HTTPExternalAuthFilter{
+			ExternalAuthProtocol: gatewayv1.HTTPRouteExternalAuthHTTPProtocol,
+			BackendRef: gatewayv1.BackendObjectReference{
+				Name: "auth-svc",
+				Port: &port,
+			},
+		},
+	}
+
+	mirrorFilter := Filter{FilterType: FilterRequestMirror}
+
+	tests := []struct {
+		route              *L7Route
+		name               string
+		expectFiltersValid bool
+		expectCondition    bool
+	}{
+		{
+			name: "valid auth backend keeps the rule valid and returns no condition",
+			route: makeRoute(
+				[]Filter{extAuthFilter},
+				true,
+				[]BackendRef{{IsExternalAuthBackend: true, Valid: true}},
+			),
+			expectFiltersValid: true,
+			expectCondition:    false,
+		},
+		{
+			name: "invalid auth backend marks the rule invalid and returns a condition",
+			route: makeRoute(
+				[]Filter{extAuthFilter},
+				true,
+				[]BackendRef{{IsExternalAuthBackend: true, Valid: false}},
+			),
+			expectFiltersValid: false,
+			expectCondition:    true,
+		},
+		{
+			name: "missing auth backend ref entirely marks the rule invalid",
+			route: makeRoute(
+				[]Filter{extAuthFilter},
+				true,
+				[]BackendRef{{IsExternalAuthBackend: false, Valid: true}},
+			),
+			expectFiltersValid: false,
+			expectCondition:    true,
+		},
+		{
+			name: "rule without an ExternalAuth filter is left untouched even if a backend is invalid",
+			route: makeRoute(
+				[]Filter{mirrorFilter},
+				true,
+				[]BackendRef{{IsExternalAuthBackend: false, Valid: false}},
+			),
+			expectFiltersValid: true,
+			expectCondition:    false,
+		},
+		{
+			name: "already invalid filters are skipped without returning another condition",
+			route: makeRoute(
+				[]Filter{extAuthFilter},
+				false,
+				[]BackendRef{{IsExternalAuthBackend: true, Valid: false}},
+			),
+			expectFiltersValid: false,
+			expectCondition:    false,
+		},
+		{
+			name: "any one valid auth backend among multiple keeps the rule valid",
+			route: makeRoute(
+				[]Filter{extAuthFilter},
+				true,
+				[]BackendRef{
+					{IsExternalAuthBackend: true, Valid: false},
+					{IsExternalAuthBackend: true, Valid: true},
+				},
+			),
+			expectFiltersValid: true,
+			expectCondition:    false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			g := NewWithT(t)
+			cond := invalidateRuleIfExternalAuthBackendUnresolved(test.route, 0)
+			g.Expect(test.route.Spec.Rules[0].Filters.Valid).To(Equal(test.expectFiltersValid))
+			if test.expectCondition {
+				g.Expect(cond).NotTo(BeNil())
+			} else {
+				g.Expect(cond).To(BeNil())
+			}
+		})
+	}
+}
