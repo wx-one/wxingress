@@ -57,13 +57,13 @@ jobs:
     name: Go tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: ${{ env.HELM_VERSION }}
 
@@ -87,11 +87,11 @@ jobs:
     name: Controller binary
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -103,7 +103,7 @@ jobs:
             -o nginx-ingress ./cmd/nginx-ingress
           ./nginx-ingress -version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: nginx-ingress
           path: nginx-ingress
@@ -115,7 +115,7 @@ jobs:
     # with: ubuntu:24.04, so the runner is ubuntu-24.04 and uses its gcc
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # meta by tag and digest, in one place: ci/meta-image
       - id: pin
@@ -143,7 +143,7 @@ jobs:
           ./dataplane/build.sh
           echo "${META_IMAGE%@*}@$META_DIGEST" > dataplane/build/META-IMAGE
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: dataplane
@@ -164,9 +164,9 @@ jobs:
     container:
       image: golang:1.27.3-trixie
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dataplane
           path: dataplane/build
@@ -183,9 +183,9 @@ jobs:
     name: Helm chart
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: ${{ env.HELM_VERSION }}
 
@@ -195,7 +195,7 @@ jobs:
       - name: Package
         run: helm package charts/wxingress -d chart
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: chart
           path: chart/*.tgz
