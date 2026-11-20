@@ -42,7 +42,7 @@ WizardTales offers support packages for organisations that run wxingress in prod
 Public releases are not held back: wxingress is usually released for everyone within about 24 to 48 hours
 on working days. The fast release channel's emergency releases are not official releases, but targeted
 fixes that close a critical gap until then. Order by email to
-[ingress-support@wx1.de](mailto:ingress-support@wx1.de). A support package does not entitle you to demand
+[support-ingress@wx1.de](mailto:support-ingress@wx1.de). A support package does not entitle you to demand
 features. Details are on the [support page](https://wx-one.github.io/wxingress/about/support/).
 
 ## What it is

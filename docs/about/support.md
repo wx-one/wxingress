@@ -40,7 +40,7 @@ package.
 
 ## Ordering
 
-Order by email to **[ingress-support@wx1.de](mailto:ingress-support@wx1.de)**. Please include the name and
+Order by email to **[support-ingress@wx1.de](mailto:support-ingress@wx1.de)**. Please include the name and
 address of the legal entity, the package you want, and a technical contact. For 24×7 coverage, tell us
 what you need and we will send you an offer.
 

@@ -22,7 +22,7 @@ If your clusters depend on it, please [sponsor its development](https://github.c
     WizardTales offers support packages for production use: the **fast release channel** (targeted fixes for critical vulnerabilities
     from the WX-ONE emergency response team, ahead of the official release) for €1,000 per month and the **emergency support desk** (8×5, prioritised, 24×7 on request, including the fast
     release channel) for €3,000 per month, each per legal entity. Order by email to
-    [ingress-support@wx1.de](mailto:ingress-support@wx1.de). [Details](about/support.md)
+    [support-ingress@wx1.de](mailto:support-ingress@wx1.de). [Details](about/support.md)
 
 ## Why it exists
 
