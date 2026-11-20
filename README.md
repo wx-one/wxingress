@@ -3,10 +3,46 @@
 **The ingress-nginx successor that you can drop in: your Ingresses, annotations and ConfigMap as they are, served by NGINX Ingress Controller's core, without Lua, and with the Gateway API.**
 
 [![CI](https://github.com/wx-one/wxingress/actions/workflows/ci.yml/badge.svg)](https://github.com/wx-one/wxingress/actions/workflows/ci.yml)
-[![Docs](https://img.shields.io/badge/docs-wx-one.github.io%2Fwxingress-blue)](https://wx-one.github.io/wxingress/)
+[![Docs](https://img.shields.io/badge/docs-wx--one.github.io%2Fwxingress-blue)](https://wx-one.github.io/wxingress/)
 [![License: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue)](LICENSE)
 [![Docker Pulls](https://img.shields.io/docker/pulls/wxone/wxingress?logo=docker&logoColor=white)](https://hub.docker.com/r/wxone/wxingress)
 [![Sponsor](https://img.shields.io/badge/sponsor-%E2%9D%A4-ea4aaa?logo=githubsponsors)](https://github.com/sponsors/wx-one)
+
+## Made by WX-ONE and WizardTales
+
+<p>
+  <a href="https://wx1.eu">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logos/wx-one-dark.svg">
+      <img alt="WX-ONE" src="docs/assets/logos/wx-one.svg" height="90">
+    </picture>
+  </a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="https://wizardtales.com">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logos/wizardtales-dark.svg">
+      <img alt="WizardTales" src="docs/assets/logos/wizardtales.svg" height="90">
+    </picture>
+  </a>
+</p>
+
+wxingress is developed by [WizardTales](https://wizardtales.com) and runs the ingress of the
+[WX-ONE](https://wx1.eu) cloud platform. If your clusters depend on it, please consider
+[sponsoring its development](https://github.com/sponsors/wx-one).
+
+## Commercial support
+
+WizardTales offers support packages for organisations that run wxingress in production:
+
+| Package | Price | Includes |
+|---|---|---|
+| **Fast release channel** | €1,000 per month per legal entity | access to the fast release channel |
+| **Emergency support desk** | €3,000 per month per legal entity | the fast release channel, plus an 8×5 emergency support desk with prioritised support; 24×7 on request |
+
+Order by email to [ingress-support@wx1.de](mailto:ingress-support@wx1.de). A support package does not
+entitle you to demand features. Details are on the [support page](https://wx-one.github.io/wxingress/about/support/).
+
+## What it is
 
 The Kubernetes project retired [ingress-nginx](https://github.com/kubernetes/ingress-nginx) in March 2026.
 Thousands of clusters still run it, with Ingresses full of `nginx.ingress.kubernetes.io/*` annotations.
@@ -96,44 +132,10 @@ command-line flags and Helm values, and how to build and develop wxingress.
 
 The chart requires Kubernetes 1.25 or newer. wxingress is tested on Kubernetes 1.31 and 1.32, on RKE2 and kind.
 
-## Commercial support
-
-WizardTales offers support packages for organisations that run wxingress in production:
-
-| Package | Price | Includes |
-|---|---|---|
-| **Fast release channel** | €1,000 per month per legal entity | access to the fast release channel |
-| **Emergency support desk** | €3,000 per month per legal entity | the fast release channel, plus an 8×5 emergency support desk with prioritised support; 24×7 on request |
-
-Order by email to [ingress-support@wx1.de](mailto:ingress-support@wx1.de). A support package does not
-entitle you to demand features. Details are on the [support page](https://wx-one.github.io/wxingress/about/support/).
-
 ## Contributing
 
 Issues, discussions and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first.
 To report a security issue, follow [SECURITY.md](SECURITY.md) and do not open a public issue.
-
-## Made by
-
-<p>
-  <a href="https://wx1.eu">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logos/wx-one-dark.svg">
-      <img alt="WX-ONE" src="docs/assets/logos/wx-one.svg" height="90">
-    </picture>
-  </a>
-  &nbsp;&nbsp;&nbsp;
-  <a href="https://wizardtales.com">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logos/wizardtales-dark.svg">
-      <img alt="WizardTales" src="docs/assets/logos/wizardtales.svg" height="90">
-    </picture>
-  </a>
-</p>
-
-wxingress is developed by [WizardTales](https://wizardtales.com) and runs the ingress of the
-[WX-ONE](https://wx1.eu) cloud platform. If your clusters depend on it, please consider
-[sponsoring its development](https://github.com/sponsors/wx-one).
 
 ## Licence
 

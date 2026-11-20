@@ -7,6 +7,23 @@ NGINX Ingress Controller's core, runs no Lua, and adds the Gateway API.
 [Install](getting-started/installation.md){ .md-button .md-button--primary }
 [Migrate from ingress-nginx](migration/ingress-nginx.md){ .md-button }
 
+## Made by WX-ONE and WizardTales
+
+<div class="makers" markdown>
+[![WX-ONE](assets/logos/wx-one.svg){ .only-light }![WX-ONE](assets/logos/wx-one-dark.svg){ .only-dark }](https://wx1.eu)
+[![WizardTales](assets/logos/wizardtales.svg){ .only-light }![WizardTales](assets/logos/wizardtales-dark.svg){ .only-dark }](https://wizardtales.com)
+</div>
+
+wxingress is developed by [WizardTales](https://wizardtales.com) and runs the ingress of the
+[WX-ONE](https://wx1.eu) cloud platform. It is open source under the [EUPL-1.2](about/license.md).
+If your clusters depend on it, please [sponsor its development](https://github.com/sponsors/wx-one).
+
+!!! tip "Commercial support"
+    WizardTales offers support packages for production use: the **fast release channel** for €1,000 per
+    month and the **emergency support desk** (8×5, prioritised, 24×7 on request, including the fast
+    release channel) for €3,000 per month, each per legal entity. Order by email to
+    [ingress-support@wx1.de](mailto:ingress-support@wx1.de). [Details](about/support.md)
+
 ## Why it exists
 
 The Kubernetes project retired [ingress-nginx](https://github.com/kubernetes/ingress-nginx) in March 2026.
@@ -88,14 +105,3 @@ Lua. Snippets that only contain NGINX directives keep working once snippets are 
 `access_by_lua_block`, `content_by_lua_block` and the like need a rewrite in
 [njs](https://nginx.org/en/docs/njs/), NGINX's JavaScript, which wxingress ships. The
 [Lua to njs guide](migration/lua-to-njs.md) shows the patterns, with a complete example.
-
-## Made by
-
-<div class="makers" markdown>
-[![WX-ONE](assets/logos/wx-one.svg){ .only-light }![WX-ONE](assets/logos/wx-one-dark.svg){ .only-dark }](https://wx1.eu)
-[![WizardTales](assets/logos/wizardtales.svg){ .only-light }![WizardTales](assets/logos/wizardtales-dark.svg){ .only-dark }](https://wizardtales.com)
-</div>
-
-wxingress is developed by [WizardTales](https://wizardtales.com) and runs the ingress of the
-[WX-ONE](https://wx1.eu) cloud platform. It is open source under the [EUPL-1.2](about/license.md).
-If your clusters depend on it, please [sponsor its development](https://github.com/sponsors/wx-one).
