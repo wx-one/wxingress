@@ -19,8 +19,8 @@ wxingress is developed by [WizardTales](https://wizardtales.com) and runs the in
 If your clusters depend on it, please [sponsor its development](https://github.com/sponsors/wx-one).
 
 !!! tip "Commercial support"
-    WizardTales offers support packages for production use: the **fast release channel** for €1,000 per
-    month and the **emergency support desk** (8×5, prioritised, 24×7 on request, including the fast
+    WizardTales offers support packages for production use: the **fast release channel** (targeted fixes for critical vulnerabilities
+    from the WX-ONE emergency response team, ahead of the official release) for €1,000 per month and the **emergency support desk** (8×5, prioritised, 24×7 on request, including the fast
     release channel) for €3,000 per month, each per legal entity. Order by email to
     [ingress-support@wx1.de](mailto:ingress-support@wx1.de). [Details](about/support.md)
 

@@ -36,11 +36,14 @@ WizardTales offers support packages for organisations that run wxingress in prod
 
 | Package | Price | Includes |
 |---|---|---|
-| **Fast release channel** | €1,000 per month per legal entity | access to the fast release channel |
+| **Fast release channel** | €1,000 per month per legal entity | targeted fixes for critical vulnerabilities from the WX-ONE emergency response team, ahead of the official release |
 | **Emergency support desk** | €3,000 per month per legal entity | the fast release channel, plus an 8×5 emergency support desk with prioritised support; 24×7 on request |
 
-Order by email to [ingress-support@wx1.de](mailto:ingress-support@wx1.de). A support package does not
-entitle you to demand features. Details are on the [support page](https://wx-one.github.io/wxingress/about/support/).
+Public releases are not held back: wxingress is usually released for everyone within about 24 to 48 hours
+on working days. The fast release channel's emergency releases are not official releases, but targeted
+fixes that close a critical gap until then. Order by email to
+[ingress-support@wx1.de](mailto:ingress-support@wx1.de). A support package does not entitle you to demand
+features. Details are on the [support page](https://wx-one.github.io/wxingress/about/support/).
 
 ## What it is
 
