@@ -11,7 +11,7 @@ The first public release.
 - An endpoint of an EndpointSlice without a `ready` condition is served, as the Kubernetes API defines.
   Hand-written EndpointSlices for Services without a selector often have no conditions.
 - Licence: EUPL-1.2 (the code from NGINX Ingress Controller and NGINX Gateway Fabric stays Apache-2.0).
-- Go module `github.com/wx-one/wxingress`; images on `docker.io/wxone/wxingress`, the chart on
+- Go module `github.com/wx-one/wxingress`; images on `ghcr.io/wx-one/wxingress`, the chart on
   `oci://ghcr.io/wx-one/charts/wxingress`.
 - The chart defaults to the wxingress image.
 

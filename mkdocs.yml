@@ -2,7 +2,7 @@ site_name: wxingress
 site_description: The drop-in successor of ingress-nginx, built on NGINX Ingress Controller, with the Gateway API.
 site_url: https://wx-one.github.io/wxingress/
 repo_url: https://github.com/wx-one/wxingress
-repo_name: wxone/wxingress
+repo_name: wx-one/wxingress
 edit_uri: edit/main/docs/
 copyright: >-
   Copyright &copy; 2025-2026 WizardTales GmbH and the wxingress contributors &middot;
@@ -45,8 +45,8 @@ extra:
   social:
     - icon: fontawesome/brands/github
       link: https://github.com/wx-one/wxingress
-    - icon: fontawesome/brands/docker
-      link: https://hub.docker.com/r/wxone/wxingress
+    - icon: fontawesome/solid/box
+      link: https://github.com/wx-one/wxingress/pkgs/container/wxingress
     - icon: fontawesome/solid/heart
       link: https://github.com/sponsors/wx-one
       name: Sponsor wxingress

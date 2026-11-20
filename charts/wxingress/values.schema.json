@@ -864,10 +864,10 @@
           "properties": {
             "repository": {
               "type": "string",
-              "default": "docker.io/wxone/wxingress",
+              "default": "ghcr.io/wx-one/wxingress",
               "title": "The repository of the Ingress Controller",
               "examples": [
-                "docker.io/wxone/wxingress"
+                "ghcr.io/wx-one/wxingress"
               ]
             },
             "tag": {
@@ -910,7 +910,7 @@
           },
           "examples": [
             {
-              "repository": "docker.io/wxone/wxingress",
+              "repository": "ghcr.io/wx-one/wxingress",
               "tag": "5.7.1",
               "pullPolicy": "IfNotPresent"
             }
@@ -2666,7 +2666,7 @@
           "logFormat": "glog",
           "customPorts": [],
           "image": {
-            "repository": "docker.io/wxone/wxingress",
+            "repository": "ghcr.io/wx-one/wxingress",
             "tag": "5.7.1",
             "digest": "",
             "pullPolicy": "IfNotPresent"
@@ -3299,7 +3299,7 @@
         "logFormat": "glog",
         "customPorts": [],
         "image": {
-          "repository": "docker.io/wxone/wxingress",
+          "repository": "ghcr.io/wx-one/wxingress",
           "tag": "5.7.1",
           "digest": "",
           "pullPolicy": "IfNotPresent"

@@ -5,7 +5,7 @@
 [![CI](https://github.com/wx-one/wxingress/actions/workflows/ci.yml/badge.svg)](https://github.com/wx-one/wxingress/actions/workflows/ci.yml)
 [![Docs](https://img.shields.io/badge/docs-wx--one.github.io%2Fwxingress-blue)](https://wx-one.github.io/wxingress/)
 [![License: EUPL-1.2](https://img.shields.io/badge/license-EUPL--1.2-blue)](LICENSE)
-[![Docker Pulls](https://img.shields.io/docker/pulls/wxone/wxingress?logo=docker&logoColor=white)](https://hub.docker.com/r/wxone/wxingress)
+[![Image](https://img.shields.io/badge/image-ghcr.io%2Fwx--one%2Fwxingress-blue?logo=github)](https://github.com/wx-one/wxingress/pkgs/container/wxingress)
 [![Sponsor](https://img.shields.io/badge/sponsor-%E2%9D%A4-ea4aaa?logo=githubsponsors)](https://github.com/sponsors/wx-one)
 
 ## Made by WX-ONE and WizardTales
@@ -98,7 +98,7 @@ defaults, updates endpoints dynamically and serves Ingresses without a host. To 
 IngressClass `nginx` of an existing ingress-nginx installation, read the
 [migration guide](https://wx-one.github.io/wxingress/migration/ingress-nginx/) first.
 
-Images: `docker.io/wxone/wxingress:<version>`, for example `5.7.1-wx5`. The image contains
+Images: `ghcr.io/wx-one/wxingress:<version>`, for example `5.7.1-wx5`. The image contains
 NGINX 1.31.9 from nginx.org.
 
 ## Moving from ingress-nginx

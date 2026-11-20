@@ -6,7 +6,7 @@ Container Registry, and the images are on Docker Hub.
 | | |
 |---|---|
 | Chart | `oci://ghcr.io/wx-one/charts/wxingress` |
-| Image | `docker.io/wxone/wxingress:<version>`, for example `5.7.1-wx5` |
+| Image | `ghcr.io/wx-one/wxingress:<version>`, for example `5.7.1-wx5` |
 | Kubernetes | 1.25 or newer (tested on 1.31 and 1.32) |
 | Helm | 3.8 or newer (OCI support) |
 
@@ -118,7 +118,7 @@ helm upgrade wxingress oci://ghcr.io/wx-one/charts/wxingress -n wxingress --reus
 Helm does not upgrade CRDs. Apply the CRDs of the new version before you upgrade the chart:
 
 ```sh
-kubectl apply --server-side -f https://raw.githubusercontent.com/wxone/wxingress/<tag>/deploy/crds.yaml
+kubectl apply --server-side -f https://raw.githubusercontent.com/wx-one/wxingress/<tag>/deploy/crds.yaml
 ```
 
 ## Uninstalling

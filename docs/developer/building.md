@@ -84,5 +84,5 @@ The scripts in `dataplane/e2e/` run against a kind cluster and need Docker, kind
 `.github/workflows/ci.yml` runs the Go tests, builds the controller, builds and tests the data plane
 module in the meta image, and lints the chart, on every push and pull request.
 `.github/workflows/release.yml` runs on tags `v*`, builds the image and pushes it to
-`docker.io/wxone/wxingress`, pushes the chart to `oci://ghcr.io/wx-one/charts`, and creates a GitHub
+`ghcr.io/wx-one/wxingress`, pushes the chart to `oci://ghcr.io/wx-one/charts`, and creates a GitHub
 release.

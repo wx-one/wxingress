@@ -57,7 +57,7 @@ upgrade. The Gateway API CRDs are optional, see [Gateway API](#gateway-api).
 
 | Value | Default | Description |
 |---|---|---|
-| `controller.image.repository` | `docker.io/wxone/wxingress` | The image repository. |
+| `controller.image.repository` | `ghcr.io/wx-one/wxingress` | The image repository. |
 | `controller.image.tag` | the chart's `appVersion` | The image tag. |
 | `controller.image.digest` | (unset) | An image digest; wins over the tag. |
 | `controller.image.pullPolicy` | `IfNotPresent` | The pull policy. |
@@ -123,7 +123,7 @@ A typical migration values file:
 ```yaml
 controller:
   image:
-    repository: docker.io/wxone/wxingress
+    repository: ghcr.io/wx-one/wxingress
   ingressNginxCompat: true
   ingressClass:
     create: false          # ingress-nginx still owns the IngressClass "nginx"

@@ -448,7 +448,7 @@ spec:
       dnsPolicy: ClusterFirst
       containers:
       - name: wxingress
-        image: docker.io/wxone/wxingress:5.7.1-wx5
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         imagePullPolicy: "IfNotPresent"
         lifecycle:
           preStop:
@@ -1220,7 +1220,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -1801,7 +1801,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -2232,7 +2232,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -2704,7 +2704,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -3185,7 +3185,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -3668,7 +3668,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -4247,7 +4247,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -4791,7 +4791,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -5287,7 +5287,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -5882,7 +5882,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -6469,7 +6469,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -7002,7 +7002,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -7557,7 +7557,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -7993,7 +7993,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -8440,7 +8440,7 @@ spec:
       dnsPolicy: ClusterFirst
       containers:
       - name: wxingress
-        image: docker.io/wxone/wxingress:5.7.1-wx5
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         imagePullPolicy: "IfNotPresent"
         ports:
         - name: http
@@ -8900,7 +8900,7 @@ spec:
       dnsPolicy: ClusterFirst
       containers:
       - name: wxingress
-        image: docker.io/wxone/wxingress:5.7.1-wx5
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         imagePullPolicy: "IfNotPresent"
         ports:
         - name: http
@@ -9003,7 +9003,7 @@ spec:
           - -weight-changes-dynamic-reload=false
       initContainers:
       - name: init-wxingress
-        image: docker.io/wxone/wxingress:5.7.1-wx5
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         imagePullPolicy: "IfNotPresent"
         command: ['cp', '-vdR', '/etc/nginx/.', '/mnt/etc']
         resources:
@@ -9359,7 +9359,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -9806,7 +9806,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -10256,7 +10256,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -10739,7 +10739,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -11235,7 +11235,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -11710,7 +11710,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -12183,7 +12183,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -12653,7 +12653,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -13104,7 +13104,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -13575,7 +13575,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -14033,7 +14033,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -14484,7 +14484,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -14935,7 +14935,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -15414,7 +15414,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -15894,7 +15894,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -16347,7 +16347,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -16797,7 +16797,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -17299,7 +17299,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -17776,7 +17776,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -18243,7 +18243,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -18730,7 +18730,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -19208,7 +19208,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -19676,7 +19676,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -20144,7 +20144,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -20673,7 +20673,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -21203,7 +21203,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -21666,7 +21666,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -22129,7 +22129,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -22596,7 +22596,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -23064,7 +23064,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -23539,7 +23539,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
@@ -23643,7 +23643,7 @@ spec:
           - -weight-changes-dynamic-reload=false
       initContainers:
       - name: init-wxingress
-        image: docker.io/wxone/wxingress:5.7.1-wx5
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         imagePullPolicy: "IfNotPresent"
         command: ['cp', '-vdR', '/etc/nginx/.', '/mnt/etc']
         resources:
@@ -24033,7 +24033,7 @@ spec:
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
-      - image: docker.io/wxone/wxingress:5.7.1-wx5
+      - image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         name: wxingress
         imagePullPolicy: "IfNotPresent"
         ports:
