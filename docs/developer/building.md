@@ -48,7 +48,7 @@ image (`NGINX_VERSION` in `dataplane/build.sh`).
 
 ```sh
 docker run --rm -v "$PWD:/src" -w /src -e META=/opt/meta/meta \
-  docker.io/wxone/meta:5129ecb6 ./dataplane/build.sh
+  docker.io/wxone/meta:44cb41f0 ./dataplane/build.sh
 # the module:      dataplane/build/ngx_http_wxingress_module.so
 # a test nginx:    dataplane/build/nginx/sbin/nginx
 

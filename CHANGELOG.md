@@ -4,6 +4,34 @@ wxingress versions are `<NGINX Ingress Controller version>-wx<n>`: `5.7.1-wx5` i
 release based on NGINX Ingress Controller 5.7.1. The changes of NGINX Ingress Controller itself are on its
 [releases page](https://github.com/nginx/kubernetes-ingress/releases).
 
+## 5.7.1-wx9
+
+A security release. Upgrade from every earlier version; it matters most where JWT or OIDC Policies
+are used.
+
+### Security
+
+- A JWT nobody verified could end an NGINX worker: deeply nested array claims were written out
+  recursively, and claims are also read for refused requests (`add_header ... always`, log formats).
+  Arrays are written out at most 8 levels deep.
+- A key set read from a file could end up in another Policy's slot when all slots of a worker were in
+  use, so that Policy accepted tokens signed with the wrong keys.
+- An OIDC session that could not be remembered (a client secret of 512 bytes or more) left the session
+  before it remembered, so the next request with that cookie got another user's tokens and claims.
+- JWT parts with a top-level name given twice or a `\u0000` in a string are refused.
+- Built with metalang 44cb41f0, which fixes in its runtime:
+  - HTTP client: only `http` and `https` (a JWKS or OIDC endpoint from a provider's discovery
+    document could name `file://` or `gopher://`), no line breaks in header names, values or the
+    method, a 64 MiB limit and a total timeout for buffered bodies, retries that start empty.
+  - HTTP: an unread request body is discarded before every answer; a request that ends while a JWT
+    or OIDC check waits no longer leaves freed memory behind or keeps an old worker from exiting
+    after a reload; routes match the normalised URI; line breaks in response headers and variables
+    (an OIDC claim passed to `proxy_set_header`) are refused; all request headers are visible, not
+    only the first 32.
+  - Tasks: a 64 KiB guard below every task stack and stack clash protection; the offload pool works
+    in workers forked from a master that used it; running out of memory or threads fails a request
+    instead of ending the process.
+
 ## 5.7.1-wx8
 
 - The data plane reads JWT key sets and OIDC session keys from their files off the event loop. Before,
