@@ -556,6 +556,9 @@ server {
 
     {{- end }}
 
+    {{- range $rule := $s.GlobalAccessRules }}
+    {{ $rule }};
+    {{- end }}
     {{- range $snippet := $s.Snippets }}
     {{ $snippet }}
     {{- end }}

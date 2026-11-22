@@ -169,11 +169,11 @@ func TranslateIngressNginxConfigMap(data map[string]string) (out map[string]stri
 				if r = strings.TrimSpace(r); r == "" {
 					continue
 				} else if k == "denylist-source-range" || k == "block-cidrs" {
-					denies = append(denies, "deny "+r+";")
+					denies = append(denies, r)
 				} else if k == "whitelist-source-range" && data["allowlist-source-range"] != "" {
 					// allowlist-source-range wins
 				} else {
-					allows = append(allows, "allow "+r+";")
+					allows = append(allows, r)
 				}
 			}
 		case ingressNginxConfigMapNoops[k] != "":
@@ -184,20 +184,19 @@ func TranslateIngressNginxConfigMap(data map[string]string) (out map[string]stri
 			warnings = append(warnings, fmt.Sprintf("%s is not supported by wxingress and is ignored", k))
 		}
 	}
-	// the denied first, as nginx takes the first rule that matches; the
-	// allowed with deny all; Ingresses with source ranges of their own replace them
-	httpAccess := denies
-	if denyAll {
-		httpAccess = append(httpAccess, "deny all;")
-	} else if len(allows) > 0 {
-		httpAccess = append(append(httpAccess, allows...), "deny all;")
-	}
-	if len(httpAccess) > 0 {
-		// in the servers of the resources, not the http block: nginx's own servers (status, the module's API) stay open
-		if s := out["server-snippets"]; s != "" {
-			httpAccess = append([]string{s}, httpAccess...)
+	// the global source ranges stay keys of their own - the controller renders
+	// them into every server beside, not inside, the server snippets, which an
+	// Ingress or VirtualServer with snippets of its own replaces
+	switch {
+	case denyAll:
+		out["denylist-source-range"] = "0.0.0.0/0,::/0"
+	default:
+		if len(denies) > 0 {
+			out["denylist-source-range"] = strings.Join(denies, ",")
 		}
-		out["server-snippets"] = strings.Join(httpAccess, "\n")
+		if len(allows) > 0 {
+			out["allowlist-source-range"] = strings.Join(allows, ",")
+		}
 	}
 	return out, warnings, unsafe
 }
@@ -209,4 +208,37 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// globalAccessRules renders the global source ranges as nginx renders access
+// rules, the first that matches deciding: the denied ranges, then the allowed
+// ones and "deny all". A range that is no address or CIDR denies everything,
+// so that a typo never opens what the list meant to close.
+func globalAccessRules(denylist, allowlist string) (rules []string, warnings []string) {
+	ranges := func(name, value string) ([]string, bool) {
+		if strings.TrimSpace(value) == "" {
+			return nil, true
+		}
+		cidrs, err := parseIngressNginxCIDRs(value)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("%s is invalid, every request is denied: %v", name, err))
+			return nil, false
+		}
+		return cidrs, true
+	}
+	deny, okDeny := ranges("denylist-source-range", denylist)
+	allow, okAllow := ranges("allowlist-source-range", allowlist)
+	if !okDeny || !okAllow {
+		return []string{"deny all"}, warnings
+	}
+	for _, r := range deny {
+		rules = append(rules, "deny "+r)
+	}
+	for _, r := range allow {
+		rules = append(rules, "allow "+r)
+	}
+	if len(allow) > 0 {
+		rules = append(rules, "deny all")
+	}
+	return rules, warnings
 }

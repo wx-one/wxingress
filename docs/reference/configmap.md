@@ -263,14 +263,13 @@ With `enable-real-ip: "true"` or `use-proxy-protocol: "true"`, the client addres
 `denylist-source-range` and `block-cidrs` take comma-separated addresses and CIDRs (IPv4 and IPv6) and are rendered as
 `deny` and `allow` rules in every server of Ingresses and VirtualServers: the denied ranges first, then the allowed
 ones followed by `deny all`. NGINX's own servers (status, the module's API) are not affected. An Ingress with source
-ranges of its own (annotations) uses those instead, as in ingress-nginx. A value that is not a list of addresses denies
-every request, with a warning and an error in the log.
+ranges of its own (annotations) uses those instead in its locations, as in ingress-nginx. A value that is not a list
+of addresses or CIDRs denies every request, with a warning and an error in the log.
 
-!!! warning
-    The rules are added to the ConfigMap's `server-snippets` (after the snippets the ConfigMap itself has). A resource
-    with server snippets of its own - `nginx.org/server-snippets` or ingress-nginx's `server-snippet` on an Ingress,
-    `server-snippets` in a VirtualServer - gets its own snippets instead of the ConfigMap's, and with them loses these
-    global allow and deny rules.
+The rules are rendered on their own, independently of snippets: a resource with server snippets of its own
+(`nginx.org/server-snippets` or ingress-nginx's `server-snippet` on an Ingress, `server-snippets` in a VirtualServer)
+replaces the ConfigMap's `server-snippets`, but keeps these rules. Up to 5.7.1-wx9 they were part of the ConfigMap's
+`server-snippets` and were lost with them.
 
 ### Accepted without effect
 

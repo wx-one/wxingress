@@ -301,6 +301,11 @@ server {
 	{{- end }}
 	{{- end }}
 
+	{{- /* the ConfigMap's source ranges, which no snippet replaces; the
+	       source ranges of an Ingress replace them in its locations */}}
+	{{- range $rule := $server.GlobalAccessRules }}
+	{{ $rule }};
+	{{- end }}
 	{{- range $value := $server.ServerSnippets}}
 	{{$value}}{{- end}}
 

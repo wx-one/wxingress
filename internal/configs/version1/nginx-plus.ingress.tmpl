@@ -428,6 +428,9 @@ server {
 	{{end}}
 	{{- end}}
 
+	{{- range $rule := $server.GlobalAccessRules }}
+	{{ $rule }};
+	{{- end }}
 	{{- if $server.ServerSnippets}}
 	{{- range $value := $server.ServerSnippets}}
 	{{$value}}{{end}}

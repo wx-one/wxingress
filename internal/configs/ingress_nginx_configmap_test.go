@@ -3,6 +3,7 @@ package configs
 import (
 	"context"
 	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -24,7 +25,8 @@ func TestTranslateIngressNginxConfigMap(t *testing.T) {
 		"real-ip-header": "proxy_protocol", "set-real-ip-from": "10.0.0.0/8", "log-format-escaping": "json",
 		"otel-exporter-endpoint": "otel:4318",
 		"otel-trace-context":     "propagate",
-		"server-snippets":        "deny 10.1.0.0/16;\nallow 10.0.0.0/8;\nallow 192.0.2.0/24;\ndeny all;",
+		"denylist-source-range":  "10.1.0.0/16",
+		"allowlist-source-range": "10.0.0.0/8,192.0.2.0/24",
 	}
 	if !maps.Equal(out, want) {
 		t.Errorf("got  %v\nwant %v", out, want)
@@ -74,5 +76,40 @@ func TestTranslateIngressNginxRealIP(t *testing.T) {
 		if out["real-ip-header"] != test.header || out["set-real-ip-from"] != test.from {
 			t.Errorf("%v: real-ip-header %q set-real-ip-from %q, want %q %q", test.data, out["real-ip-header"], out["set-real-ip-from"], test.header, test.from)
 		}
+	}
+}
+
+// The global source ranges are rules of every server of their own, not server
+// snippets: an Ingress or VirtualServer with snippets of its own replaced
+// those, and the rules with them.
+func TestParseConfigMapGlobalAccessRules(t *testing.T) {
+	t.Parallel()
+	parse := func(data map[string]string, defaults bool) []string {
+		t.Helper()
+		cfg, _ := ParseConfigMap(context.Background(), &v1.ConfigMap{Data: data}, false, false, false, false, false, false, defaults, nil)
+		return cfg.GlobalAccessRules
+	}
+	for _, tc := range []struct {
+		name string
+		data map[string]string
+		want []string
+	}{
+		{"whitelist and block-cidrs", map[string]string{"whitelist-source-range": "10.0.0.0/8, 192.0.2.1", "block-cidrs": "10.1.0.0/16"}, []string{"deny 10.1.0.0/16", "allow 10.0.0.0/8", "allow 192.0.2.1", "deny all"}},
+		{"allowlist wins over whitelist", map[string]string{"allowlist-source-range": "10.0.0.0/8", "whitelist-source-range": "192.0.2.0/24"}, []string{"allow 10.0.0.0/8", "deny all"}},
+		{"denylist alone", map[string]string{"denylist-source-range": "198.51.100.0/24"}, []string{"deny 198.51.100.0/24"}},
+		{"not a list of addresses", map[string]string{"allowlist-source-range": "intranet"}, []string{"deny 0.0.0.0/0", "deny ::/0"}},
+		{"an invalid CIDR", map[string]string{"allowlist-source-range": "10.0.0.0/99"}, []string{"deny all"}},
+		{"with server snippets", map[string]string{"allowlist-source-range": "10.0.0.0/8", "server-snippets": "# mine"}, []string{"allow 10.0.0.0/8", "deny all"}},
+	} {
+		if got := parse(tc.data, true); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	if got := parse(map[string]string{"allowlist-source-range": "10.0.0.0/8"}, false); got != nil {
+		t.Errorf("without -ingress-nginx-defaults: %q", got)
+	}
+	cfg, _ := ParseConfigMap(context.Background(), &v1.ConfigMap{Data: map[string]string{"allowlist-source-range": "10.0.0.0/8", "server-snippets": "# mine"}}, false, false, false, false, false, true, true, nil)
+	if !slices.Equal(cfg.ServerSnippets, []string{"# mine"}) {
+		t.Errorf("the server snippets are %q", cfg.ServerSnippets)
 	}
 }

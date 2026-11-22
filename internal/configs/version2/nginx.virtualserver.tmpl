@@ -357,6 +357,10 @@ server {
     error_page {{ $e.Codes }} {{ if gt $e.ResponseCode 0 }}={{ $e.ResponseCode }} {{ end }}"{{ $e.Name }}";
     {{- end }}
 
+    {{- /* the ConfigMap's source ranges, which no snippet replaces */}}
+    {{- range $rule := $s.GlobalAccessRules }}
+    {{ $rule }};
+    {{- end }}
     {{- range $snippet := $s.Snippets }}
     {{ $snippet }}
     {{- end }}

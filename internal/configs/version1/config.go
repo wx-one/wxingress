@@ -115,9 +115,11 @@ type LimitReqZone struct {
 type Server struct {
 	AddHeaderInherit string
 	ServerSnippets   []string
-	Name             string
-	IsDefaultServer  bool
-	AccessLogOff     bool
+	// GlobalAccessRules are the allow/deny directives of the ConfigMap's source ranges.
+	GlobalAccessRules []string
+	Name              string
+	IsDefaultServer   bool
+	AccessLogOff      bool
 	// ServerAliases are more names of the server (server-alias of ingress-nginx).
 	ServerAliases []string
 	// IngressNginxRedirect makes the redirect to https ingress-nginx's: https://<Host without port><URI without trailing slash>.

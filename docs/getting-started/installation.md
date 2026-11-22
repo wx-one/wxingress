@@ -7,7 +7,7 @@ context.
 | | |
 |---|---|
 | Chart | `oci://ghcr.io/wx-one/charts/wxingress` |
-| Image | `ghcr.io/wx-one/wxingress:<version>`, for example `5.7.1-wx9`, signed with cosign |
+| Image | `ghcr.io/wx-one/wxingress:<version>`, for example `5.7.1-wx10`, signed with cosign |
 | Kubernetes | 1.25 or newer (tested on 1.31 and 1.32) |
 | Helm | 3.8 or newer (OCI support) |
 

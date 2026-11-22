@@ -1293,6 +1293,7 @@ func (vsc *virtualServerConfigurator) GenerateVirtualServerConfig(
 			SetRealIPFrom:             vsc.cfgParams.SetRealIPFrom,
 			RealIPHeader:              vsc.cfgParams.RealIPHeader,
 			RealIPRecursive:           vsc.cfgParams.RealIPRecursive,
+			GlobalAccessRules:         vsc.cfgParams.GlobalAccessRules,
 			Snippets:                  serverSnippets,
 			InternalRedirectLocations: internalRedirectLocations,
 			Locations:                 locations,

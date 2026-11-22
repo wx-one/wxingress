@@ -549,6 +549,7 @@ func generateNginxCfg(ncp NginxCfgParams) (version1.IngressNginxConfig, Warnings
 			ProxyPassHeaders:       cfgParams.ProxyPassHeaders,
 			AddHeaders:             cfgParams.AddHeaders,
 			ServerSnippets:         cfgParams.ServerSnippets,
+			GlobalAccessRules:      cfgParams.GlobalAccessRules,
 			Ports:                  cfgParams.Ports,
 			SSLPorts:               cfgParams.SSLPorts,
 			TLSPassthrough:         ncp.staticParams.TLSPassthrough,

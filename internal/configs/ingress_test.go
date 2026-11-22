@@ -7291,3 +7291,30 @@ func TestGenerateNginxCfgForEmptyHostNoRedirectWithIngressNginxDefaults(t *testi
 		}
 	}
 }
+
+// An Ingress with server snippets of its own - nginx.org/server-snippets or
+// ingress-nginx's server-snippet - replaces the ConfigMap's server-snippets,
+// but not its source ranges: they were snippets once and went with them.
+func TestGenerateNginxCfgKeepsGlobalAccessRulesWithServerSnippets(t *testing.T) {
+	t.Parallel()
+	for _, annotation := range []string{"nginx.org/server-snippets", IngressNginxAnnotationPrefix + "server-snippet"} {
+		configParams := NewDefaultConfigParams(context.Background(), false)
+		configParams.ServerSnippets = []string{"# the ConfigMap's"}
+		configParams.GlobalAccessRules = []string{"deny 10.1.0.0/16", "allow 10.0.0.0/8", "deny all"}
+		ingEx := createCafeIngressEx()
+		ingEx.Ingress.Annotations[annotation] = "# the Ingress's"
+		result, _ := generateNginxCfg(NginxCfgParams{
+			staticParams:  &StaticConfigParams{EnableSnippets: true},
+			ingEx:         &ingEx,
+			BaseCfgParams: configParams,
+		})
+		for _, server := range result.Servers {
+			if !slices.Equal(server.GlobalAccessRules, configParams.GlobalAccessRules) {
+				t.Errorf("%s: server %s has the rules %q", annotation, server.Name, server.GlobalAccessRules)
+			}
+			if slices.Contains(server.ServerSnippets, "# the ConfigMap's") {
+				t.Errorf("%s: the ConfigMap's server snippets are still there", annotation)
+			}
+		}
+	}
+}

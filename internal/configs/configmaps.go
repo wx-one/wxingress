@@ -525,6 +525,17 @@ func ParseConfigMap(ctx context.Context, cfgm *v1.ConfigMap, nginxPlus bool, has
 		cfgParams.ServerSnippets = serverSnippets
 	}
 
+	if ingressNginxDefaults {
+		rules, warnings := globalAccessRules(cfgm.Data["denylist-source-range"], cfgm.Data["allowlist-source-range"])
+		for _, w := range warnings {
+			nl.Warnf(l, "ConfigMap %s/%s: %s", cfgm.Namespace, cfgm.Name, w)
+			if eventLog != nil {
+				eventLog.Event(cfgm, v1.EventTypeWarning, nl.EventReasonInvalidValue, w)
+			}
+		}
+		cfgParams.GlobalAccessRules = rules
+	}
+
 	if _, exists, err := GetMapKeyAsInt(cfgm.Data, "worker-processes", cfgm); exists {
 		if err != nil && cfgm.Data["worker-processes"] != "auto" {
 			nl.Error(l, err)

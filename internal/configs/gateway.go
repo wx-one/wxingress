@@ -224,11 +224,8 @@ func ParseGatewaySettings(namespace, name string, annotations map[string]string,
 	if n, size := splitProxyBuffers(cfg.ProxyBuffers); n > 0 {
 		u.ProxyBuffers = &conf_v1.UpstreamBuffers{Number: n, Size: size}
 	}
-	// what ewma and round_robin are without the module, as for an Ingress;
-	// least_time is NGINX Plus', which a VirtualServer upstream does not take
-	if strings.HasPrefix(u.LBMethod, "least_time") {
-		u.LBMethod = ""
-	}
+	// what ewma and round_robin are without the module, as for an Ingress:
+	// open-source nginx has least_time, and a VirtualServer upstream takes it
 
 	s := GatewaySettings{
 		Upstream: u, ServerSnippets: serverSnippets, LocationSnippets: locationSnippets,

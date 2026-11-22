@@ -9850,3 +9850,28 @@ func TestExecuteTemplate_ForIngressWithIngressNginxErrors(t *testing.T) {
 		}
 	}
 }
+
+// The ConfigMap's source ranges are in the server beside its snippets: an
+// Ingress with server snippets of its own keeps them.
+func TestExecuteTemplate_ForIngressWithGlobalAccessRulesBesideSnippets(t *testing.T) {
+	t.Parallel()
+
+	for name, tmpl := range map[string]*template.Template{"oss": newNGINXIngressTmpl(t), "plus": newNGINXPlusIngressTmpl(t)} {
+		cfg := ingressCfg
+		cfg.Servers = slices.Clone(ingressCfg.Servers)
+		cfg.Servers[0].GlobalAccessRules = []string{"deny 10.1.0.0/16", "allow 10.0.0.0/8", "deny all"}
+		cfg.Servers[0].ServerSnippets = []string{"# a server snippet of the Ingress"}
+		buf := &bytes.Buffer{}
+		if err := tmpl.Execute(buf, cfg); err != nil {
+			t.Fatal(err)
+		}
+		rules := strings.Index(buf.String(), "deny 10.1.0.0/16;\n\tallow 10.0.0.0/8;\n\tdeny all;")
+		snippet := strings.Index(buf.String(), "# a server snippet of the Ingress")
+		if rules < 0 || snippet < rules {
+			t.Errorf("%s: want the rules, then the snippet, in\n%s", name, buf.String())
+		}
+		if name == "oss" {
+			snaps.MatchSnapshot(t, buf.String())
+		}
+	}
+}

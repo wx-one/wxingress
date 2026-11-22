@@ -110,16 +110,22 @@ type ConfigParams struct {
 	ResolverTimeout                        string
 	ResolverValid                          string
 	ServerSnippets                         []string
-	ServerTokens                           string
-	ServerSSLCiphers                       string
-	ServerSSLPreferServerCiphers           bool
-	SlowStart                              string
-	SSLRedirect                            bool
-	UpstreamZoneSize                       string
-	UseClusterIP                           bool
-	VariablesHashBucketSize                uint64
-	VariablesHashMaxSize                   uint64
-	ZoneSync                               ZoneSync
+	// GlobalAccessRules are the allow and deny directives of the ConfigMap's
+	// denylist-source-range and allowlist-source-range (ingress-nginx's, with
+	// -ingress-nginx-defaults), in every server of an Ingress or VirtualServer
+	// whatever its snippets; the source ranges of an Ingress replace them in
+	// its locations, as in ingress-nginx.
+	GlobalAccessRules            []string
+	ServerTokens                 string
+	ServerSSLCiphers             string
+	ServerSSLPreferServerCiphers bool
+	SlowStart                    string
+	SSLRedirect                  bool
+	UpstreamZoneSize             string
+	UseClusterIP                 bool
+	VariablesHashBucketSize      uint64
+	VariablesHashMaxSize         uint64
+	ZoneSync                     ZoneSync
 
 	// The rewrite of ingress-nginx: rewrite-target, use-regex and x-forwarded-prefix.
 	// IngressNginxDefaults tells that the defaults are those of ingress-nginx

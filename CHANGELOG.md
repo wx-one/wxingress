@@ -4,6 +4,25 @@ wxingress versions are `<NGINX Ingress Controller version>-wx<n>`: `5.7.1-wx5` i
 release based on NGINX Ingress Controller 5.7.1. The changes of NGINX Ingress Controller itself are on its
 [releases page](https://github.com/nginx/kubernetes-ingress/releases).
 
+## 5.7.1-wx10
+
+A security release. Upgrade where an ingress-nginx ConfigMap has global allow or deny lists and
+snippets are enabled.
+
+### Security
+
+- The global allow and deny lists of an ingress-nginx ConfigMap (`allowlist-source-range`,
+  `whitelist-source-range`, `denylist-source-range`, `block-cidrs`, with `-ingress-nginx-defaults`) were
+  rendered into the ConfigMap's `server-snippets`. With snippets enabled, an Ingress or VirtualServer
+  with server snippets of its own replaced those, and its host was served without the global lists.
+  They are now rules of every server of their own, which snippets do not replace. A range that is
+  not a valid address or CIDR denies every request instead of failing the reload.
+
+### Changes
+
+- Routes of the Gateway API keep `least_time`, which open-source NGINX has: `load-balance: ewma`
+  without the wxingress module is `least_time last_byte` on a route as on an Ingress, not round robin.
+
 ## 5.7.1-wx9
 
 A security release. Upgrade from every earlier version; it matters most where JWT or OIDC Policies

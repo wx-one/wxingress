@@ -5418,3 +5418,26 @@ func TestVirtualServerNamesTheDefaultCertificateWhenTheModuleHasTheCertificates(
 		}
 	}
 }
+
+// The ConfigMap's source ranges are in the server beside its snippets: a
+// VirtualServer with server snippets of its own keeps them.
+func TestExecuteVirtualServerTemplate_RendersGlobalAccessRulesBesideSnippets(t *testing.T) {
+	t.Parallel()
+	for name, executor := range map[string]*TemplateExecutor{"oss": newTmplExecutorNGINX(t), "plus": newTmplExecutorNGINXPlus(t)} {
+		cfg := virtualServerCfg
+		cfg.Server.GlobalAccessRules = []string{"deny 10.1.0.0/16", "allow 10.0.0.0/8", "deny all"}
+		cfg.Server.Snippets = []string{"# a server snippet of the VirtualServer"}
+		got, err := executor.ExecuteVirtualServerTemplate(&cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rules := bytes.Index(got, []byte("deny 10.1.0.0/16;\n    allow 10.0.0.0/8;\n    deny all;"))
+		snippet := bytes.Index(got, []byte("# a server snippet of the VirtualServer"))
+		if rules < 0 || snippet < rules {
+			t.Errorf("%s: want the rules, then the snippet, in\n%s", name, got)
+		}
+		if name == "oss" {
+			snaps.MatchSnapshot(t, string(got))
+		}
+	}
+}

@@ -509,8 +509,8 @@ key of the same name as it is, a renamed one under the name of wxingress
 `server-name-hash-*`) - a key of wxingress itself wins - and
 `whitelist-source-range`, `allowlist-source-range`, `denylist-source-range`
 and `block-cidrs` as allow/deny in every server of the resources (an Ingress
-with source ranges of its own has those, as in ingress-nginx; one with
-`nginx.org/server-snippets` replaces them). Keys wxingress needs nothing for
+with source ranges of its own has those, as in ingress-nginx; snippets do
+not replace them). Keys wxingress needs nothing for
 (`strict-validate-path-type`, `allow-snippet-annotations`, ...) are taken
 silently. So are `compute-full-forwarded-for`, `generate-request-id` and
 `ssl-session-tickets`, which are not read at all: a value other than the
