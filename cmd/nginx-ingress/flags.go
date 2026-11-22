@@ -138,8 +138,9 @@ NIC prints a startup warning when set. Requires -plm-storage-url.`)
 	ingressClass = flag.String("ingress-class", "nginx",
 		`A class of the Ingress Controller.
 
-	An IngressClass resource with the name equal to the class must be deployed. Otherwise, the Ingress Controller will fail to start.
-	The Ingress Controller only processes resources that belong to its class - i.e. have the "ingressClassName" field resource equal to the class.
+	Ingresses whose "ingressClassName" field (or kubernetes.io/ingress.class annotation) names the class are processed, whether or not an IngressClass resource of that name exists:
+	a missing IngressClass, or one whose controller is not in -ingress-class-controllers, only logs a warning.
+	Ingresses of every IngressClass whose controller is in -ingress-class-controllers are processed as well, whatever the class is called.
 
 	The Ingress Controller processes all the VirtualServer/VirtualServerRoute/TransportServer resources that do not have the "ingressClassName" field for all versions of kubernetes.`)
 
@@ -182,7 +183,7 @@ NIC prints a startup warning when set. Requires -plm-storage-url.`)
 		"Enable Leader election to avoid multiple replicas of the controller reporting the status of Ingress, VirtualServer and VirtualServerRoute resources -- only one replica will report status (default true). See -report-ingress-status flag.")
 
 	leaderElectionLockName = flag.String("leader-election-lock-name", "nginx-ingress-leader-election",
-		`Specifies the name of the ConfigMap, within the same namespace as the controller, used as the lock for leader election. Requires -enable-leader-election.`)
+		`Specifies the name of the Lease (coordination.k8s.io), within the same namespace as the controller, used as the lock for leader election. Requires -enable-leader-election.`)
 
 	nginxStatusAllowCIDRs = flag.String("nginx-status-allow-cidrs", "127.0.0.1,::1", `Add IP/CIDR blocks to the allow list for NGINX stub_status or the NGINX Plus API. Separate multiple IP/CIDR by commas.`)
 
@@ -313,7 +314,7 @@ NIC prints a startup warning when set. Requires -plm-storage-url.`)
 
 	enableTelemetryReporting = flag.Bool("enable-telemetry-reporting", false, "Ignored: wxingress has no telemetry. Kept so that existing values and arguments keep working.")
 
-	logFormat = flag.String("log-format", logFormatDefault, "Set log format to either glog, text, or json.")
+	logFormat = flag.String("log-format", logFormatDefault, "Set log format to glog, text, json, text-unix, text-unix-ms, json-unix or json-unix-ms (the -unix variants log the time as Unix seconds or milliseconds).")
 
 	logLevel = flag.String("log-level", logLevelDefault,
 		`Sets log level for Ingress Controller. Allowed values: fatal, error, warning, info, debug, trace.`)
@@ -357,7 +358,7 @@ func initValidate(ctx context.Context) {
 	l := nl.LoggerFromContext(ctx)
 	logFormatValidationError := validateLogFormat(*logFormat)
 	if logFormatValidationError != nil {
-		nl.Warnf(l, "Invalid log format: %s. Valid options are: glog, text, json. Falling back to default: %s", *logFormat, logFormatDefault)
+		nl.Warnf(l, "Invalid log format: %s. Valid options are: glog, text, json, text-unix, text-unix-ms, json-unix, json-unix-ms. Falling back to default: %s", *logFormat, logFormatDefault)
 	}
 
 	logLevelValidationError := validateLogLevel(*logLevel)

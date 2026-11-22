@@ -816,7 +816,11 @@
           "enum": [
             "glog",
             "json",
-            "text"
+            "json-unix",
+            "json-unix-ms",
+            "text",
+            "text-unix",
+            "text-unix-ms"
           ],
           "examples": [
             "json"

@@ -19,8 +19,10 @@ General rules, as in ingress-nginx:
   ignored`), typos included. Those that restrict who gets an answer make all
   locations of the Ingress answer 503 instead, with a warning event, since
   serving without them would serve what ingress-nginx refuses: `enable-modsecurity` and `enable-owasp-core-rules` (other than `false`),
-  `modsecurity-snippet`, `satisfy`, `global-rate-limit` (other than 0) and
-  `enable-global-auth` (other than `false`). That holds for Ingresses; on
+  `modsecurity-snippet` and `global-rate-limit` (other than 0).
+  `enable-global-auth` is only ignored with a warning: wxingress has no
+  global auth to turn on or off (the ConfigMap's `global-auth-*` keys are not
+  supported, below). That holds for Ingresses; on
   Gateway API routes only the annotations in "The Gateway API" are read, and
   each other one is a warning in the route's status and events - for those
   that restrict access, that the route is served without them (a Policy
@@ -189,6 +191,12 @@ and 128 MB of PEM.
 | `proxy-ssl-secret`, `proxy-ssl-verify`, `proxy-ssl-verify-depth`, `proxy-ssl-ciphers`, `proxy-ssl-protocols`, `proxy-ssl-name`, `proxy-ssl-server-name` | TLS to the backends (with `backend-protocol: HTTPS`) with ingress-nginx's defaults - verify off, depth 1, `TLSv1.2`, `DEFAULT` ciphers, server name off: the client certificate from `tls.crt`/`tls.key` and the CA from `ca.crt` of a Secret of the namespace (503 if it has neither). An `nginx.org` egressMTLS Policy wins. |
 | `ssl-passthrough` | With `-enable-tls-passthrough` (chart `controller.enableTLSPassthrough`, ingress-nginx's `--enable-ssl-passthrough`): per host a TransportServer of the TLS passthrough listener, made by the controller, that sends the TLS connections of that name untouched to the Service of path `/` (or the first path), endpoints without a reload. Without the flag ignored with a warning, as ingress-nginx ignores it without its flag. |
 | `enable-access-log` | `false`: `access_log off` in the locations of the Ingress. |
+| `enable-rewrite-log` | `true`: `rewrite_log on` in the locations of the Ingress (the rewrites are logged in the error log at `notice`). |
+| `proxy-cookie-domain`, `proxy-cookie-path` | `proxy_cookie_domain` and `proxy_cookie_path` in the locations of the Ingress, with the value `<from> <to>` or `off`; another value is ignored with a warning. |
+| `relative-redirects` | `true`: `absolute_redirect off` in the locations of the Ingress, so nginx's own redirects are relative; `false` leaves nginx's default. |
+| `use-port-in-redirects` | `port_in_redirect on` (`true`) or `off` (`false`) in the locations of the Ingress. |
+| `satisfy` | `satisfy any` or `satisfy all` in the locations of the Ingress: with `any`, a request that passes one of the source ranges, basic auth and external auth is served. Another value is ignored with a warning. |
+| `disable-proxy-intercept-errors` | `true`: the codes of `custom-http-errors` are not intercepted, the backends' answers go to the client as they are. A `default-backend` still gets the 502 and 503 (above). |
 | `server-alias` | More names of the server, comma- or space-separated host names. |
 | `upstream-vhost`, `app-root`, `ssl-ciphers`, `ssl-prefer-server-ciphers`, `proxy-redirect-from`, `proxy-redirect-to` | As `nginx.org/upstream-vhost`, `nginx.org/app-root`, `nginx.org/ssl-ciphers`, `nginx.org/ssl-prefer-server-ciphers`, `nginx.org/proxy-redirect-from` and `-to` (which win); a value with characters that would break out of the directive is ignored with a warning. |
 | `backend-protocol` | `HTTPS`, `GRPC`, `GRPCS` for every Service of the Ingress (as `nginx.org/ssl-services`, `nginx.org/grpc-services`); `HTTP`, `AUTO_HTTP` as they are; `FCGI` below; any other answers 503. |
@@ -401,9 +409,10 @@ keys apply without `hsts`, `hsts-preload` is read, and the ConfigMap takes
 ingress-nginx's keys as well (`internal/configs/ingress_nginx_configmap.go`): a
 key of the same name as it is, a renamed one under the name of wxingress
 (`proxy-body-size` as `client-max-body-size`, `keep-alive`,
-`upstream-keepalive-connections`, `max-worker-connections`,
-`use-proxy-protocol`, `enable-real-ip` with `forwarded-for-header` and
-`proxy-real-ip-cidr`, `log-format-upstream`, `log-format-escape-json`, the
+`keep-alive-requests`, `upstream-keepalive-connections`,
+`max-worker-connections`, `max-worker-open-files`, `use-proxy-protocol`,
+`enable-real-ip` with `forwarded-for-header` and `proxy-real-ip-cidr`,
+`log-format-upstream`, `log-format-stream`, `log-format-escape-json`, the
 `*-snippet` keys, `otlp-collector-host`/`-port`, `use-http2`, `hide-headers`,
 `server-name-hash-*`) - a key of wxingress itself wins - and
 `whitelist-source-range`, `allowlist-source-range`, `denylist-source-range`
@@ -411,7 +420,14 @@ and `block-cidrs` as allow/deny in every server of the resources (an Ingress
 with source ranges of its own has those, as in ingress-nginx; one with
 `nginx.org/server-snippets` replaces them). Keys wxingress needs nothing for
 (`strict-validate-path-type`, `allow-snippet-annotations`, ...) are taken
-silently; every other key is a Warning event on the ConfigMap, and those that
+silently. So are `compute-full-forwarded-for`, `generate-request-id` and
+`ssl-session-tickets`, which are not read at all: a value other than the
+default is dropped without a warning - `compute-full-forwarded-for: "true"`
+still sends `X-Forwarded-For $remote_addr`, `generate-request-id: "false"`
+still sends `X-Request-ID`, `ssl-session-tickets: "false"` leaves nginx's
+tickets on. The wxingress keys `limit-req-status-code`, `max-conns` and
+`slow-start` are taken without a warning too but are never parsed, so they
+have no effect. Every other key is a Warning event on the ConfigMap, and those that
 restrict access (`global-auth-*`, `enable-modsecurity`, `block-user-agents`,
 ...) also an error in the log that the Ingresses are served without them.
 `hack/ingress-nginx-values` translates the `controller.config` of the chart the
@@ -420,18 +436,30 @@ size, as ingress-nginx does.
 
 ### Taken from ingress-nginx with the switch
 
+The first column names the setting by its ingress-nginx key. Not every one of
+those keys is read from the ConfigMap: `proxy-buffers-number`,
+`proxy-request-buffering`, `proxy-next-upstream`, `proxy-next-upstream-timeout`,
+`proxy-next-upstream-tries`, `proxy-redirect-from` and, below,
+`proxy-http-version`, `proxy-cookie-domain`, `proxy-cookie-path` and
+`limit-conn-status-code` are refused as ConfigMap keys (a Warning event, the
+key is ignored); for them only the default of the table and the annotation of
+the same name per Ingress apply (for the buffers the wxingress key
+`proxy-buffers`, `"4 4k"`, sets the same). `limit-req-status-code`,
+`generate-request-id` and `compute-full-forwarded-for` are taken without a
+warning but have no effect: only the default of the table applies (see above).
+
 | Setting (ingress-nginx key) | ingress-nginx | without the switch | with the switch |
 |---|---|---|---|
 | `proxy-connect-timeout` | 5s | 60s | **5s** |
 | `client-body-buffer-size` | 8k | not set (nginx: two pages, 8k on x86-64) | **8k** |
 | `proxy-buffering` | off | on | **off** |
 | `proxy-buffer-size` | 4k | not set (nginx: one page) | **4k** |
-| `proxy-buffers-number` | 4 (`proxy_buffers 4 4k`) | not set (nginx: `8 4k`) | **`4 4k`** |
-| `proxy-request-buffering` | on | not set (nginx: on) | on |
-| `proxy-next-upstream` | error timeout | not set (nginx: error timeout) | error timeout |
-| `proxy-next-upstream-timeout` | 0 | not set (nginx: 0) | 0 |
-| `proxy-next-upstream-tries` | 3 | not set (nginx: 0, every server) | **3** |
-| `proxy-redirect-from` | off | not set (nginx: `proxy_redirect default`) | **off** |
+| `proxy-buffers-number` (annotation only) | 4 (`proxy_buffers 4 4k`) | not set (nginx: `8 4k`) | **`4 4k`** |
+| `proxy-request-buffering` (annotation only) | on | not set (nginx: on) | on |
+| `proxy-next-upstream` (annotation only) | error timeout | not set (nginx: error timeout) | error timeout |
+| `proxy-next-upstream-timeout` (annotation only) | 0 | not set (nginx: 0) | 0 |
+| `proxy-next-upstream-tries` (annotation only) | 3 | not set (nginx: 0, every server) | **3** |
+| `proxy-redirect-from` (annotation only) | off | not set (nginx: `proxy_redirect default`) | **off** |
 | `upstream-keepalive-connections` | 320 | 0, no `keepalive` | **64** per Service port (see below) |
 | `http-redirect-code` | 308 | 301 | **308** |
 | `hsts` | true | false | **true** |
@@ -445,9 +473,9 @@ size, as ingress-nginx does.
 | `max-worker-connections` | 16384 | 1024 | **16384** |
 | `worker-shutdown-timeout` | 240s | not set | **240s** |
 | `variables-hash-max-size` | 2048 | 1024 | **2048** |
-| `limit-req-status-code` | 503 | 429 for `nginx.org/limit-req-*` (ingress-nginx's rate limits answer 503 anyway) | **503** |
-| `generate-request-id` | true: `X-Request-ID` to the upstream, the client's or `$request_id` | not sent | **sent** |
-| `compute-full-forwarded-for` | false: `X-Forwarded-For $remote_addr` | `$proxy_add_x_forwarded_for` | **`$remote_addr`** |
+| `limit-req-status-code` (no effect as a key) | 503 | 429 for `nginx.org/limit-req-*` (ingress-nginx's rate limits answer 503 anyway) | **503** |
+| `generate-request-id` (no effect as a key) | true: `X-Request-ID` to the upstream, the client's or `$request_id` | not sent | **sent** |
+| `compute-full-forwarded-for` (no effect as a key) | false: `X-Forwarded-For $remote_addr` | `$proxy_add_x_forwarded_for` | **`$remote_addr`** |
 | WebSocket (not a setting: always in ingress-nginx) | `Upgrade` and `Connection` in every location | only for `nginx.org/websocket-services` | **every Ingress location** |
 | Other headers to the upstream | `X-Scheme`, `X-Forwarded-Scheme`, `X-Original-Forwarded-For`, `Proxy ""` | not sent | **sent** |
 | The same path twice for a host of one Ingress (not a setting: a host listed twice, a path listed twice) | the first one's location | two `location` of the path, a configuration nginx refuses (`duplicate location`) for every resource | **the first one**, as ingress-nginx |
@@ -472,8 +500,8 @@ ConfigMap gives every upstream that number.
 | `proxy-body-size` | 1m | 1m |
 | `proxy-busy-buffers-size` | not set | not set |
 | `proxy-max-temp-file-size` | 1024m | not set (nginx: 1024m) |
-| `proxy-http-version` | 1.1 | not set (nginx 1.31: 1.1); left unset so gRPC and `appProtocol: kubernetes.io/h2c` keep their own |
-| `proxy-cookie-domain`, `proxy-cookie-path` | off | not set (nginx: off) |
+| `proxy-http-version` (annotation only) | 1.1 | not set (nginx 1.31: 1.1); left unset so gRPC and `appProtocol: kubernetes.io/h2c` keep their own |
+| `proxy-cookie-domain`, `proxy-cookie-path` (annotations only) | off | not set (nginx: off) |
 | `ssl-redirect` | true | true |
 | `keep-alive`, `keep-alive-requests` | 75s, 1000 | 75s, 1000 |
 | `worker-processes` | number of CPUs | auto |
@@ -485,7 +513,7 @@ ConfigMap gives every upstream that number.
 | `client-header-buffer-size`, `large-client-header-buffers`, `client-header-timeout`, `client-body-timeout` | 1k, 4 8k, 60s, 60s | not set (nginx: the same) |
 | `http2-max-concurrent-streams` | 128 | not set (nginx: 128) |
 | `enable-underscores-in-headers`, `ignore-invalid-headers` | off, on | not set (nginx: the same) |
-| `limit-conn-status-code` | 503 | 503 for ingress-nginx's `limit-connections` |
+| `limit-conn-status-code` (not a key) | 503 | 503 for ingress-nginx's `limit-connections` |
 | default backend | 404 (`--default-backend-service`) | 404 (`-default-backend-service`) |
 
 ### Not covered
@@ -497,7 +525,7 @@ or the difference is one of capacity, not of behaviour:
 | Setting | ingress-nginx | wxingress |
 |---|---|---|
 | `ssl-session-cache`, `ssl-session-cache-size`, `ssl-session-timeout` | `shared:SSL:10m`, 10m | nginx's: no shared cache, 5m |
-| `ssl-session-tickets` | off | nginx's: on |
+| `ssl-session-tickets` | off | nginx's: on; the key is taken without a warning and has no effect |
 | `ssl-buffer-size` | 4k | nginx's: 16k |
 | `upstream-keepalive-time`, `-timeout`, `-requests` | 1h, 60s, 10000 | nginx's: 1h, 60s, 1000 |
 | `map-hash-bucket-size` | 64 | 256 (larger, only capacity) |

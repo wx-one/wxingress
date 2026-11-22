@@ -470,9 +470,10 @@ controller:
   ingressClass:
     ## A class of the Ingress Controller.
 
-    ## IngressClass resource with the name equal to the class must be deployed. Otherwise,
-    ## the Ingress Controller will fail to start.
-    ## The Ingress Controller only processes resources that belong to its class - i.e. have the "ingressClassName" field resource equal to the class.
+    ## Ingresses whose "ingressClassName" field (or kubernetes.io/ingress.class annotation) names the class are processed,
+    ## whether or not an IngressClass resource of that name exists: a missing IngressClass, or one whose controller is not
+    ## in "controllerValue"/"controllers", only logs a warning. The Ingresses of every IngressClass whose controller is in
+    ## "controllerValue"/"controllers" are processed as well, whatever the class is called.
 
     ## The Ingress Controller processes all the resources that do not have the "ingressClassName" field for all versions of kubernetes.
     name: nginx

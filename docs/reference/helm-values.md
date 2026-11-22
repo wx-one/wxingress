@@ -221,7 +221,7 @@ configuration fails `nginx -t`.
 | Value | Default | Description |
 |---|---|---|
 | `controller.logLevel` | `info` | `trace`, `debug`, `info`, `warning`, `error`, `fatal`. |
-| `controller.logFormat` | `glog` | `glog`, `json` or `text`. |
+| `controller.logFormat` | `glog` | `glog`, `json` or `text`, or `json-unix`, `json-unix-ms`, `text-unix`, `text-unix-ms` (the time as Unix seconds or milliseconds). |
 | `controller.watchNamespace`, `controller.watchNamespaceLabel`, `controller.watchSecretNamespace` | `""` | Restrict the watched namespaces. |
 | `controller.enableCustomResources` | `true` | Serve VirtualServer, TransportServer, Policy and the other custom resources. |
 | `controller.globalConfiguration.create`, `.spec`, `.customName` | `false` | A GlobalConfiguration with extra listeners for TransportServers. |

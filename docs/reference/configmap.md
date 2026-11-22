@@ -184,8 +184,11 @@ with a warning. For their meaning see the upstream
 [ConfigMap reference](https://docs.nginx.com/nginx-ingress-controller/configuration/global-configuration/configmap-resource/).
 
 !!! note "Keys without effect"
-    `limit-req-status-code`, `max-conns` and `slow-start` are accepted without a warning but currently have no
-    effect.
+    `limit-req-status-code`, `max-conns` and `slow-start` are accepted without a warning (also with
+    `-ingress-nginx-defaults`) but are never read, so they have no effect. In particular `limit-req-status-code` does not
+    change the status of rate-limited requests: ingress-nginx's `limit-rps`/`limit-rpm` annotations answer 503, and
+    `nginx.org/limit-req-*` answers 429 (503 with ingress-nginx defaults) unless `nginx.org/limit-req-reject-code` sets
+    another code.
 
 ## ingress-nginx keys
 
@@ -256,7 +259,8 @@ every request, with a warning and an error in the log.
 
 ### Accepted without effect
 
-These keys are accepted silently because wxingress behaves as their usual setting anyway:
+These keys are accepted silently - no Warning event, no log line - because wxingress behaves as their usual setting
+anyway. They are not read, so whatever value they have is dropped:
 
 | Key | Why |
 |---|---|
@@ -270,9 +274,11 @@ These keys are accepted silently because wxingress behaves as their usual settin
 | `ssl-session-tickets` | NGINX's default applies. |
 
 !!! warning
-    Because these keys are not read, a non-default value has no effect: `compute-full-forwarded-for: "true"`,
-    `generate-request-id: "false"` and `ssl-session-tickets: "false"` behave as their ingress-nginx defaults (for
-    `ssl-session-tickets`, NGINX's default `on`).
+    Because these keys are not read, a non-default value is dropped **without a warning**:
+    `compute-full-forwarded-for: "true"` still sends `X-Forwarded-For $remote_addr` (with ingress-nginx defaults; the
+    client's `X-Forwarded-For` is not appended), `generate-request-id: "false"` still sends `X-Request-ID`, and
+    `ssl-session-tickets: "false"` (ingress-nginx's default) leaves NGINX's session tickets on. Check a ConfigMap taken
+    from ingress-nginx for these keys.
 
 ### Keys that restrict access: served without them
 
@@ -297,7 +303,7 @@ Every other ingress-nginx key is ignored with a Warning event. Common ones and w
 
 | Keys | Alternative |
 |---|---|
-| `proxy-next-upstream`, `proxy-next-upstream-timeout`, `proxy-next-upstream-tries`, `proxy-request-buffering`, `proxy-redirect-from`, `proxy-http-version`, `proxy-buffers-number`, `proxy-cookie-domain`, `proxy-cookie-path` | The annotations of the same name per Ingress. With ingress-nginx defaults the defaults of ingress-nginx apply (for example 3 tries, `proxy_redirect off`). |
+| `proxy-next-upstream`, `proxy-next-upstream-timeout`, `proxy-next-upstream-tries`, `proxy-request-buffering`, `proxy-redirect-from`, `proxy-http-version`, `proxy-buffers-number`, `proxy-cookie-domain`, `proxy-cookie-path` | Not ConfigMap keys in wxingress: the annotations of the same name per Ingress. With ingress-nginx defaults the defaults of ingress-nginx apply (for example 3 tries, `proxy_redirect off`, `proxy_buffers 4 4k`) whatever the ConfigMap says. For the buffers, the wxingress key `proxy-buffers` (`"4 4k"`) sets the same. |
 | `load-balance`, `upstream-keepalive-time`, `-timeout`, `-requests` | `lb-method` and `keepalive` in the ConfigMap; `load-balance` per Ingress as an annotation. |
 | `use-gzip`, `gzip-*`, `enable-brotli`, `brotli-*` | `http-snippets` (`gzip on;` ...). |
 | `ssl-session-cache`, `ssl-session-cache-size`, `ssl-session-timeout`, `ssl-buffer-size`, `ssl-early-data`, `ssl-ecdh-curve`, `ssl-dh-param` | `http-snippets` for the directives; `ssl-dhparam-file` for DH parameters. |

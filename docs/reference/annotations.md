@@ -42,7 +42,8 @@ These behave as in ingress-nginx.
 | `proxy-buffer-size`, `proxy-buffers-number`, `proxy-busy-buffers-size` | Rendered as ingress-nginx renders them: `proxy_buffer_size S` and `proxy_buffers N S`. |
 | `proxy-max-temp-file-size`, `proxy-http-version` | `proxy-http-version` takes `1.0` or `1.1`. |
 | `proxy-next-upstream`, `proxy-next-upstream-timeout`, `proxy-next-upstream-tries` | ingress-nginx's validation; `non_idempotent` is moved to the end. |
-| `proxy-redirect-from`, `proxy-redirect-to`, `proxy-cookie-domain`, `proxy-cookie-path` | |
+| `proxy-redirect-from`, `proxy-redirect-to` | |
+| `proxy-cookie-domain`, `proxy-cookie-path` | `proxy_cookie_domain`, `proxy_cookie_path`: `<from> <to>` or `off`. |
 | `rewrite-target`, `use-regex`, `x-forwarded-prefix` | A `rewrite-target` or `use-regex` turns every path of the host (of every Ingress on it) into a case-insensitive regular expression, ordered longest first, as ingress-nginx does. |
 | `app-root`, `upstream-vhost`, `server-alias` | |
 | `permanent-redirect`, `permanent-redirect-code`, `temporal-redirect`, `temporal-redirect-code` | `temporal-redirect` wins. The URL must be http or https. |
@@ -59,10 +60,10 @@ These behave as in ingress-nginx.
 | `auth-tls-secret`, `auth-tls-verify-client`, `auth-tls-verify-depth`, `auth-tls-error-page`, `auth-tls-pass-certificate-to-upstream`, `auth-tls-match-cn` | Client certificates from `ca.crt` (and `ca.crl`) of the Secret. |
 | `proxy-ssl-secret`, `proxy-ssl-verify`, `proxy-ssl-verify-depth`, `proxy-ssl-ciphers`, `proxy-ssl-protocols`, `proxy-ssl-name`, `proxy-ssl-server-name` | TLS to the backends, with ingress-nginx's defaults. |
 | `connection-proxy-header` | `close` or `keep-alive`. |
-| `enable-access-log`, `enable-rewrite-log` | |
-| `relative-redirects`, `use-port-in-redirects` | `absolute_redirect off`, `port_in_redirect`. |
-| `satisfy` | `any` or `all`. |
-| `default-backend`, `custom-http-errors`, `disable-proxy-intercept-errors` | See also `-default-backend-service`. |
+| `enable-access-log`, `enable-rewrite-log` | `enable-access-log: "false"` is `access_log off`, `enable-rewrite-log: "true"` is `rewrite_log on`. |
+| `relative-redirects`, `use-port-in-redirects` | `relative-redirects: "true"` is `absolute_redirect off`; `use-port-in-redirects` is `port_in_redirect on` or `off`. |
+| `satisfy` | `satisfy any` or `satisfy all` in the locations of the Ingress; another value is ignored with a warning. |
+| `default-backend`, `custom-http-errors`, `disable-proxy-intercept-errors` | See also `-default-backend-service`. `disable-proxy-intercept-errors: "true"` stops intercepting the `custom-http-errors` codes; a `default-backend` still gets the 502 and 503. |
 | `mirror-target`, `mirror-host`, `mirror-request-body` | |
 | `ssl-passthrough` | Needs `-enable-tls-passthrough` (Helm `controller.enableTLSPassthrough`), the equivalent of ingress-nginx's `--enable-ssl-passthrough`; without it ignored with a warning, as in ingress-nginx. |
 | `server-snippet`, `configuration-snippet`, `stream-snippet` | Need `-enable-snippets`. |
@@ -90,7 +91,7 @@ These behave as in ingress-nginx.
 ## Not supported
 
 Every ingress-nginx annotation not listed above is ignored with a Warning event. Among them are `enable-global-auth`
-(wxingress has no global auth), `enable-opentracing` and `opentracing-trust-incoming-span` (use OpenTelemetry), and
+(wxingress has no global auth; ignored with a warning whatever its value, it does not make the locations answer 503), `enable-opentracing` and `opentracing-trust-incoming-span` (use OpenTelemetry), and
 `http2-push-preload`.
 
 Annotations that restrict access and that wxingress does not implement are not ignored: an Ingress with one of them
