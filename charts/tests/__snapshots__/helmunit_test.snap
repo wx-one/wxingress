@@ -13942,6 +13942,7 @@ spec:
           - -dynamic-upstreams=true
           - -sync-rate-limit=0.3
           - -ingress-nginx-defaults=true
+          - -ingress-nginx-cross-namespace=false
           - -validating-webhook=:8443
           - -validating-webhook-certificate=/usr/local/certificates/cert
           - -validating-webhook-key=/usr/local/certificates/key
