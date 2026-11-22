@@ -14,6 +14,28 @@ import (
 	nl "github.com/wx-one/wxingress/internal/logger"
 )
 
+// run executes a program with its arguments directly, without a shell: the
+// image has none (its base is a hardened runtime with no shell and no
+// package manager), so nothing the controller runs may need one.
+func run(l *slog.Logger, name string, args ...string) error {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	nl.Debugf(l, "executing %s %s", name, strings.Join(args, " "))
+
+	command := exec.Command(name, args...) // #nosec G204 -- the nginx binary and fixed arguments
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("command %v %v stdout: %q\nstderr: %q\nfinished with error: %w", name, args,
+			stdout.String(), stderr.String(), err)
+	}
+	return nil
+}
+
+// shellOut runs a command line with sh. Only NGINX Plus, App Protect and the
+// agent use it, none of which the wxingress image ships.
 func shellOut(l *slog.Logger, cmd string) (err error) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

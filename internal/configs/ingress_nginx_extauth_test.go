@@ -111,6 +111,36 @@ func TestParseIngressNginxExternalAuth(t *testing.T) {
 			wantDenied:  true, wantWarning: "has no scheme",
 		},
 		{
+			name:        "an auth-url to a unix socket denies",
+			annotations: map[string]string{IngressNginxAuthURLAnnotation: "http://unix:/var/lib/nginx/nginx-plus-api.sock:/api/9/http/upstreams/$http_x_u/servers/$http_x_id"},
+			wantDenied:  true, wantWarning: "has no valid host",
+		},
+		{
+			name:        "an auth-url whose host a client sets denies",
+			annotations: map[string]string{IngressNginxAuthURLAnnotation: "http://$http_x_target/auth"},
+			wantDenied:  true, wantWarning: "has no valid host",
+		},
+		{
+			name:        "an auth-url of another scheme denies",
+			annotations: map[string]string{IngressNginxAuthURLAnnotation: "ftp://auth/"},
+			wantDenied:  true, wantWarning: "must be http or https",
+		},
+		{
+			name:        "an auth-url on $host with a port denies",
+			annotations: map[string]string{IngressNginxAuthURLAnnotation: "http://$host:80/auth"},
+			wantDenied:  true, wantWarning: "has no valid host",
+		},
+		{
+			name:        "an auth-url on $host is taken",
+			annotations: map[string]string{IngressNginxAuthURLAnnotation: "https://$host/oauth2/auth"},
+			wantAuth:    true,
+		},
+		{
+			name:        "an auth-url to a Service with a port is taken",
+			annotations: map[string]string{IngressNginxAuthURLAnnotation: "http://oauth2-proxy.auth.svc.cluster.local:4180/oauth2/auth"},
+			wantAuth:    true,
+		},
+		{
 			name:        "an invalid auth-method denies",
 			annotations: map[string]string{IngressNginxAuthURLAnnotation: "http://auth/", IngressNginxAuthMethodAnnotation: "get"},
 			wantDenied:  true, wantWarning: IngressNginxAuthMethodAnnotation,

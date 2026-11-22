@@ -410,7 +410,7 @@ func (lm *LocalManager) signalReload() error {
 		return lm.master.Signal(syscall.SIGHUP)
 	}
 	binaryFilename := getBinaryFileName(lm.debug)
-	return shellOut(lm.logger, fmt.Sprintf("%v -s %v -e stderr", binaryFilename, "reload"))
+	return run(lm.logger, binaryFilename, "-s", "reload", "-e", "stderr")
 }
 
 // Quit shutdowns NGINX gracefully.
@@ -428,7 +428,7 @@ func (lm *LocalManager) Quit() {
 	}
 
 	binaryFilename := getBinaryFileName(lm.debug)
-	if err := shellOut(lm.logger, fmt.Sprintf("%v -s %v", binaryFilename, "quit")); err != nil {
+	if err := run(lm.logger, binaryFilename, "-s", "quit"); err != nil {
 		nl.Fatalf(lm.logger, "Failed to quit nginx: %v", err)
 	}
 }

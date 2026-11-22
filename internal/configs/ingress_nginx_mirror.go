@@ -22,8 +22,10 @@ func init() {
 }
 
 var (
-	// a URL that may end in nginx variables, nothing that leaves the string
-	ingressNginxMirrorTargetRegexp = regexp.MustCompile(`^https?://[A-Za-z0-9.\-]+(:\d+)?[A-Za-z0-9\-._~/%?&=$]*$`)
+	// a URL whose path may hold nginx variables, nothing that leaves the
+	// string; a variable right after the host would let a client complete it
+	// to "unix:/...sock:", a socket of the controller
+	ingressNginxMirrorTargetRegexp = regexp.MustCompile(`^https?://[A-Za-z0-9.\-]+(:\d+)?(/[A-Za-z0-9\-._~/%?&=$]*)?$`)
 	ingressNginxMirrorHostRegexp   = regexp.MustCompile(`^[A-Za-z0-9.\-]+(:\d+)?$`)
 )
 

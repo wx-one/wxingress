@@ -41,6 +41,10 @@ const (
 
 var (
 	// the validators of ingress-nginx
+	// the host of an auth-url: a DNS name or IPv4 address, an IPv6 address in
+	// brackets, each with an optional port; or $host or $server_name
+	// without one ("$host:80" with a Host of "unix" would be a socket path)
+	ingressNginxAuthHostRegexp         = regexp.MustCompile(`^(?:(?:[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?|\[[0-9a-fA-F:.]+\])(?::[0-9]{1,5})?|\$host|\$server_name)$`)
 	ingressNginxURLWithVariablesRegexp = regexp.MustCompile(`^[\-\._~a-zA-Z0-9/:, ,:?&=$]*$`)
 	ingressNginxURLRegexp              = regexp.MustCompile(`^[\-\._~a-zA-Z0-9/:,:?&=]*$`)
 	ingressNginxMethodRegexp           = regexp.MustCompile(`^(GET|HEAD|POST|PUT|PATCH|DELETE|CONNECT|OPTIONS|TRACE)$`)
@@ -93,6 +97,14 @@ func parseIngressNginxExternalAuth(a *ingressNginxAnnotations, ingEx *IngressEx,
 		return deny("%s has no scheme", IngressNginxAuthURLAnnotation)
 	case parsed.Host == "" || strings.Contains(parsed.Host, ".."):
 		return deny("%s has no valid host", IngressNginxAuthURLAnnotation)
+	case parsed.Scheme != "http" && parsed.Scheme != "https":
+		return deny("%s must be http or https: %q", IngressNginxAuthURLAnnotation, authURL)
+	case !ingressNginxAuthHostRegexp.MatchString(parsed.Host):
+		// nginx takes "unix:" in proxy_pass, also from a variable at request
+		// time: an auth-url to a unix socket would reach the controller's own
+		// APIs (the data plane module's), so the host is a name, an address
+		// or nginx's own $host/$server_name, never a variable a client sets
+		return deny("%s has no valid host: %q (a DNS name or an IP address with an optional port, or $host or $server_name)", IngressNginxAuthURLAnnotation, parsed.Host)
 	}
 
 	auth := &ingressNginxExternalAuth{}
