@@ -50,9 +50,9 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: false
@@ -67,12 +67,12 @@ jobs:
       # build/Dockerfile.wxingress expects both in the build context:
       #   nginx-ingress                                  the controller binary
       #   dataplane/build/ngx_http_wxingress_module.so   the data plane module
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: nginx-ingress
           path: .
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dataplane
           path: dataplane/build
@@ -116,7 +116,7 @@ jobs:
           docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$VERSION" > "out/$RELEASE.image-digest"
           cat "out/$RELEASE.image-digest"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release
           path: out/*
@@ -129,9 +129,9 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: ${{ env.HELM_VERSION }}
 
@@ -155,7 +155,7 @@ jobs:
             helm push "$chart" "$CHART_REPOSITORY"
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: chart-release
           path: chart/*.tgz
@@ -168,12 +168,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release
           path: out
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: chart-release
           path: out
