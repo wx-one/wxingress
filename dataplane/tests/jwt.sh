@@ -66,6 +66,8 @@ events { worker_connections 128; }
 
 http {
     access_log off;
+    # room for a token of JWT_MOST in a header
+    large_client_header_buffers 4 32k;
 
     # as nginx.tmpl writes them
     map "" \$wxingress_jwt_realm { default ""; }
@@ -172,6 +174,13 @@ http {
 
         location /arg {
             set \$wxingress_jwt_token_from arg_token;
+            proxy_pass http://127.0.0.1:$backend;
+        }
+
+        # a claim in every answer, a 401's too: the variable is read for a
+        # token the access step refused, which nobody verified
+        location /always {
+            add_header X-Deep \$meta_jwt_claim_deep always;
             proxy_pass http://127.0.0.1:$backend;
         }
 

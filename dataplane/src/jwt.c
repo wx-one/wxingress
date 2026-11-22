@@ -83,7 +83,11 @@ typedef struct {
    * Policy that asked for it, even at the same URL.
    */
   char tls[1200];
-  /** set while a task of this worker fetches it, which the others wait for */
+  /**
+   * set while a task of this worker fetches it, which the others wait for;
+   * for a file, how many tasks are reading it - a slot that is not taken by
+   * another source meanwhile
+   */
   int fetching;
   /** the file's modification time and size when it was read */
   struct timespec modified;
@@ -461,6 +465,11 @@ static long fileReadInto(const char *path, char *into, size_t room, struct stat 
   return (long)read.got;
 }
 
+/** Whether the slot is still the set of this source, after a wait. */
+static int jwtSetIs(const jwtSet_t *set, const char *source, int fromURL, const char *tlsKey) {
+  return strcmp(set->source, source) == 0 && set->fromURL == fromURL && strcmp(set->tls, tlsKey) == 0;
+}
+
 static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
                           const jwtTls_t *tls, int unknownKid) {
 
@@ -509,6 +518,8 @@ static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
     struct stat info;
     char *text;
     long length;
+    int found;
+    jwtSet_t fresh;
 
     /* a rotated Secret is a new file: looked for once a second, not on every request */
     if (set->count > 0 && set->looked == now)
@@ -516,7 +527,26 @@ static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
 
     set->looked = now;
 
-    if (!fileStat(source, &info))
+    /**
+     * The stat and the read wait (meta_offload), and meanwhile another
+     * request of this worker may want a slot when all are taken: the one it
+     * takes is one nobody is fetching. A slot whose file was being read used
+     * to count as free, so it could be emptied and named after another
+     * Policy's file while this read went on - and the keys of this file were
+     * then read into the slot of that one, whose tokens they verified from
+     * then on, for as long as the other file kept the modification time and
+     * size this one had. Marked as fetching while it waits, it is not taken,
+     * and what was read goes into the slot only when the slot is still this
+     * file's. Counted rather than set, as two requests may read one file.
+     */
+    ++set->fetching;
+    found = fileStat(source, &info);
+    --set->fetching;
+
+    if (!jwtSetIs(set, source, fromURL, tlsKey))
+      return NULL;
+
+    if (!found)
       return set->count > 0 ? set : NULL;
 
     if (set->count > 0 && info.st_mtim.tv_sec == set->modified.tv_sec &&
@@ -528,12 +558,27 @@ static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
     if (text == NULL)
       return set->count > 0 ? set : NULL;
 
+    ++set->fetching;
     length = fileReadInto(source, text, 256 * 1024, &info);
+    --set->fetching;
 
-    if (length > 0 && jwtSetRead(set, text, (size_t)length) > 0) {
-      set->modified = info.st_mtim;
-      set->size = info.st_size;
-      set->generation = ++jwtGenerations;
+    if (!jwtSetIs(set, source, fromURL, tlsKey)) {
+      free(text);
+      return NULL;
+    }
+
+    /* a file that has no keys now leaves the set without keys, as before */
+    if (length > 0) {
+      memset(&fresh, 0, sizeof fresh);
+      jwtSetRead(&fresh, text, (size_t)length);
+      jwtSetEmpty(set);
+      memcpy(set->keys, fresh.keys, sizeof fresh.keys);
+      set->count = fresh.count;
+      if (set->count > 0) {
+        set->modified = info.st_mtim;
+        set->size = info.st_size;
+        set->generation = ++jwtGenerations;
+      }
     }
 
     free(text);
@@ -798,13 +843,97 @@ static int jwtSplit(const char *token, jwtParts_t *parts) {
   return parts->headerLength > 0 && parts->payloadLength > 0;
 }
 
-/** The JSON of one part, decoded; the document is the caller's to release. */
+/**
+ * Whether the JSON text has a NUL inside a string: the escape \u0000, as a
+ * NUL byte itself is no JSON. A string is read back as a C string, so
+ * "sub": "alice\u0000x" would be the sub "alice" to every comparison and
+ * every variable while the token says something else.
+ */
+static int jwtHasNul(const char *text, size_t length) {
+
+  for (size_t at = 0; at < length; ++at) {
+    if (text[at] != '\\')
+      continue;
+    if (length - at > 5 && memcmp(text + at + 1, "u0000", 5) == 0)
+      return 1;
+    /* the escaped character is skipped, so an escaped backslash is not an escape */
+    ++at;
+  }
+
+  return 0;
+}
+
+static int jwtNameOrder(const void *one, const void *two) {
+
+  const yyjson_mut_val *a = *(const yyjson_mut_val *const *)one;
+  const yyjson_mut_val *b = *(const yyjson_mut_val *const *)two;
+  size_t aLength = yyjson_mut_get_len(a), bLength = yyjson_mut_get_len(b);
+  int order = memcmp(yyjson_mut_get_str(a), yyjson_mut_get_str(b), aLength < bLength ? aLength : bLength);
+
+  return order != 0 ? order : aLength < bLength ? -1 : aLength > bLength;
+}
+
+/**
+ * Whether an object names a member twice. A lookup takes the first, and
+ * another reader of the same token may take the last - `{"sub": "alice",
+ * "sub": "admin"}` is two users, depending on who asks (RFC 7519 7.2 lets a
+ * token with duplicate names be refused, and this one does). Sorted, as
+ * json_t's at() walks an object from its start each time: over the members
+ * of a token nobody verified yet - a variable is read in the log phase of a
+ * request whose token was refused, too - a walk per member would be
+ * quadratic in what the client sends.
+ */
+static int jwtNamesTwice(json_t object) {
+
+  static yyjson_mut_val *names[JWT_MOST / 4 + 1];
+  yyjson_mut_obj_iter walk;
+  yyjson_mut_val *name;
+  size_t count = 0;
+
+  if (object._node == NULL || !yyjson_mut_is_obj(object._node))
+    return 0;
+
+  yyjson_mut_obj_iter_init(object._node, &walk);
+
+  while ((name = yyjson_mut_obj_iter_next(&walk)) != NULL) {
+    /* more members than the room for them cannot be a token of JWT_MOST */
+    if (count == sizeof names / sizeof names[0])
+      return 1;
+    names[count++] = name;
+  }
+
+  qsort(names, count, sizeof names[0], jwtNameOrder);
+
+  for (size_t at = 1; at < count; ++at)
+    if (jwtNameOrder(&names[at - 1], &names[at]) == 0)
+      return 1;
+
+  return 0;
+}
+
+/**
+ * The JSON of one part, decoded; the document is the caller's to release.
+ * Refused - `_refused` set, nothing in it - when a string in it holds a NUL
+ * or the part names a member twice, as neither has one meaning.
+ */
 static json_t jwtPart(const char *text, size_t length) {
 
   static unsigned char decoded[JWT_MOST];
   long got = base64url(text, length, decoded, sizeof decoded);
+  size_t size = got > 0 ? (size_t)got : 0;
+  json_t part;
 
-  return meta_toJSONn((const char *)decoded, got > 0 ? (size_t)got : 0);
+  if (jwtHasNul((const char *)decoded, size))
+    return meta_toJSONn(NULL, 0);
+
+  part = meta_toJSONn((const char *)decoded, size);
+
+  if (part._refused == NULL && jwtNamesTwice(part)) {
+    part.release();
+    return meta_toJSONn(NULL, 0);
+  }
+
+  return part;
 }
 
 /* ---------------------------------------------------- verified tokens */
@@ -997,8 +1126,15 @@ static http_response_t jwtGuard(http_request_t *req) {
 
 /* ------------------------------------------------------------ the claims */
 
-/** A value of a claim or a header field as nginx text into `into`. */
-static void jwtValue(json_t value, char *into, size_t room) {
+/**
+ * How deep arrays in arrays are written out. Each level is a frame with a
+ * buffer of 1 kB, and a payload of JWT_MOST is some 6000 levels of `[` deep:
+ * megabytes of stack, which a variable read in the log phase of a request
+ * whose token was refused - nobody verified that payload - would have spent.
+ */
+#define JWT_VALUE_DEPTH 8
+
+static void jwtValueAt(json_t value, char *into, size_t room, int depth) {
 
   const char *kind = value.kind();
 
@@ -1014,14 +1150,19 @@ static void jwtValue(json_t value, char *into, size_t room) {
       snprintf(into, room, "%g", real);
   } else if (strcmp(kind, "bool") == 0) {
     snprintf(into, room, "%s", value.truth() ? "true" : "false");
-  } else if (strcmp(kind, "array") == 0) {
+  } else if (strcmp(kind, "array") == 0 && depth < JWT_VALUE_DEPTH) {
     size_t used = 0;
     for (int at = 0; at < value.count() && used + 1 < room; ++at) {
       char one[1024];
-      jwtValue(value.at(at), one, sizeof one);
+      jwtValueAt(value.at(at), one, sizeof one, depth + 1);
       used += (size_t)snprintf(into + used, room - used, "%s%s", at > 0 ? "," : "", one);
     }
   }
+}
+
+/** A value of a claim or a header field as nginx text into `into`. */
+static void jwtValue(json_t value, char *into, size_t room) {
+  jwtValueAt(value, into, room, 0);
 }
 
 /**

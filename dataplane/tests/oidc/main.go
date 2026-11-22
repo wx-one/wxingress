@@ -45,6 +45,8 @@ var b64 = base64.RawURLEncoding
 var (
 	client = "e2e-client"
 	secret = "e2e secret: with & and ="
+	// the secret of -long's server, longer than a worker remembers of one
+	longSecret string
 )
 
 // idp is the identity provider.
@@ -133,7 +135,7 @@ func (p *idp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// a public client: no credentials, its id in the form
 			ok, user, pass = !ok && r.Form.Get("client_id") == client, client, ""
 		}
-		if !ok || user != client || pass != secret {
+		if !ok || user != client || (pass != secret && (longSecret == "" || pass != longSecret)) {
 			p.badSecret++
 			http.Error(w, `{"error":"invalid_client"}`, 401)
 			return
@@ -180,6 +182,8 @@ func (p *idp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type browser struct {
 	cookies map[string]string
 	client  *http.Client
+	// a connection for each request, which any worker may take
+	close bool
 }
 
 func newBrowser() *browser {
@@ -190,6 +194,7 @@ func newBrowser() *browser {
 
 func (b *browser) get(u string) (int, http.Header, string) {
 	req, _ := http.NewRequest("GET", u, nil)
+	req.Close = b.close
 	var pairs []string
 	for k, v := range b.cookies {
 		pairs = append(pairs, k+"="+v)
@@ -237,6 +242,8 @@ func main() {
 	discovery := flag.Bool("discovery", false, "the server names only the issuer: endpoints from discovery, iss checked, logouts and revocations")
 	api := flag.String("api", "", "the unix socket of the module's API")
 	otherNginx := flag.String("other", "", "a server of another Policy with the same client and key file")
+	longNginx := flag.String("long", "", "a server of the same client whose secret is -long-secret")
+	flag.StringVar(&longSecret, "long-secret", "", "")
 	flag.Parse()
 	if *public {
 		client, secret = "e2e-public", ""
@@ -275,6 +282,33 @@ func main() {
 		}
 	}
 	check("every worker opens the session", code, 200)
+
+	if *longNginx != "" {
+		// A worker remembers the session it opened last, and answers the
+		// next request with the same cookie from it. A session it could not
+		// remember - its Policy's client secret is longer than what is kept
+		// of one - must not leave the one before remembered: the next request
+		// with that one's cookie was answered with this one's tokens.
+		a := newBrowser()
+		got, _ = a.login(app)
+		check("a login at the server", got, "200 alice|ok /app/page?x=1")
+		_, h, _ = a.get(app)
+		mine := h.Get("X-Token")
+		l := newBrowser()
+		got, _ = l.login("http://" + *longNginx + "/app/page")
+		check("a login at a server whose client secret is long", strings.HasPrefix(got, "200 alice"), true)
+		_, h, _ = l.get("http://" + *longNginx + "/app/page")
+		theirs := h.Get("X-Token")
+		a.close, l.close = true, true
+		mixed := 0
+		for i := 0; i < 40; i++ {
+			l.get("http://" + *longNginx + "/app/page")
+			if _, h, _ = a.get(app); h.Get("X-Token") != mine {
+				mixed++
+			}
+		}
+		check("each request answered from its own session, whichever worker opened the other one", fmt.Sprint(mine != theirs, " ", mixed), "true 0")
+	}
 
 	if *otherNginx != "" {
 		// the session of one Policy is no session of another's server, though

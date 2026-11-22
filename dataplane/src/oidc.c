@@ -472,6 +472,14 @@ static int oidcSessionOf(http_request_t *req, char *into, size_t room) {
       into = opened;
     }
 
+    /**
+     * What is remembered above stands for what oidcOpenedParse holds, and
+     * that is this session from here on. It is forgotten first: a session it
+     * could not remember - a client secret longer than lastSecret - left the
+     * one before remembered, and the next request with that one's cookie was
+     * answered from the claims, tokens and sub of this one.
+     */
+    lastSealed[0] = 0;
     oidcOpenedParse(into);
 
     if (strlen(into) < sizeof lastPlain && strlen(client) < sizeof lastClient && strlen(secret) < sizeof lastSecret) {

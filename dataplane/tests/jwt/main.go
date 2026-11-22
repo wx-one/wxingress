@@ -120,7 +120,13 @@ func sign(k key, claims map[string]any, header map[string]any) string {
 	}
 	hj, _ := json.Marshal(h)
 	cj, _ := json.Marshal(claims)
-	input := b64.EncodeToString(hj) + "." + b64.EncodeToString(cj)
+	return signed(k, string(hj), string(cj))
+}
+
+// signed makes a compact JWS of the header and the claims as they are
+// written, which a map cannot say: a name twice, an escape.
+func signed(k key, hj, cj string) string {
+	input := b64.EncodeToString([]byte(hj)) + "." + b64.EncodeToString([]byte(cj))
 	var sig []byte
 	switch s := k.signer.(type) {
 	case *rsa.PrivateKey:
@@ -296,6 +302,46 @@ func main() {
 	check("not a JWS: 401", code, 401)
 	code, _, _ = ask(*nginx, "/open", nil)
 	check("a location without a realm needs no token", code, 200)
+
+	// a token whose JSON has no one meaning: a name twice - a lookup takes
+	// the first, another reader the last - or a NUL in a string, which C reads
+	// as its end. Signed all the same, as an IdP could sign one.
+	exp := time.Now().Add(time.Hour).Unix()
+	header := fmt.Sprintf(`{"alg":%q,"typ":"JWT","kid":%q}`, keys[0].alg, keys[0].kid)
+	code, _, _ = ask(*nginx, "/file", bearer(signed(keys[0], header, fmt.Sprintf(`{"sub":"alice","sub":"admin","exp":%d}`, exp))))
+	check("a claim named twice: 401", code, 401)
+	code, _, _ = ask(*nginx, "/file", bearer(signed(keys[0], header, fmt.Sprintf(`{"sub":"admin\u0000alice","exp":%d}`, exp))))
+	check("a NUL in a claim: 401", code, 401)
+	code, got, _ = ask(*nginx, "/file", bearer(signed(keys[0], header, fmt.Sprintf(`{"sub":"alice\\u0000","groups":["a"],"exp":%d}`, exp))))
+	check("an escaped backslash before u0000 is no NUL: 200", fmt.Sprint(code, " ", got), `200 alice\u0000|a|RS256`)
+	code, _, _ = ask(*nginx, "/file", bearer(signed(keys[0], fmt.Sprintf(`{"alg":%q,"kid":%q,"alg":"none"}`, keys[0].alg, keys[0].kid), fmt.Sprintf(`{"sub":"alice","exp":%d}`, exp))))
+	check("a header field named twice: 401", code, 401)
+
+	// a claim read for every answer, a 401's too, whose token nobody verified
+	deep := func(levels int) string {
+		return strings.Repeat("[", levels) + `"x"` + strings.Repeat("]", levels)
+	}
+	always := func(token string) (int, string) {
+		req, _ := http.NewRequest("GET", "http://"+*nginx+"/always", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, err.Error()
+		}
+		resp.Body.Close()
+		return resp.StatusCode, resp.Header.Get("X-Deep")
+	}
+	code, got = always(signed(keys[0], header, fmt.Sprintf(`{"deep":[[1,2],[3]],"exp":%d}`, exp)))
+	check("arrays in an array, as one list", fmt.Sprint(code, " ", got), "200 1,2,3")
+	code, got = always(signed(keys[0], header, fmt.Sprintf(`{"deep":%s,"exp":%d}`, deep(8), exp)))
+	check("eight arrays deep: written out", fmt.Sprint(code, " ", got), "200 x")
+	code, got = always(signed(keys[0], header, fmt.Sprintf(`{"deep":%s,"exp":%d}`, deep(9), exp)))
+	check("nine: not", fmt.Sprint(code, " ", got), "200 ")
+	unsigned := b64.EncodeToString([]byte(header)) + "." + b64.EncodeToString([]byte(`{"deep":`+deep(5900)+`}`)) + ".AAAA"
+	code, _ = always(unsigned)
+	check("a token of 5900 arrays deep that nobody signed: 401", code, 401)
+	code, _ = always(sign(keys[0], claims(nil), nil))
+	check("and the worker is still there", code, 200)
 
 	// a request nginx redirects inside itself is asked where it lands
 	signed := bearer(sign(keys[0], claims(nil), nil))

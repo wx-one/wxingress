@@ -6,7 +6,7 @@
 # writes for an oidc Policy without NGINX Plus, and runs tests/oidc, which is
 # the identity provider and the browser.
 #
-#   PORT=18420    the first of the eight ports it uses (below the ephemeral range,
+#   PORT=18420    the first of the nine ports it uses (below the ephemeral range,
 #                 where an outgoing connection of an earlier test can hold one)
 #   KEEP=1        leave the prefix behind to look at
 
@@ -37,6 +37,9 @@ idp2=$((port + 4))
 discovered=$((port + 5))
 idp3=$((port + 6))
 other=$((port + 7))
+long=$((port + 8))
+# longer than the 512 bytes a worker keeps of the secret of the session it remembers
+longSecret=$(printf '%600s' '' | tr ' ' s)
 api="$work/api.sock"
 
 stop() {
@@ -131,6 +134,28 @@ http {
         location = /_logout { try_files /.wxingress-oidc =404; }
     }
 
+    # the same client and IdP with a secret longer than a worker remembers
+    server {
+        listen 127.0.0.1:$long;
+
+        set \$wxingress_oidc_client "e2e-client";
+        set \$wxingress_oidc_client_secret "$longSecret";
+        set \$wxingress_oidc_auth "http://127.0.0.1:$idp/authorize";
+        set \$wxingress_oidc_token "http://127.0.0.1:$idp/token";
+        set \$wxingress_oidc_jwks "http://127.0.0.1:$idp/jwks";
+        set \$wxingress_oidc_extra "prompt=login";
+        set \$wxingress_oidc_pkce "1";
+
+        location /app {
+            set \$wxingress_oidc_on "1";
+            add_header X-User \$meta_oidc_claim_sub;
+            add_header X-Token \$meta_oidc_access_token;
+            proxy_pass http://127.0.0.1:$backend;
+        }
+
+        location = /_codexch { try_files /.wxingress-oidc =404; }
+    }
+
     # the module's API, where the controller sets the revocations
     server {
         listen unix:$api;
@@ -223,7 +248,7 @@ sleep 1
 
 result=0
 say "--- a confidential client"
-( cd "$repository" && go run ./dataplane/tests/oidc -nginx "127.0.0.1:$front" -idp "127.0.0.1:$idp" ) || result=1
+( cd "$repository" && go run ./dataplane/tests/oidc -nginx "127.0.0.1:$front" -idp "127.0.0.1:$idp" -long "127.0.0.1:$long" -long-secret "$longSecret" ) || result=1
 say "--- only an issuer: discovery, iss, logouts of the IdP, revocations"
 ( cd "$repository" && go run ./dataplane/tests/oidc -discovery -api "$api" -nginx "127.0.0.1:$discovered" -idp "127.0.0.1:$idp3" ) || result=1
 say "--- a public client with PKCE"
