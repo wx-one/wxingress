@@ -125,7 +125,7 @@ Kubernetes object. An invalid value of most flags stops the controller at startu
 
 | Flag | Default | Helm value | Description |
 |---|---|---|---|
-| `-enable-oidc` | `false` | `controller.enableOIDC` | Enable OIDC Policies. |
+| `-enable-oidc` | `false` | `controller.enableOIDC` | Enable `oidc` Policies. Without NGINX Plus they need `-dynamic-upstreams`, which loads the wxingress module that implements them; see [JWT and OIDC](../user-guide/jwt-oidc.md). |
 | `-oidc-revocations-configmap` | (none) | set by the chart with `controller.enableOIDC` and dynamic upstreams | With `-enable-oidc` and `-dynamic-upstreams`: a ConfigMap (`<namespace>/<name>`) whose `revocations` end sessions of the wxingress module before their ID tokens expire. Each replica writes the logouts it handled into it, so a logout reaches all replicas without a reload. |
 
 ## Logging and miscellaneous

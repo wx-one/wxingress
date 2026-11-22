@@ -54,11 +54,11 @@ ConfigMap key in wxingress; the [annotations](annotations.md) of ingress-nginx s
 
 | Key | Default | ingress-nginx defaults | Description |
 |---|---|---|---|
-| `lb-method` | `random two least_conn` | | The load-balancing method of upstreams: `round_robin`, `least_conn`, `ip_hash`, `random`, `random two`, `random two least_conn`, `least_time header`, `least_time last_byte` (each optionally with `inflight`), or `hash <key> [consistent]` With `-dynamic-upstreams`, an Ingress with ingress-nginx's `load-balance`, `upstream-hash-by` or affinity annotations is balanced by the wxingress module instead. |
+| `lb-method` | `random two least_conn` | | The load-balancing method of upstreams: `round_robin`, `least_conn`, `ip_hash`, `random`, `random two`, `random two least_conn`, `least_time header`, `least_time last_byte` (each optionally with `inflight`), or `hash <key> [consistent]`. With `-dynamic-upstreams`, an Ingress with ingress-nginx's `load-balance`, `upstream-hash-by` or affinity annotations is balanced by the wxingress module instead. |
 | `keepalive` | `0` (no `keepalive`) | `64` | Idle keepalive connections to each upstream, per worker. ingress-nginx's `upstream-keepalive-connections` (320 there, for all backends together; every Service port is its own upstream here). |
 | `max-fails` | `1` | | `max_fails` of upstream servers. |
 | `fail-timeout` | `10s` | | `fail_timeout` of upstream servers. |
-| `upstream-zone-size` | `256k` | | The shared memory zone of each upstream. |
+| `upstream-zone-size` | `256k` | | The shared memory zone of each upstream. No effect with `-dynamic-upstreams`: the upstreams of Ingresses and VirtualServers then share one zone of 64m. |
 
 ### Redirects, HSTS and HTTP/2
 
@@ -143,8 +143,8 @@ ConfigMap key in wxingress; the [annotations](annotations.md) of ingress-nginx s
 |---|---|
 | `main-snippets` | Lines for the `main` context. |
 | `http-snippets` | Lines for the `http` context. |
-| `server-snippets` | Lines for every `server` of Ingresses and VirtualServers. |
-| `location-snippets` | Lines for every `location` of Ingresses and VirtualServers. |
+| `server-snippets` | Lines for every `server` of Ingresses and VirtualServers. A resource with server snippets of its own (`nginx.org/server-snippets`, ingress-nginx's `server-snippet`, a VirtualServer's `server-snippets`) gets those instead. |
+| `location-snippets` | Lines for every `location` of Ingresses and VirtualServers. A resource with location snippets of its own gets those instead. |
 | `stream-snippets` | Lines for the `stream` context. |
 | `main-template`, `ingress-template`, `virtualserver-template`, `transportserver-template` | Replacement templates. See the warning on [custom templates](cli-flags.md#nginx-and-listeners). |
 
@@ -170,18 +170,26 @@ Snippets in the ConfigMap do not need `-enable-snippets`; only whoever can edit 
 ### OIDC
 
 `oidc-pkce-timeout` (`90s`), `oidc-id-tokens-timeout` (`1h`), `oidc-access-tokens-timeout` (`1h`),
-`oidc-refresh-tokens-timeout` (`8h`), `oidc-sids-timeout` (`8h`) and the matching `*-zone-size` keys (`128K` for PKCE,
-`1M` for the others) size and expire the key-value zones of OIDC Policies.
+`oidc-refresh-tokens-timeout` (`8h`), `oidc-sids-timeout` (`8h`), `oidc-pkce-zone-size` (`128K`),
+`oidc-id-tokens-zone-size`, `oidc-access-tokens-zone-size`, `oidc-refresh-tokens-zone-size` and
+`oidc-sids-zone-size` (`1M` each) size and expire the key-value zones of NGINX Plus's OIDC. They are rendered only with
+`-nginx-plus`. wxingress's own OIDC, which serves oidc Policies in the wxingress module without NGINX Plus, keeps no
+key-value zones: its session is a sealed cookie that lasts as long as the ID token in it and is renewed with the refresh
+token. These keys are therefore validated (an invalid value gets a Warning event) but have no effect.
 
 ### NGINX Plus and App Protect only
 
 These keys are inherited from NGINX Ingress Controller and only have an effect with `-nginx-plus` or App Protect,
-which wxingress does not support: `resolver-addresses`, `resolver-ipv6`, `resolver-timeout`, `resolver-valid`,
-`zone-sync`, `zone-sync-port`, `zone-sync-resolver-addresses`, `zone-sync-resolver-ipv6`, `zone-sync-resolver-valid`,
-`app-protect-*`, `license-token-secret-name`, `ssl-certificate-secret-name`, `ssl-trusted-certificate-secret-name`,
-`ssl-verify`, `enforce-initial-report` and `usage-report-*`. Without NGINX Plus the `resolver-*` keys are ignored
-with a warning. For their meaning see the upstream
+which wxingress does not build. For their meaning see the upstream
 [ConfigMap reference](https://docs.nginx.com/nginx-ingress-controller/configuration/global-configuration/configmap-resource/).
+
+| Keys | Without NGINX Plus or App Protect |
+|---|---|
+| `resolver-addresses`, `resolver-ipv6`, `resolver-timeout`, `resolver-valid` | Ignored with a Warning event (`requires NGINX Plus`). |
+| `zone-sync`, `zone-sync-port`, `zone-sync-resolver-addresses`, `zone-sync-resolver-ipv6`, `zone-sync-resolver-valid` | `zone-sync` gets a Warning event (`requires NGINX Plus`); the others need `zone-sync`. |
+| `app-protect-compressed-requests-action`, `app-protect-cookie-seed`, `app-protect-cpu-thresholds`, `app-protect-failure-mode-action`, `app-protect-physical-memory-util-thresholds`, `app-protect-reconnect-period-seconds`, `app-protect-dos-arb-fqdn`, `app-protect-dos-log-format`, `app-protect-dos-log-format-escaping` | Not read. |
+| `oidc-*` | Validated, not rendered (see [OIDC](#oidc)). |
+| `license-token-secret-name`, `ssl-verify`, `ssl-certificate-secret-name`, `ssl-trusted-certificate-secret-name`, `enforce-initial-report`, `usage-report-endpoint`, `usage-report-interval`, `usage-report-proxy-host` | Not read from this ConfigMap at all: upstream reads them from the separate `-mgmt-configmap`, which needs `-nginx-plus`. Accepted here without a warning. |
 
 !!! note "Keys without effect"
     `limit-req-status-code`, `max-conns` and `slow-start` are accepted without a warning (also with
@@ -194,7 +202,7 @@ with a warning. For their meaning see the upstream
 
 With `-ingress-nginx-defaults` the ConfigMap also takes the keys of ingress-nginx, so that the `controller.config` of an
 ingress-nginx Helm release can be used as it is. Without the flag only the keys of wxingress are read, and other keys
-are ignored.
+are ignored without a warning.
 
 Every key that is not a key of wxingress is handled in one of the ways below. A key that is neither listed here nor
 a wxingress key gets a Warning event on the ConfigMap (`<key> is not supported by wxingress and is ignored`).
@@ -242,7 +250,8 @@ With `enable-real-ip: "true"` or `use-proxy-protocol: "true"`, the client addres
 | `enable-real-ip: "true"` with `forwarded-for-header` | `real-ip-header: <forwarded-for-header>` (default `X-Forwarded-For`) |
 | `proxy-real-ip-cidr` | `set-real-ip-from` (default `0.0.0.0/0`, as ingress-nginx) |
 
-`real-ip-header` and `set-real-ip-from`, if set in the ConfigMap, win.
+`real-ip-header` and `set-real-ip-from`, if set in the ConfigMap, win. Without `enable-real-ip: "true"` or
+`use-proxy-protocol: "true"`, `forwarded-for-header` and `proxy-real-ip-cidr` are dropped without a warning.
 
 !!! warning
     As in ingress-nginx, `enable-real-ip` without `proxy-real-ip-cidr` trusts the header from every address. Set
@@ -256,6 +265,12 @@ With `enable-real-ip: "true"` or `use-proxy-protocol: "true"`, the client addres
 ones followed by `deny all`. NGINX's own servers (status, the module's API) are not affected. An Ingress with source
 ranges of its own (annotations) uses those instead, as in ingress-nginx. A value that is not a list of addresses denies
 every request, with a warning and an error in the log.
+
+!!! warning
+    The rules are added to the ConfigMap's `server-snippets` (after the snippets the ConfigMap itself has). A resource
+    with server snippets of its own - `nginx.org/server-snippets` or ingress-nginx's `server-snippet` on an Ingress,
+    `server-snippets` in a VirtualServer - gets its own snippets instead of the ConfigMap's, and with them loses these
+    global allow and deny rules.
 
 ### Accepted without effect
 

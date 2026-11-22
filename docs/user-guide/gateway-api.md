@@ -128,7 +128,7 @@ Ingress: timeouts, body size, buffering, `proxy-next-upstream*`, `backend-protoc
 `upstream-hash-by`, `affinity` and `session-cookie-*`, rate limits, canary by header or cookie, and, with
 snippets enabled, the snippet annotations. Rate limits, authentication and access control are NGINX
 Ingress Controller's Policies, attached with `wxingress.wizardtales.com/policies: <policy>[, ...]` on
-the route or the Gateway. Redirects, rewrites, header changes and CORS are the Gateway API's own filters.
+the route or the Gateway; `jwt` and `oidc` work without NGINX Plus (see [JWT and OIDC](jwt-oidc.md)). Redirects, rewrites, header changes and CORS are the Gateway API's own filters.
 
 A route or Gateway may name any Policy of its own namespace. A Policy of another namespace
 (`<namespace>/<name>`) needs the consent of that namespace: a ReferenceGrant there that allows it

@@ -99,6 +99,7 @@ nav:
   - User guide:
       - ingress-nginx compatibility: user-guide/ingress-nginx-compatibility.md
       - Gateway API: user-guide/gateway-api.md
+      - JWT and OIDC: user-guide/jwt-oidc.md
   - Reference:
       - Annotations: reference/annotations.md
       - ConfigMap: reference/configmap.md

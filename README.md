@@ -83,7 +83,9 @@ each of the other 51 has a documented reason.
   ReferenceGrants, on the same controller and the same data plane. The Gateway API semantics come from NGINX Gateway Fabric. It is tested (the Gateway API conformance suite and our own
   end-to-end tests) but does not run in production yet, unlike the Ingress side.
 - **Everything NGINX Ingress Controller has.** VirtualServer, VirtualServerRoute, TransportServer, Policy
-  and GlobalConfiguration resources, and the `nginx.org/*` annotations.
+  and GlobalConfiguration resources, and the `nginx.org/*` annotations. The `jwt` and `oidc` Policies,
+  which need NGINX Plus there, work with open-source NGINX in wxingress
+  ([JWT and OIDC](https://wx-one.github.io/wxingress/user-guide/jwt-oidc/)).
 - **Built for a careful switch.** Both controllers can serve the same Ingresses at the same time, node by
   node or address by address. There is a
   [runbook](https://wx-one.github.io/wxingress/migration/rke2/) for RKE2's bundled
