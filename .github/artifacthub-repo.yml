@@ -1,0 +1,5 @@
+# Artifact Hub's metadata for the Helm chart repository
+# oci://ghcr.io/wx-one/charts/wxingress: the repository ID makes the chart a
+# verified publisher's. Pushed as the tag artifacthub.io next to the chart by
+# .github/workflows/artifacthub.yml.
+repositoryID: 2c255ccd-1e3c-45c5-9892-2e9664ddbcc4
