@@ -332,6 +332,7 @@ Build the args for the service binary.
 - -sync-rate-limit={{ .Values.controller.syncRateLimit }}
 {{- end }}
 - -ingress-nginx-defaults={{ or .Values.controller.ingressNginxDefaults .Values.controller.ingressNginxCompat }}
+- -ingress-nginx-cross-namespace={{ default false .Values.controller.ingressNginxCrossNamespace }}
 {{- if (dig "admissionWebhooks" "enabled" false .Values.controller) }}
 - -validating-webhook=:{{ .Values.controller.admissionWebhooks.port }}
 - -validating-webhook-certificate={{ .Values.controller.admissionWebhooks.certificate }}

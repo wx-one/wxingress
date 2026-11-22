@@ -361,6 +361,9 @@ type NewLoadBalancerControllerInput struct {
 	IsNginxPlus          bool
 	IsDynamicUpstreams   bool
 	IngressNginxDefaults bool
+	// IngressNginxCrossNamespace lets Ingresses of different namespaces share a host and canaries attach across
+	// namespaces, as ingress-nginx does (-ingress-nginx-cross-namespace).
+	IngressNginxCrossNamespace bool
 	// TCPServicesConfigMap and UDPServicesConfigMap are ingress-nginx's tcp/udp services (<namespace>/<name>).
 	TCPServicesConfigMap string
 	UDPServicesConfigMap string
@@ -619,6 +622,7 @@ func NewLoadBalancerController(input NewLoadBalancerControllerInput) *LoadBalanc
 	)
 	lbc.configuration.isDynamicUpstreams = input.IsDynamicUpstreams
 	lbc.configuration.canaryPerUpstream = input.IngressNginxDefaults
+	lbc.configuration.crossNamespace = input.IngressNginxCrossNamespace
 	lbc.ingressNginxDefaults = input.IngressNginxDefaults
 
 	lbc.appProtectConfiguration = appprotect.NewConfiguration(lbc.Logger)
@@ -1175,7 +1179,7 @@ func (lbc *LoadBalancerController) createExtendedResources(resources []Resource)
 				mergeableIng := lbc.createMergeableIngresses(impl)
 				result.MergeableIngresses = append(result.MergeableIngresses, mergeableIng)
 			} else {
-				ingEx := lbc.createIngressEx(impl.Ingress, impl.ValidHosts, nil)
+				ingEx := lbc.createIngressEx(impl.ingressForServer(), impl.ValidHosts, nil)
 				ingEx.Canaries = lbc.createCanaryIngressExes(impl.Canaries, impl.CanaryBackends)
 				ingEx.Merged = lbc.createMergedIngressExes(impl.Merged, ingEx.Canaries)
 				result.IngressExes = append(result.IngressExes, ingEx)
@@ -2012,7 +2016,7 @@ func (lbc *LoadBalancerController) processAddOrUpdate(c ResourceChange) {
 			lbc.updateMergeableIngressStatusAndEvents(ingForEvent, warnings, addOrUpdateErr)
 		} else {
 			// for regular Ingress, validMinionPaths is nil
-			ingEx := lbc.createIngressEx(impl.Ingress, impl.ValidHosts, nil)
+			ingEx := lbc.createIngressEx(impl.ingressForServer(), impl.ValidHosts, nil)
 			ingEx.Canaries = lbc.createCanaryIngressExes(impl.Canaries, impl.CanaryBackends)
 			ingEx.Merged = lbc.createMergedIngressExes(impl.Merged, ingEx.Canaries)
 
@@ -2198,6 +2202,18 @@ func (lbc *LoadBalancerController) updateResourcesStatusAndEvents(resources []Re
 	}
 }
 
+// ingressWarnings returns the warnings of the config for the Ingress: those of the Ingress itself, and those of the
+// copy of it its config was made of when server aliases were left out of it (IngressConfiguration.ingressForServer).
+func ingressWarnings(warnings configs.Warnings, ing *networking.Ingress) ([]string, bool) {
+	messages, ok := warnings[ing]
+	for obj, ws := range warnings {
+		if other, isIngress := obj.(*networking.Ingress); isIngress && other != ing && other.Namespace == ing.Namespace && other.Name == ing.Name && other.UID == ing.UID {
+			messages, ok = append(slices.Clone(messages), ws...), true
+		}
+	}
+	return messages, ok
+}
+
 func (lbc *LoadBalancerController) updateMergeableIngressStatusAndEvents(ingConfig *IngressConfiguration, warnings configs.Warnings, operationErr error) {
 	eventType := api_v1.EventTypeNormal
 	eventTitle := nl.EventReasonAddedOrUpdated
@@ -2211,7 +2227,7 @@ func (lbc *LoadBalancerController) updateMergeableIngressStatusAndEvents(ingConf
 		eventWarningSuffix = "; "
 	}
 
-	if messages, ok := warnings[ingConfig.Ingress]; ok {
+	if messages, ok := ingressWarnings(warnings, ingConfig.Ingress); ok {
 		eventType = api_v1.EventTypeWarning
 		eventTitle = nl.EventReasonAddedOrUpdatedWithWarning
 		eventWarningMessage = fmt.Sprintf("%s%swith warning(s): %v", eventWarningMessage, eventWarningSuffix, formatWarningMessages(messages))
@@ -2302,7 +2318,7 @@ func (lbc *LoadBalancerController) updateRegularIngressStatusAndEvents(ingConfig
 		eventWarningMessage = fmt.Sprintf("with warning(s): %s", formatWarningMessages(ingConfig.Warnings))
 	}
 
-	if messages, ok := warnings[ingConfig.Ingress]; ok {
+	if messages, ok := ingressWarnings(warnings, ingConfig.Ingress); ok {
 		eventType = api_v1.EventTypeWarning
 		eventTitle = nl.EventReasonAddedOrUpdatedWithWarning
 		eventWarningMessage = fmt.Sprintf("%s; with warning(s): %v", eventWarningMessage, formatWarningMessages(messages))
@@ -3228,7 +3244,7 @@ func (lbc *LoadBalancerController) isOnlyCertificateOfHosts(key string, roles []
 // VirtualServers regenerated - once for all such Secrets, by that task - for
 // the hosts the module is to have and for their warnings; the config stays.
 func (lbc *LoadBalancerController) certificateOfHostsChanged(key string, rolesBefore []secrets.SecretRole, exists bool) {
-	validAfter := exists && lbc.secretStore.GetSecret(key, secrets.RoleTLS).Error == nil
+	validAfter := exists && lbc.secretRef(key, secrets.RoleTLS).Error == nil
 	if slices.Contains(rolesBefore, secrets.RoleTLS) != validAfter {
 		if lbc.certificateSecretsChanged == nil {
 			lbc.certificateSecretsChanged = make(map[string]bool)
@@ -3716,7 +3732,7 @@ func mergeExtendedResourceWarnings(resources []Resource, exResources configs.Ext
 
 func (lbc *LoadBalancerController) createMergeableIngresses(ingConfig *IngressConfiguration) *configs.MergeableIngresses {
 	// for master Ingress, validMinionPaths are nil
-	masterIngressEx := lbc.createIngressEx(ingConfig.Ingress, ingConfig.ValidHosts, nil)
+	masterIngressEx := lbc.createIngressEx(ingConfig.ingressForServer(), ingConfig.ValidHosts, nil)
 	canaries := lbc.createCanaryIngressExes(ingConfig.Canaries, ingConfig.CanaryBackends)
 
 	var minions []*configs.IngressEx
@@ -3799,7 +3815,7 @@ func (lbc *LoadBalancerController) createIngressEx(ing *networking.Ingress, vali
 		}
 		secretKey := ing.Namespace + "/" + secretName
 
-		secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleTLS)
+		secretRef := lbc.secretRef(secretKey, secrets.RoleTLS)
 		if secretRef.Error != nil {
 			nl.Warnf(l, "Error trying to get the secret %v for Ingress %v: %v", secretName, ing.Name, secretRef.Error)
 		}
@@ -3811,7 +3827,7 @@ func (lbc *LoadBalancerController) createIngressEx(ing *networking.Ingress, vali
 		secretName := basicAuth
 		secretKey := ing.Namespace + "/" + secretName
 
-		secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleHtpasswd)
+		secretRef := lbc.secretRef(secretKey, secrets.RoleHtpasswd)
 		if secretRef.Error != nil {
 			nl.Warnf(l, "Error trying to get the secret %v for Ingress %v/%v: %v", secretName, ing.Namespace, ing.Name, secretRef.Error)
 		}
@@ -3821,7 +3837,7 @@ func (lbc *LoadBalancerController) createIngressEx(ing *networking.Ingress, vali
 
 	// the auth-secret of ingress-nginx, an Opaque Secret with an htpasswd file or a map of users
 	if secretKey, role, exists := configs.IngressNginxBasicAuthSecret(ing); exists {
-		secretRef := lbc.secretStore.GetSecret(secretKey, role)
+		secretRef := lbc.secretRef(secretKey, role)
 		if secretRef.Error != nil {
 			nl.Warnf(l, "Error trying to get the secret %v for Ingress %v/%v: %v", secretKey, ing.Namespace, ing.Name, secretRef.Error)
 		}
@@ -3831,13 +3847,13 @@ func (lbc *LoadBalancerController) createIngressEx(ing *networking.Ingress, vali
 	// the proxy-ssl-secret of ingress-nginx: a client certificate, a CA, or both
 	if secretKey, exists := configs.IngressNginxProxySSLSecret(ing); exists {
 		for _, role := range []secrets.SecretRole{secrets.RoleTLS, secrets.RoleCA} {
-			ingEx.SecretRefs[secrets.RefKey(secretKey, role)] = lbc.secretStore.GetSecret(secretKey, role)
+			ingEx.SecretRefs[secrets.RefKey(secretKey, role)] = lbc.secretRef(secretKey, role)
 		}
 	}
 
 	// the auth-tls-secret of ingress-nginx, a CA
 	if secretKey, exists := configs.IngressNginxAuthTLSSecret(ing); exists {
-		secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleCA)
+		secretRef := lbc.secretRef(secretKey, secrets.RoleCA)
 		if secretRef.Error != nil {
 			nl.Warnf(l, "Error trying to get the secret %v for Ingress %v/%v: %v", secretKey, ing.Namespace, ing.Name, secretRef.Error)
 		}
@@ -3903,7 +3919,7 @@ func (lbc *LoadBalancerController) createIngressEx(ing *networking.Ingress, vali
 			secretName := jwtKey
 			secretKey := ing.Namespace + "/" + secretName
 
-			secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleJWK)
+			secretRef := lbc.secretRef(secretKey, secrets.RoleJWK)
 			if secretRef.Error != nil {
 				nl.Warnf(l, "Error trying to get the secret %v for Ingress %v/%v: %v", secretName, ing.Namespace, ing.Name, secretRef.Error)
 			}
@@ -4147,7 +4163,7 @@ func (lbc *LoadBalancerController) createVirtualServerEx(virtualServer *conf_v1.
 	if virtualServer.Spec.TLS != nil && virtualServer.Spec.TLS.Secret != "" {
 		scrtKey := virtualServer.Namespace + "/" + virtualServer.Spec.TLS.Secret
 
-		scrtRef := lbc.secretStore.GetSecret(scrtKey, secrets.RoleTLS)
+		scrtRef := lbc.secretRef(scrtKey, secrets.RoleTLS)
 		if scrtRef.Error != nil {
 			nl.Warnf(l, "Error trying to get the secret %v for VirtualServer %v: %v", scrtKey, virtualServer.Name, scrtRef.Error)
 		}
@@ -4715,7 +4731,7 @@ func (lbc *LoadBalancerController) addJWTSecretRefs(secretRefs map[secrets.Secre
 		}
 
 		secretKey := fmt.Sprintf("%v/%v", pol.Namespace, pol.Spec.JWTAuth.Secret)
-		secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleJWK)
+		secretRef := lbc.secretRef(secretKey, secrets.RoleJWK)
 
 		secretRefs[secrets.RefKey(secretKey, secrets.RoleJWK)] = secretRef
 
@@ -4734,7 +4750,7 @@ func (lbc *LoadBalancerController) addBasicSecretRefs(secretRefs map[secrets.Sec
 		}
 
 		secretKey := fmt.Sprintf("%v/%v", pol.Namespace, pol.Spec.BasicAuth.Secret)
-		secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleHtpasswd)
+		secretRef := lbc.secretRef(secretKey, secrets.RoleHtpasswd)
 
 		secretRefs[secrets.RefKey(secretKey, secrets.RoleHtpasswd)] = secretRef
 
@@ -4753,7 +4769,7 @@ func (lbc *LoadBalancerController) addIngressMTLSSecretRefs(secretRefs map[secre
 		}
 
 		secretKey := fmt.Sprintf("%v/%v", pol.Namespace, pol.Spec.IngressMTLS.ClientCertSecret)
-		secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleCA)
+		secretRef := lbc.secretRef(secretKey, secrets.RoleCA)
 
 		secretRefs[secrets.RefKey(secretKey, secrets.RoleCA)] = secretRef
 
@@ -4771,7 +4787,7 @@ func (lbc *LoadBalancerController) addEgressMTLSSecretRefs(secretRefs map[secret
 		// Resolve both client and trusted CA secrets up front so policy validation and template rendering share the same inputs.
 		if pol.Spec.EgressMTLS.TLSSecret != "" {
 			secretKey := fmt.Sprintf("%v/%v", pol.Namespace, pol.Spec.EgressMTLS.TLSSecret)
-			secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleTLS)
+			secretRef := lbc.secretRef(secretKey, secrets.RoleTLS)
 
 			secretRefs[secrets.RefKey(secretKey, secrets.RoleTLS)] = secretRef
 
@@ -4781,7 +4797,7 @@ func (lbc *LoadBalancerController) addEgressMTLSSecretRefs(secretRefs map[secret
 		}
 		if pol.Spec.EgressMTLS.TrustedCertSecret != "" {
 			secretKey := fmt.Sprintf("%v/%v", pol.Namespace, pol.Spec.EgressMTLS.TrustedCertSecret)
-			secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleCA)
+			secretRef := lbc.secretRef(secretKey, secrets.RoleCA)
 
 			secretRefs[secrets.RefKey(secretKey, secrets.RoleCA)] = secretRef
 
@@ -4801,7 +4817,7 @@ func (lbc *LoadBalancerController) addJWTTrustedCertSecretRefs(secretRefs map[se
 		}
 		if pol.Spec.JWTAuth.TrustedCertSecret != "" {
 			secretKey := fmt.Sprintf("%v/%v", pol.Namespace, pol.Spec.JWTAuth.TrustedCertSecret)
-			secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleCA)
+			secretRef := lbc.secretRef(secretKey, secrets.RoleCA)
 
 			secretRefs[secrets.RefKey(secretKey, secrets.RoleCA)] = secretRef
 
@@ -4825,7 +4841,7 @@ func (lbc *LoadBalancerController) addOIDCSecretRefs(secretRefs map[secrets.Secr
 		}
 
 		secretKey := fmt.Sprintf("%v/%v", pol.Namespace, pol.Spec.OIDC.ClientSecret)
-		secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleOIDC)
+		secretRef := lbc.secretRef(secretKey, secrets.RoleOIDC)
 
 		secretRefs[secrets.RefKey(secretKey, secrets.RoleOIDC)] = secretRef
 
@@ -4843,7 +4859,7 @@ func (lbc *LoadBalancerController) addOIDCNativeSecretRefs(secretRefs map[secret
 		}
 
 		secretKey := fmt.Sprintf("%v/%v", pol.Namespace, pol.Spec.OIDCNative.ClientSecret)
-		secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleOIDC)
+		secretRef := lbc.secretRef(secretKey, secrets.RoleOIDC)
 
 		secretRefs[secrets.RefKey(secretKey, secrets.RoleOIDC)] = secretRef
 
@@ -4861,7 +4877,7 @@ func (lbc *LoadBalancerController) addOIDCNativeTrustedCertSecretRefs(secretRefs
 		}
 
 		secretKey := fmt.Sprintf("%v/%v", pol.Namespace, pol.Spec.OIDCNative.TrustedCertSecret)
-		secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleCA)
+		secretRef := lbc.secretRef(secretKey, secrets.RoleCA)
 
 		secretRefs[secrets.RefKey(secretKey, secrets.RoleCA)] = secretRef
 
@@ -4879,7 +4895,7 @@ func (lbc *LoadBalancerController) addOIDCTrustedCertSecretRefs(secretRefs map[s
 		}
 		if pol.Spec.OIDC.TrustedCertSecret != "" {
 			secretKey := fmt.Sprintf("%v/%v", pol.Namespace, pol.Spec.OIDC.TrustedCertSecret)
-			secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleCA)
+			secretRef := lbc.secretRef(secretKey, secrets.RoleCA)
 
 			secretRefs[secrets.RefKey(secretKey, secrets.RoleCA)] = secretRef
 
@@ -4900,7 +4916,7 @@ func (lbc *LoadBalancerController) addExternalAuthTrustedCertSecretRefs(secretRe
 		if pol.Spec.ExternalAuth.TrustedCertSecret != "" {
 			secretNS, secretName := configs.ParseServiceReference(pol.Spec.ExternalAuth.TrustedCertSecret, pol.Namespace)
 			secretKey := fmt.Sprintf("%v/%v", secretNS, secretName)
-			secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleCA)
+			secretRef := lbc.secretRef(secretKey, secrets.RoleCA)
 
 			secretRefs[secrets.RefKey(secretKey, secrets.RoleCA)] = secretRef
 
@@ -4920,7 +4936,7 @@ func (lbc *LoadBalancerController) addAPIKeySecretRefs(secretRefs map[secrets.Se
 		}
 
 		secretKey := fmt.Sprintf("%v/%v", pol.Namespace, pol.Spec.APIKey.ClientSecret)
-		secretRef := lbc.secretStore.GetSecret(secretKey, secrets.RoleAPIKey)
+		secretRef := lbc.secretRef(secretKey, secrets.RoleAPIKey)
 
 		secretRefs[secrets.RefKey(secretKey, secrets.RoleAPIKey)] = secretRef
 

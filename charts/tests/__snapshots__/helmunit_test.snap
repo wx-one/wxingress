@@ -506,6 +506,7 @@ spec:
           - -dynamic-upstreams=true
           - -sync-rate-limit=0.3
           - -ingress-nginx-defaults=true
+          - -ingress-nginx-cross-namespace=false
           - -validating-webhook=:8443
           - -validating-webhook-certificate=/usr/local/certificates/cert
           - -validating-webhook-key=/usr/local/certificates/key
@@ -1274,6 +1275,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -validating-webhook=:8443
           - -validating-webhook-certificate=/usr/local/certificates/cert
           - -validating-webhook-key=/usr/local/certificates/key
@@ -1849,6 +1851,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -2280,6 +2283,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -2752,6 +2756,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -3233,6 +3238,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=true
           - -enable-app-protect-ip-intelligence=false
@@ -3724,6 +3730,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=true
           - -enable-app-protect-ip-intelligence=false
@@ -4306,6 +4313,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=true
           - -enable-app-protect-ip-intelligence=false
@@ -4849,6 +4857,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=true
           - -enable-app-protect-ip-intelligence=false
@@ -5343,6 +5352,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=true
           - -enable-app-protect-ip-intelligence=true
@@ -5949,6 +5959,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=true
           - -enable-app-protect-ip-intelligence=false
@@ -6535,6 +6546,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=true
           - -enable-app-protect-ip-intelligence=false
@@ -7058,6 +7070,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=true
           - -enable-app-protect-ip-intelligence=true
@@ -7605,6 +7618,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -8041,6 +8055,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -8487,6 +8502,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -8957,6 +8973,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -9407,6 +9424,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -9854,6 +9872,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -10304,6 +10323,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -10787,6 +10807,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -11283,6 +11304,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -11758,6 +11780,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -12231,6 +12254,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -12701,6 +12725,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -13152,6 +13177,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -13629,6 +13655,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -14081,6 +14108,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -14532,6 +14560,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -14983,6 +15012,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -15462,6 +15492,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -15942,6 +15973,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -16395,6 +16427,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -16845,6 +16878,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -17357,6 +17391,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -17824,6 +17859,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -18301,6 +18337,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -18788,6 +18825,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -19256,6 +19294,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -19724,6 +19763,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -20202,6 +20242,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -20731,6 +20772,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -21261,6 +21303,7 @@ spec:
           - -nginx-plus=true
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -21725,6 +21768,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -22179,6 +22223,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -22646,6 +22691,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -23114,6 +23160,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -23597,6 +23644,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false
@@ -24081,6 +24129,7 @@ spec:
           - -nginx-plus=false
           - -dynamic-upstreams=false
           - -ingress-nginx-defaults=false
+          - -ingress-nginx-cross-namespace=false
           - -nginx-reload-timeout=60000
           - -enable-app-protect=false
           - -enable-app-protect-ip-intelligence=false

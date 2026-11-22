@@ -1,7 +1,9 @@
 package k8s
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/wx-one/wxingress/internal/configs"
+	"github.com/wx-one/wxingress/internal/k8s/secrets"
 	nl "github.com/wx-one/wxingress/internal/logger"
 	admissionv1 "k8s.io/api/admission/v1"
 	networking "k8s.io/api/networking/v1"
@@ -25,13 +28,55 @@ type AdmissionChecks interface {
 type admission struct {
 	// mu keeps a check apart from the sync of the controller: a check
 	// reads the configuration, the listers' Ingresses and the configurator
-	// as the sync leaves them, and writes nothing they keep.
+	// as the sync leaves them, and writes nothing they keep. It is held
+	// while a check builds and renders the configs, not while nginx -t of
+	// them runs, which tests a copy of the configuration taken under it.
 	mu sync.Mutex
-	// checking makes createIngressEx remember nothing of the Ingress it makes (the ConfigMaps it names, its www redirects).
+	// checking makes createIngressEx remember nothing of the Ingress it makes (the ConfigMaps it names, its www
+	// redirects), and Secrets be resolved for the check only (secretRef).
 	checking bool
+	// heldSecrets are the Secrets the check under mu materialized for nginx -t, to be let go when it is done.
+	heldSecrets []secrets.SecretRefKey
+	// test serializes the nginx -t of the checks: one at a time, as a sync would run it.
+	test sync.Mutex
 	// nginxTest runs nginx -t of the configs a check renders.
 	nginxTest bool
 	checks    AdmissionChecks
+}
+
+// checkSecretStore is a SecretStore that resolves Secrets for a check of the admission webhook without keeping
+// them (secrets.LocalSecretStore).
+type checkSecretStore interface {
+	GetSecretForCheck(key string, role secrets.SecretRole) (*secrets.SecretReference, bool)
+	ReleaseCheckSecret(key string, role secrets.SecretRole)
+}
+
+// secretRef returns the reference of the Secret in the role. During a check of the admission webhook, a Secret no
+// resource resolved yet is held by the check and removed again when it is done, instead of staying on disk.
+func (lbc *LoadBalancerController) secretRef(key string, role secrets.SecretRole) *secrets.SecretReference {
+	if lbc.admission.checking {
+		if store, ok := lbc.secretStore.(checkSecretStore); ok {
+			ref, held := store.GetSecretForCheck(key, role)
+			if held {
+				lbc.admission.heldSecrets = append(lbc.admission.heldSecrets, secrets.RefKey(key, role))
+			}
+			return ref
+		}
+	}
+	return lbc.secretStore.GetSecret(key, role)
+}
+
+// releaseCheckSecrets lets go of the Secrets a check held, under mu.
+func (lbc *LoadBalancerController) releaseCheckSecrets(held []secrets.SecretRefKey) {
+	store, ok := lbc.secretStore.(checkSecretStore)
+	if !ok || len(held) == 0 {
+		return
+	}
+	lbc.admission.mu.Lock()
+	defer lbc.admission.mu.Unlock()
+	for _, k := range held {
+		store.ReleaseCheckSecret(k.Key, k.Role)
+	}
 }
 
 // EnableAdmission prepares the controller for the admission webhook: nginx -t of what a check renders unless
@@ -40,6 +85,11 @@ type admission struct {
 func (lbc *LoadBalancerController) EnableAdmission(nginxTest bool, checks AdmissionChecks) {
 	lbc.admission.nginxTest = nginxTest && !lbc.configuration.snippetsEnabled
 	lbc.admission.checks = checks
+	if c, ok := checks.(interface {
+		SetIngressExists(func(namespace, name string) bool)
+	}); ok {
+		c.SetIngressExists(lbc.configuration.HasIngress)
+	}
 }
 
 // CheckIngress is the admission webhook's check of an Ingress to be created
@@ -53,10 +103,9 @@ func (lbc *LoadBalancerController) CheckIngress(ing *networking.Ingress) (warnin
 	if ing.DeletionTimestamp != nil {
 		return nil, nil
 	}
-	lbc.admission.mu.Lock()
-	defer lbc.admission.mu.Unlock()
-
-	if !lbc.HasCorrectIngressClass(ing) {
+	ours, warnings, test, held, err := lbc.renderIngressCheck(ing)
+	defer lbc.releaseCheckSecrets(held)
+	if !ours {
 		return nil, nil
 	}
 	defer func() {
@@ -64,6 +113,29 @@ func (lbc *LoadBalancerController) CheckIngress(ing *networking.Ingress) (warnin
 			lbc.admission.checks.CheckDone(ing.Namespace, ing.Name, err == nil)
 		}
 	}()
+	if err != nil {
+		return warnings, err
+	}
+	if test != nil {
+		lbc.admission.test.Lock()
+		defer lbc.admission.test.Unlock()
+		if err := test(context.Background()); err != nil {
+			return warnings, fmt.Errorf("the configuration of the Ingress fails nginx -t: %w", err)
+		}
+	}
+	return dedupe(warnings), nil
+}
+
+// renderIngressCheck is the part of CheckIngress under the lock of the sync: whether the Ingress is ours, its
+// warnings, why it is refused, and the nginx -t of its configs, prepared on a copy of the configuration to run
+// without the lock (nil for none). held are the Secrets the check materialized, to be released when it is done.
+func (lbc *LoadBalancerController) renderIngressCheck(ing *networking.Ingress) (ours bool, warnings []string, test func(context.Context) error, held []secrets.SecretRefKey, err error) {
+	lbc.admission.mu.Lock()
+	defer lbc.admission.mu.Unlock()
+
+	if !lbc.HasCorrectIngressClass(ing) {
+		return false, nil, nil, nil, nil
+	}
 
 	if !lbc.configuration.snippetsEnabled {
 		keys := make([]string, 0, len(ing.Annotations))
@@ -73,22 +145,26 @@ func (lbc *LoadBalancerController) CheckIngress(ing *networking.Ingress) (warnin
 		sort.Strings(keys)
 		for _, key := range keys {
 			if strings.HasSuffix(key, "-snippet") || strings.HasSuffix(key, "-snippets") {
-				return nil, fmt.Errorf("%s annotation cannot be used. Snippet directives are disabled by the Ingress administrator", key)
+				return true, nil, nil, nil, fmt.Errorf("%s annotation cannot be used. Snippet directives are disabled by the Ingress administrator", key)
 			}
 		}
 	}
 
 	check := lbc.configuration.CheckIngress(ing)
 	if !check.Ours {
-		return nil, nil
+		return false, nil, nil, nil, nil
 	}
 	warnings = check.Warnings
 	if check.Invalid != nil {
-		return warnings, check.Invalid
+		return true, warnings, nil, nil, check.Invalid
 	}
 
 	lbc.admission.checking = true
-	defer func() { lbc.admission.checking = false }()
+	lbc.admission.heldSecrets = nil
+	defer func() {
+		lbc.admission.checking = false
+		held, lbc.admission.heldSecrets = lbc.admission.heldSecrets, nil
+	}()
 
 	var rendered []configs.RenderedConfig
 	for _, ingConfig := range check.Changed {
@@ -100,13 +176,13 @@ func (lbc *LoadBalancerController) CheckIngress(ing *networking.Ingress) (warnin
 		if ingConfig.IsMaster {
 			r, cfgWar, rerr = lbc.configurator.RenderMergeableIngresses(lbc.createMergeableIngresses(ingConfig))
 		} else {
-			ingEx := lbc.createIngressEx(ingConfig.Ingress, ingConfig.ValidHosts, nil)
+			ingEx := lbc.createIngressEx(ingConfig.ingressForServer(), ingConfig.ValidHosts, nil)
 			ingEx.Canaries = lbc.createCanaryIngressExes(ingConfig.Canaries, ingConfig.CanaryBackends)
 			ingEx.Merged = lbc.createMergedIngressExes(ingConfig.Merged, ingEx.Canaries)
 			r, cfgWar, rerr = lbc.configurator.RenderIngress(ingEx)
 		}
 		if rerr != nil {
-			return warnings, rerr
+			return true, warnings, nil, nil, rerr
 		}
 		for obj, ws := range cfgWar {
 			if m, ok := obj.(metav1.Object); ok && m.GetNamespace() == ing.Namespace && m.GetName() == ing.Name {
@@ -117,11 +193,12 @@ func (lbc *LoadBalancerController) CheckIngress(ing *networking.Ingress) (warnin
 	}
 
 	if lbc.admission.nginxTest && len(rendered) > 0 {
-		if err := lbc.configurator.TestConfigs(rendered); err != nil {
-			return warnings, fmt.Errorf("the configuration of the Ingress fails nginx -t: %w", err)
+		test, err = lbc.configurator.PrepareTestConfigs(rendered)
+		if err != nil {
+			return true, warnings, nil, nil, fmt.Errorf("the configuration of the Ingress fails nginx -t: %w", err)
 		}
 	}
-	return dedupe(warnings), nil
+	return true, warnings, test, nil, nil
 }
 
 func dedupe(s []string) []string {
@@ -141,21 +218,45 @@ type IngressChecker interface {
 	CheckIngress(ing *networking.Ingress) ([]string, error)
 }
 
-// maxAdmissionReview is the most of an AdmissionReview the webhook reads: the API server's limit of an object is 3 MiB.
-const maxAdmissionReview = 8 << 20
+// maxAdmissionReview is the most of an AdmissionReview the webhook reads: the API server's limit of an object is
+// 3 MiB (etcd's request limit is 1.5 MiB), and the review carries the object, and its old version only for an update.
+const maxAdmissionReview = 3<<20 + 512<<10
+
+// maxAdmissionChecks is the most reviews the webhook takes at once, those that wait for the sync or another
+// check included: one more is answered 503 at once, a failure of the webhook call, so the webhook's
+// failurePolicy decides, instead of piling up behind the lock of the sync.
+const maxAdmissionChecks = 4
 
 // AdmissionHandler answers the API server's AdmissionReviews (admission.k8s.io/v1) of networking.k8s.io/v1
 // Ingresses with the checker's verdict, as ingress-nginx's /networking/v1/ingresses: a request of another kind is
 // refused, an Ingress the checker refuses is not allowed, with its error as the message, and its warnings go along.
+// At most maxAdmissionChecks reviews are taken at once, and none bigger than maxAdmissionReview.
 func AdmissionHandler(checker IngressChecker) http.Handler {
+	slots := make(chan struct{}, maxAdmissionChecks)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		l := nl.LoggerFromContext(r.Context())
 		if r.Method != http.MethodPost {
 			http.Error(w, "the webhook takes a POST of an AdmissionReview", http.StatusMethodNotAllowed)
 			return
 		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxAdmissionReview))
+		if r.ContentLength > maxAdmissionReview {
+			http.Error(w, "the AdmissionReview is too big", http.StatusRequestEntityTooLarge)
+			return
+		}
+		select {
+		case slots <- struct{}{}:
+			defer func() { <-slots }()
+		default:
+			http.Error(w, "the webhook is busy", http.StatusServiceUnavailable)
+			return
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAdmissionReview))
 		if err != nil {
+			var tooBig *http.MaxBytesError
+			if errors.As(err, &tooBig) {
+				http.Error(w, "the AdmissionReview is too big", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}

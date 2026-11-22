@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/wx-one/wxingress/internal/logger/levels"
@@ -140,5 +141,21 @@ func TestGlogHandlerAndRecordAttrsCombined(t *testing.T) {
 	re := regexp.MustCompile(wantre)
 	if !re.MatchString(got) {
 		t.Errorf("\ngot:\n%q\nwant match:\n%q", got, wantre)
+	}
+}
+
+// What would end the line or forge another - in the message, a key or a value - is escaped: one entry, one line.
+func TestGlogEscapesLineBreaks(t *testing.T) {
+	var buf bytes.Buffer
+	l := slog.New(New(&buf, nil))
+	l.Info("ingress default/x\nI20260101 00:00:00.000000 1 forged.go:1] admin login\r\x1b[31m\u2028\xff", "key\n", "va\nl")
+	got := buf.String()
+	if strings.Count(got, "\n") != 1 || !strings.HasSuffix(got, "\n") {
+		t.Fatalf("the entry is not one line: %q", got)
+	}
+	for _, want := range []string{`default/x\nI2026`, `admin login\r\x1b[31m\u2028\xff`, `key\n=va\nl`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("%q lacks %q", got, want)
+		}
 	}
 }

@@ -83,7 +83,7 @@ func TestGenerateNginxCfgWithMergedIngresses(t *testing.T) {
 	if !hasWarningContaining(directWarnings, "path /tea of host cafe.example.com is ignored: Ingress default/cafe-ingress has it already") {
 		t.Errorf("warnings of the merged Ingress: %v", directWarnings)
 	}
-	if !hasUpstream(cfg, "other-direct-cafe.example.com-direct-svc-8181") {
+	if !hasUpstream(cfg, "other_direct_cafe.example.com_direct-svc_8181") {
 		t.Errorf("the upstreams %v lack the one of the merged Ingress", cfg.Upstreams)
 	}
 }

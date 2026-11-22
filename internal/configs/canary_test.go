@@ -177,8 +177,8 @@ func TestGenerateNginxCfgWithCanary(t *testing.T) {
 
 	cfg, _ := generateCanaryCfg(t, &ingEx, true)
 
-	const primary = "default-cafe-ingress-cafe.example.com-tea-svc-80"
-	const canary = "default-cafe-canary-cafe.example.com-tea-canary-svc-80"
+	const primary = "default_cafe-ingress_cafe.example.com_tea-svc_80"
+	const canary = "default_cafe-canary_cafe.example.com_tea-canary-svc_80"
 
 	if !hasUpstream(cfg, canary) {
 		t.Errorf("the config lacks the canary upstream %s", canary)
@@ -193,7 +193,7 @@ func TestGenerateNginxCfgWithCanary(t *testing.T) {
 	if tea.Upstream.Name != primary {
 		t.Errorf("/tea has upstream %q, want %q", tea.Upstream.Name, primary)
 	}
-	if coffee := findLocation(cfg, "/coffee"); coffee == nil || coffee.ProxyPass != "http://default-cafe-ingress-cafe.example.com-coffee-svc-80" {
+	if coffee := findLocation(cfg, "/coffee"); coffee == nil || coffee.ProxyPass != "http://default_cafe-ingress_cafe.example.com_coffee-svc_80" {
 		t.Errorf("/coffee, which has no canary, is %+v", coffee)
 	}
 
@@ -253,7 +253,7 @@ func TestGenerateNginxCfgIgnoresCanary(t *testing.T) {
 			if len(cfg.Canaries) != 0 {
 				t.Errorf("Canaries = %+v, want none", cfg.Canaries)
 			}
-			if hasUpstream(cfg, "default-cafe-canary-cafe.example.com-tea-canary-svc-80") {
+			if hasUpstream(cfg, "default_cafe-canary_cafe.example.com_tea-canary-svc_80") {
 				t.Error("the config has the upstream of an ignored canary")
 			}
 			if tea := findLocation(cfg, "/tea"); tea == nil || strings.Contains(tea.ProxyPass, "$meta_canary_") {
@@ -276,11 +276,11 @@ func TestGenerateNginxCfgTakesFirstCanary(t *testing.T) {
 
 	cfg, _ := generateCanaryCfg(t, &ingEx, true)
 
-	got := cfg.Canaries["default-cafe-ingress-cafe.example.com-tea-svc-80"]
-	if got.Canary != "default-cafe-canary-cafe.example.com-tea-canary-svc-80" || got.Weight != 1 {
+	got := cfg.Canaries["default_cafe-ingress_cafe.example.com_tea-svc_80"]
+	if got.Canary != "default_cafe-canary_cafe.example.com_tea-canary-svc_80" || got.Weight != 1 {
 		t.Errorf("the canary is %+v, want the first one", got)
 	}
-	if hasUpstream(cfg, "default-cafe-canary-2-cafe.example.com-tea-canary-svc-80") {
+	if hasUpstream(cfg, "default_cafe-canary-2_cafe.example.com_tea-canary-svc_80") {
 		t.Error("the config has the upstream of the second canary")
 	}
 }
@@ -299,7 +299,7 @@ func TestGenerateNginxCfgForMergeableIngressesWithCanary(t *testing.T) {
 		staticParams:  &StaticConfigParams{UpstreamAPI: true},
 	})
 
-	const primary = "default-cafe-ingress-tea-minion-cafe.example.com-tea-svc-80"
+	const primary = "default_cafe-ingress-tea-minion_cafe.example.com_tea-svc_80"
 	if got := cfg.Canaries[primary]; got.Header != "X-Canary" {
 		t.Errorf("Canaries = %+v, want one for %s", cfg.Canaries, primary)
 	}
@@ -382,8 +382,8 @@ func createCanaryConfigurator(t *testing.T, manager nginx.Manager) *Configurator
 }
 
 const (
-	cafeTeaUpstream       = "default-cafe-ingress-cafe.example.com-tea-svc-80"
-	cafeTeaCanaryUpstream = "default-cafe-canary-cafe.example.com-tea-canary-svc-80"
+	cafeTeaUpstream       = "default_cafe-ingress_cafe.example.com_tea-svc_80"
+	cafeTeaCanaryUpstream = "default_cafe-canary_cafe.example.com_tea-canary-svc_80"
 )
 
 func TestConfiguratorCanaryLifecycle(t *testing.T) {
@@ -518,9 +518,9 @@ func TestGenerateNginxCfgWithCanaryPerUpstream(t *testing.T) {
 
 	cfg, _ := generateCanaryCfg(t, &ingEx, true)
 
-	const primary = "default-cafe-ingress-cafe.example.com-tea-svc-80"
+	const primary = "default_cafe-ingress_cafe.example.com_tea-svc_80"
 	// named by the host of the location, so that each config has its own
-	const canary = "default-cafe-canary-cafe.example.com-tea-canary-svc-80"
+	const canary = "default_cafe-canary_cafe.example.com_tea-canary-svc_80"
 	if !hasUpstream(cfg, canary) {
 		t.Errorf("the config lacks the canary upstream %s", canary)
 	}

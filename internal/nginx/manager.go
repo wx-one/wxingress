@@ -3,6 +3,7 @@ package nginx
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -877,4 +878,46 @@ func getOSCABundlePath(s string) string {
 	}
 
 	return caFilePath
+}
+
+// RemoveLegacyIngressConfigs removes from conf.d the config files of Ingresses named as they were before they were
+// named <namespace>_<name>: <namespace>-<name>.conf, which begin with "# configuration for <namespace>/<name>".
+// The controller writes the configs of all Ingresses anew at startup, and the old files, left in a conf.d that
+// outlives the container, would make the servers of the Ingresses twice.
+func (lm *LocalManager) RemoveLegacyIngressConfigs() {
+	removeLegacyIngressConfigs(lm.logger, lm.confdPath)
+}
+
+func removeLegacyIngressConfigs(l *slog.Logger, confdPath string) {
+	entries, err := os.ReadDir(confdPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			nl.Warnf(l, "Failed to read %v for old Ingress configs: %v", confdPath, err)
+		}
+		return
+	}
+	for _, e := range entries {
+		name, ok := strings.CutSuffix(e.Name(), ".conf")
+		if !ok || e.IsDir() || strings.Contains(name, "_") || !strings.Contains(name, "-") {
+			continue
+		}
+		filename := path.Join(confdPath, e.Name())
+		f, err := os.Open(filename)
+		if err != nil {
+			continue
+		}
+		head := make([]byte, 512)
+		n, _ := io.ReadFull(f, head)
+		_ = f.Close()
+		first, _, _ := strings.Cut(string(head[:n]), "\n")
+		key, isIngress := strings.CutPrefix(first, "# configuration for ")
+		if !isIngress || strings.Replace(strings.TrimSpace(key), "/", "-", 1) != name {
+			continue
+		}
+		if err := os.Remove(filename); err != nil {
+			nl.Warnf(l, "Failed to remove the old Ingress config %v: %v", filename, err)
+			continue
+		}
+		nl.Infof(l, "Removed the old Ingress config %v", filename)
+	}
 }

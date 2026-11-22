@@ -503,6 +503,12 @@ controller:
   ## (unless controller.lifecycle is set). Turn controller.reportIngressStatus.enable off while both run.
   ingressNginxCompat: false
 
+  ## Lets Ingresses of different namespaces share a host (their paths merged into the server of the oldest one) and
+  ## canary Ingresses attach to Ingresses of other namespaces, as ingress-nginx does (-ingress-nginx-cross-namespace).
+  ## Whoever may create an Ingress in any namespace can then add paths to, or divert traffic of, the hosts of every
+  ## other namespace. Off: a host belongs to the namespace of the Ingress that holds it. Not implied by ingressNginxCompat.
+  ingressNginxCrossNamespace: false
+
   ## ingress-nginx's tcp and udp services (its chart's tcp and udp values): "<port>": "<namespace>/<service>:<port>[:PROXY][:PROXY]",
   ## the first PROXY taking the PROXY protocol of the client, the second sending it to the Service (TCP only). The chart puts
   ## them into a ConfigMap (-tcp-services-configmap, -udp-services-configmap), opens the ports in the pods - with

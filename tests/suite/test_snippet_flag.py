@@ -35,7 +35,7 @@ class TestSnippetAnnotation:
         time.sleep(5)
         pod_namespace = ingress_controller_prerequisites.namespace
         pod_name = get_first_pod_name(kube_apis.v1, ingress_controller_prerequisites.namespace, IC_SELECTOR)
-        file_path = f"/etc/nginx/conf.d/{test_namespace}-{ingress_name}.conf"
+        file_path = f"/etc/nginx/conf.d/{test_namespace}_{ingress_name}.conf"
         result_conf = get_file_contents(kube_apis.v1, file_path, pod_name, pod_namespace)
         snippet_annotation = "tcp_nodelay on;"
         assert snippet_annotation in result_conf, f"failed to find snippet ({snippet_annotation}) in nginx conf"
