@@ -4,6 +4,14 @@ wxingress versions are `<NGINX Ingress Controller version>-wx<n>`: `5.7.1-wx5` i
 release based on NGINX Ingress Controller 5.7.1. The changes of NGINX Ingress Controller itself are on its
 [releases page](https://github.com/nginx/kubernetes-ingress/releases).
 
+## 5.7.1-wx8
+
+- The data plane reads JWT key sets and OIDC session keys from their files off the event loop. Before,
+  `stat`, `fopen` and `fread` ran in the request's access phase and stopped the worker while the file
+  was read; a rotated OIDC session key is now looked for once a second instead of on every request.
+- CI shows the analyses of the metalang compiler on every build and runs the certificates, JWT and OIDC
+  tests of the data plane.
+
 ## 5.7.1-wx7
 
 A security release for the data plane module. It matters where JWT or OIDC Policies are used; upgrade

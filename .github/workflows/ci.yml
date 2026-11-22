@@ -166,6 +166,10 @@ jobs:
         run: |
           "$META" --version
           ./dataplane/build.sh
+          # meta's analyses: errors fail the lowering above; notes are
+          # annotated so they show on the run's summary page
+          grep -E '^[^ ]+:[0-9]+: note: ' dataplane/build/lower.log |
+            sed -E 's#^.*/dataplane/build/main.c:([0-9]+): note: (.*)$#::warning title=meta (lowered main.c line \1)::\2#' || true
           echo "${META_IMAGE%@*}@$META_DIGEST" > dataplane/build/META-IMAGE
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -205,6 +209,24 @@ jobs:
           NGINX="$GITHUB_WORKSPACE/dataplane/build/nginx/sbin/nginx" \
           MODULE="$GITHUB_WORKSPACE/dataplane/build/ngx_http_wxingress_module.so" \
             ./dataplane/tests/upstream-api.sh
+
+      - name: Certificates test
+        run: |
+          NGINX="$GITHUB_WORKSPACE/dataplane/build/nginx/sbin/nginx" \
+          MODULE="$GITHUB_WORKSPACE/dataplane/build/ngx_http_wxingress_module.so" \
+            ./dataplane/tests/certificates.sh
+
+      - name: JWT test
+        run: |
+          NGINX="$GITHUB_WORKSPACE/dataplane/build/nginx/sbin/nginx" \
+          MODULE="$GITHUB_WORKSPACE/dataplane/build/ngx_http_wxingress_module.so" \
+            ./dataplane/tests/jwt.sh
+
+      - name: OIDC test
+        run: |
+          NGINX="$GITHUB_WORKSPACE/dataplane/build/nginx/sbin/nginx" \
+          MODULE="$GITHUB_WORKSPACE/dataplane/build/ngx_http_wxingress_module.so" \
+            ./dataplane/tests/oidc.sh
 
   helm:
     name: Helm chart

@@ -11,7 +11,8 @@
 #   NGINX=build/nginx/sbin/nginx MODULE=build/ngx_http_wxingress_module.so \
 #       tests/jwt.sh
 #
-#   PORT=38400    the first of the three ports it uses
+#   PORT=18400    the first of the four ports it uses (below the ephemeral range,
+#                 where an outgoing connection of an earlier test can hold one)
 #   KEEP=1        leave the prefix behind to look at
 
 set -u
@@ -21,7 +22,7 @@ repository=$(CDPATH= cd -- "$here/../.." && pwd)
 nginx=${NGINX:-$here/../build/nginx/sbin/nginx}
 unset NGINX
 module=${MODULE:-$here/../build/ngx_http_wxingress_module.so}
-port=${PORT:-38400}
+port=${PORT:-18400}
 
 say() { printf '%s\n' "$*"; }
 

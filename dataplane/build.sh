@@ -114,10 +114,15 @@ mkdir -p "$build"
 awk -v dir="$here/src" '/^#include "[a-z]+\.c"$/ { f = $2; gsub(/"/, "", f); while ((getline line < (dir "/" f)) > 0) print line; close(dir "/" f); next } { print }' \
   "$here/src/main.c" >"$build/main.c"
 "$meta" -s -module "$addon" "$build/main.c" >"$build/lower.log" 2>&1 || {
-  grep -A3 "error" "$build/lower.log" | head -20
+  cat "$build/lower.log"
   say "lowering failed, see $build/lower.log"
   exit 1
 }
+
+# What meta's analyses say - ownership, blocking calls on the loop, what it
+# could not resolve - is shown on every build, not only when lowering fails:
+# a note that nobody reads is a note that is never acted on.
+cat "$build/lower.log"
 
 if [ "${CURL_SHARED:-0}" != 1 ]; then
   # the addon meta wrote names -lcurl: the static one instead, its headers

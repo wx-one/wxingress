@@ -6,7 +6,8 @@
 # writes for an oidc Policy without NGINX Plus, and runs tests/oidc, which is
 # the identity provider and the browser.
 #
-#   PORT=38420    the first of the three ports it uses
+#   PORT=18420    the first of the eight ports it uses (below the ephemeral range,
+#                 where an outgoing connection of an earlier test can hold one)
 #   KEEP=1        leave the prefix behind to look at
 
 set -u
@@ -16,7 +17,7 @@ repository=$(CDPATH= cd -- "$here/../.." && pwd)
 nginx=${NGINX:-$here/../build/nginx/sbin/nginx}
 unset NGINX
 module=${MODULE:-$here/../build/ngx_http_wxingress_module.so}
-port=${PORT:-38420}
+port=${PORT:-18420}
 
 say() { printf '%s\n' "$*"; }
 

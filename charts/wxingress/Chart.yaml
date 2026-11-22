@@ -1,7 +1,7 @@
 apiVersion: v2
 name: wxingress
-version: 2.8.3
-appVersion: 5.7.1-wx7
+version: 2.8.4
+appVersion: 5.7.1-wx8
 kubeVersion: ">= 1.25.0-0"
 type: application
 description: wxingress, the drop-in successor of ingress-nginx, built on NGINX Ingress Controller, with the Gateway API
@@ -19,7 +19,7 @@ annotations:
   artifacthub.io/prerelease: "false"
   artifacthub.io/images: |
     - name: wxingress
-      image: ghcr.io/wx-one/wxingress:5.7.1-wx7
+      image: ghcr.io/wx-one/wxingress:5.7.1-wx8
   artifacthub.io/links: |
     - name: Documentation
       url: https://wx-one.github.io/wxingress/

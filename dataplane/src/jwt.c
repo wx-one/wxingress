@@ -394,11 +394,78 @@ static void jwtTlsKey(const jwtTls_t *tls, char *into, size_t room) {
 /** How long a task waits for another's fetch of the same set: its timeouts and retries. */
 #define JWT_FETCH_WAIT_MS 20000
 
+/**
+ * A small file - a key set or a key a Secret mounts - read where blocking is
+ * allowed. stat, open and read wait on a device, and a regular file is always
+ * "ready", so the loop cannot wait for one: they run in meta_offload and the
+ * task parks meanwhile. The bytes go into the caller's buffer, never a static
+ * one, because another request of this worker runs while this one waits.
+ */
+typedef struct fileRead_t {
+  const char *path;
+  struct stat seen;
+  int statOnly;
+  int found;
+  char *into;
+  size_t room;
+  size_t got;
+} fileRead_t;
+
+static void fileReadOffloaded(void *with) {
+
+  fileRead_t *read = with;
+  FILE *in;
+
+  read->found = stat(read->path, &read->seen) == 0;
+  read->got = 0;
+
+  if (!read->found || read->statOnly || read->into == NULL || read->room == 0)
+    return;
+
+  in = fopen(read->path, "r");
+
+  if (in == NULL) {
+    read->found = 0;
+    return;
+  }
+
+  read->got = fread(read->into, 1, read->room, in);
+  fclose(in);
+}
+
+static int fileStat(const char *path, struct stat *seen) {
+
+  fileRead_t read = {.path = path, .statOnly = 1};
+
+  meta_offload(fileReadOffloaded, &read);
+
+  if (read.found)
+    *seen = read.seen;
+
+  return read.found;
+}
+
+/* the number of bytes read into `into`, or -1 when the file is not there */
+static long fileReadInto(const char *path, char *into, size_t room, struct stat *seen) {
+
+  fileRead_t read = {.path = path, .into = into, .room = room};
+
+  meta_offload(fileReadOffloaded, &read);
+
+  if (!read.found)
+    return -1;
+
+  if (seen != NULL)
+    *seen = read.seen;
+
+  return (long)read.got;
+}
+
 static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
                           const jwtTls_t *tls, int unknownKid) {
 
   jwtSet_t *set = NULL;
-  jwtSet_t *free = NULL;
+  jwtSet_t *unused = NULL;
   time_t now = time(NULL);
   char tlsKey[sizeof jwtSets[0].tls];
 
@@ -409,8 +476,8 @@ static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
 
   for (int at = 0; at < JWT_SETS; ++at) {
     if (jwtSets[at].source[0] == 0) {
-      if (free == NULL)
-        free = &jwtSets[at];
+      if (unused == NULL)
+        unused = &jwtSets[at];
       continue;
     }
     if (jwtSets[at].fromURL == fromURL && strcmp(jwtSets[at].source, source) == 0 &&
@@ -421,16 +488,16 @@ static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
   }
 
   if (set == NULL) {
-    if (free == NULL) {
+    if (unused == NULL) {
       /* full: the first one that nobody is fetching goes */
-      for (int at = 0; at < JWT_SETS && free == NULL; ++at)
+      for (int at = 0; at < JWT_SETS && unused == NULL; ++at)
         if (!jwtSets[at].fetching)
-          free = &jwtSets[at];
-      if (free == NULL)
+          unused = &jwtSets[at];
+      if (unused == NULL)
         return NULL;
-      jwtSetEmpty(free);
+      jwtSetEmpty(unused);
     }
-    set = free;
+    set = unused;
     memset(set, 0, sizeof *set);
     snprintf(set->source, sizeof set->source, "%s", source);
     snprintf(set->tls, sizeof set->tls, "%s", tlsKey);
@@ -440,9 +507,8 @@ static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
   if (!fromURL) {
 
     struct stat info;
-    FILE *file;
-    static char text[256 * 1024];
-    size_t length;
+    char *text;
+    long length;
 
     /* a rotated Secret is a new file: looked for once a second, not on every request */
     if (set->count > 0 && set->looked == now)
@@ -450,26 +516,27 @@ static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
 
     set->looked = now;
 
-    if (stat(source, &info) != 0)
+    if (!fileStat(source, &info))
       return set->count > 0 ? set : NULL;
 
     if (set->count > 0 && info.st_mtim.tv_sec == set->modified.tv_sec &&
         info.st_mtim.tv_nsec == set->modified.tv_nsec && info.st_size == set->size)
       return set;
 
-    file = fopen(source, "r");
+    text = malloc(256 * 1024);
 
-    if (file == NULL)
+    if (text == NULL)
       return set->count > 0 ? set : NULL;
 
-    length = fread(text, 1, sizeof text, file);
-    fclose(file);
+    length = fileReadInto(source, text, 256 * 1024, &info);
 
-    if (jwtSetRead(set, text, length) > 0) {
+    if (length > 0 && jwtSetRead(set, text, (size_t)length) > 0) {
       set->modified = info.st_mtim;
       set->size = info.st_size;
       set->generation = ++jwtGenerations;
     }
+
+    free(text);
 
     return set->count > 0 ? set : NULL;
   }

@@ -115,26 +115,43 @@ static int oidcKey(http_request_t *req, unsigned char key[32]) {
   static char fileKey[256];
   static char fileRead[512];
   static struct timespec fileModified;
+  static time_t fileLooked;
   const char *file = req.variable("wxingress_oidc_session_key_file");
   const char *secret = req.variable("wxingress_oidc_client_secret");
   char info[2048];
   size_t length = 32;
   struct stat seen;
+  time_t now = time(NULL);
 
-  if (file[0] != 0 && stat(file, &seen) == 0 && seen.st_size > 0) {
-    if (strcmp(fileRead, file) != 0 || seen.st_mtim.tv_sec != fileModified.tv_sec ||
-        seen.st_mtim.tv_nsec != fileModified.tv_nsec) {
-      FILE *in = fopen(file, "r");
-      size_t got = in != NULL ? fread(fileKey, 1, sizeof fileKey - 1, in) : 0;
-      if (in != NULL)
-        fclose(in);
-      fileKey[got] = 0;
-      snprintf(fileRead, sizeof fileRead, "%s", file);
-      fileModified = seen.st_mtim;
+  /*
+   * A rotated Secret is a new file: looked for once a second and for another
+   * file, not on every request, and read off the loop (fileReadInto). The
+   * worker's copy is only written here, on the loop, after the read is back.
+   */
+  if (file[0] != 0 && (fileLooked != now || strcmp(fileRead, file) != 0)) {
+
+    fileLooked = now;
+
+    if (!fileStat(file, &seen) || seen.st_size == 0) {
+      fileKey[0] = 0;
+      fileRead[0] = 0;
+    } else if (strcmp(fileRead, file) != 0 || seen.st_mtim.tv_sec != fileModified.tv_sec ||
+               seen.st_mtim.tv_nsec != fileModified.tv_nsec) {
+
+      char read[256];
+      long got = fileReadInto(file, read, sizeof read - 1, &seen);
+
+      if (got >= 0) {
+        memcpy(fileKey, read, (size_t)got);
+        fileKey[got] = 0;
+        snprintf(fileRead, sizeof fileRead, "%s", file);
+        fileModified = seen.st_mtim;
+      }
     }
-    if (fileKey[0] != 0)
-      secret = fileKey;
   }
+
+  if (file[0] != 0 && strcmp(fileRead, file) == 0 && fileKey[0] != 0)
+    secret = fileKey;
 
   if (secret[0] == 0 || !oidcKeyInfo(req, info, sizeof info))
     return 0;
