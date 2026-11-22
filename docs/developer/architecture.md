@@ -307,11 +307,28 @@ When rollback is enabled, `CreateConfig()` follows a safe write sequence:
 This protects against a single bad resource taking down the entire NGINX
 instance.
 
-### NGINX Plus dynamic reconfiguration
+### Changes without a reload (`-dynamic-upstreams`)
 
-For NGINX Plus, upstream server changes (endpoint updates) can be applied via the
-NGINX Plus API without a full reload, avoiding traffic disruption. Weight changes
-below a threshold are also handled dynamically.
+With NGINX OSS and the wxingress data plane module (`-dynamic-upstreams`, on with
+`controller.ingressNginxCompat`), NGINX is reloaded only when its configuration
+changes, as in ingress-nginx. Everything else goes to the module through its
+upstream API, or to disk, without a reload (`internal/k8s/dynamic.go`):
+
+- the servers of upstreams (endpoint changes), for Ingresses, VirtualServers,
+  TransportServers, the TCP services and the Gateway API;
+- canaries and their weights, and the load-balancing rules (`ewma`, `chash`,
+  sticky sessions);
+- certificates (re-read per handshake with `-ssl-dynamic-reload`);
+- files NGINX reads per request: basic auth user files and the JWK sets of
+  `jwt` Policies;
+- OIDC session revocations (`-oidc-revocations-configmap`).
+
+Reloads that remain are limited by `-sync-rate-limit`; changes that arrive in
+the meantime are applied in one reload.
+
+With NGINX Plus (`-nginx-plus`), the NGINX Plus API takes the upstream servers
+instead, and `-weight-changes-dynamic-reload` handles weight changes below a
+threshold without a reload.
 
 ---
 
