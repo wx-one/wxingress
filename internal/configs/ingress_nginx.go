@@ -152,6 +152,16 @@ func (a *ingressNginxAnnotations) matching(name string, re *regexp.Regexp, reaso
 	return value, true
 }
 
+// variables tells whether the value of the annotation has only variables nginx
+// knows (checkIngressNginxVariables), and warns that it is ignored when not.
+func (a *ingressNginxAnnotations) variables(name string, value string, bareBraces bool) bool {
+	if err := checkIngressNginxVariables(value, bareBraces); err != nil {
+		a.invalid(name, value, err.Error())
+		return false
+	}
+	return true
+}
+
 // boolean returns an annotation that is a boolean, which ingress-nginx parses with strconv.ParseBool.
 func (a *ingressNginxAnnotations) boolean(name string, nginxOrg ...string) (bool, bool) {
 	value, exists := a.value(name, nginxOrg...)
@@ -255,7 +265,8 @@ func parseIngressNginxSnippets(a *ingressNginxAnnotations, enableSnippets bool) 
 func parseIngressNginxRewriteAnnotations(a *ingressNginxAnnotations, cfgParams *ConfigParams) {
 	// ingress-nginx removes no spaces from rewrite-target before it validates it
 	if target, ok := a.matching(IngressNginxRewriteTargetAnnotation, ingressNginxPathWithCaptureRegexp,
-		"it must be a path of letters, digits, -._~/: and $1-style captures", RewriteTargetAnnotation, "nginx.org/rewrites"); ok {
+		"it must be a path of letters, digits, -._~/: and $1-style captures", RewriteTargetAnnotation, "nginx.org/rewrites"); ok &&
+		a.variables(IngressNginxRewriteTargetAnnotation, target, false) {
 		cfgParams.IngressNginxRewriteTarget = target
 	}
 	if useRegex, ok := a.boolean(IngressNginxUseRegexAnnotation, PathRegexAnnotation); ok {
@@ -263,7 +274,9 @@ func parseIngressNginxRewriteAnnotations(a *ingressNginxAnnotations, cfgParams *
 	}
 	if prefix, exists := a.value(IngressNginxXForwardedPrefixAnnotation); exists {
 		if ingressNginxPathWithCaptureRegexp.MatchString(strings.ReplaceAll(prefix, " ", "")) {
-			cfgParams.IngressNginxXForwardedPrefix = prefix
+			if a.variables(IngressNginxXForwardedPrefixAnnotation, prefix, true) {
+				cfgParams.IngressNginxXForwardedPrefix = prefix
+			}
 		} else {
 			a.invalid(IngressNginxXForwardedPrefixAnnotation, prefix, "it must be a path of letters, digits, -._~/: and $1-style captures")
 		}
@@ -297,6 +310,9 @@ func parseIngressNginxRedirect(a *ingressNginxAnnotations) *version2.Return {
 		target = strings.TrimSpace(target)
 		if !ingressNginxRedirectURLRegexp.MatchString(target) {
 			a.invalid(urlAnnotation, target, "it must be an http or https URL")
+			return nil
+		}
+		if !a.variables(urlAnnotation, target, true) {
 			return nil
 		}
 		code := defaultCode

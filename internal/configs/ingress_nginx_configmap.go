@@ -202,7 +202,7 @@ func TranslateIngressNginxConfigMap(data map[string]string) (out map[string]stri
 	return out, warnings, unsafe
 }
 
-func sortedKeys(m map[string]string) []string {
+func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range maps.Keys(m) {
 		keys = append(keys, k)

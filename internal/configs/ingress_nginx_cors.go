@@ -38,10 +38,12 @@ const (
 )
 
 var (
-	ingressNginxCORSOriginRegexp  = regexp.MustCompile(`^([a-z]+://(\*\.)?[A-Za-z0-9\-.]*(:\d+)?|\*|null)?$`)
-	ingressNginxCORSMethodsRegexp = regexp.MustCompile(`^([A-Za-z]+,?\s?)+$`)
+	ingressNginxCORSOriginRegexp = regexp.MustCompile(`^([a-z]+://(\*\.)?[A-Za-z0-9\-.]*(:\d+)?|\*|null)?$`)
+	// ingress-nginx has \s where these have a space: a CR or LF would end the
+	// header of add_header and start another
+	ingressNginxCORSMethodsRegexp = regexp.MustCompile(`^([A-Za-z]+,? ?)+$`)
 	ingressNginxCORSHeadersRegexp = regexp.MustCompile(`^[A-Za-z0-9-_, ]*$`)
-	ingressNginxCORSExposeRegexp  = regexp.MustCompile(`^(([A-Za-z0-9\-\_]+|\*),?\s?)+$`)
+	ingressNginxCORSExposeRegexp  = regexp.MustCompile(`^(([A-Za-z0-9\-\_]+|\*),? ?)+$`)
 )
 
 // parseIngressNginxCORS reads enable-cors and the cors-* annotations as

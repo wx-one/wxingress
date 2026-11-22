@@ -10,6 +10,11 @@ supported, which behave differently, and which are not supported. Names below ar
 
 - An invalid value is ignored, with a Warning event on the Ingress, as ingress-nginx ignores it. Values are trimmed
   line by line first.
+- Annotations that take nginx variables take only those every server knows: `$1` to `$9` (the captures of the path's regular expression), the request's `$http_<header>`, `$arg_<name>` and `$cookie_<name>`, and `$args`, `$binary_remote_addr`, `$content_length`, `$content_type`, `$document_root`, `$document_uri`, `$escaped_request_uri`, `$fastcgi_path_info`, `$fastcgi_script_name`, `$host`, `$hostname`, `$https`, `$is_args`, `$proxy_add_x_forwarded_for`, `$proxy_host`, `$proxy_port`, `$query_string`, `$realpath_root`, `$remote_addr`, `$remote_port`, `$remote_user`, `$request_filename`, `$request_id`, `$request_method`, `$request_uri`, `$scheme`, `$server_addr`, `$server_name`, `$server_port`, `$server_protocol` and `$uri`. Any other
+  variable (also `$best_http_host`, which wxingress does not define) makes the value invalid, since nginx would refuse
+  the whole configuration. Regular expressions nginx compiles (paths with `use-regex` or `rewrite-target`, `~` values
+  of `proxy-redirect-from` and `proxy-cookie-*`) must be valid PCRE; .NET-only syntax such as balancing groups is
+  refused.
 - Where an `nginx.org/*` annotation sets the same thing, the `nginx.org/*` annotation wins and the ingress-nginx one
   is ignored with a warning (see [nginx.org annotations](#nginxorg-annotations)).
 - Where ingress-nginx refuses to serve a location because its protection cannot be set up (a missing auth Secret, an
@@ -42,10 +47,10 @@ These behave as in ingress-nginx.
 | `proxy-buffer-size`, `proxy-buffers-number`, `proxy-busy-buffers-size` | Rendered as ingress-nginx renders them: `proxy_buffer_size S` and `proxy_buffers N S`. |
 | `proxy-max-temp-file-size`, `proxy-http-version` | `proxy-http-version` takes `1.0` or `1.1`. |
 | `proxy-next-upstream`, `proxy-next-upstream-timeout`, `proxy-next-upstream-tries` | ingress-nginx's validation; `non_idempotent` is moved to the end. |
-| `proxy-redirect-from`, `proxy-redirect-to` | |
+| `proxy-redirect-from`, `proxy-redirect-to` | Validated as `nginx.org/proxy-redirect-from` and `-to`; one without the other is ignored (except `off` and `default`). |
 | `proxy-cookie-domain`, `proxy-cookie-path` | `proxy_cookie_domain`, `proxy_cookie_path`: `<from> <to>` or `off`. |
 | `rewrite-target`, `use-regex`, `x-forwarded-prefix` | A `rewrite-target` or `use-regex` turns every path of the host (of every Ingress on it) into a case-insensitive regular expression, ordered longest first, as ingress-nginx does. |
-| `app-root`, `upstream-vhost`, `server-alias` | |
+| `app-root`, `upstream-vhost`, `server-alias` | A `server-alias` wildcard must leave at least two labels (`*.example.com`, not `*.com`). |
 | `permanent-redirect`, `permanent-redirect-code`, `temporal-redirect`, `temporal-redirect-code` | `temporal-redirect` wins. The URL must be http or https. |
 | `ssl-ciphers`, `ssl-prefer-server-ciphers` | |
 | `backend-protocol` | `HTTP`, `HTTPS`, `GRPC`, `GRPCS`, `AUTO_HTTP`, `FCGI`. Any other value makes the locations answer 503. |

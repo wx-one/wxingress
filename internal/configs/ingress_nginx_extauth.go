@@ -89,6 +89,9 @@ func parseIngressNginxExternalAuth(a *ingressNginxAnnotations, ingEx *IngressEx,
 	if !ingressNginxURLWithVariablesRegexp.MatchString(authURL) {
 		return deny("%s is invalid: %q", IngressNginxAuthURLAnnotation, authURL)
 	}
+	if err := checkIngressNginxVariables(authURL, false); err != nil {
+		return deny("%s is invalid: %q: %v", IngressNginxAuthURLAnnotation, authURL, err)
+	}
 	parsed, err := url.Parse(authURL)
 	switch {
 	case err != nil:
@@ -152,10 +155,10 @@ func parseIngressNginxExternalAuth(a *ingressNginxAnnotations, ingEx *IngressEx,
 	}
 
 	if signin, exists := a.value(IngressNginxAuthSigninAnnotation); exists {
-		if signin = strings.ReplaceAll(signin, " ", ""); ingressNginxURLWithVariablesRegexp.MatchString(signin) {
-			auth.signinURL = signin
-		} else {
+		if signin = strings.ReplaceAll(signin, " ", ""); !ingressNginxURLWithVariablesRegexp.MatchString(signin) {
 			a.invalid(IngressNginxAuthSigninAnnotation, signin, "it must be a URL")
+		} else if a.variables(IngressNginxAuthSigninAnnotation, signin, false) {
+			auth.signinURL = signin
 		}
 	}
 	auth.signinRedirectParam = ingressNginxDefaultSigninRedirectParam
@@ -176,10 +179,10 @@ func parseIngressNginxExternalAuth(a *ingressNginxAnnotations, ingEx *IngressEx,
 	}
 
 	if key, exists := a.value(IngressNginxAuthCacheKeyAnnotation); exists {
-		if key = strings.ReplaceAll(key, " ", ""); ingressNginxVariableRegexp.MatchString(key) {
-			auth.cacheKey = key
-		} else {
+		if key = strings.ReplaceAll(key, " ", ""); !ingressNginxVariableRegexp.MatchString(key) {
 			a.invalid(IngressNginxAuthCacheKeyAnnotation, key, "it must be letters, digits, -, _ and variables")
+		} else if a.variables(IngressNginxAuthCacheKeyAnnotation, key, false) {
+			auth.cacheKey = key
 		}
 	}
 	durations := ingressNginxDefaultAuthCacheDuration

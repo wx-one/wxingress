@@ -574,7 +574,7 @@ func validateProxyRedirectFromAnnotation(context *annotationValidationContext) f
 		// value unquoted, so NGINX unescapes it (collapsing \\ to \, etc.) before
 		// its PCRE engine compiles it; validate the post-unescape form so a value
 		// that compiles as written cannot still fail nginx -t.
-		if _, err := regexp2.Compile(internalValidation.UnescapeNGINXToken(pattern)); err != nil {
+		if err := configs.CheckPCRERegex(internalValidation.UnescapeNGINXToken(pattern)); err != nil {
 			return field.ErrorList{field.Invalid(context.fieldPath, v,
 				"invalid regex pattern")}
 		}
@@ -1444,6 +1444,10 @@ func validateRFC1738Path(path string) bool {
 func validateRegexPath(path string, fieldPath *field.Path) field.ErrorList {
 	if _, err := regexp2.Compile(path); err != nil {
 		return field.ErrorList{field.Invalid(fieldPath, path, fmt.Sprintf("must be a valid regular expression: %v", err))}
+	}
+	// regexp2 takes constructs of .NET that nginx's PCRE refuses, which would fail nginx -t
+	if err := configs.CheckPCRERegex(path); err != nil {
+		return field.ErrorList{field.Invalid(fieldPath, path, fmt.Sprintf("must be a regular expression PCRE takes: %v", err))}
 	}
 	if err := ValidateEscapedString(path, "*.jpg", "^/images/image_*.png$"); err != nil {
 		return field.ErrorList{field.Invalid(fieldPath, path, err.Error())}

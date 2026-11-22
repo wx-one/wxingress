@@ -9,6 +9,24 @@ General rules, as in ingress-nginx:
 
 - An invalid annotation is ignored, with a warning event on the Ingress; values
   are trimmed line by line first.
+- Where an annotation takes nginx variables (`rewrite-target`,
+  `x-forwarded-prefix`, `permanent-redirect`, `temporal-redirect`,
+  `upstream-vhost`, `app-root`, `proxy-redirect-from`/`-to`, `auth-url`,
+  `auth-signin`, `auth-cache-key`, `auth-proxy-set-headers`, `mirror-target`,
+  `proxy-ssl-name`, `proxy-cookie-domain`/`-path`, `upstream-hash-by`,
+  `fastcgi-params-configmap`), only variables every server knows are taken:
+  `$1` to `$9` (the captures of the path's regular expression), the request's `$http_<header>`, `$arg_<name>` and `$cookie_<name>`, and `$args`, `$binary_remote_addr`, `$content_length`, `$content_type`, `$document_root`, `$document_uri`, `$escaped_request_uri`, `$fastcgi_path_info`, `$fastcgi_script_name`, `$host`, `$hostname`, `$https`, `$is_args`, `$proxy_add_x_forwarded_for`, `$proxy_host`, `$proxy_port`, `$query_string`, `$realpath_root`, `$remote_addr`, `$remote_port`, `$remote_user`, `$request_filename`, `$request_id`, `$request_method`, `$request_uri`, `$scheme`, `$server_addr`, `$server_name`, `$server_port`, `$server_protocol` and `$uri`. A value with another variable (`$best_http_host`
+  included, which wxingress does not define), a `$` without a name or a brace
+  outside `${name}` where the value is unquoted is invalid: an unknown variable
+  would make `nginx -t` fail for every Ingress. Where an invalid value denies
+  the locations (`auth-url`, `auth-proxy-set-headers`,
+  `fastcgi-params-configmap`), it does so here as well.
+- A regular expression nginx compiles (a `use-regex` or `rewrite-target` path,
+  a `~` of `proxy-redirect-from`, `proxy-cookie-path` or `proxy-cookie-domain`)
+  must be one PCRE takes: .NET's balancing groups (`(?<a-b>...)`,
+  `(?<-a>...)`), group names starting with a digit, conditions that are no
+  group (`(?(text)yes|no)`), `\p{IsBlock}` and a quantifier other than `{n}` in
+  a lookbehind are refused; an Ingress with such a path is rejected.
 - Where an `nginx.org/*` annotation sets the same, the `nginx.org/*` one wins,
   with a warning.
 - Where ingress-nginx refuses to serve a location because its auth cannot be
@@ -197,15 +215,15 @@ and 128 MB of PEM.
 | `use-port-in-redirects` | `port_in_redirect on` (`true`) or `off` (`false`) in the locations of the Ingress. |
 | `satisfy` | `satisfy any` or `satisfy all` in the locations of the Ingress: with `any`, a request that passes one of the source ranges, basic auth and external auth is served. Another value is ignored with a warning. |
 | `disable-proxy-intercept-errors` | `true`: the codes of `custom-http-errors` are not intercepted, the backends' answers go to the client as they are. A `default-backend` still gets the 502 and 503 (above). |
-| `server-alias` | More names of the server, comma- or space-separated host names. |
-| `upstream-vhost`, `app-root`, `ssl-ciphers`, `ssl-prefer-server-ciphers`, `proxy-redirect-from`, `proxy-redirect-to` | As `nginx.org/upstream-vhost`, `nginx.org/app-root`, `nginx.org/ssl-ciphers`, `nginx.org/ssl-prefer-server-ciphers`, `nginx.org/proxy-redirect-from` and `-to` (which win); a value with characters that would break out of the directive is ignored with a warning. |
+| `server-alias` | More names of the server, comma- or space-separated host names. A wildcard stands for one label and must leave at least two (`*.example.com`; `*.com`, `*` and `example.*` are ignored with a warning). |
+| `upstream-vhost`, `app-root`, `ssl-ciphers`, `ssl-prefer-server-ciphers`, `proxy-redirect-from`, `proxy-redirect-to` | As `nginx.org/upstream-vhost`, `nginx.org/app-root`, `nginx.org/ssl-ciphers`, `nginx.org/ssl-prefer-server-ciphers`, `nginx.org/proxy-redirect-from` and `-to` (which win); a value with characters that would break out of the directive is ignored with a warning, as is one the controller would refuse in the `nginx.org/*` annotation (`#`, a backtick, a regular expression PCRE does not compile in `proxy-redirect-from`). `proxy-redirect-from` other than `off` or `default` without `proxy-redirect-to`, and `proxy-redirect-to` without `proxy-redirect-from`, are ignored with a warning. |
 | `backend-protocol` | `HTTPS`, `GRPC`, `GRPCS` for every Service of the Ingress (as `nginx.org/ssl-services`, `nginx.org/grpc-services`); `HTTP`, `AUTO_HTTP` as they are; `FCGI` below; any other answers 503. |
 | `backend-protocol: FCGI`, `fastcgi-index`, `fastcgi-params-configmap` | The locations pass to their upstreams with FastCGI as in ingress-nginx: nginx's `fastcgi_params`, `fastcgi_index`, and a `fastcgi_param` for each key of a ConfigMap of the Ingress's namespace (watched; keys and values validated as ingress-nginx does). A missing ConfigMap, one of another namespace or an invalid parameter: 503. |
 | `allowlist-source-range` (`whitelist-source-range`), `denylist-source-range` | Comma-separated addresses and CIDRs, IPv4 and IPv6, in every location of the Ingress as ingress-nginx renders them: `deny` of each denied range first, then `allow` of each allowed one and `deny all` (403). `allowlist-source-range` wins over `whitelist-source-range`. An invalid range makes the locations answer 503, as ingress-nginx denies them. |
 | `limit-rps`, `limit-rpm`, `limit-connections`, `limit-burst-multiplier`, `limit-allowlist` (`limit-whitelist`), `limit-rate`, `limit-rate-after` | ingress-nginx's zones, keys, allowlist, bursts (limit × multiplier, default 5, `nodelay`) and its 503. An invalid limit drops the whole rate limit, as there. |
 | `auth-type`, `auth-secret`, `auth-secret-type`, `auth-realm` | Basic auth from the Opaque Secret (`auth-file` with key `auth`, or `auth-map`), kept in step with the Secret; the Authorization header is not passed on. `auth-type: digest` answers 503: open-source nginx has no digest auth. |
 | `auth-url`, `auth-method`, `auth-signin`, `auth-signin-redirect-param`, `auth-response-headers`, `auth-request-redirect`, `auth-snippet`, `auth-cache-key`, `auth-cache-duration`, `auth-always-set-cookie` | External auth with `auth_request`, its internal location and headers as in ingress-nginx, and the 302 to the sign-in URL with `rd=` on 401. `auth-snippet` needs `-enable-snippets`. |
-| `auth-proxy-set-headers` | The headers of a ConfigMap of the Ingress's namespace (`name` or `<namespace>/name`) to the auth service, nginx variables in the values as in ingress-nginx; watched, a change configures the Ingress again. A missing ConfigMap, one of another namespace (wxingress takes no resources of other namespaces) or an invalid header name: 503. |
+| `auth-proxy-set-headers` | The headers of a ConfigMap of the Ingress's namespace (`name` or `<namespace>/name`) to the auth service, nginx variables in the values as in ingress-nginx; watched, a change configures the Ingress again. A missing ConfigMap, one of another namespace (wxingress takes no resources of other namespaces), an invalid header name or a value ingress-nginx would not take as a header value (a line break or other control character) or with a variable not every server knows: 503. |
 | `auth-keepalive`, `auth-keepalive-requests`, `auth-keepalive-timeout`, `auth-keepalive-share-vars` | The auth service as an upstream with `keepalive` (default 1000 requests, 60 s), its name resolved while nginx runs (`server ... resolve`), so a missing auth service fails no reload. As in ingress-nginx not with HTTP/2 on (the ingress-nginx default; ignored with a warning) and not when the host of `auth-url` has a variable. nginx keeps the connection of an auth answer without a body (oauth2-proxy's 202, a `Content-Length: 0`) and closes one with a body, which `auth_request` does not read. `auth-keepalive-share-vars` is what nginx's subrequests do anyway (they share the variables of the request). |
 | `connection-proxy-header` | `close` or `keep-alive`: the Connection header to the backend instead of the one the location sends (`$connection_upgrade`, or none for HTTP/2) - exactly one. |
 | `custom-headers` | The headers of a ConfigMap of the Ingress's namespace on every answer of its locations, also nginx's own, the backend's of the same name replaced (`proxy_hide_header` and `add_header ... always`, with `add_header_inherit merge` so the server's stay - where ingress-nginx has `more_set_headers`). As in ingress-nginx each header must be in the ConfigMap key `global-allowed-response-headers` (comma-separated), and a `$` of a value is a `$`. Not allowed, missing, of another namespace, an invalid name or value: 503. The ConfigMap is watched (an informer for just it, while an Ingress names it); a change reloads. |

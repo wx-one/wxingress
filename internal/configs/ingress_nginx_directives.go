@@ -31,6 +31,29 @@ var (
 	ingressNginxCookieRuleRegexp = regexp.MustCompile(`^[A-Za-z0-9.\-_/~*$^()|]+ [A-Za-z0-9.\-_/~$]+$|^off$`)
 )
 
+// checkIngressNginxCookieRule checks what nginx -t would refuse of
+// proxy_cookie_domain or proxy_cookie_path from to: a regular expression
+// (~ or ~*) PCRE does not compile, which nginx compiles as it is, without
+// variables, or a variable it does not know.
+func checkIngressNginxCookieRule(rule string) error {
+	if rule == "off" {
+		return nil
+	}
+	from, to, _ := strings.Cut(rule, " ")
+	pattern, isRegex := strings.CutPrefix(from, "~*")
+	if !isRegex {
+		pattern, isRegex = strings.CutPrefix(from, "~")
+	}
+	if isRegex {
+		if err := CheckPCRERegex(pattern); err != nil {
+			return err
+		}
+	} else if err := checkIngressNginxVariables(from, false); err != nil {
+		return err
+	}
+	return checkIngressNginxVariables(to, false)
+}
+
 // parseIngressNginxDirectives reads the annotations that are one directive
 // each, as ingress-nginx renders them in the locations.
 func parseIngressNginxDirectives(a *ingressNginxAnnotations, cfgParams *ConfigParams) {
@@ -42,7 +65,11 @@ func parseIngressNginxDirectives(a *ingressNginxAnnotations, cfgParams *ConfigPa
 		if v, ok := a.value(name); ok {
 			v = strings.Join(strings.Fields(v), " ")
 			if ingressNginxCookieRuleRegexp.MatchString(v) {
-				d = append(d, directive+" "+v)
+				if err := checkIngressNginxCookieRule(v); err != nil {
+					a.invalid(name, v, err.Error())
+				} else {
+					d = append(d, directive+" "+v)
+				}
 			} else {
 				a.invalid(name, v, `it must be "<from> <to>" or off`)
 			}

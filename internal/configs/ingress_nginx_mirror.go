@@ -41,6 +41,9 @@ func parseIngressNginxMirror(a *ingressNginxAnnotations) *version1.IngressNginxM
 		a.invalid(IngressNginxMirrorTargetAnnotation, target, "it must be an http or https URL")
 		return nil
 	}
+	if !a.variables(IngressNginxMirrorTargetAnnotation, target, false) {
+		return nil
+	}
 	m := &version1.IngressNginxMirror{
 		Source:      "/_mirror-" + string(a.ing.UID),
 		Target:      strings.ReplaceAll(target, "$request_uri", "$ingress_nginx_mirror_uri"),
