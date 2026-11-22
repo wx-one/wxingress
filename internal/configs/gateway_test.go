@@ -234,3 +234,35 @@ func TestGatewayCanaryGoesToTheModule(t *testing.T) {
 		t.Errorf("canaries %+v", c)
 	}
 }
+
+// TestRestrictiveAnnotationsOfARouteAreReported: the annotations of a route
+// that restrict who gets an answer, which a route does not take, are
+// reported, so that its rules answer 503 rather than serve without them.
+func TestRestrictiveAnnotationsOfARouteAreReported(t *testing.T) {
+	t.Parallel()
+	p := IngressNginxAnnotationPrefix
+	s := ParseGatewaySettings("app", "r", map[string]string{
+		p + "auth-url": "https://auth.example.com", p + "whitelist-source-range": "10.0.0.0/8", p + "satisfy": "any",
+		p + "enable-modsecurity": "false", p + "enable-cors": "true", p + "proxy-read-timeout": "30",
+	}, false)
+	want := []string{p + "auth-url", p + "satisfy", p + "whitelist-source-range"}
+	if !slices.Equal(s.Restricted, want) {
+		t.Errorf("restricted %q, want %q", s.Restricted, want)
+	}
+	if s.Empty() {
+		t.Error("settings with restrictions are empty")
+	}
+	if only := ParseGatewaySettings("app", "r", map[string]string{p + "denylist-source-range": "10.0.0.0/8"}, false); only.Empty() {
+		t.Error("settings with a deny list alone are empty")
+	}
+	// what restricts nothing on an Ingress restricts nothing on a route
+	none := ParseGatewaySettings("app", "r", map[string]string{
+		p + "enable-global-auth": "true", p + "global-rate-limit": "0", p + "global-rate-limit-window": "1m", p + "enable-owasp-core-rules": "false",
+	}, false)
+	if len(none.Restricted) != 0 {
+		t.Errorf("restricted %q", none.Restricted)
+	}
+	if rl := ParseGatewaySettings("app", "r", map[string]string{p + "global-rate-limit": "100"}, false); len(rl.Restricted) != 1 {
+		t.Errorf("a global rate limit: restricted %q", rl.Restricted)
+	}
+}

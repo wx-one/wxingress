@@ -46,6 +46,9 @@ func (lbc *LoadBalancerController) syncGatewayAPI() {
 	for _, s := range res.Skipped {
 		nl.Debugf(lbc.Logger, "Gateway API: %s", s)
 	}
+	for _, w := range res.Warnings {
+		nl.Warnf(lbc.Logger, "Gateway API: %s", w)
+	}
 
 	if lbc.gatewayErrors == nil {
 		lbc.gatewayErrors = make(map[string]gatewayError)
@@ -76,11 +79,13 @@ func (lbc *LoadBalancerController) syncGatewayAPI() {
 		switch o := p.Object.(type) {
 		case *conf_v1.VirtualServer:
 			if gateway.IsGatewayVirtualServer(o) {
-				lbc.gatewayErrors[getResourceKey(&o.ObjectMeta)] = gatewayError{gateway: gatewayOfAnnotations(o.Annotations), err: errors.New(p.Message)}
+				nl.Warnf(lbc.Logger, "Gateway API: Gateway %s: %s", o.Annotations[gateway.AnnotationGateway], p.Message)
+				lbc.gatewayErrors[getResourceKey(&o.ObjectMeta)] = gatewayError{gateway: gatewayOfAnnotations(o.Annotations), err: gatewayProblem(o.Annotations, p.Message)}
 			}
 		case *conf_v1.TransportServer:
 			if gateway.IsGatewayTransportServer(o) {
-				lbc.gatewayErrors[getResourceKey(&o.ObjectMeta)] = gatewayError{gateway: gatewayOfAnnotations(o.Annotations), err: errors.New(p.Message)}
+				nl.Warnf(lbc.Logger, "Gateway API: Gateway %s: %s", o.Annotations[gateway.AnnotationGateway], p.Message)
+				lbc.gatewayErrors[getResourceKey(&o.ObjectMeta)] = gatewayError{gateway: gatewayOfAnnotations(o.Annotations), err: gatewayProblem(o.Annotations, p.Message)}
 			}
 		}
 	}
@@ -200,7 +205,7 @@ func (lbc *LoadBalancerController) gatewayVirtualServerApplied(vs *conf_v1.Virtu
 	if lbc.gatewayErrors == nil {
 		lbc.gatewayErrors = make(map[string]gatewayError)
 	}
-	lbc.gatewayErrors[key] = gatewayError{gateway: gatewayOf(vs), err: err}
+	lbc.gatewayErrors[key] = gatewayError{gateway: gatewayOf(vs), err: gatewayApplyError(vs.Annotations)}
 }
 
 func gatewayOf(vs *conf_v1.VirtualServer) types.NamespacedName {
@@ -225,7 +230,42 @@ func (lbc *LoadBalancerController) gatewayTransportServerApplied(ts *conf_v1.Tra
 	if lbc.gatewayErrors == nil {
 		lbc.gatewayErrors = make(map[string]gatewayError)
 	}
-	lbc.gatewayErrors[key] = gatewayError{gateway: gatewayOfAnnotations(ts.Annotations), err: err}
+	lbc.gatewayErrors[key] = gatewayError{gateway: gatewayOfAnnotations(ts.Annotations), err: gatewayApplyError(ts.Annotations)}
+}
+
+// The status of a Gateway is read by those who may read the Gateway, and a
+// Gateway takes routes of other namespaces: the errors of its config there
+// say only which of its hostnames and ports they are about, never the
+// message of the validator, of the host conflict or of nginx - which can
+// name the hosts, resources and config of others. The log has the message.
+
+// gatewayServed says which part of a Gateway the config made from it with
+// annotations serves: its hostname and listener port.
+func gatewayServed(annotations map[string]string) string {
+	host := annotations[gateway.AnnotationHostname]
+	what := "listeners without a hostname"
+	if host != "" && !gateway.IsCatchAllHost(host) {
+		what = fmt.Sprintf("hostname %q", host)
+	}
+	if port := annotations[gateway.AnnotationPort]; port != "" {
+		what += " on listener port " + port
+	}
+	return what
+}
+
+// gatewayProblem is the error a Gateway's status gets for a problem of the
+// config made from it.
+func gatewayProblem(annotations map[string]string, message string) error {
+	if strings.HasSuffix(message, "is taken by another resource") {
+		return fmt.Errorf("%s: not served, the host is taken by another resource", gatewayServed(annotations))
+	}
+	return fmt.Errorf("%s: not served, its configuration was rejected - the controller's log has the reason", gatewayServed(annotations))
+}
+
+// gatewayApplyError is the error a Gateway's status gets when the config
+// made from it could not be applied.
+func gatewayApplyError(annotations map[string]string) error {
+	return fmt.Errorf("%s: not served, its configuration could not be applied - the controller's log has the reason", gatewayServed(annotations))
 }
 
 // gatewayAddresses are the addresses the Gateways report: those the

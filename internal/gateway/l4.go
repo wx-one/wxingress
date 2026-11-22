@@ -109,7 +109,9 @@ func toTransportServers(gw *graph.Gateway, cfg dataplane.Configuration, idx upst
 		p := listenerPort{port: s.Port, protocol: corev1.ProtocolTCP}
 		var secret *types.NamespacedName
 		if s.SSL != nil {
-			if len(s.SSL.KeyPairIDs) == 0 {
+			if len(s.SSL.KeyPairIDs) == 0 || s.SSL.VerifyClient != "" || s.SSL.ClientCertBundleID != "" {
+				// client certificate validation is not carried into the
+				// TransportServer: not served rather than served without it
 				continue
 			}
 			sec, ok := secretOfKeyPair(s.SSL.KeyPairIDs[0])

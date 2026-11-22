@@ -38,13 +38,50 @@ helm upgrade wxingress oci://ghcr.io/wx-one/charts/wxingress -n wxingress --reus
 
 ## Addresses
 
-Every Gateway gets an address of its own: the controller creates a Service for it in the release
-namespace, owned by the GatewayClass and removed together with the Gateway.
+Every Gateway gets an address of its own: the controller creates a Service for it in the Gateway's
+namespace, owned by the Gateway and removed together with it. The Service maps each listener port onto a
+port NGINX listens on for this Gateway alone, from `controller.gatewayAPI.listenerPorts`.
+
+Whoever can edit Services in the Gateway's namespace can edit that Service. The controller therefore
+checks the NGINX ports it reads back: a port is only served if the Service is owned by the Gateway (its
+controlling owner reference, with the Gateway's UID), the port lies within `listenerPorts`, is none of
+the ports NGINX or the controller use otherwise, and no other listener has it. Where two listeners claim
+the same port, the Service that was written to first keeps it. A port that fails a check is not served,
+and the controller puts a free port back into the Service. A Service with the Gateway's name that the
+controller did not create for this Gateway is never taken over: the Gateway stays without an address
+(`Programmed: False`, `AddressNotAssigned`) until it is deleted.
+
+`spec.infrastructure.labels` and `spec.infrastructure.annotations` of a Gateway are copied onto its
+Service, as the Gateway API intends. With a Service of type `LoadBalancer` these annotations reach the
+cloud provider's load balancer controller, so the owners of a Gateway can choose, for example, an
+internal load balancer, a fixed or pre-allocated IP address, or source ranges, as far as the provider
+reads them from annotations. If that must not be up to them, restrict who may create Gateways, or limit
+the annotations with an admission policy.
 
 The exception is the **default Gateway** (`controller.gatewayAPI.defaultGateway.name`). It shares the
 controller's own Service and ports 80 and 443 with Ingresses and VirtualServers, so routes and Ingresses
 can serve hosts from the same address during a migration. Its listeners can only be HTTP on 80 and HTTPS
 on 443. This is a deliberate deviation from the Gateway API.
+
+On the default Gateway a host can be served by a route and by an Ingress or VirtualServer at once; as
+between Ingresses, the oldest one gets it. A route's host counts as created when the first route that
+brought that hostname was created, but never before the Gateway itself. Hosts that existing Ingresses
+and VirtualServers already serve therefore stay with them, even when the default Gateway takes routes
+from all namespaces.
+
+## Client certificates
+
+Validation of client certificates on a listener (`spec.tls.frontend` of the Gateway) is not supported.
+A listener that asks for it is not served: it gets `Accepted: False` with the reason `UnsupportedValue`
+and `Programmed: False`, rather than being served to clients without verification. Use an `ingressMTLS`
+Policy, attached with `wxingress.wizardtales.com/policies`, to verify client certificates.
+
+## Status messages
+
+A Gateway's status is readable by everyone who may read the Gateway, and a Gateway takes routes from
+other namespaces. Where the configuration made from it is rejected, conflicts with another resource or
+cannot be applied, its `Programmed` condition only names the affected hostname and listener port. The
+full message is in the controller's log.
 
 ## A first route
 
@@ -92,6 +129,37 @@ Ingress: timeouts, body size, buffering, `proxy-next-upstream*`, `backend-protoc
 snippets enabled, the snippet annotations. Rate limits, authentication and access control are NGINX
 Ingress Controller's Policies, attached with `wxingress.wizardtales.com/policies: <policy>[, ...]` on
 the route or the Gateway. Redirects, rewrites, header changes and CORS are the Gateway API's own filters.
+
+A route or Gateway may name any Policy of its own namespace. A Policy of another namespace
+(`<namespace>/<name>`) needs the consent of that namespace: a ReferenceGrant there that allows it
+`from` the route's kind (`HTTPRoute`, `GRPCRoute`) or `Gateway` in the route's namespace, `to` group
+`k8s.nginx.org`, kind `Policy`, with the Policy's name or without one for all Policies:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: shared-policies
+  namespace: security
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: default
+  to:
+    - group: k8s.nginx.org
+      kind: Policy
+      name: corporate-jwt
+```
+
+Without one the Policy is not applied, and the rules of the route answer 500, as for a Policy that does
+not exist; a Gateway that names such a Policy answers 500 for all its hostnames.
+
+The ingress-nginx annotations that restrict who gets an answer are not taken on routes: `auth-*`,
+`allowlist-source-range`/`whitelist-source-range`, `denylist-source-range`, `satisfy`,
+`enable-modsecurity` and `enable-owasp-core-rules` (other than `false`), `modsecurity-snippet` and
+`global-rate-limit` (other than 0). Rather than serve a route without the restriction, its rules answer 503 and the
+controller logs a warning. Use the equivalent Policy instead.
 
 The full list is in [ingress-nginx compatibility](ingress-nginx-compatibility.md#the-gateway-api-the-same-annotations-on-routes).
 

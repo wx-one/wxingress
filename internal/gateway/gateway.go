@@ -114,6 +114,8 @@ type Controller struct {
 	// handled is what the status was last written for, to clear the status
 	// of what is gone since
 	handled status.HandledStatusResources
+	// warned are the warnings of the last Build
+	warned map[string]bool
 }
 
 // New makes a Controller. Its informers start with Start; it watches the
@@ -223,6 +225,10 @@ type Result struct {
 	Addresses map[types.NamespacedName][]gatewayv1.GatewayStatusAddress
 	// Skipped are the reasons parts of the graph are not served.
 	Skipped []string
+	// Warnings are about what is not served, or answers with an error, so
+	// as not to serve it without a restriction it asks for: those that were
+	// not in the last Build, to be logged once.
+	Warnings []string
 }
 
 // Build evaluates the Gateway API resources and maps every Gateway of the
@@ -254,15 +260,23 @@ func (c *Controller) build(ctx context.Context, state graph.ClusterState) Result
 	)
 
 	res := Result{Graph: g, Addresses: make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress)}
-	addr, err := c.newAddressing()
+	gatewayUIDs := make(map[types.NamespacedName]types.UID, len(g.Gateways))
+	for name, gw := range g.Gateways {
+		gatewayUIDs[name] = gw.Source.UID
+	}
+	addr, err := c.newAddressing(gatewayUIDs)
 	if err != nil {
 		c.logger.Error(err, "listing the Services of the Gateways")
-		addr = &addressing{c: c, used: map[int32]bool{}, existing: map[types.NamespacedName]*v1.Service{}, wanted: map[types.NamespacedName]bool{}}
+		addr = &addressing{
+			c: c, used: map[int32]bool{}, existing: map[types.NamespacedName]*v1.Service{},
+			ports: map[types.NamespacedName]map[listenerPort]int32{}, gateways: gatewayUIDs, wanted: map[types.NamespacedName]bool{},
+		}
 	}
 
 	byKey := make(map[string]*conf_v1.VirtualServer)
 	tsByKey := make(map[string]*conf_v1.TransportServer)
 	idx := newUpstreamIndex(g)
+	access := newPolicyAccess(state.ReferenceGrants, g)
 	for _, gw := range sortedGateways(g) {
 		if !gw.Valid {
 			continue
@@ -283,8 +297,10 @@ func (c *Controller) build(ctx context.Context, state graph.ClusterState) Result
 			ingressClass: c.cfg.IngressClass,
 			httpPort:     c.cfg.HTTPPort,
 			httpsPort:    c.cfg.HTTPSPort,
+			access:       access,
 		}, a)
 		res.Skipped = append(res.Skipped, m.skipped...)
+		res.Warnings = append(res.Warnings, m.warnings...)
 		res.Listeners = append(res.Listeners, m.listeners...)
 		for _, vs := range m.virtualServers {
 			key := vs.Namespace + "/" + vs.Name
@@ -307,9 +323,24 @@ func (c *Controller) build(ctx context.Context, state graph.ClusterState) Result
 		}
 	}
 	addr.collect(ctx)
+	res.Warnings = c.newWarnings(res.Warnings)
 	c.previous = byKey
 	c.previousTS = tsByKey
 	return res
+}
+
+// newWarnings are those of warnings the last Build did not have.
+func (c *Controller) newWarnings(warnings []string) []string {
+	warned := make(map[string]bool, len(warnings))
+	var out []string
+	for _, w := range warnings {
+		if !c.warned[w] && !warned[w] {
+			out = append(out, w)
+		}
+		warned[w] = true
+	}
+	c.warned = warned
+	return out
 }
 
 // keepGeneration gives vs the generation of the VirtualServer with the same
