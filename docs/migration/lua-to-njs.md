@@ -34,7 +34,7 @@ controller:
   config:
     entries:
       # 1. the module (the data plane module replaces njs by default, so load it here)
-      main-snippets: load_module modules/ngx_http_js_module.so;
+      main-snippets: load_module /usr/lib/nginx/modules/ngx_http_js_module.so;
       # 2. the script, and the variables it computes
       http-snippets: |
         js_import checks from /etc/nginx/njs/checks.js;
@@ -222,13 +222,13 @@ carries it.
 
 ## Testing njs
 
-Test the script before it reaches the cluster, with the `njs` command line or in a container of the
-wxingress image:
+Test the script before it reaches the cluster, with the `njs` command line or in a container of NGINX's
+official image, which has the njs module (the wxingress image has no shell to run this in):
 
 ```sh
-docker run --rm -v "$PWD:/njs" --entrypoint sh ghcr.io/wx-one/wxingress:5.7.1-wx5 -c '
+docker run --rm -v "$PWD:/njs" nginx:1.31.9 sh -c '
   cat > /tmp/nginx.conf <<EOF
-load_module modules/ngx_http_js_module.so;
+load_module /usr/lib/nginx/modules/ngx_http_js_module.so;
 events {}
 http {
   js_import checks from /njs/checks.js;
