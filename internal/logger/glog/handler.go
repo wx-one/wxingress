@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/wx-one/wxingress/internal/logger/levels"
 )
@@ -111,27 +112,54 @@ func (h *Handler) Handle(_ context.Context, r slog.Record) error {
 	// Render handler-level attrs (from WithAttrs)
 	for _, a := range h.attrs {
 		buf = append(buf, " "...)
-		buf = append(buf, a.Key...)
+		buf = appendEscaped(buf, a.Key)
 		buf = append(buf, "="...)
-		buf = append(buf, a.Value.String()...)
+		buf = appendEscaped(buf, a.Value.String())
 	}
 
 	// Render record-level attrs (from AddAttrs)
 	r.Attrs(func(a slog.Attr) bool {
 		buf = append(buf, " "...)
-		buf = append(buf, a.Key...)
+		buf = appendEscaped(buf, a.Key)
 		buf = append(buf, "="...)
-		buf = append(buf, a.Value.String()...)
+		buf = appendEscaped(buf, a.Value.String())
 		return true
 	})
 
 	buf = append(buf, " "...)
-	buf = append(buf, r.Message...)
+	buf = appendEscaped(buf, r.Message)
 	buf = append(buf, "\n"...)
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	_, err := h.out.Write(buf)
 	return err
+}
+
+// appendEscaped appends s with what would end the line or forge another - CR, LF, the other control characters,
+// the Unicode line and paragraph separators - escaped as Go does in a quoted string, and invalid UTF-8 as \xNN:
+// a message or attribute may carry what a user put into a resource or a request, and one log entry stays one line.
+func appendEscaped(buf []byte, s string) []byte {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		switch {
+		case r == utf8.RuneError && size == 1:
+			buf = append(buf, `\x`...)
+			buf = append(buf, "0123456789abcdef"[s[i]>>4], "0123456789abcdef"[s[i]&0xf])
+		case r == '\n':
+			buf = append(buf, `\n`...)
+		case r == '\r':
+			buf = append(buf, `\r`...)
+		case r == '\t':
+			buf = append(buf, `\t`...)
+		case r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) || r == '\u2028' || r == '\u2029':
+			q := strconv.QuoteRuneToASCII(r)
+			buf = append(buf, q[1:len(q)-1]...)
+		default:
+			buf = append(buf, s[i:i+size]...)
+		}
+		i += size
+	}
+	return buf
 }
 
 func getShortFileName(f string) string {

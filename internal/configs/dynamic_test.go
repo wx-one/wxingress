@@ -70,10 +70,10 @@ func TestIngressUpdateReloadsOnlyWhenTheConfigChanges(t *testing.T) {
 	if _, err := cnf.AddOrUpdateIngress(&ingEx); err != nil {
 		t.Fatal(err)
 	}
-	if manager.reloads != 0 || !slices.Equal(manager.updated, []string{"default-cafe-ingress-cafe.example.com-tea-svc-80"}) {
+	if manager.reloads != 0 || !slices.Equal(manager.updated, []string{"default_cafe-ingress_cafe.example.com_tea-svc_80"}) {
 		t.Errorf("new servers: reloads %d, updated %v", manager.reloads, manager.updated)
 	}
-	if config := manager.configs["default-cafe-ingress"]; !slicesContainsLine(config, "10.0.0.5:80") {
+	if config := manager.configs["default_cafe-ingress"]; !slicesContainsLine(config, "10.0.0.5:80") {
 		t.Errorf("the file does not have the new servers for the next reload:\n%s", config)
 	}
 

@@ -3,6 +3,7 @@ package k8s
 import (
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync/atomic"
 	"time"
 
@@ -152,9 +153,32 @@ func (tq *taskQueue) worker() {
 			return
 		}
 		nl.Debugf(tq.logger, "Syncing %v", t.(task).Key)
-		tq.sync(t.(task))
+		tq.syncRecovering(t.(task))
 		tq.queue.Done(t)
 	}
+}
+
+// panicRequeueDelay is how long a task whose sync panicked waits before it is synced again.
+var panicRequeueDelay = 30 * time.Second
+
+// syncRecovering syncs the task, and when the sync panics - an object no one foresaw - logs the panic with its
+// stack and syncs the task again after panicRequeueDelay, instead of the process crashing: every replica syncs the
+// same objects, and one object must not keep them all restarting. A coalesced task is not requeued: whatever asks
+// for it next schedules it again.
+func (tq *taskQueue) syncRecovering(t task) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		nl.Errorf(tq.logger, "Sync of %v %v panicked: %v\n%s", t.Kind, t.Key, r, debug.Stack())
+		switch t.Kind {
+		case certificates, endpoints, reload, retry:
+			return
+		}
+		tq.RequeueAfter(t, fmt.Errorf("sync panicked: %v", r), panicRequeueDelay)
+	}()
+	tq.sync(t)
 }
 
 // Shutdown shuts down the work queue and waits for the worker to ACK

@@ -67,6 +67,8 @@ func ServeAdmission(ctx context.Context, address, certFile, keyFile string, hand
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12, GetCertificate: certificate.get},
 		// the controller's context, with its logger
 		BaseContext: func(net.Listener) context.Context { return ctx },

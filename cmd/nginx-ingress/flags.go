@@ -92,6 +92,9 @@ var (
 	ingressNginxDefaults = flag.Bool("ingress-nginx-defaults", false,
 		`Use the defaults of ingress-nginx instead of those of this controller for what neither the ConfigMap nor an annotation sets: timeouts, buffering, retries, keepalive, redirects, HSTS, HTTP/2, TLS, the headers to the upstream and WebSocket in every Ingress location. For clusters moving from ingress-nginx.`)
 
+	ingressNginxCrossNamespace = flag.Bool("ingress-nginx-cross-namespace", false,
+		`Let Ingresses of different namespaces share a host, as ingress-nginx does: the paths of every Ingress with the host are merged into the server of the oldest one, whatever its namespace, and a canary Ingress attaches to the Ingresses of other namespaces. Whoever may create an Ingress in any namespace can then add paths to, or divert traffic of, the hosts of all other namespaces. Without it, a host belongs to the namespace of the Ingress that holds it: Ingresses of other namespaces with that host lose it (with a warning), and a canary attaches only to Ingresses of its own namespace.`)
+
 	appProtect = flag.Bool("enable-app-protect", false, "Enable support for NGINX App Protect. Requires -nginx-plus.")
 
 	appProtectLogLevel = flag.String("app-protect-log-level", appProtectLogLevelDefault,

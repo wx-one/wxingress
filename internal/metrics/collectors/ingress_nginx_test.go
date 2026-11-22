@@ -120,3 +120,28 @@ nginx_ingress_controller_check_success{controller_class="k8s.io/ingress-nginx",c
 		t.Fatal(err)
 	}
 }
+
+// The counts of the checks of Ingresses that do not exist go checksRetention after their last check.
+func TestIngressNginxCollectorPrunesChecks(t *testing.T) {
+	t.Parallel()
+	c := NewIngressNginxCollector("pod-1", "ingress", "k8s.io/ingress-nginx", IngressNginxSources{})
+	c.SetIngressExists(func(namespace, name string) bool { return name == "web" })
+	c.CheckDone("shop", "web", true)
+	c.CheckDone("shop", "refused", false)
+	c.CheckDone("shop", "fresh", false)
+
+	c.mu.Lock()
+	for key, n := range c.checks {
+		if key[1] != "fresh" {
+			n.last = time.Now().Add(-checksRetention - time.Minute)
+		}
+	}
+	c.pruneChecks(time.Now())
+	_, web := c.checks[[2]string{"shop", "web"}]
+	_, refused := c.checks[[2]string{"shop", "refused"}]
+	_, fresh := c.checks[[2]string{"shop", "fresh"}]
+	c.mu.Unlock()
+	if !web || refused || !fresh {
+		t.Errorf("kept web %v, refused %v, fresh %v: want the existing and the recent one", web, refused, fresh)
+	}
+}

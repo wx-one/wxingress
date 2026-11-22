@@ -53,8 +53,8 @@ because the default server has the default certificate).
 ## Several Ingresses of one host
 
 As ingress-nginx does, regular Ingresses that share a host make one server:
-the oldest Ingress of the host holds it, and the paths the others have for the
-host become locations of its server, in any namespace. The annotations of
+the oldest Ingress of the host holds it, and the paths the others of its
+namespace have for the host become locations of its server. The annotations of
 each Ingress apply to its own paths; the settings of the server (redirects,
 HSTS, server snippets) are those of the holder, and its certificate is that of
 the holder or, if it has no TLS for the host, of the first other Ingress that
@@ -64,6 +64,55 @@ event that names the Ingress whose server has its paths; a change to it
 changes that server. Masters and minions (`nginx.org/mergeable-ingress-type`)
 and VirtualServers keep the controller's rule: the host is theirs, and the
 other resources of the host are rejected.
+
+### Hosts across namespaces: `-ingress-nginx-cross-namespace`
+
+ingress-nginx merges the Ingresses of a host whatever their namespace, and a
+canary Ingress of any namespace attaches to the Ingresses of the host it
+names. In a cluster shared by teams, that lets whoever may create an Ingress
+in one namespace add paths to the host of another namespace - a `/login` in
+front of someone else's application - or send its traffic, or a share of it,
+to a Service of their own with a canary. wxingress therefore keeps a host in
+the namespace of the Ingress that holds it unless told otherwise:
+
+- an Ingress of another namespace with that host loses it, with the warning
+  `host <host> is taken by an Ingress of another namespace` (and, if it has
+  no other host, the event `All hosts are taken by other resources`); the
+  warning names neither the holder nor its namespace;
+- a canary Ingress attaches only to the Ingresses of its own namespace; one
+  that finds its host and path only in another namespace gets the event
+  `The canary has no Ingress with the same host, path and path type in its
+  namespace`. With `-ingress-nginx-defaults` a canary is the canary only of
+  upstreams (namespace, Service, port) of its own namespace, and the upstream
+  is told by namespace, Service and port, not by ingress-nginx's name
+  `<namespace>-<service>-<port>`, which namespace `a-b` with Service `c` shares
+  with namespace `a` with Service `b-c`.
+
+Clusters that rely on ingress-nginx's behaviour - a WAF or an authentication
+proxy in a namespace of its own that adds a canary or paths to the hosts of
+other namespaces - turn it on with `-ingress-nginx-cross-namespace` (Helm:
+`controller.ingressNginxCrossNamespace: true`). It is not part of
+`controller.ingressNginxCompat`: turn it on only where everyone who may create
+Ingresses may also take over the hosts of every namespace.
+
+### Server aliases
+
+A `server-alias` never takes a host away. nginx serves a name with the server
+it reads first, so an alias that competed with a host would decide by the
+order of the config files. As ingress-nginx skips an alias that is a host or
+an alias already, wxingress leaves out of the server, with a warning on its
+Ingress (`server-alias <name> is ignored: ...`), every alias that
+
+- is the host of another resource (Ingress, VirtualServer, TLS-passthrough
+  TransportServer), compared without case, or, as a wildcard
+  (`*.example.com`), matches one, or falls under another resource's wildcard
+  host - nginx prefers the exact name and the longer wildcard, so either would
+  take requests from the other;
+- collides in the same way with an alias of an older Ingress.
+
+An alias that is a host of the Ingress itself is no conflict and simply not
+repeated; an alias is given once, to the first server of the Ingress. When the
+other resource goes, the alias comes back with the next sync.
 
 ## Prefix paths
 
@@ -311,7 +360,10 @@ deleted, and refuses:
 - a path of a host that another Ingress of the class has, whatever their
   path types, unless one of the two has the `canary` annotation, with
   ingress-nginx's message (`host "<host>" and path "<path>" is already
-  defined in ingress <namespace>/<name>`);
+  defined in ingress <namespace>/<name>`) when that Ingress is of the same
+  namespace; for one of another namespace the message is `... is already
+  defined in another Ingress`, which tells whoever creates the Ingress
+  neither the namespace nor the name of someone else's;
 - an Ingress whose configuration does not render or does not pass
   `nginx -t`: the configuration is built aside as it would be with the
   Ingress - its own config, those of the Ingresses of its hosts it would be
@@ -326,8 +378,21 @@ deleted, and refuses:
 The warnings of the Ingress's config (an annotation that is ignored, a host
 another resource has) go back with the answer, which kubectl prints. A check
 waits for the controller's sync to finish what it is doing, and the sync for
-the check: they read the same state. The certificate is read again when its
-files change (a renewed Secret). [the RKE2 runbook](../migration/rke2.md), step 5, puts
+the check while it builds and renders the configs: they read the same state.
+`nginx -t` runs afterwards, without holding the sync up, on a copy of the
+configuration taken while the check held it, one check at a time, and is
+stopped after 10 seconds (the API server's default timeout of a webhook). A
+Secret the check needs for `nginx -t` that no resource uses yet is written for
+the test only and removed when the check is done. The webhook takes at most 4
+reviews at once - more are answered `503`, a failed call, so the webhook's
+`failurePolicy` decides - and none bigger than 3.5 MiB (`413`). The
+certificate is read again when its files change (a renewed Secret).
+
+The webhook does not authenticate its callers: API servers present no client
+certificate by default, and whoever reaches the port can have Ingresses
+checked (built, rendered and, with `-validating-webhook-nginx-test`, parsed by
+`nginx -t`). Restrict who reaches it with a NetworkPolicy that admits only the
+API server to the webhook port. [the RKE2 runbook](../migration/rke2.md), step 5, puts
 it in the place of rke2-ingress-nginx's; `dataplane/e2e/admission-webhook.sh`
 checks what it admits, refuses and counts.
 

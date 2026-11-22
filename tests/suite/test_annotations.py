@@ -141,12 +141,12 @@ def annotations_setup(
         event_text = f"Configuration for {test_namespace}/{ingress_name} was added or updated"
         error_text = f"{test_namespace}/{ingress_name} was rejected: with error"
         for minion in minions_info:
-            upstream_names.append(f"{test_namespace}-{minion['name']}-{ingress_host}-{minion['svc_name']}-80")
+            upstream_names.append(f"{test_namespace}_{minion['name']}_{ingress_host}_{minion['svc_name']}_80")
     else:
         event_text = f"Configuration for {test_namespace}/{ingress_name} was added or updated"
         error_text = f"{test_namespace}/{ingress_name} was rejected: with error"
-        upstream_names.append(f"{test_namespace}-{ingress_name}-{ingress_host}-backend1-svc-80")
-        upstream_names.append(f"{test_namespace}-{ingress_name}-{ingress_host}-backend2-svc-80")
+        upstream_names.append(f"{test_namespace}_{ingress_name}_{ingress_host}_backend1-svc_80")
+        upstream_names.append(f"{test_namespace}_{ingress_name}_{ingress_host}_backend2-svc_80")
 
     def fin():
         if request.config.getoption("--skip-fixture-teardown") == "no":

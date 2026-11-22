@@ -20,6 +20,7 @@ func holderOf(t *testing.T, c *Configuration, host string) *IngressConfiguration
 func TestIngressesOfAHostAreMerged(t *testing.T) {
 	t.Parallel()
 	c := createTestConfiguration()
+	c.crossNamespace = true
 	now := time.Now()
 
 	older := createTestIngressWithPath("gitlab", "gitlab.example.com", "/", "webservice", now.Add(-time.Hour))
@@ -138,6 +139,7 @@ func TestIngressesOfAHostAreNotMergedIntoAVirtualServer(t *testing.T) {
 func TestCanaryAttachesToThePathOfAMergedIngress(t *testing.T) {
 	t.Parallel()
 	c := createTestCanaryConfiguration()
+	c.crossNamespace = true
 	now := time.Now()
 
 	direct := createTestIngressWithPath("gitlab-direct", "gitlab.example.com", "/api", "direct", now.Add(-time.Hour))

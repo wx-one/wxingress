@@ -3142,7 +3142,7 @@ func TestSyncPolicy_UpdatesMergeableIngressesWhenPolicyChanges(t *testing.T) {
 
 	foundMasterConfig := false
 	for _, name := range manager.CreatedConfigNames {
-		if name == "default-master-ingress" {
+		if name == "default_master-ingress" {
 			foundMasterConfig = true
 			break
 		}

@@ -130,6 +130,9 @@ type IngressConfiguration struct {
 	// Merged contains the other regular Ingresses with a host of this regular Ingress, oldest first:
 	// as ingress-nginx does, their paths for the host are locations of its server.
 	Merged []MergedIngress
+	// DroppedServerAliases are the names of ingress-nginx's server-alias of the Ingress that are left out of its
+	// server: a host another resource has, or the server-alias of an older Ingress (lower case).
+	DroppedServerAliases map[string]bool
 }
 
 // CanaryBackend is the canary of an upstream: the canary Ingress and the backend of its path that matched the upstream's location.
@@ -257,7 +260,7 @@ func (ic *IngressConfiguration) IsEqual(resource Resource) bool {
 		}
 	}
 
-	return true
+	return maps.Equal(ic.DroppedServerAliases, ingConfig.DroppedServerAliases)
 }
 
 // MinionConfiguration holds a Minion resource.
@@ -521,6 +524,11 @@ type Configuration struct {
 	// with its host, path and path type, for every path of every Ingress with that upstream, as ingress-nginx's
 	// alternative backends are (-ingress-nginx-defaults); without it, the canary of that location's Ingress alone.
 	canaryPerUpstream bool
+	// crossNamespace lets Ingresses of other namespaces share a host with the Ingress that holds it - their paths
+	// merged into its server - and canary Ingresses attach to Ingresses of other namespaces, as ingress-nginx does
+	// (-ingress-nginx-cross-namespace). Without it, the host of an Ingress is its namespace's: an Ingress of another
+	// namespace with that host loses it, and a canary attaches only to Ingresses of its own namespace.
+	crossNamespace bool
 
 	// startupComplete indicates whether the initial informer cache sync and
 	// queue drain have finished. When false, rebuildHosts() is skipped in
@@ -2023,11 +2031,15 @@ func (c *Configuration) buildHostsAndResources() (newHosts map[string]Resource, 
 
 	// Step 4 - Merge the regular Ingresses of a host into the one that won it
 
-	mergeIngressesOfHosts(newHosts, regularByHost, ingressHolders)
+	mergeIngressesOfHosts(newHosts, regularByHost, ingressHolders, c.crossNamespace)
 
 	// Step 5 - Attach canary Ingresses to the Ingresses that won their hosts
 
 	c.attachCanaries(newHosts)
+
+	// Step 6 - Leave out the server aliases that are hosts of other resources or aliases of older Ingresses
+
+	dropTakenServerAliases(newHosts)
 
 	return newHosts, newResources, vsrToVSConfigs
 }
@@ -2036,8 +2048,10 @@ func (c *Configuration) buildHostsAndResources() (newHosts map[string]Resource, 
 // regular Ingress that holds it, oldest first. Where a VirtualServer or a
 // TransportServer took the host from the regular Ingress that held it after
 // the Ingresses, the others lose it as they would have lost it to that one,
-// with the warning that one got.
-func mergeIngressesOfHosts(hosts map[string]Resource, regularByHost map[string][]*IngressConfiguration, ingressHolders map[string]Resource) {
+// with the warning that one got. Unless crossNamespace, only the Ingresses of
+// the holder's namespace are merged: those of other namespaces lose the host,
+// with a warning that names neither the holder nor its namespace.
+func mergeIngressesOfHosts(hosts map[string]Resource, regularByHost map[string][]*IngressConfiguration, ingressHolders map[string]Resource, crossNamespace bool) {
 	for host, ingConfigs := range regularByHost {
 		if len(ingConfigs) < 2 {
 			continue
@@ -2055,9 +2069,14 @@ func mergeIngressesOfHosts(hosts map[string]Resource, regularByHost map[string][
 
 		var merged []*IngressConfiguration
 		for _, ingConfig := range ingConfigs {
-			if ingConfig != holder {
-				merged = append(merged, ingConfig)
+			if ingConfig == holder {
+				continue
 			}
+			if !crossNamespace && ingConfig.Ingress.Namespace != holder.Ingress.Namespace {
+				ingConfig.AddWarning(fmt.Sprintf("host %s is taken by an Ingress of another namespace", host))
+				continue
+			}
+			merged = append(merged, ingConfig)
 		}
 		slices.SortFunc(merged, func(a, b *IngressConfiguration) int {
 			if a.Wins(b) {
@@ -2093,6 +2112,102 @@ func mergedIngressKeys(hosts map[string]Resource) map[string]map[string]bool {
 		}
 	}
 	return result
+}
+
+// serverNameMatches tells if nginx would give the name to a server with the server name pattern: the same name, or
+// a name under a wildcard pattern (*.example.com, which nginx does not match to example.com itself). Lower case.
+func serverNameMatches(pattern, name string) bool {
+	if pattern == name {
+		return true
+	}
+	suffix, isWildcard := strings.CutPrefix(pattern, "*")
+	return isWildcard && strings.HasPrefix(suffix, ".") && strings.HasSuffix(name, suffix) && len(name) > len(suffix)
+}
+
+// serverNamesCollide tells if a server with one name and a server with the other would compete for a request: the
+// same name, or one a wildcard the other falls under (nginx prefers the exact name to the wildcard, and the longer
+// wildcard to the shorter, so either may take requests away from the other).
+func serverNamesCollide(a, b string) bool {
+	return serverNameMatches(a, b) || serverNameMatches(b, a)
+}
+
+// dropTakenServerAliases leaves out of the servers of the Ingresses the server aliases that would take requests
+// from another resource or from an older Ingress, as ingress-nginx skips an alias that is a host or an alias
+// already: aliases rank below every host of every resource - Ingress, VirtualServer, TransportServer - so an alias
+// that is such a host, matches it as a wildcard, or falls under its wildcard, is dropped, as is one that collides
+// with an alias of an older Ingress. Every dropped alias is a warning of its Ingress.
+func dropTakenServerAliases(hosts map[string]Resource) {
+	type hostHolder struct {
+		host   string
+		holder Resource
+	}
+	var taken []hostHolder
+	var holders []*IngressConfiguration
+	for _, key := range getSortedResourceKeys(hosts) {
+		r := hosts[key]
+		// a VirtualServer of a Gateway has its host with the listener's ports
+		host, _, _ := strings.Cut(key, " ")
+		if host != "" {
+			taken = append(taken, hostHolder{host: strings.ToLower(host), holder: r})
+		}
+		if ingConfig, ok := r.(*IngressConfiguration); ok && !slices.Contains(holders, ingConfig) {
+			holders = append(holders, ingConfig)
+		}
+	}
+	slices.SortFunc(holders, func(a, b *IngressConfiguration) int {
+		if a == b {
+			return 0
+		}
+		if a.Wins(b) {
+			return -1
+		}
+		return 1
+	})
+	var claimed []string
+	for _, ingConfig := range holders {
+		for _, alias := range configs.IngressNginxServerAliases(ingConfig.Ingress) {
+			alias = strings.ToLower(alias)
+			own, other := false, false
+			for _, t := range taken {
+				if !serverNamesCollide(alias, t.host) {
+					continue
+				}
+				if t.holder == Resource(ingConfig) && t.host == alias {
+					own = true
+				} else if t.holder != Resource(ingConfig) {
+					other = true
+				}
+			}
+			var warning string
+			switch {
+			case other:
+				warning = fmt.Sprintf("server-alias %s is ignored: the host is taken by another resource", alias)
+			case own:
+				// a host of its own: the server has the name already
+				continue
+			case slices.ContainsFunc(claimed, func(c string) bool { return serverNamesCollide(alias, c) }):
+				warning = fmt.Sprintf("server-alias %s is ignored: it is the server-alias of another Ingress", alias)
+			default:
+				claimed = append(claimed, alias)
+				continue
+			}
+			if ingConfig.DroppedServerAliases == nil {
+				ingConfig.DroppedServerAliases = make(map[string]bool)
+			}
+			ingConfig.DroppedServerAliases[alias] = true
+			ingConfig.AddWarning(warning)
+		}
+	}
+}
+
+// ingressForServer is the Ingress of the config without the server aliases that dropTakenServerAliases dropped.
+func (ic *IngressConfiguration) ingressForServer() *networking.Ingress {
+	if len(ic.DroppedServerAliases) == 0 {
+		return ic.Ingress
+	}
+	return configs.WithoutIngressNginxServerAliases(ic.Ingress, func(alias string) bool {
+		return ic.DroppedServerAliases[strings.ToLower(alias)]
+	})
 }
 
 // canaryError tells why a canary Ingress is ignored, if it is.
@@ -2137,6 +2252,9 @@ func (c *Configuration) attachCanaries(hosts map[string]Resource) {
 			if !ok || rule.HTTP == nil || slices.Contains(ingConfig.Canaries, canary) {
 				continue
 			}
+			if !c.crossNamespace && ingConfig.Ingress.Namespace != canary.Namespace {
+				continue
+			}
 			if ingressConfigurationHasPath(ingConfig, rule.Host, rule.HTTP.Paths) {
 				ingConfig.Canaries = append(ingConfig.Canaries, canary)
 			}
@@ -2151,9 +2269,10 @@ func (c *Configuration) attachCanaries(hosts map[string]Resource) {
 // port - so it holds for every path of every Ingress whose backend is that
 // upstream, on any host. An upstream takes the first canary that names it,
 // oldest first (ingress-nginx uses only its first alternative backend), and
-// none whose backend is the upstream itself.
+// none whose backend is the upstream itself. Unless crossNamespace, a canary
+// is the canary only of upstreams of its own namespace.
 func (c *Configuration) attachCanariesPerUpstream(hosts map[string]Resource) {
-	bindings := make(map[string]CanaryBackend)
+	bindings := make(map[backendKey]CanaryBackend)
 	for _, canary := range c.getSortedCanaries() {
 		for _, rule := range canary.Spec.Rules {
 			ingConfig, ok := hosts[rule.Host].(*IngressConfiguration)
@@ -2168,8 +2287,11 @@ func (c *Configuration) attachCanariesPerUpstream(hosts map[string]Resource) {
 				if primary == nil {
 					continue
 				}
-				upstream := configs.IngressNginxBackendName(primaryNamespace, primary)
-				if upstream == configs.IngressNginxBackendName(canary.Namespace, &path.Backend) {
+				if !c.crossNamespace && primaryNamespace != canary.Namespace {
+					continue
+				}
+				upstream := newBackendKey(primaryNamespace, primary)
+				if upstream == newBackendKey(canary.Namespace, &path.Backend) {
 					continue
 				}
 				if _, taken := bindings[upstream]; !taken {
@@ -2190,14 +2312,14 @@ func (c *Configuration) attachCanariesPerUpstream(hosts map[string]Resource) {
 		}
 		seen[ingConfig] = true
 		for _, upstream := range ingressConfigurationUpstreams(ingConfig) {
-			cb, ok := bindings[upstream]
+			cb, ok := bindings[upstream.key]
 			if !ok {
 				continue
 			}
 			if ingConfig.CanaryBackends == nil {
 				ingConfig.CanaryBackends = make(map[string]CanaryBackend)
 			}
-			ingConfig.CanaryBackends[upstream] = cb
+			ingConfig.CanaryBackends[upstream.name] = cb
 			if !slices.Contains(ingConfig.Canaries, cb.Ingress) {
 				ingConfig.Canaries = append(ingConfig.Canaries, cb.Ingress)
 			}
@@ -2260,9 +2382,28 @@ func ingressConfigurationBackendForPath(ingConfig *IngressConfiguration, host st
 	return "", nil
 }
 
-// ingressConfigurationUpstreams returns ingress-nginx's names of the upstreams of the paths of the config.
-func ingressConfigurationUpstreams(ingConfig *IngressConfiguration) []string {
-	var upstreams []string
+// backendKey is the upstream of ingress-nginx - namespace, Service, port - without the ambiguity of its name
+// (<namespace>-<service>-<port>, the same for namespace a-b and Service c as for namespace a and Service b-c).
+type backendKey struct {
+	namespace, service, port string
+}
+
+func newBackendKey(namespace string, backend *networking.IngressBackend) backendKey {
+	if backend == nil || backend.Service == nil {
+		return backendKey{namespace: namespace}
+	}
+	return backendKey{namespace: namespace, service: backend.Service.Name, port: configs.GetBackendPortAsString(backend.Service.Port)}
+}
+
+// ingressUpstream is an upstream of a path of an Ingress: its key, and ingress-nginx's name of it.
+type ingressUpstream struct {
+	key  backendKey
+	name string
+}
+
+// ingressConfigurationUpstreams returns the upstreams of the paths of the config, with ingress-nginx's names.
+func ingressConfigurationUpstreams(ingConfig *IngressConfiguration) []ingressUpstream {
+	var upstreams []ingressUpstream
 	ings, validPaths, onlyHost := ingressConfigurationIngresses(ingConfig)
 	for i, ing := range ings {
 		for _, rule := range ing.Spec.Rules {
@@ -2274,8 +2415,9 @@ func ingressConfigurationUpstreams(ingConfig *IngressConfiguration) []string {
 				if p.Backend.Service == nil || (validPaths[i] != nil && !validPaths[i][p.Path]) {
 					continue
 				}
-				if name := configs.IngressNginxBackendName(ing.Namespace, &p.Backend); !slices.Contains(upstreams, name) {
-					upstreams = append(upstreams, name)
+				u := ingressUpstream{key: newBackendKey(ing.Namespace, &p.Backend), name: configs.IngressNginxBackendName(ing.Namespace, &p.Backend)}
+				if !slices.Contains(upstreams, u) {
+					upstreams = append(upstreams, u)
 				}
 			}
 		}
@@ -2349,6 +2491,9 @@ func (c *Configuration) addProblemsForCanaries(problems map[string]Configuration
 		}
 
 		message := "The canary has no Ingress with the same host, path and path type"
+		if !c.crossNamespace {
+			message += " in its namespace"
+		}
 		if err := c.canaryError(ing); err != nil {
 			message = fmt.Sprintf("The canary is ignored: %v", err)
 		}

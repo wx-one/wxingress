@@ -1,6 +1,9 @@
 package configs
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // RenderedConfig is the config file an Ingress config would have: its name in conf.d (without .conf) and its content.
 type RenderedConfig struct {
@@ -62,15 +65,27 @@ func (cnf *Configurator) RenderMergeableIngresses(mergeableIngs *MergeableIngres
 // TestConfigs runs nginx -t of the configuration with the config files
 // replaced - or added - by those given, leaving the configuration as it is.
 func (cnf *Configurator) TestConfigs(configs []RenderedConfig) error {
+	test, err := cnf.PrepareTestConfigs(configs)
+	if err != nil {
+		return err
+	}
+	return test(context.Background())
+}
+
+// PrepareTestConfigs takes a copy of the configuration with the config files
+// replaced - or added - by those given, and returns the nginx -t of that
+// copy, to be run later without the lock the copy was taken under. Without
+// an NGINX manager that tests, the test passes.
+func (cnf *Configurator) PrepareTestConfigs(configs []RenderedConfig) (func(context.Context) error, error) {
 	tester, ok := cnf.nginxManager.(interface {
-		TestWithConfigs(map[string][]byte) error
+		PrepareTestWithConfigs(map[string][]byte) (func(context.Context) error, error)
 	})
 	if !ok {
-		return nil
+		return func(context.Context) error { return nil }, nil
 	}
 	replaced := make(map[string][]byte, len(configs))
 	for _, c := range configs {
 		replaced[c.Name] = c.Content
 	}
-	return tester.TestWithConfigs(replaced)
+	return tester.PrepareTestWithConfigs(replaced)
 }

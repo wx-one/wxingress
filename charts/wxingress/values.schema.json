@@ -2456,6 +2456,11 @@
           "default": false,
           "title": "The profile for running in the place of ingress-nginx"
         },
+        "ingressNginxCrossNamespace": {
+          "type": "boolean",
+          "default": false,
+          "title": "Lets Ingresses of different namespaces share a host and canaries attach across namespaces"
+        },
         "tcpServices": {
           "type": "object",
           "default": {},

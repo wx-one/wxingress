@@ -479,6 +479,25 @@ func generateNginxCfg(ncp NginxCfgParams) (version1.IngressNginxConfig, Warnings
 		stickyUpstreams.balance(getNameForUpstream(ncp.ingEx.Ingress, emptyHostName, defaultBackend), cfgParams.IngressNginxBalancing, ncp.ingEx.Ingress.Namespace, defaultBackend)
 	}
 
+	// ingress-nginx's server-alias: a name once, on the first server of the Ingress, and none that is a host of the
+	// Ingress (those another resource has, or an older Ingress as an alias, are out of the Ingress already)
+	aliasesGiven := make(map[string]bool)
+	for _, rule := range ncp.ingEx.Ingress.Spec.Rules {
+		aliasesGiven[strings.ToLower(rule.Host)] = true
+	}
+	serverAliases := func() []string {
+		var aliases []string
+		for _, alias := range cfgParams.IngressNginxServerAliases {
+			name := strings.ToLower(alias)
+			if aliasesGiven[name] {
+				continue
+			}
+			aliasesGiven[name] = true
+			aliases = append(aliases, alias)
+		}
+		return aliases
+	}
+
 	for _, rule := range ncp.ingEx.Ingress.Spec.Rules {
 		// skipping invalid hosts
 		if !ncp.ingEx.ValidHosts[rule.Host] {
@@ -512,7 +531,7 @@ func generateNginxCfg(ncp NginxCfgParams) (version1.IngressNginxConfig, Warnings
 			ForceSSLRedirect:       cfgParams.IngressNginxForceSSLRedirect,
 			IngressNginxRedirect:   cfgParams.IngressNginxDefaults,
 			PreserveTrailingSlash:  cfgParams.IngressNginxPreserveTrailingSlash,
-			ServerAliases:          cfgParams.IngressNginxServerAliases,
+			ServerAliases:          serverAliases(),
 			HTTPRedirectCode:       cfgParams.HTTPRedirectCode,
 			SSLCiphers:             cfgParams.ServerSSLCiphers,
 			SSLPreferServerCiphers: cfgParams.ServerSSLPreferServerCiphers,
@@ -1843,15 +1862,20 @@ func pathOrDefault(path string) string {
 	return path
 }
 
+// getNameForUpstream returns the name of the upstream of the backend of the Ingress for the host:
+// <namespace>_<name>_<host>_<service>_<port>. None of the parts has an underscore - but the host _ of an empty one,
+// which is a part of its own - so no two Ingresses, hosts or backends share a name, as they did when the parts were
+// joined with hyphens (namespace a-b and name c, namespace a and name b-c), when the upstream of one Ingress took
+// the servers of another's.
 func getNameForUpstream(ing *networking.Ingress, host string, backend *networking.IngressBackend) string {
 	if host == emptyHostName {
 		host = emptyHostToken
 	}
-	return fmt.Sprintf("%v-%v-%v-%v-%v", ing.Namespace, ing.Name, host, backend.Service.Name, GetBackendPortAsString(backend.Service.Port))
+	return fmt.Sprintf("%v_%v_%v_%v_%v", ing.Namespace, ing.Name, host, backend.Service.Name, GetBackendPortAsString(backend.Service.Port))
 }
 
 func getNameForRedirectLocation(ing *networking.Ingress) string {
-	return fmt.Sprintf("@login_url_%v-%v", ing.Namespace, ing.Name)
+	return fmt.Sprintf("@login_url_%v_%v", ing.Namespace, ing.Name)
 }
 
 func upstreamMapToSlice(upstreams map[string]version1.Upstream) []version1.Upstream {

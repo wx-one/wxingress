@@ -1064,7 +1064,7 @@ def get_default_server_conf(v1: CoreV1Api, pod_name, pod_namespace, print_log=Fa
 
 def get_ingress_nginx_template_conf(v1: CoreV1Api, ingress_namespace, ingress_name, pod_name, pod_namespace) -> str:
     """
-    Get contents of /etc/nginx/conf.d/{namespace}-{ingress_name}.conf in the pod.
+    Get contents of /etc/nginx/conf.d/{namespace}_{ingress_name}.conf in the pod.
 
     :param v1: CoreV1Api
     :param ingress_namespace:
@@ -1073,7 +1073,7 @@ def get_ingress_nginx_template_conf(v1: CoreV1Api, ingress_namespace, ingress_na
     :param pod_namespace:
     :return: str
     """
-    file_path = f"/etc/nginx/conf.d/{ingress_namespace}-{ingress_name}.conf"
+    file_path = f"/etc/nginx/conf.d/{ingress_namespace}_{ingress_name}.conf"
     return get_file_contents(v1, file_path, pod_name, pod_namespace)
 
 

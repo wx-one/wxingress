@@ -34,7 +34,7 @@ func TestConfiguratorBalancersWithoutReloads(t *testing.T) {
 	t.Parallel()
 	manager := &balancerManager{canaryManager: newCanaryManager()}
 	cnf := createCanaryConfigurator(t, manager)
-	const coffee = "default-cafe-ingress-cafe.example.com-coffee-svc-80"
+	const coffee = "default_cafe-ingress_cafe.example.com_coffee-svc_80"
 
 	ingEx := createCafeIngressEx()
 	if _, err := cnf.AddOrUpdateIngress(&ingEx); err != nil {

@@ -165,7 +165,7 @@ func (m *endpointsManager) reset() {
 	m.configs, m.reloads, m.updates = 0, 0, nil
 }
 
-const teaUpstream = "default-cafe-cafe.example.com-tea-80"
+const teaUpstream = "default_cafe_cafe.example.com_tea_80"
 
 func teaSlice(name string, ips ...string) *discovery_v1.EndpointSlice {
 	slice := &discovery_v1.EndpointSlice{
@@ -250,8 +250,8 @@ func newEndpointsTestLBC(t *testing.T, syncRateLimit ...float64) (*LoadBalancerC
 	if _, err := lbc.configurator.AddOrUpdateResources(lbc.createExtendedResources(lbc.configuration.GetResources()), true); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(manager.written["default-cafe"], "server 10.0.0.1:8080") {
-		t.Fatalf("the config has no server of tea:\n%s", manager.written["default-cafe"])
+	if !strings.Contains(manager.written["default_cafe"], "server 10.0.0.1:8080") {
+		t.Fatalf("the config has no server of tea:\n%s", manager.written["default_cafe"])
 	}
 	return lbc, manager, nsi.endpointSliceLister.Store
 }
@@ -288,7 +288,7 @@ func TestEndpointSlicesOfAServiceGoToTheModuleTogether(t *testing.T) {
 	if err := lbc.configurator.Reload(false); err != nil {
 		t.Fatal(err)
 	}
-	if config := manager.written["default-cafe"]; !strings.Contains(config, "server 10.0.0.3:8080") {
+	if config := manager.written["default_cafe"]; !strings.Contains(config, "server 10.0.0.3:8080") {
 		t.Errorf("the config reloaded without the new servers:\n%s", config)
 	}
 
@@ -427,8 +427,8 @@ func TestEndpointsRefusedInABatchReload(t *testing.T) {
 	if manager.reloads != 1 {
 		t.Errorf("a refused server: %d reloads, want 1", manager.reloads)
 	}
-	if !strings.Contains(manager.written["default-cafe"], "server 10.0.0.2:8080") {
-		t.Errorf("the reload had the config without the new server:\n%s", manager.written["default-cafe"])
+	if !strings.Contains(manager.written["default_cafe"], "server 10.0.0.2:8080") {
+		t.Errorf("the reload had the config without the new server:\n%s", manager.written["default_cafe"])
 	}
 }
 
@@ -503,7 +503,7 @@ func reloadsWaitForTheSyncRateLimit(t *testing.T) bool {
 	}
 	lbc.sync(obj.(task))
 	lbc.syncQueue.queue.Done(obj)
-	if manager.reloads != 1 || !strings.Contains(manager.written["default-cafe"], "proxy_read_timeout 34s") {
+	if manager.reloads != 1 || !strings.Contains(manager.written["default_cafe"], "proxy_read_timeout 34s") {
 		t.Errorf("after the interval: %d reloads, want 1 with the last change", manager.reloads)
 	}
 

@@ -91,7 +91,7 @@ func TestConfiguratorCertificateLifecycle(t *testing.T) {
 	}
 
 	// the config names the default certificate, never the Secret's file
-	config := manager.canaryManager.configs["default-cafe-ingress"]
+	config := manager.canaryManager.configs["default_cafe-ingress"]
 	if !strings.Contains(config, "ssl_certificate /etc/nginx/secrets/default;") || strings.Contains(config, "default-cafe-secret") {
 		t.Errorf("the config names another certificate:\n%s", config)
 	}
@@ -134,7 +134,7 @@ func TestConfiguratorCertificateLifecycle(t *testing.T) {
 	if want := []string{"cafe.example.com"}; !slices.Equal(manager.deleted, want) || len(manager.set) != 0 {
 		t.Errorf("a Secret that went: set %v, deleted %v, want deleted %v", manager.set, manager.deleted, want)
 	}
-	if config := manager.canaryManager.configs["default-cafe-ingress"]; strings.Contains(config, "ssl_reject_handshake") {
+	if config := manager.canaryManager.configs["default_cafe-ingress"]; strings.Contains(config, "ssl_reject_handshake") {
 		t.Errorf("a host without its Secret rejects handshakes rather than having the default certificate:\n%s", config)
 	}
 
@@ -212,7 +212,7 @@ func TestConfiguratorCertificatesNeedTheModule(t *testing.T) {
 	if len(manager.set) != 0 {
 		t.Errorf("without the module: set %v", manager.set)
 	}
-	if config := manager.canaryManager.configs["default-cafe-ingress"]; !strings.Contains(config, "default-cafe-secret") {
+	if config := manager.canaryManager.configs["default_cafe-ingress"]; !strings.Contains(config, "default-cafe-secret") {
 		t.Errorf("without the module the config does not name the Secret:\n%s", config)
 	}
 }
@@ -370,7 +370,7 @@ func TestConfiguratorCertificateDigestsAreCached(t *testing.T) {
 		}
 		return os.ReadFile(name) //nolint:gosec // a file of the test
 	}
-	cnf.setCertificates("default-cafe-ingress", map[string]string{"cafe.example.com": file})
+	cnf.setCertificates("default_cafe-ingress", map[string]string{"cafe.example.com": file})
 
 	if err := cnf.SyncCertificates(); err != nil {
 		t.Fatal(err)
