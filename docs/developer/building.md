@@ -6,7 +6,7 @@ wxingress has three parts:
 |---|---|---|
 | The controller (`cmd/nginx-ingress`, `internal/`, `pkg/`) | Go | `go build`, `make` |
 | The data plane module (`dataplane/`) | metalang | the metalang compiler, in the image `docker.io/wxone/meta` |
-| The image | Dockerfile | `build/Dockerfile.wxingress`, from the two above and NGINX packages from nginx.org |
+| The image | Dockerfile | `build/Dockerfile.wxingress`, from the two above and NGINX packages from nginx.org, on the hardened Debian 13 runtime seed of container.gov.de |
 
 ## The controller
 
@@ -69,7 +69,38 @@ docker build -f build/Dockerfile.wxingress -t wxingress:dev \
 ```
 
 `build/Dockerfile.wxingress` expects the controller binary `nginx-ingress` and
-`dataplane/build/ngx_http_wxingress_module.so` in the build context.
+`dataplane/build/ngx_http_wxingress_module.so` in the build context. It has two stages:
+
+- **assemble**, on the Debian snapshot the seed's own builder uses (by digest): installs NGINX, njs and
+  the OpenTelemetry module from nginx.org - the signing key checked by its SHA-256 (`ADD --checksum`)
+  and against nginx.org's published fingerprints - loads all three modules with `nginx -t`, and puts
+  into `/rootfs` what the image carries: NGINX and `nginx-debug`, the modules, `/etc/nginx`, the
+  templates, the njs scripts, the controller, the licences, every shared library `ldd` proves for NGINX
+  and the modules (and `libgcc_s`), and `/usr/share/doc/wxingress/PACKAGES`, the Debian and nginx.org
+  packages those files come from, for the SBOM. Binaries, templates and libraries are root's and
+  read-only; what the controller and NGINX write belongs to 101:0. NGINX, `nginx-debug` and
+  `/nginx-ingress` get the file capability `cap_net_bind_service` (it survives `COPY --from`).
+- the final stage: the runtime seed
+  (`registry.opencode.de/oci-community/images/auswaertiges-amt/debian:13.7`, by digest) with `/rootfs`
+  on top, `USER 101`.
+
+There is no shell in the image. The chart runs the two things it needs besides the controller as
+subcommands of the controller binary: `/nginx-ingress sleep <seconds>` (the preStop hook before
+Kubernetes 1.30) and `/nginx-ingress copy <source> <dest>` (the init container with a read-only root
+file system). To look inside, use `docker cp` or run `nginx` as entrypoint:
+
+```sh
+docker run --rm --entrypoint /usr/sbin/nginx wxingress:dev -V
+```
+
+The SBOMs of a build:
+
+```sh
+ci/sbom.sh release dev nginx-ingress dataplane/build/ngx_http_wxingress_module.so > release.cdx.json
+ci/sbom.sh image release.cdx.json wxingress:dev wxingress:dev > image.cdx.json
+```
+
+When container.gov.de publishes a new seed, update `SEED` and the assemble stage's snapshot together.
 
 ## End-to-end tests
 
@@ -89,6 +120,10 @@ The scripts in `dataplane/e2e/` run against a kind cluster and need Docker, kind
 
 `.github/workflows/ci.yml` runs the Go tests, builds the controller, builds and tests the data plane
 module with the metalang compiler, and lints the chart, on every push and pull request.
-`.github/workflows/release.yml` runs on tags `v*`, builds the image and pushes it to
-`ghcr.io/wx-one/wxingress`, pushes the chart to `oci://ghcr.io/wx-one/charts`, and creates a GitHub
-release.
+`.github/workflows/release.yml` runs on tags `v<major>.<minor>.<patch>[-wx<n>]` whose commit is on
+`main`. In the GitHub Environment `release` (its protection rules gate every push) it builds the image,
+pushes it to `ghcr.io/wx-one/wxingress` (`:latest` only for the highest version), signs it with cosign
+(keyless), attaches build provenance and SBOM attestations, pushes the chart with the image's digest to
+`oci://ghcr.io/wx-one/charts`, and creates a GitHub release. Releases always build the data plane with
+the metalang compiler of `ci/meta-image`; the `META_IMAGE` override (by digest) applies to runs of
+`ci.yml` alone. All actions are pinned by commit.

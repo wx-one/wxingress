@@ -519,6 +519,8 @@ List of volumes for controller.
   emptyDir: {}
 - name: nginx-log
   emptyDir: {}
+- name: tmp
+  emptyDir: {}
 {{- /* For StatefulSet, nginx-cache volume is always provided via volumeClaimTemplates */ -}}
 {{- if ne .Values.controller.kind "statefulset" }}
 - name: nginx-cache
@@ -605,6 +607,8 @@ volumeMounts:
   name: nginx-state
 - mountPath: /var/log/nginx
   name: nginx-log
+- mountPath: /tmp
+  name: tmp
 {{- else if eq .Values.controller.kind "statefulset" }}
 - mountPath: /var/cache/nginx
   name: nginx-cache
@@ -814,9 +818,16 @@ so that a load balancer or kube-proxy has stopped sending to the pod before ngin
 {{- if .Values.controller.lifecycle -}}
 {{ toYaml .Values.controller.lifecycle }}
 {{- else if .Values.controller.ingressNginxCompat -}}
+{{- /* the image has no shell and no sleep: Kubernetes' own sleep action from 1.30, else the controller's sleep subcommand */ -}}
+{{- if semverCompare ">=1.30-0" .Capabilities.KubeVersion.Version -}}
+preStop:
+  sleep:
+    seconds: 5
+{{- else -}}
 preStop:
   exec:
-    command: ["sleep", "5"]
+    command: ["/nginx-ingress", "sleep", "5"]
+{{- end }}
 {{- end -}}
 {{- end -}}
 

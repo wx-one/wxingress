@@ -22,7 +22,23 @@ updates:
         patterns:
           - '*'
 
+  # build/Dockerfile.wxingress: the assemble stage's debian snapshot by
+  # digest. Pinned by hand, not seen by Dependabot: the runtime seed (ARG
+  # SEED, by digest - when container.gov.de publishes a new one, together with
+  # the snapshot its builder uses), nginx.org's signing key (ADD --checksum and
+  # the fingerprints), NGINX_OSS_VERSION (with dataplane/build.sh), the golang
+  # container of ci.yml's dataplane-test and ci/meta-image.
   - package-ecosystem: docker
     directory: /build
     schedule:
       interval: weekly
+
+  # the documentation site: docs/requirements.txt, exact versions with hashes
+  - package-ecosystem: pip
+    directory: /docs
+    schedule:
+      interval: weekly
+    groups:
+      docs:
+        patterns:
+          - '*'

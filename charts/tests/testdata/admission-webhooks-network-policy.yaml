@@ -1,0 +1,9 @@
+controller:
+  ingressNginxCompat: true
+  admissionWebhooks:
+    enabled: true
+    networkPolicy:
+      enabled: true
+      from:
+        - ipBlock:
+            cidr: 10.0.0.0/24

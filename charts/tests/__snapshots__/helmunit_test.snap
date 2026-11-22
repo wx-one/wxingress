@@ -169,6 +169,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -177,10 +179,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -298,6 +296,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -441,6 +449,18 @@ spec:
           type: RuntimeDefault
       terminationGracePeriodSeconds: 30
       volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       - name: webhook-cert
         secret:
           secretName: admission-webhooks-wxingress-controller-admission
@@ -452,8 +472,8 @@ spec:
         imagePullPolicy: "IfNotPresent"
         lifecycle:
           preStop:
-            exec:
-              command: ["sleep", "5"]
+            sleep:
+              seconds: 5
         ports:
         - name: http
           containerPort: 80
@@ -476,15 +496,29 @@ spec:
           initialDelaySeconds: 0
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         - name: webhook-cert
           mountPath: /usr/local/certificates
           readOnly: true
@@ -555,6 +589,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -937,6 +998,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -945,10 +1008,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -1066,6 +1125,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -1204,6 +1273,18 @@ spec:
         prometheus.io/scheme: "http"
     spec:
       volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       - name: webhook-cert
         secret:
           secretName: admission-webhooks-cert-manager-wxingress-controller-admission
@@ -1250,15 +1331,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         - name: webhook-cert
           mountPath: /usr/local/certificates
           readOnly: true
@@ -1324,6 +1419,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -1477,6 +1599,48 @@ metadata:
     helm.sh/resource-policy: keep
 ---
 
+[TestHelmNICTemplate/admission-webhooks-network-policy - 1]
+/-/-/-/
+# Source: wxingress/templates/admission-webhooks/networkpolicy.yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: admission-webhooks-network-policy-wxingress-controller-admissio
+  namespace: default
+  labels:
+    helm.sh/chart: wxingress-2.8.1
+    app.kubernetes.io/name: wxingress
+    app.kubernetes.io/instance: admission-webhooks-network-policy
+    app.kubernetes.io/version: "5.7.1-wx5"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: wxingress
+      app.kubernetes.io/instance: admission-webhooks-network-policy
+  policyTypes:
+    - Ingress
+  ingress:
+    # the webhook, from the API server only
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/24
+      ports:
+        - protocol: TCP
+          port: 8443
+    # every other port, from everybody
+    - ports:
+        - protocol: TCP
+          port: 1
+          endPort: 8442
+        - protocol: TCP
+          port: 8444
+          endPort: 65535
+        - protocol: UDP
+          port: 1
+          endPort: 65535
+---
+
 [TestHelmNICTemplate/allowEmptyIngressHost - 1]
 /-/-/-/
 # Source: wxingress/templates/controller-serviceaccount.yaml
@@ -1551,6 +1715,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -1559,10 +1725,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -1680,6 +1842,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -1793,7 +1965,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: allow-empty-ingress-host-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -1829,15 +2013,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -1897,6 +2095,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -2004,6 +2229,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -2012,10 +2239,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -2112,6 +2335,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -2225,7 +2458,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: allow-empty-ingress-host-no-crs-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -2261,15 +2506,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -2324,6 +2583,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -2446,6 +2732,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -2454,10 +2742,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -2585,6 +2869,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -2698,7 +2992,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: appprotect-dos-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -2734,15 +3040,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -2806,6 +3126,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -2928,6 +3275,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -2936,10 +3285,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -3067,6 +3412,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -3180,7 +3535,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: appprotect-waf-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -3216,15 +3583,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -3284,6 +3665,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -3406,6 +3814,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -3414,10 +3824,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -3545,6 +3951,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -3659,6 +4075,18 @@ spec:
         prometheus.io/scheme: "http"
     spec:
       volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       - emptyDir: {}
         name: app-protect-bd-config
       - emptyDir: {}
@@ -3700,15 +4128,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         - name: app-protect-bd-config
           mountPath: /opt/app_protect/bd_config
         - name: app-protect-config
@@ -3810,6 +4252,33 @@ spec:
             mountPath: /opt/app_protect/config
           - name: app-protect-bundles
             mountPath: /etc/app_protect/bundles
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -3977,6 +4446,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -3985,10 +4456,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -4116,6 +4583,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -4231,6 +4708,18 @@ spec:
         prometheus.io/scheme: "http"
     spec:
       volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       - name: agent-conf
         configMap:
           name: app-protect-waf-agentv2-wxingress-agent-config
@@ -4280,15 +4769,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         - name: agent-etc
           mountPath: /etc/nginx-agent
           # needed for agent otel collector config
@@ -4361,6 +4864,33 @@ spec:
           - -weight-changes-dynamic-reload=false
           - -agent=true
           - -agent-instance-group=app-protect-waf-agentv2-wxingress-controller
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -4526,6 +5056,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -4534,10 +5066,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -4665,6 +5193,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -4780,6 +5318,18 @@ spec:
         prometheus.io/scheme: "http"
     spec:
       volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       - name: agent-conf
         configMap:
           name: app-protect-waf-agentv3-wxingress-agent-config
@@ -4825,15 +5375,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         - name: agent-etc
           mountPath: /etc/nginx-agent
           # needed for agent otel collector config
@@ -4904,6 +5468,33 @@ spec:
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
           - -agent=true
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -5026,6 +5617,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -5034,10 +5627,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -5165,6 +5754,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -5279,6 +5878,18 @@ spec:
         prometheus.io/scheme: "http"
     spec:
       volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       - emptyDir: {}
         name: app-protect-bd-config
       - emptyDir: {}
@@ -5322,15 +5933,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         - name: app-protect-bd-config
           mountPath: /opt/app_protect/bd_config
         - name: app-protect-config
@@ -5442,6 +6067,33 @@ spec:
         volumeMounts:
           - name: app-protect-ipi-db
             mountPath: /var/IpRep
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -5609,6 +6261,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -5617,10 +6271,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -5748,6 +6398,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -5863,6 +6523,18 @@ spec:
         prometheus.io/scheme: "http"
     spec:
       volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       - emptyDir: {}
         name: app-protect-bd-config
       - emptyDir: {}
@@ -5918,15 +6590,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         - name: app-protect-bd-config
           mountPath: /opt/app_protect/bd_config
         - name: app-protect-config
@@ -6036,6 +6722,33 @@ spec:
             mountPath: /opt/app_protect/config
           - name: app-protect-bundles
             mountPath: /etc/app_protect/bundles
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -6201,6 +6914,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -6209,10 +6924,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -6340,6 +7051,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -6455,6 +7176,18 @@ spec:
         prometheus.io/scheme: "http"
     spec:
       volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       - emptyDir: {}
         name: app-protect-bd-config
       - emptyDir: {}
@@ -6506,15 +7239,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         - name: app-protect-bd-config
           mountPath: /opt/app_protect/bd_config
         - name: app-protect-config
@@ -6622,6 +7369,33 @@ spec:
             mountPath: /opt/app_protect/config
           - name: app-protect-bundles
             mountPath: /etc/app_protect/bundles
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -6744,6 +7518,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -6752,10 +7528,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -6883,6 +7655,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -6997,6 +7779,18 @@ spec:
         prometheus.io/scheme: "http"
     spec:
       volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       - emptyDir: {}
         name: app-protect-bd-config
       - emptyDir: {}
@@ -7040,15 +7834,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         - name: app-protect-bd-config
           mountPath: /opt/app_protect/bd_config
         - name: app-protect-config
@@ -7181,6 +7989,33 @@ spec:
         volumeMounts:
           - name: app-protect-ipi-db
             mountPath: /var/IpRep
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -7300,6 +8135,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -7308,10 +8145,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -7435,6 +8268,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -7560,7 +8403,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: common-labels-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -7596,15 +8451,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -7663,6 +8532,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -7776,6 +8672,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -7784,10 +8682,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -7884,6 +8778,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -7997,7 +8901,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: custom-resources-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -8033,15 +8949,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -8096,6 +9026,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -8203,6 +9160,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -8211,10 +9170,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -8332,6 +9287,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -8450,7 +9415,19 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       terminationGracePeriodSeconds: 30
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       hostNetwork: false
       dnsPolicy: ClusterFirst
       containers:
@@ -8476,15 +9453,29 @@ spec:
           initialDelaySeconds: 0
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -8547,6 +9538,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -8654,6 +9672,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -8662,10 +9682,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -8783,6 +9799,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -8910,6 +9936,8 @@ spec:
         emptyDir: {}
       - name: nginx-log
         emptyDir: {}
+      - name: tmp
+        emptyDir: {}
       - name: nginx-cache
         emptyDir: {}
       hostNetwork: false
@@ -8956,6 +9984,8 @@ spec:
           name: nginx-state
         - mountPath: /var/log/nginx
           name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -9022,7 +10052,8 @@ spec:
       - name: init-wxingress
         image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         imagePullPolicy: "IfNotPresent"
-        command: ['cp', '-vdR', '/etc/nginx/.', '/mnt/etc']
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
         resources:
           requests:
             cpu: 100m
@@ -9032,9 +10063,15 @@ spec:
           readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
           capabilities:
             drop:
             - ALL
+            add:
+            - NET_BIND_SERVICE
         volumeMounts:
         - mountPath: /mnt/etc
           name: nginx-etc
@@ -9145,6 +10182,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -9153,10 +10192,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -9253,6 +10288,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -9366,7 +10411,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: default-listener-ports-no-crs-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -9402,15 +10459,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -9465,6 +10536,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -9572,6 +10670,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -9580,10 +10680,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -9701,6 +10797,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -9814,7 +10920,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: default-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -9850,15 +10968,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -9917,6 +11049,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -10024,6 +11183,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -10032,10 +11193,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -10153,6 +11310,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -10265,7 +11432,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: deployment-hpa-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -10301,15 +11480,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -10368,6 +11561,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-hpa.yaml
 apiVersion: autoscaling/v2
@@ -10508,6 +11728,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -10516,10 +11738,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -10637,6 +11855,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -10749,7 +11977,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: deployment-hpa-no-create-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -10785,15 +12025,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -10852,6 +12106,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -10959,6 +12240,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -10967,10 +12250,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -11133,6 +12412,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -11246,7 +12535,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: gateway-api-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -11282,15 +12583,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -11355,6 +12670,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -11480,6 +12822,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -11488,10 +12832,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -11609,6 +12949,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -11722,7 +13072,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: global-configuration-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -11758,15 +13120,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -11826,6 +13202,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -11954,6 +13357,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -11962,10 +13367,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -12083,6 +13484,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -12196,7 +13607,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: global-config-custom-name-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -12232,15 +13655,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -12300,6 +13737,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -12349,6 +13813,210 @@ metadata:
     app.kubernetes.io/managed-by: Helm
   annotations:
     helm.sh/resource-policy: keep
+---
+
+[TestHelmNICTemplate/ingress-nginx-compat-kube-1.29 - 1]
+/-/-/-/
+# Source: wxingress/templates/controller-daemonset.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: compat-kube-129-wxingress-controller
+  namespace: default
+  labels:
+    helm.sh/chart: wxingress-2.8.1
+    app.kubernetes.io/name: wxingress
+    app.kubernetes.io/instance: compat-kube-129
+    app.kubernetes.io/version: "5.7.1-wx5"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wxingress
+      app.kubernetes.io/instance: compat-kube-129
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wxingress
+        app.kubernetes.io/instance: compat-kube-129
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9113"
+        prometheus.io/scheme: "http"
+    spec:
+      serviceAccountName: compat-kube-129-wxingress
+      automountServiceAccountToken: true
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      terminationGracePeriodSeconds: 30
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
+      - name: webhook-cert
+        secret:
+          secretName: compat-kube-129-wxingress-controller-admission
+      hostNetwork: false
+      dnsPolicy: ClusterFirst
+      containers:
+      - name: wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/nginx-ingress", "sleep", "5"]
+        ports:
+        - name: http
+          containerPort: 80
+          protocol: TCP
+        - name: https
+          containerPort: 443
+          protocol: TCP
+        - name: prometheus
+          containerPort: 9113
+        - name: readiness-port
+          containerPort: 8081
+        - name: webhook
+          containerPort: 8443
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /nginx-ready
+            port: readiness-port
+          periodSeconds: 1
+          initialDelaySeconds: 0
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
+        - name: webhook-cert
+          mountPath: /usr/local/certificates
+          readOnly: true
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        args:
+          - -nginx-plus=false
+          - -dynamic-upstreams=true
+          - -sync-rate-limit=0.3
+          - -ingress-nginx-defaults=true
+          - -validating-webhook=:8443
+          - -validating-webhook-certificate=/usr/local/certificates/cert
+          - -validating-webhook-key=/usr/local/certificates/key
+          - -validating-webhook-nginx-test=true
+          - -nginx-reload-timeout=60000
+          - -enable-app-protect=false
+          - -enable-app-protect-ip-intelligence=false
+          - -enable-app-protect-dos=false
+          - -nginx-configmaps=$(POD_NAMESPACE)/compat-kube-129-wxingress
+          - -ingress-class=nginx
+          - -ingress-class-controllers=nginx.wx1.eu/ingress-controller
+          - -watch-ingress-without-class=true
+          - -health-status=false
+          - -health-status-uri=/nginx-health
+          - -nginx-debug=false
+          - -log-level=info
+          - -log-format=glog
+          - -enable-config-safety=false
+          - -nginx-status=true
+          - -nginx-status-port=8080
+          - -nginx-status-allow-cidrs=127.0.0.1
+          - -report-ingress-status
+          - -external-service=compat-kube-129-wxingress-controller
+          - -enable-leader-election=true
+          - -leader-election-lock-name=compat-kube-129-wxingress-leader-election
+          - -enable-prometheus-metrics=true
+          - -prometheus-metrics-listen-port=9113
+          - -prometheus-tls-secret=
+          - -enable-service-insight=false
+          - -service-insight-listen-port=9114
+          - -service-insight-tls-secret=
+          - -enable-custom-resources=true
+          - -enable-snippets=false
+          - -disable-ipv6=false
+          - -enable-tls-passthrough=false
+          - -enable-cert-manager=false
+          - -enable-oidc=false
+          - -enable-external-dns=false
+          - -default-http-listener-port=80
+          - -default-https-listener-port=443
+          - -allow-empty-ingress-host=true
+          - -ready-status=true
+          - -ready-status-port=8081
+          - -enable-latency-metrics=false
+          - -enable-topology-aware-routing=false
+          - -ssl-dynamic-reload=true
+          - -enable-telemetry-reporting=false
+          - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 ---
 
 [TestHelmNICTemplate/ingressClass - 1]
@@ -12425,6 +14093,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -12433,10 +14103,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -12554,6 +14220,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -12667,7 +14343,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: ingress-class-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -12703,15 +14391,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -12770,6 +14472,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -12877,6 +14606,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -12885,10 +14616,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -13006,6 +14733,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -13119,7 +14856,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: latency-metrics-buckets-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -13155,15 +14904,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -13223,6 +14986,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -13330,6 +15120,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -13338,10 +15130,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -13459,6 +15247,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -13591,7 +15389,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: list-configs-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -13633,15 +15443,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -13700,6 +15524,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -13807,6 +15658,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -13815,10 +15668,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -13936,6 +15785,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -14050,7 +15909,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: loadbalancerclass-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -14086,15 +15957,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -14153,6 +16038,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -14260,6 +16172,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -14268,10 +16182,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -14389,6 +16299,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -14502,7 +16422,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: namespace-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -14538,15 +16470,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -14605,6 +16551,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -14712,6 +16685,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -14720,10 +16695,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -14841,6 +16812,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -14954,7 +16935,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: network-policy-disabled-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -14990,15 +16983,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -15057,6 +17064,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -15192,6 +17226,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -15200,10 +17236,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -15321,6 +17353,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -15434,7 +17476,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: network-policy-ingress-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -15470,15 +17524,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -15537,6 +17605,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -15673,6 +17768,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -15681,10 +17778,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -15802,6 +17895,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -15915,7 +18018,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: network-policy-ingress-egress-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -15951,15 +18066,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -16018,6 +18147,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -16125,6 +18281,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -16133,10 +18291,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -16254,6 +18408,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -16369,7 +18533,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: nodeport-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -16405,15 +18581,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -16471,6 +18661,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -16578,6 +18795,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -16586,10 +18805,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -16707,6 +18922,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -16820,7 +19045,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: nodeport-zero-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -16856,15 +19093,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -16922,6 +19173,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -17070,6 +19348,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -17078,10 +19358,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -17199,6 +19475,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -17314,6 +19600,18 @@ spec:
         prometheus.io/scheme: "http"
     spec:
       volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       - name: agent-conf
         configMap:
           name: oss-agent-wxingress-agent-config
@@ -17359,15 +19657,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         - name: agent-etc
           mountPath: /etc/nginx-agent
           # needed for agent otel collector config
@@ -17437,6 +19749,33 @@ spec:
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
           - -agent=true
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -17559,6 +19898,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -17567,10 +19908,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -17688,6 +20025,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -17801,7 +20148,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: plus-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -17837,15 +20196,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -17905,6 +20278,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -18027,6 +20427,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -18035,10 +20437,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -18156,6 +20554,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -18269,7 +20677,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: plus-debug-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -18305,15 +20725,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -18383,6 +20817,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -18515,6 +20976,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -18523,10 +20986,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -18644,6 +21103,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -18757,7 +21226,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: plus-mgmt-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -18793,15 +21274,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -18871,6 +21366,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -18994,6 +21516,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -19002,10 +21526,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -19123,6 +21643,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -19236,7 +21766,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: plus-mgmt-custom-endpoint-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -19272,15 +21814,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -19340,6 +21896,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -19463,6 +22046,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -19471,10 +22056,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -19592,6 +22173,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -19705,7 +22296,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: plus-mgmt-proxy-host-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -19741,15 +22344,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -19809,6 +22426,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -19932,6 +22576,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -19940,10 +22586,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -20061,6 +22703,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -20174,7 +22826,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: plus-mgmt-proxy-host-auth-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -20210,15 +22874,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -20288,6 +22966,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -20451,6 +23156,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -20459,10 +23166,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -20580,6 +23283,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -20695,6 +23408,18 @@ spec:
         prometheus.io/scheme: "http"
     spec:
       volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       - name: agent-conf
         configMap:
           name: plus-agent-wxingress-agent-config
@@ -20740,15 +23465,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         - name: agent-etc
           mountPath: /etc/nginx-agent
           # needed for agent otel collector config
@@ -20819,6 +23558,33 @@ spec:
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
           - -agent=true
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -20982,6 +23748,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -20990,10 +23758,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -21111,6 +23875,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -21226,6 +24000,18 @@ spec:
         prometheus.io/scheme: "http"
     spec:
       volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       - name: agent-conf
         configMap:
           name: plus-agent-all-wxingress-agent-config
@@ -21271,15 +24057,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         - name: agent-etc
           mountPath: /etc/nginx-agent
           # needed for agent otel collector config
@@ -21350,6 +24150,33 @@ spec:
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
           - -agent=true
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -21457,6 +24284,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -21465,10 +24294,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -21586,6 +24411,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -21699,7 +24534,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: startupstatus-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -21746,15 +24593,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -21813,6 +24674,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1
@@ -21920,6 +24808,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -21928,10 +24818,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -22049,6 +24935,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -22163,7 +25059,17 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
       serviceAccountName: statefulset-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -22199,17 +25105,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
         - mountPath: /var/cache/nginx
           name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -22268,6 +25186,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
   podManagementPolicy: OrderedReady
   persistentVolumeClaimRetentionPolicy:
     whenDeleted: Retain
@@ -22388,6 +25333,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -22396,10 +25343,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -22517,6 +25460,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -22631,7 +25584,17 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
       serviceAccountName: statefulset-config-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -22667,17 +25630,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
         - mountPath: /var/cache/nginx
           name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -22736,6 +25711,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
   podManagementPolicy: Parallel
   persistentVolumeClaimRetentionPolicy:
     whenDeleted: Delete
@@ -22857,6 +25859,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -22865,10 +25869,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -22986,6 +25986,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -23100,7 +26110,17 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
       serviceAccountName: statefulset-no-storageclass-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -23136,17 +26156,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
         volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
         - mountPath: /var/cache/nginx
           name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -23205,6 +26237,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
   podManagementPolicy: Parallel
   persistentVolumeClaimRetentionPolicy:
     whenDeleted: Delete
@@ -23325,6 +26384,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -23333,10 +26394,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -23454,6 +26511,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -23577,6 +26644,8 @@ spec:
         emptyDir: {}
       - name: nginx-log
         emptyDir: {}
+      - name: tmp
+        emptyDir: {}
       serviceAccountName: statefulset-readonly-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -23631,6 +26700,8 @@ spec:
           name: nginx-state
         - mountPath: /var/log/nginx
           name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -23693,7 +26764,8 @@ spec:
       - name: init-wxingress
         image: ghcr.io/wx-one/wxingress:5.7.1-wx5
         imagePullPolicy: "IfNotPresent"
-        command: ['cp', '-vdR', '/etc/nginx/.', '/mnt/etc']
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
         resources:
           requests:
             cpu: 100m
@@ -23703,9 +26775,15 @@ spec:
           readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
           capabilities:
             drop:
             - ALL
+            add:
+            - NET_BIND_SERVICE
         volumeMounts:
         - mountPath: /mnt/etc
           name: nginx-etc
@@ -23829,6 +26907,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -23837,10 +26917,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
@@ -23958,6 +27034,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 - apiGroups:
     - ""
   resources:
@@ -24071,7 +27157,19 @@ spec:
         prometheus.io/port: "9113"
         prometheus.io/scheme: "http"
     spec:
-      volumes: []
+      volumes:
+      - name: nginx-etc
+        emptyDir: {}
+      - name: nginx-lib
+        emptyDir: {}
+      - name: nginx-state
+        emptyDir: {}
+      - name: nginx-log
+        emptyDir: {}
+      - name: tmp
+        emptyDir: {}
+      - name: nginx-cache
+        emptyDir: {}
       serviceAccountName: topology-aware-routing-wxingress
       automountServiceAccountToken: true
       securityContext:
@@ -24107,15 +27205,29 @@ spec:
             memory: 128Mi
         securityContext:
           allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: false
+          readOnlyRootFilesystem: true
           runAsUser: 101 #nginx
           runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
           capabilities:
             drop:
             - ALL
             add:
             - NET_BIND_SERVICE
-        volumeMounts: []
+        volumeMounts:
+        - mountPath: /etc/nginx
+          name: nginx-etc
+        - mountPath: /var/cache/nginx
+          name: nginx-cache
+        - mountPath: /var/lib/nginx
+          name: nginx-lib
+        - mountPath: /var/lib/nginx/state
+          name: nginx-state
+        - mountPath: /var/log/nginx
+          name: nginx-log
+        - mountPath: /tmp
+          name: tmp
         env:
         - name: POD_NAMESPACE
           valueFrom:
@@ -24174,6 +27286,33 @@ spec:
           - -ssl-dynamic-reload=true
           - -enable-telemetry-reporting=false
           - -weight-changes-dynamic-reload=false
+      initContainers:
+      - name: init-wxingress
+        image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+        imagePullPolicy: "IfNotPresent"
+        # the image has no shell and no cp: the controller's copy subcommand
+        command: ['/nginx-ingress', 'copy', '/etc/nginx', '/mnt/etc']
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsUser: 101 #nginx
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+          # /nginx-ingress carries the file capability cap_net_bind_service,
+          # and the kernel refuses to run it where the bounding set lacks it
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE
+        volumeMounts:
+        - mountPath: /mnt/etc
+          name: nginx-etc
 /-/-/-/
 # Source: wxingress/templates/controller-ingress-class.yaml
 apiVersion: networking.k8s.io/v1

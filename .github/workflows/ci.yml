@@ -30,12 +30,8 @@ on:
         description: metalang compiler image to build the data plane with
         required: false
         type: string
+  # release.yml: always with ci/meta-image, no override (see dataplane-build)
   workflow_call:
-    inputs:
-      meta_image:
-        description: metalang compiler image to build the data plane with
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -49,7 +45,8 @@ env:
   HELM_VERSION: v4.3.0
   # The metalang compiler is pinned by tag and digest in ci/meta-image: the data
   # plane is built and tested with a known compiler, not latest. The
-  # repository variable META_IMAGE or the workflow_dispatch input try another.
+  # repository variable META_IMAGE or the workflow_dispatch input try another,
+  # by digest, in runs of this workflow only - never when release.yml calls it.
   # must match NGINX_VERSION in dataplane/build.sh
   NGINX_OSS_VERSION: 1.31.9
 
@@ -58,13 +55,15 @@ jobs:
     name: Go tests
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         with:
           version: ${{ env.HELM_VERSION }}
 
@@ -88,13 +87,16 @@ jobs:
     name: Controller binary
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: actions/setup-go@v5
+      # the binary the release ships: no restored build cache
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Build
         run: |
@@ -104,7 +106,7 @@ jobs:
             -o nginx-ingress ./cmd/nginx-ingress
           ./nginx-ingress -version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nginx-ingress
           path: nginx-ingress
@@ -116,18 +118,40 @@ jobs:
     # with: ubuntu:24.04, so the runner is ubuntu-24.04 and uses its gcc
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
-
-      # metalang by tag and digest, in one place: ci/meta-image
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      # metalang by tag and digest, in one place: ci/meta-image. An override
+      # (the workflow_dispatch input, else the repository variable) only in a
+      # run of ci.yml itself: called from release.yml, github.workflow_ref is
+      # release.yml's, and a release is built with ci/meta-image. An override
+      # must name the image by digest.
       - id: pin
-        run: echo "image=${{ inputs.meta_image || vars.META_IMAGE }}" >>"$GITHUB_OUTPUT"
-      - id: pinfile
-        if: steps.pin.outputs.image == ''
-        run: echo "image=$(cat ci/meta-image)" >>"$GITHUB_OUTPUT"
+        env:
+          OVERRIDE: ${{ inputs.meta_image || vars.META_IMAGE }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          image=$(cat ci/meta-image)
+          case "$WORKFLOW_REF" in
+            */.github/workflows/ci.yml@*)
+              if [ -n "$OVERRIDE" ]; then
+                if ! [[ "$OVERRIDE" =~ ^[a-z0-9./_-]+(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$ ]]; then
+                  echo "::error::META_IMAGE must be <repository>[:<tag>]@sha256:<digest>"
+                  exit 1
+                fi
+                image=$OVERRIDE
+                echo "::notice::metalang image overridden: $image"
+              fi ;;
+          esac
+          if ! [[ "$image" =~ ^[a-z0-9./_-]+(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::ci/meta-image must be <repository>[:<tag>]@sha256:<digest>"
+            exit 1
+          fi
+          echo "image=$image" >>"$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/meta
         with:
-          image: ${{ steps.pin.outputs.image || steps.pinfile.outputs.image }}
+          image: ${{ steps.pin.outputs.image }}
 
       # what nginx and the module's static libcurl need to build, and the
       # headers metalang lowers the module against (curl/curl.h for meta_fetch)
@@ -144,7 +168,7 @@ jobs:
           ./dataplane/build.sh
           echo "${META_IMAGE%@*}@$META_DIGEST" > dataplane/build/META-IMAGE
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: dataplane
@@ -163,11 +187,13 @@ jobs:
     # the same Debian release the image runs on, so the nginx built in the
     # metalang image finds its libraries
     container:
-      image: golang:1.27.3-trixie
+      image: golang:1.27.3-trixie@sha256:af1bfc2614ebb1dbd31af514b78740fd678850e76498762b425ecee4c5c6ea80
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: dataplane
           path: dataplane/build
@@ -184,9 +210,11 @@ jobs:
     name: Helm chart
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         with:
           version: ${{ env.HELM_VERSION }}
 
@@ -196,7 +224,7 @@ jobs:
       - name: Package
         run: helm package charts/wxingress -d chart
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: chart
           path: chart/*.tgz

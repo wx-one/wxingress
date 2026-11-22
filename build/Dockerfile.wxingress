@@ -1,104 +1,161 @@
-# The wxingress image as CI builds it (.github/workflows/release.yml).
+# The wxingress image as CI builds it (.github/workflows/release.yml): nginx
+# and the modules the templates load, from nginx.org's packages, the data plane
+# module and the controller, on the hardened Debian 13 runtime seed of
+# container.gov.de (Secure Government Container Initiative) - scratch with a
+# trust store and a nonroot user, no shell, no package manager.
 #
-# It is what `make debian-image-wxingress TARGET=local` builds, the stages
-# debian -> debian-wxingress -> common -> local of build/Dockerfile: nginx and
-# its modules from nginx.org's packages, the data plane module from
-# dataplane/build.sh and the controller binary built before.
+# Two stages:
 #
-# A file of its own because it must build without `RUN --mount`, which
-# build/Dockerfile uses for keys, helper scripts and the source tree; here they
-# are COPY and ADD. A change of one of those stages belongs here as well.
+#   assemble  the Debian snapshot the seed's own builder uses: installs nginx
+#             from nginx.org (signing key checked by its SHA-256 and its
+#             fingerprints), loads the data plane module once with nginx -t,
+#             and puts everything the image carries into /rootfs - nginx,
+#             nginx-debug, the modules, every shared library `ldd` proves for
+#             them (and libgcc_s), the controller, the templates, the
+#             licences, and the list of Debian and nginx.org packages those
+#             files came from (/usr/share/doc/wxingress/PACKAGES, for the SBOM)
+#   final     the seed with /rootfs on top
+#
+# The controller runs nginx without a shell, so the image has none. Binaries,
+# templates, njs scripts and libraries are root's and read-only; what the
+# controller and nginx write (/etc/nginx and its conf.d, stream-conf.d and
+# secrets, /var/cache/nginx, /var/lib/nginx, /tmp) belongs to 101:0, g=u.
 #
 # Expected in the build context beforehand (CI puts both there):
 #
 #   nginx-ingress                                    the controller binary
 #   dataplane/build/ngx_http_wxingress_module.so     the data plane module
+#
+#   docker build -f build/Dockerfile.wxingress --build-arg IC_VERSION=<v> -t wxingress:<v> .
 
-FROM debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+ARG SEED=registry.opencode.de/oci-community/images/auswaertiges-amt/debian:13.7@sha256:e6a784c10fcb9e6748815e6838b8c71a2f099846131232ddf17581fa518aacc9
+
+# the Debian snapshot the seed's builder uses
+FROM debian:trixie-20260918@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c AS assemble
 
 ARG OSS_PACKAGE_REPO=packages.nginx.org
+# must match NGINX_VERSION in dataplane/build.sh: nginx takes the module only
+# if it is built against exactly its version
 ARG NGINX_OSS_VERSION=1.31.9
-ARG AGENT_V3_VERSION=3
-ARG IC_VERSION
-ARG BUILD_OS=debian-wxingress
 
-ENV BUILD_OS=${BUILD_OS}
+# nginx.org's signing key, by its SHA-256; its fingerprints are checked below
+# against those nginx.org publishes (https://nginx.org/en/linux_packages.html).
+# When nginx.org rotates the key, the build stops here until both are updated.
+ADD --checksum=sha256:55385da31d198fa6a5012d40ae98ecb272a6c4e8fffffba94719ffd3e87de37a \
+	https://nginx.org/keys/nginx_signing.key /tmp/nginx_signing.key
 
-ADD https://cs.nginx.com/static/keys/nginx_signing.key /tmp/nginx_signing.key
-COPY build/scripts/agent.sh /usr/local/bin/agent.sh
+# the security updates first, before nginx.org's sources are added, else the
+# upgrade lifts nginx past the version the module is built against
+RUN set -eu; \
+	export DEBIAN_FRONTEND=noninteractive; \
+	apt-get update; \
+	apt-get upgrade -y; \
+	apt-get install --no-install-recommends --no-install-suggests -y gpg libcap2-bin ca-certificates; \
+	gpg --show-keys --with-colons /tmp/nginx_signing.key | awk -F: '$1=="fpr"{print $10}' | sort > /tmp/fprs; \
+	printf '%s\n' 573BFD6B3D8FBC641079A6ABABF5BD827BD9BF62 8540A6F18833A80E9C1653A42FD21310B49F6B46 \
+		9E9BE90EACBCDE69FE9B204CBCDCD8A38D88A2B3 | sort | diff - /tmp/fprs; \
+	gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg /tmp/nginx_signing.key; \
+	echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] https://${OSS_PACKAGE_REPO}/nginx/mainline/debian trixie nginx" \
+		> /etc/apt/sources.list.d/nginx.list; \
+	printf 'Package: *\nPin: origin %s\nPin: release o=nginx\nPin-Priority: 900\n' "${OSS_PACKAGE_REPO}" > /etc/apt/preferences.d/99nginx; \
+	apt-get update; \
+	# njs: the njs scripts of the templates and main-snippets; otel: loaded when
+	# OpenTelemetry is configured - the only modules nginx.tmpl loads besides
+	# the data plane module
+	apt-get install --no-install-recommends --no-install-suggests -y \
+		nginx=${NGINX_OSS_VERSION}* \
+		nginx-module-njs=${NGINX_OSS_VERSION}* \
+		nginx-module-otel=${NGINX_OSS_VERSION}*; \
+	nginx -v 2>&1 | grep -qx "nginx version: nginx/${NGINX_OSS_VERSION}"
 
-# the stage debian of build/Dockerfile, then patch-os.sh (apt-get upgrade) -
-# before nginx.org's sources are added, else the upgrade lifts nginx past the
-# version the module is built against, and load_module refuses it
-RUN apt-get update \
-	&& apt-get install --no-install-recommends --no-install-suggests -y \
-	gpg libcap2-bin ca-certificates lsb-release debian-archive-keyring \
-	&& groupadd --system --gid 101 nginx \
-	&& useradd --system --gid nginx --no-create-home --home-dir /nonexistent --comment "nginx user" --shell /bin/false --uid 101 nginx \
-	&& gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg /tmp/nginx_signing.key \
-	&& echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
-	https://${OSS_PACKAGE_REPO}/nginx/mainline/debian `lsb_release -cs` nginx" > /etc/apt/sources.list.d/nginx.list \
-	&& echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
-	https://${OSS_PACKAGE_REPO}/nginx-agent/debian `lsb_release -cs` agent" >> /etc/apt/sources.list.d/nginx.list \
-	&& printf "%s" "Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n" > /etc/apt/preferences.d/99nginx \
-	&& apt-get update \
-	&& apt-get install --no-install-recommends --no-install-suggests -y \
-	nginx=${NGINX_OSS_VERSION}* \
-	nginx-module-njs=${NGINX_OSS_VERSION}* \
-	nginx-module-otel=${NGINX_OSS_VERSION}* \
-	nginx-module-xslt=${NGINX_OSS_VERSION}* \
-	nginx-module-geoip=${NGINX_OSS_VERSION}* \
-	nginx-module-acme=${NGINX_OSS_VERSION}* \
-	nginx-module-image-filter=${NGINX_OSS_VERSION}* \
-	nginx-agent=${AGENT_V3_VERSION}* \
-	&& apt-get purge --auto-remove -y gpg \
-	&& rm -rf /var/lib/apt/lists/* /etc/apt/preferences.d/99nginx /etc/apt/sources.list.d/nginx.list \
-		/tmp/nginx_signing.key \
-	&& apt-get update \
-	&& apt-get upgrade -y \
-	&& rm -rf /var/lib/apt/lists/* \
-	&& agent.sh \
-	&& rm /usr/local/bin/agent.sh
-
-# the stage debian-wxingress
 COPY dataplane/build/ngx_http_wxingress_module.so /usr/lib/nginx/modules/ngx_http_wxingress_module.so
-
-# nginx takes the module only if it is built against exactly its version
-# (NGINX_VERSION in dataplane/build.sh); better fail here than in the pod
-RUN printf 'load_module modules/ngx_http_wxingress_module.so;\nevents {}\nhttp {}\n' > /tmp/module.conf \
-	&& nginx -t -q -c /tmp/module.conf \
-	&& rm /tmp/module.conf
-
-# the stage common: what build/scripts/common.sh does without Plus
+COPY nginx-ingress /nginx-ingress
 COPY internal/configs/njs/ /etc/nginx/njs/
 COPY internal/configs/version1/nginx.ingress.tmpl \
 	internal/configs/version1/nginx.tmpl \
 	internal/configs/version2/nginx.virtualserver.tmpl \
 	internal/configs/version2/nginx.transportserver.tmpl \
-	/
-RUN mkdir -p /var/lib/nginx /etc/nginx/secrets /etc/nginx/stream-conf.d \
-	&& setcap 'cap_net_bind_service=+eip' /usr/sbin/nginx 'cap_net_bind_service=+eip' /usr/sbin/nginx-debug \
-	&& setcap -v 'cap_net_bind_service=+eip' /usr/sbin/nginx 'cap_net_bind_service=+eip' /usr/sbin/nginx-debug \
-	&& chown -R 101:0 /etc/nginx /var/cache/nginx /var/lib/nginx /var/log/nginx /*.tmpl \
-	&& chmod -R g=u /etc/nginx /var/cache/nginx /var/lib/nginx /var/log/nginx /*.tmpl \
-	&& rm -f /etc/nginx/conf.d/* \
-	&& ln -sf /dev/stdout /var/log/nginx/access.log \
-	&& ln -sf /dev/stderr /var/log/nginx/error.log
+	/templates/
+COPY LICENSE NOTICE /licences/
+COPY LICENSES/ /licences/LICENSES/
 
-# the licences of wxingress and of the Apache-2.0 code it is built on
-COPY LICENSE NOTICE /usr/share/doc/wxingress/
-COPY LICENSES/ /usr/share/doc/wxingress/LICENSES/
+RUN set -eu; \
+	# nginx takes the module only if it is built against exactly its version
+	# (NGINX_VERSION in dataplane/build.sh); better fail here than in the pod
+	printf 'load_module modules/ngx_http_wxingress_module.so;\nload_module modules/ngx_http_js_module.so;\nload_module modules/ngx_otel_module.so;\nevents {}\nhttp {}\n' > /tmp/module.conf; \
+	nginx -t -q -c /tmp/module.conf; \
+	nginx-debug -t -q -c /tmp/module.conf; \
+	rm /tmp/module.conf; \
+	r=/rootfs; \
+	mkdir -p $r/usr/sbin $r/usr/lib/nginx $r/etc $r/var/cache $r/var/lib/nginx $r/var/log/nginx $r/tmp \
+		$r/usr/share/doc/wxingress; \
+	# nginx and its modules: those of the packages and the data plane module
+	cp -a /usr/sbin/nginx /usr/sbin/nginx-debug $r/usr/sbin/; \
+	cp -a /usr/lib/nginx/modules $r/usr/lib/nginx/; \
+	# /etc/nginx as the packages install it (mime.types, fastcgi_params, the
+	# modules link), conf.d emptied, and what the controller writes into
+	cp -a /etc/nginx $r/etc/nginx; \
+	rm -rf $r/etc/nginx/conf.d/* $r/etc/nginx/njs; \
+	cp -a /etc/nginx/njs $r/etc/nginx/njs; \
+	mkdir -p $r/etc/nginx/secrets $r/etc/nginx/stream-conf.d; \
+	cp -a /var/cache/nginx $r/var/cache/; \
+	ln -s /dev/stdout $r/var/log/nginx/access.log; \
+	ln -s /dev/stderr $r/var/log/nginx/error.log; \
+	cp /nginx-ingress $r/nginx-ingress; \
+	cp /templates/*.tmpl $r/; \
+	cp -r /licences/. $r/usr/share/doc/wxingress/; \
+	# every library ldd proves, from this Debian release - and libgcc_s, which
+	# glibc loads itself when a thread ends with pthread_exit
+	for f in /usr/sbin/nginx /usr/sbin/nginx-debug /usr/lib/nginx/modules/*.so; do \
+		ldd "$f" | awk '/=>/ {print $3} /^\t\// {print $1}'; \
+	done | sort -u > /libs; \
+	echo /lib/x86_64-linux-gnu/libgcc_s.so.1 >> /libs; \
+	if grep -q 'not found' /libs; then cat /libs; exit 1; fi; \
+	for l in $(sort -u /libs); do \
+		mkdir -p "$r$(dirname "$l")"; cp -L "$l" "$r$l"; \
+	done; \
+	# and which packages those and nginx came from, for the SBOM
+	{ for l in $(sort -u /libs); do dpkg -S "$(readlink -f "$l")" 2>/dev/null || dpkg -S "$l"; done \
+		| cut -d: -f1; echo nginx; echo nginx-module-njs; echo nginx-module-otel; } \
+		| sort -u | xargs dpkg-query -W -f '${Package} ${Version} ${source:Package} ${source:Version} ${Architecture}\n' \
+		> $r/usr/share/doc/wxingress/PACKAGES; \
+	cat $r/usr/share/doc/wxingress/PACKAGES; \
+	# root's and read-only: binaries, libraries, modules, templates, njs,
+	# mime.types; 101:0 g=u: what the controller and nginx write
+	chown -R 0:0 $r; \
+	chmod -R u=rwX,go=rX $r; \
+	chmod 0755 $r/usr/sbin/nginx $r/usr/sbin/nginx-debug $r/nginx-ingress; \
+	chmod 0644 $r/*.tmpl; \
+	chown 101:0 $r/etc/nginx $r/etc/nginx/nginx.conf; \
+	chown -R 101:0 $r/etc/nginx/conf.d $r/etc/nginx/stream-conf.d $r/etc/nginx/secrets \
+		$r/var/cache/nginx $r/var/lib/nginx; \
+	chmod -R g=u $r/etc/nginx/conf.d $r/etc/nginx/stream-conf.d $r/etc/nginx/secrets \
+		$r/var/cache/nginx $r/var/lib/nginx; \
+	chmod 0775 $r/etc/nginx; \
+	chmod 0664 $r/etc/nginx/nginx.conf; \
+	chmod 0770 $r/etc/nginx/secrets; \
+	chmod 1777 $r/tmp; \
+	# ports below 1024 as uid 101, where the runtime does not open them to
+	# everybody (net.ipv4.ip_unprivileged_port_start)
+	for f in $r/usr/sbin/nginx $r/usr/sbin/nginx-debug $r/nginx-ingress; do \
+		setcap 'cap_net_bind_service=+ep' "$f"; setcap -v 'cap_net_bind_service=+ep' "$f"; \
+	done; \
+	find $r -exec touch -h -d @0 {} +
 
-# the stage local: the binary from outside
-COPY --chown=101:0 nginx-ingress /nginx-ingress
-RUN setcap 'cap_net_bind_service=+ep' /nginx-ingress && setcap -v 'cap_net_bind_service=+ep' /nginx-ingress
+FROM ${SEED}
+
+ARG IC_VERSION
+ARG SEED
+
+COPY --from=assemble /rootfs/ /
 
 EXPOSE 80 443
 
 STOPSIGNAL SIGTERM
+# 101 is nginx's uid in the chart (runAsUser 101); nothing looks it up, so it
+# needs no passwd entry
+USER 101:0
 ENTRYPOINT ["/nginx-ingress"]
-# 101 is nginx
-USER 101
 
 LABEL org.opencontainers.image.title="wxingress" \
 	org.opencontainers.image.description="The drop-in successor of ingress-nginx, built on NGINX Ingress Controller, with the Gateway API" \
@@ -108,4 +165,5 @@ LABEL org.opencontainers.image.title="wxingress" \
 	org.opencontainers.image.documentation="https://wx-one.github.io/wxingress/" \
 	org.opencontainers.image.vendor="WizardTales GmbH" \
 	org.opencontainers.image.licenses="EUPL-1.2 AND Apache-2.0" \
-	org.opencontainers.image.base.name="docker.io/library/debian:trixie-slim"
+	org.opencontainers.image.base.name="registry.opencode.de/oci-community/images/auswaertiges-amt/debian:13.7" \
+	org.opencontainers.image.base.digest="sha256:e6a784c10fcb9e6748815e6838b8c71a2f099846131232ddf17581fa518aacc9"

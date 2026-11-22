@@ -2,7 +2,8 @@
 # CycloneDX 1.6 SBOMs for wxingress, written from what the build knows rather
 # than scanned for: the controller is a static Go binary (its modules are in
 # its build info), the data plane module links libcurl statically and the
-# metalang runtime, and the image installs packages whose list dpkg keeps.
+# metalang runtime, and the image carries the list of the Debian and
+# nginx.org packages its files were copied from.
 #
 #   ci/sbom.sh release <version> <nginx-ingress> <module.so> > release.cdx.json
 #       the controller binary and its Go modules, the data plane module with
@@ -10,9 +11,12 @@
 #       (scope "excluded": the image provides it)
 #
 #   ci/sbom.sh image <release.cdx.json> <image-ref> <image-id> > image.cdx.json
-#       the image: the release, every Debian and nginx.org package installed
-#       in it (read from the image's dpkg database), and the base image by
-#       digest
+#       what the image adds on top of its base: the release, nginx and its
+#       modules from nginx.org's packages, and the Debian packages the shared
+#       libraries were copied from - read from /usr/share/doc/wxingress/PACKAGES
+#       in the image, which build/Dockerfile.wxingress writes with dpkg (the
+#       image itself has no dpkg) - and the base, the runtime seed of
+#       container.gov.de, by digest; it carries a signed SBOM of its own
 #
 # Needs jq, go (for `go version -m`) and, for image, docker. Reads from
 # dataplane/build.sh: NGINX_VERSION, CURL_VERSION, CURL_SHA256, CURL_URL; and
@@ -99,24 +103,47 @@ image)
   # the release as one component, with what is inside it nested
   comps+=("$(jq '.metadata.component + {components: [.components[] | select(.scope != "excluded")]}' "$release")")
 
-  # every package installed in the image; nginx.org's carry "~<codename>"
+  # the packages the image's files came from, as the build wrote them down;
+  # nginx.org's carry "~<codename>". The image has no shell: docker cp.
+  packages=$(mktemp)
+  container=$(docker create "$id")
+  trap 'docker rm "$container" >/dev/null; rm -f "$packages"' EXIT
+  docker cp "$container:/usr/share/doc/wxingress/PACKAGES" - | tar -xOf - > "$packages"
+  [ -s "$packages" ] || { echo "no /usr/share/doc/wxingress/PACKAGES in $id" >&2; exit 1; }
   while read -r pkg ver src srcver arch; do
     case "$ver" in
       *~trixie*|*~bookworm*) ns=nginx origin="nginx.org's package repository" ;;
       *) ns=debian origin="Debian 13" ;;
     esac
+    case "$src" in
+      glibc) l=LGPL-2.1-or-later ;;
+      gcc-*) l="GPL-3.0-or-later WITH GCC-exception-3.1" ;;
+      nginx|nginx-module-njs) l=BSD-2-Clause ;;
+      nginx-module-otel) l=Apache-2.0 ;;
+      openssl) l=Apache-2.0 ;;
+      zlib) l=Zlib ;;
+      pcre2) l="BSD-3-Clause WITH PCRE2-exception" ;;
+      libxml2|c-ares) l=MIT ;;
+      xz-utils) l=0BSD ;;
+      libzstd) l="BSD-3-Clause OR GPL-2.0-only" ;;
+      libxcrypt) l=LGPL-2.1-or-later ;;
+      *) l="" ;;
+    esac
     comps+=("$(jq -n --arg p "$pkg" --arg v "$ver" --arg s "${src:-$pkg}" --arg sv "${srcver:-$ver}" \
-                     --arg a "$arch" --arg ns "$ns" --arg o "$origin" '
+                     --arg a "$arch" --arg ns "$ns" --arg o "$origin" --arg l "$l" '
       {type: "library", "bom-ref": ("pkg:deb/" + $ns + "/" + $p + "@" + $v), name: $p, version: $v,
        purl: ("pkg:deb/" + $ns + "/" + $p + "@" + $v + "?arch=" + $a + "&distro=debian-13"),
-       description: ("installed from " + $o + " (source package " + $s + " " + $sv + ")")}')")
-  done < <(docker run --rm --entrypoint dpkg-query "$id" -W \
-             -f '${Package} ${Version} ${source:Package} ${source:Version} ${Architecture}\n')
+       description: ("copied from " + $o + " (source package " + $s + " " + $sv + ")")}
+      + (if $l == "" then {} elif ($l | test(" WITH | OR ")) then {licenses: [{expression: $l}]} else {licenses: [{license: {id: $l}}]} end)')")
+  done < "$packages"
 
-  base=$(sed -n 's/^FROM \([^ ]*\).*/\1/p' "$here/build/Dockerfile.wxingress" | head -1)
+  # the base: the SEED argument of the Dockerfile, by digest
+  base=$(sed -n 's/^ARG SEED=\(.*\)$/\1/p' "$here/build/Dockerfile.wxingress" | head -1)
+  case "$base" in *@sha256:*) ;; *) echo "no SEED by digest in build/Dockerfile.wxingress" >&2; exit 1 ;; esac
   comps+=("$(jq -n --arg s "$base" '
     {type: "container", "bom-ref": "base-image", name: ($s | split("@")[0]), version: ($s | split("@")[1]),
-     description: "the base image, by digest"}')")
+     description: "hardened Debian 13 runtime seed of container.gov.de (Secure Government Container Initiative): a trust store and a nonroot user, no shell, no package manager; its own signed CycloneDX SBOM is attached to it in its registry",
+     externalReferences: [{type: "distribution", url: ("https://" + ($s | split("@")[0]))}]}')")
 
   app=$(jq -n --arg i "$image" --arg v "$(jq -r .metadata.component.version "$release")" '
     {type: "container", "bom-ref": ("image:" + $i), name: $i, version: $v,
@@ -126,5 +153,5 @@ image)
   ;;
 
 *)
-  sed -n '2,20p' "$0"; exit 2 ;;
+  sed -n '2,24p' "$0"; exit 2 ;;
 esac

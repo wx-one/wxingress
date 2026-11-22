@@ -2377,10 +2377,10 @@
         },
         "readOnlyRootFilesystem": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "title": "The readOnlyRootFilesystem",
           "examples": [
-            false
+            true
           ]
         },
         "enableSSLDynamicReload": {
@@ -2557,6 +2557,25 @@
             "labels": {
               "type": "object",
               "default": {}
+            },
+            "networkPolicy": {
+              "type": "object",
+              "title": "A NetworkPolicy that lets only the API server reach the webhook's port",
+              "default": {},
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "from": {
+                  "type": "array",
+                  "default": [],
+                  "title": "NetworkPolicy peers of the API server (ipBlock)",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              }
             },
             "service": {
               "type": "object",
@@ -2824,7 +2843,7 @@
           "disableIPV6": false,
           "defaultHTTPListenerPort": 80,
           "defaultHTTPSListenerPort": 443,
-          "readOnlyRootFilesystem": false,
+          "readOnlyRootFilesystem": true,
           "enableSSLDynamicReload": true,
           "telemetryReporting": {
             "enable": false
@@ -3457,7 +3476,7 @@
         "disableIPV6": false,
         "defaultHTTPListenerPort": 80,
         "defaultHTTPSListenerPort": 443,
-        "readOnlyRootFilesystem": false,
+        "readOnlyRootFilesystem": true,
         "enableSSLDynamicReload": true,
         "telemetryReporting": {
           "enable": false
