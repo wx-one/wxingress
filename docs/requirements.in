@@ -1,0 +1,5 @@
+# The documentation site (mkdocs.yml), built by .github/workflows/docs.yml.
+# docs/requirements.txt pins it and everything it pulls in, with hashes:
+#   cd docs && pip-compile --allow-unsafe --generate-hashes --no-emit-index-url \
+#     --output-file=requirements.txt --strip-extras requirements.in
+mkdocs-material==9.8.2

@@ -100,6 +100,7 @@ const maxProcs = 4
 const gcPercent = 50
 
 func main() {
+	runSubcommand(os.Args)
 	if os.Getenv("GOMAXPROCS") == "" && runtime.GOMAXPROCS(0) > maxProcs {
 		runtime.GOMAXPROCS(maxProcs)
 	}

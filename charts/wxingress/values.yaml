@@ -359,13 +359,17 @@ controller:
     seccompProfile:
       type: RuntimeDefault
 
-  ## The security context for the Ingress Controller containers.
+  ## The security context for the Ingress Controller containers. Empty: the chart's default, as below (with
+  ## readOnlyRootFilesystem from controller.readOnlyRootFilesystem). nginx and /nginx-ingress carry the file capability
+  ## cap_net_bind_service, so NET_BIND_SERVICE must stay in the capabilities: without it the kernel refuses to run them.
   securityContext:
     {} # Remove curly brackets before adding values
-    # allowPrivilegeEscalation: true
+    # allowPrivilegeEscalation: false
     # readOnlyRootFilesystem: true
     # runAsUser: 101 #nginx
     # runAsNonRoot: true
+    # seccompProfile:
+    #   type: RuntimeDefault
     # capabilities:
     #   drop:
     #   - ALL
@@ -373,6 +377,9 @@ controller:
     #   - NET_BIND_SERVICE
 
   ## The security context for the Ingress Controller init container which is used when readOnlyRootFilesystem is set to true.
+  ## It runs /nginx-ingress copy, which carries the file capability cap_net_bind_service: keep NET_BIND_SERVICE in
+  ## capabilities.add. Empty: runAsUser 101, read-only, no privilege escalation, RuntimeDefault seccomp, all other
+  ## capabilities dropped.
   initContainerSecurityContext: {}
 
   ## The resources for the Ingress Controller init container which is used when readOnlyRootFilesystem is set to true.
@@ -544,6 +551,17 @@ controller:
     objectSelector: {}
     ## Labels of the ValidatingWebhookConfiguration.
     labels: {}
+    ## The webhook takes Ingresses from whoever reaches its port and, with nginxTest, runs nginx -t on the configuration
+    ## they make. Its port is never a hostPort; with controller.hostNetwork, though, it listens on the node's addresses,
+    ## where no NetworkPolicy applies - keep hostNetwork off with the webhook, or close the port on the nodes.
+    ## The NetworkPolicy lets only the API server reach the port (every other port of the pods stays open to all, as
+    ## without a policy). The API server's source addresses depend on the cluster: the control plane nodes' addresses,
+    ## or those of a konnectivity agent; from must name them, as NetworkPolicy peers (ipBlock), for example
+    ##   from: [{ipBlock: {cidr: 10.0.0.0/24}}]
+    ## It needs a CNI that enforces NetworkPolicies and endPort (Kubernetes 1.25+).
+    networkPolicy:
+      enabled: false
+      from: []
     service:
       annotations: {}
       externalIPs: []
@@ -686,6 +704,9 @@ controller:
       ## The Gateway itself is not part of the release. For ingress-nginx's behaviour - every host on the
       ## controller's address - give it an HTTP listener on 80 that allows routes from all namespaces:
       ##   listeners: [{name: http, protocol: HTTP, port: 80, allowedRoutes: {namespaces: {from: All}}}]
+      ## With `from: All`, any namespace can attach routes to the default Gateway; a route only gets a host that no
+      ## older Ingress or VirtualServer serves, but a host nobody serves yet goes to the first route that claims it.
+      ## Use it only when every namespace is trusted.
 
     ## The Services of the Gateways with addresses of their own.
     service:
@@ -960,10 +981,11 @@ controller:
   ## nginx.org/listen-ports and nginx.org/listen-ports-ssl are not supported; use controller.defaultHTTPListenerPort and controller.defaultHTTPSListenerPort instead.
   allowEmptyIngressHost: false
 
-  ## Configure root filesystem as read-only and add volumes for temporary data.
-  ## Three major releases after 3.5.x this argument will be moved to the `securityContext` section.
-  ## This value will not be used if `controller.securityContext` is set
-  readOnlyRootFilesystem: false
+  ## A read-only root file system: the controller and nginx write only into emptyDirs - /etc/nginx (filled from the
+  ## image by an init container, /nginx-ingress copy, since the controller rewrites nginx.conf there), /var/cache/nginx,
+  ## /var/lib/nginx, /var/log/nginx and /tmp. On by default; turn it off only for something that writes elsewhere.
+  ## With controller.securityContext set, its readOnlyRootFilesystem counts as well.
+  readOnlyRootFilesystem: true
 
   ## Enable dynamic reloading of certificates
   enableSSLDynamicReload: true
