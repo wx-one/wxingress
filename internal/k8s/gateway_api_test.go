@@ -1,6 +1,9 @@
 package k8s
 
 import (
+	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -161,5 +164,51 @@ func TestGatewayEventFilter(t *testing.T) {
 	}
 	if e := <-fake.Events; e != "Normal AddedOrUpdated y" {
 		t.Errorf("event %q", e)
+	}
+}
+
+// TestGatewayStatusErrorsNameOnlyTheGatewaysOwnPart: what a Gateway's status
+// says of a config that is not served names its hostname and port, never
+// the message of the validator, of a host conflict or of nginx, which can
+// carry the hosts and config of other tenants.
+func TestGatewayStatusErrorsNameOnlyTheGatewaysOwnPart(t *testing.T) {
+	t.Parallel()
+	annotations := map[string]string{
+		gateway.AnnotationGateway:  "infra/gw",
+		gateway.AnnotationHostname: "shop.example.com",
+		gateway.AnnotationPort:     "443",
+	}
+	leaky := `nginx: [emerg] duplicate listen in /etc/nginx/conf.d/vs_other_secret.conf:12 for "admin.other-tenant.example"`
+	for name, err := range map[string]error{
+		"rejected":   gatewayProblem(annotations, "the VirtualServer of Gateway infra/gw for shop.example.com was rejected: "+leaky),
+		"applied":    gatewayApplyError(annotations),
+		"host taken": gatewayProblem(annotations, "Host is taken by another resource"),
+	} {
+		msg := err.Error()
+		if !strings.Contains(msg, `hostname "shop.example.com" on listener port 443`) {
+			t.Errorf("%s: %q does not name the hostname and port", name, msg)
+		}
+		for _, secret := range []string{"other-tenant", "conf.d", "emerg"} {
+			if strings.Contains(msg, secret) {
+				t.Errorf("%s: %q leaks %q", name, msg, secret)
+			}
+		}
+	}
+	if msg := gatewayProblem(annotations, "Host is taken by another resource").Error(); !strings.Contains(msg, "taken by another resource") {
+		t.Errorf("a host conflict says %q", msg)
+	}
+	catchAll := map[string]string{gateway.AnnotationHostname: "~^"}
+	if msg := gatewayApplyError(catchAll).Error(); !strings.HasPrefix(msg, "listeners without a hostname: not served") {
+		t.Errorf("catch-all: %q", msg)
+	}
+
+	// the error of applying it goes to the status without nginx's message
+	lbc := &LoadBalancerController{Logger: slog.New(slog.DiscardHandler)}
+	vs := gatewayVS("a", "shop.example.com", 1)
+	vs.Annotations[gateway.AnnotationHostname] = "shop.example.com"
+	lbc.gatewayVirtualServerApplied(vs, errors.New(leaky))
+	got := lbc.gatewayErrors[getResourceKey(&vs.ObjectMeta)]
+	if got.err == nil || strings.Contains(got.err.Error(), "other-tenant") || got.gateway.Name != "gw" {
+		t.Errorf("stored %+v", got)
 	}
 }

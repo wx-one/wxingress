@@ -142,6 +142,12 @@ type GatewaySettings struct {
 	// -enable-snippets.
 	ServerSnippets   []string
 	LocationSnippets []string
+	// Restricted are the annotations of the route that restrict who gets an
+	// answer - auth-*, *list-source-range, satisfy, ModSecurity, global rate
+	// limits - which a route does not take: its rules are not served without
+	// them but answer 503, as an Ingress location whose restriction cannot
+	// apply.
+	Restricted []string
 
 	affinity       *ingressNginxAffinity
 	balancing      *ingressNginxBalancing
@@ -243,7 +249,7 @@ func ParseGatewaySettings(namespace, name string, annotations map[string]string,
 		s.CanaryBy = &canary
 		break
 	}
-	flagUnsupportedOnRoutes(a)
+	s.Restricted = flagUnsupportedOnRoutes(a)
 	for _, w := range a.warnings {
 		s.Warnings = append(s.Warnings, w...)
 	}
@@ -272,12 +278,14 @@ func init() {
 	}
 }
 
-// ingressNginxRestrictive are those that restrict who gets an answer: a route
-// with one is served without the restriction, which its warning says.
+// ingressNginxRestrictive are those that restrict who gets an answer: the
+// rules of a route with one answer 503 rather than be served without the
+// restriction.
 var ingressNginxRestrictive = regexp.MustCompile(`^nginx\.ingress\.kubernetes\.io/(auth-.*|(allow|white|deny)list-source-range|enable-modsecurity|enable-owasp-core-rules|modsecurity-snippet|satisfy|global-rate-limit.*|enable-global-auth)$`)
 
-// flagUnsupportedOnRoutes warns about each ingress-nginx annotation of a route it does not take.
-func flagUnsupportedOnRoutes(a *ingressNginxAnnotations) {
+// flagUnsupportedOnRoutes warns about each ingress-nginx annotation of a
+// route it does not take, and returns those that restrict who gets an answer.
+func flagUnsupportedOnRoutes(a *ingressNginxAnnotations) []string {
 	var names []string
 	for name := range a.ing.Annotations {
 		if strings.HasPrefix(name, IngressNginxAnnotationPrefix) && !ingressNginxReadOnRoutes[name] {
@@ -285,19 +293,40 @@ func flagUnsupportedOnRoutes(a *ingressNginxAnnotations) {
 		}
 	}
 	sort.Strings(names)
+	var restricted []string
 	for _, name := range names {
-		if ingressNginxRestrictive.MatchString(name) {
-			a.warnings.AddWarningf(a.ing, "%s is not supported on Gateway API routes: the route is served WITHOUT it - use a Policy (wxingress.wizardtales.com/policies)", name)
+		if ingressNginxRestrictive.MatchString(name) && !disablesOnly(name, a.ing.Annotations[name]) {
+			a.warnings.AddWarningf(a.ing, "%s is not supported on Gateway API routes: the rules of the route answer 503 - use a Policy (wxingress.wizardtales.com/policies)", name)
+			restricted = append(restricted, name)
 			continue
 		}
 		a.warnings.AddWarningf(a.ing, "%s is not supported on Gateway API routes and is ignored", name)
 	}
+	return restricted
+}
+
+// disablesOnly tells whether a restrictive annotation restricts nothing, as
+// on an Ingress: one that turns its restriction off, the global auth that
+// wxingress does not have, and the parts of a global rate limit without one.
+func disablesOnly(name, value string) bool {
+	value = strings.TrimSpace(value)
+	switch short := strings.TrimPrefix(name, IngressNginxAnnotationPrefix); {
+	case short == "enable-modsecurity", short == "enable-owasp-core-rules":
+		return strings.EqualFold(value, "false")
+	case short == "enable-global-auth":
+		return true
+	case short == "global-rate-limit":
+		return value == "0"
+	case strings.HasPrefix(short, "global-rate-limit-"):
+		return true
+	}
+	return false
 }
 
 // Empty tells whether the annotations set nothing.
 func (s GatewaySettings) Empty() bool {
 	return reflect.DeepEqual(s.Upstream, conf_v1.Upstream{}) && !s.Balancing && s.CanaryBy == nil &&
-		len(s.ServerSnippets) == 0 && len(s.LocationSnippets) == 0 && !s.Limits()
+		len(s.ServerSnippets) == 0 && len(s.LocationSnippets) == 0 && !s.Limits() && len(s.Restricted) == 0
 }
 
 // Limits tells whether the annotations limit requests, connections or the rate.

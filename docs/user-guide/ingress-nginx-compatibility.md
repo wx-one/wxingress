@@ -24,9 +24,10 @@ General rules, as in ingress-nginx:
   global auth to turn on or off (the ConfigMap's `global-auth-*` keys are not
   supported, below). That holds for Ingresses; on
   Gateway API routes only the annotations in "The Gateway API" are read, and
-  each other one is a warning in the route's status and events - for those
-  that restrict access, that the route is served without them (a Policy
-  through `wxingress.wizardtales.com/policies` restricts a route).
+  each other one is a warning in the route's status and events. Those that
+  restrict access make the rules of the route answer 503 instead, as the
+  locations of an Ingress, with a warning in the log (a Policy through
+  `wxingress.wizardtales.com/policies` restricts a route).
 
 ## Which Ingresses
 

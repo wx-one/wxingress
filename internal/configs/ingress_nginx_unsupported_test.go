@@ -127,7 +127,7 @@ func TestUnsupportedOnRoutes(t *testing.T) {
 		p + "proxy-read-timeout": "30", p + "enable-cors": "true", p + "whitelist-source-range": "10.0.0.0/8",
 	}, false)
 	all := strings.Join(s.Warnings, "\n")
-	for _, want := range []string{p + "enable-cors is not supported on Gateway API routes and is ignored", p + "whitelist-source-range is not supported on Gateway API routes: the route is served WITHOUT it"} {
+	for _, want := range []string{p + "enable-cors is not supported on Gateway API routes and is ignored", p + "whitelist-source-range is not supported on Gateway API routes: the rules of the route answer 503"} {
 		if !strings.Contains(all, want) {
 			t.Errorf("no %q in %q", want, all)
 		}

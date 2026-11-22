@@ -62,6 +62,9 @@ type mapOptions struct {
 	ingressClass string
 	httpPort     int32
 	httpsPort    int32
+	// access decides which Policies of other namespaces a route or the
+	// Gateway may name
+	access *policyAccess
 }
 
 // servicePort is a Service port a backend of a route names.
@@ -118,6 +121,8 @@ type mapped struct {
 	// own, one per port
 	listeners []conf_v1.Listener
 	skipped   []string
+	// warnings are what is not served for safety's sake: logged as warnings
+	warnings []string
 }
 
 var http2On = true
@@ -150,6 +155,7 @@ func toVirtualServers(
 	}
 	var out mapped
 	gwName := types.NamespacedName{Namespace: gw.Source.Namespace, Name: gw.Source.Name}
+	gwPolicies := out.gatewayPolicies(gw, opts)
 
 	listeners := make(map[int32]conf_v1.Listener)
 	add := func(s *dataplane.VirtualServer, ssl bool) {
@@ -164,7 +170,7 @@ func toVirtualServers(
 		name := ListenerName(gwName, s.Port)
 		listeners[s.Port] = conf_v1.Listener{Name: name, Protocol: conf_v1.HTTPProtocol, Port: int(nginxPort), Ssl: ssl}
 
-		vs := newVirtualServer(gw, virtualServerName(gwName, s.Hostname, s.Port), s.Hostname, opts)
+		vs := newVirtualServer(gw, virtualServerName(gwName, s.Hostname, s.Port), s.Hostname, opts, gwPolicies, s)
 		vs.Annotations[AnnotationPort] = strconv.Itoa(int(s.Port))
 		// HTTP/2 as well: with TLS by ALPN, without it a client may speak
 		// h2c with prior knowledge (gRPC does), and HTTP/1 still works
@@ -182,7 +188,8 @@ func toVirtualServers(
 			scheme = "https"
 		}
 		switch {
-		case out.addRoutes(vs, gwName, s.PathRules, idx, listenerInfo{port: s.Port, scheme: scheme, dynamic: opts.dynamic, snippets: opts.snippets}):
+		case out.addRoutes(vs, gwName, s.PathRules, idx, listenerInfo{port: s.Port, scheme: scheme, dynamic: opts.dynamic, snippets: opts.snippets, access: opts.access}):
+			gwPolicies.apply(vs)
 			out.virtualServers = append(out.virtualServers, vs)
 		case ssl && vs.Spec.TLS != nil:
 			// a listener without routes still has its certificate on its
@@ -214,6 +221,7 @@ func toSharedVirtualServers(
 ) mapped {
 	var out mapped
 	gwName := types.NamespacedName{Namespace: gw.Source.Namespace, Name: gw.Source.Name}
+	gwPolicies := out.gatewayPolicies(gw, opts)
 
 	hosts := make(map[string]*hostServers)
 	add := func(s *dataplane.VirtualServer, https bool, port int32) {
@@ -260,23 +268,32 @@ func toSharedVirtualServers(
 			sets = []ruleSet{{rules: h.https.PathRules, scheme: "https"}, {rules: h.http.PathRules, scheme: "http"}}
 		}
 
-		vs := newVirtualServer(gw, virtualServerName(gwName, host, 0), host, opts)
+		vs := newVirtualServer(gw, virtualServerName(gwName, host, 0), host, opts, gwPolicies, h.http, h.https)
 		if h.https != nil && !out.setTLS(vs, gwName, h.https) {
 			continue
 		}
-		if out.addRouteSets(vs, gwName, sets, idx, listenerInfo{dynamic: opts.dynamic, snippets: opts.snippets}) {
+		if out.addRouteSets(vs, gwName, sets, idx, listenerInfo{dynamic: opts.dynamic, snippets: opts.snippets, access: opts.access}) {
+			gwPolicies.apply(vs)
 			out.virtualServers = append(out.virtualServers, vs)
 		}
 	}
 	return out
 }
 
-func newVirtualServer(gw *graph.Gateway, name, host string, opts mapOptions) *conf_v1.VirtualServer {
+// newVirtualServer makes the VirtualServer of a hostname of a Gateway, served
+// by servers.
+func newVirtualServer(
+	gw *graph.Gateway,
+	name, host string,
+	opts mapOptions,
+	gwPolicies gatewayPolicies,
+	servers ...*dataplane.VirtualServer,
+) *conf_v1.VirtualServer {
 	vs := &conf_v1.VirtualServer{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:         gw.Source.Namespace,
 			Name:              name,
-			CreationTimestamp: gw.Source.CreationTimestamp,
+			CreationTimestamp: creationOf(gw, servers...),
 			Annotations: map[string]string{
 				AnnotationGateway:  gw.Source.Namespace + "/" + gw.Source.Name,
 				AnnotationHostname: host,
@@ -286,16 +303,87 @@ func newVirtualServer(gw *graph.Gateway, name, host string, opts mapOptions) *co
 			IngressClass: opts.ingressClass,
 			Host:         host,
 			// the Policies of the Gateway are those of all its servers
-			Policies: policiesOf(&gw.Source.ObjectMeta),
+			Policies: gwPolicies.allowed,
 		},
 	}
 	return vs
 }
 
+// gatewayPolicies are the Policies a Gateway names: those it may name, and
+// whether it names one it may not.
+type gatewayPolicies struct {
+	allowed []conf_v1.PolicyReference
+	denied  bool
+}
+
+// gatewayPolicies reads the Policies of gw.
+func (out *mapped) gatewayPolicies(gw *graph.Gateway, opts mapOptions) gatewayPolicies {
+	allowed, denied := opts.access.permittedPolicies(&gw.Source.ObjectMeta, kindGateway)
+	if len(denied) > 0 {
+		out.warnings = append(out.warnings, deniedMessage(fmt.Sprintf("Gateway %s/%s", gw.Source.Namespace, gw.Source.Name), denied))
+	}
+	return gatewayPolicies{allowed: allowed, denied: len(denied) > 0}
+}
+
+// apply fails vs closed when the Gateway names a Policy it may not: every
+// request answers 500, as with a Policy that does not exist.
+func (p gatewayPolicies) apply(vs *conf_v1.VirtualServer) {
+	if !p.denied {
+		return
+	}
+	vs.Spec.Routes = []conf_v1.Route{{Path: "/", Action: returnAction(500, "Internal Server Error")}}
+	vs.Spec.Upstreams = nil
+	delete(vs.Annotations, extras.Annotation)
+}
+
+// creationOf is the creation time a VirtualServer of a Gateway competes for
+// its host with: of a host an Ingress or VirtualServer has too, the oldest
+// gets it. It is that of the first route that brought the hostname - the
+// oldest of the routes of the servers - but not before the Gateway was made:
+// neither a new Gateway nor a new route takes the host of an older Ingress
+// or VirtualServer, as a Gateway that routes from all namespaces would let
+// any of them do with the Gateway's time. Without routes it is the
+// Gateway's.
+func creationOf(gw *graph.Gateway, servers ...*dataplane.VirtualServer) metav1.Time {
+	var first *metav1.Time
+	for _, s := range servers {
+		if s == nil {
+			continue
+		}
+		for i := range s.PathRules {
+			for j := range s.PathRules[i].MatchRules {
+				src := s.PathRules[i].MatchRules[j].Source
+				if src == nil {
+					continue
+				}
+				if first == nil || src.CreationTimestamp.Before(first) {
+					t := src.CreationTimestamp
+					first = &t
+				}
+			}
+		}
+	}
+	created := gw.Source.CreationTimestamp
+	if first != nil && created.Before(first) {
+		return *first
+	}
+	return created
+}
+
 // setTLS gives vs the certificate of an HTTPS server. It tells whether vs
 // can be served.
 func (out *mapped) setTLS(vs *conf_v1.VirtualServer, gwName types.NamespacedName, s *dataplane.VirtualServer) bool {
-	if s.SSL == nil || len(s.SSL.KeyPairIDs) == 0 {
+	if s.SSL == nil {
+		return true
+	}
+	if s.SSL.VerifyClient != "" || s.SSL.ClientCertBundleID != "" || s.SSL.RequireVerifiedCert {
+		// client certificate validation, which a VirtualServer made from a
+		// Gateway does not carry: not served rather than served without it
+		// (restrictFrontendValidation rejects the listener before)
+		out.skipped = append(out.skipped, fmt.Sprintf("Gateway %s: %s: client certificate validation is not supported, not served", gwName, s.Hostname))
+		return false
+	}
+	if len(s.SSL.KeyPairIDs) == 0 {
 		return true
 	}
 	secret, ok := secretOfKeyPair(s.SSL.KeyPairIDs[0])
@@ -365,6 +453,7 @@ func (out *mapped) addRouteSets(
 	m.mirrorSamples(all)
 	vs.Spec.Routes = m.routes(sets)
 	out.skipped = append(out.skipped, m.skipped...)
+	out.warnings = append(out.warnings, m.warnings...)
 	for _, name := range slices.Sorted(maps.Keys(m.upstreams)) {
 		vs.Spec.Upstreams = append(vs.Spec.Upstreams, m.upstreams[name])
 	}
@@ -415,6 +504,7 @@ type routeMapper struct {
 	idx         upstreamIndex
 	upstreams   map[string]conf_v1.Upstream
 	skipped     []string
+	warnings    []string
 
 	// ext collects the extras of the VirtualServer, keys the key each
 	// action's extras have there
@@ -515,16 +605,33 @@ func (m *routeMapper) locationRoutes(locs map[string]*location) []conf_v1.Route 
 // match. Without one the route answers 404, as a request no rule matches.
 func (m *routeMapper) route(l *location) conf_v1.Route {
 	route := conf_v1.Route{Path: l.path}
-	// the Policies of the routes of the location, of all of them
+	// the Policies of the routes of the location, of all of them; a route
+	// that names one of another namespace without a ReferenceGrant gets
+	// none of it, and its rules answer 500
+	denied := make(map[*metav1.ObjectMeta]bool)
 	for _, c := range l.rules {
 		for i := range c.rule.MatchRules {
-			route.Policies = addPolicies(route.Policies, policiesOf(c.rule.MatchRules[i].Source))
+			src := c.rule.MatchRules[i].Source
+			allowed, refused := m.listener.access.permittedPolicies(src, m.listener.access.kindOf(src))
+			route.Policies = addPolicies(route.Policies, allowed)
+			if len(refused) > 0 {
+				if !denied[src] {
+					m.warnings = append(m.warnings, deniedMessage(fmt.Sprintf("route %s/%s", src.Namespace, src.Name), refused))
+				}
+				denied[src] = true
+			}
 		}
 	}
 	for _, c := range l.rules {
 		for i := range c.rule.MatchRules {
 			mr := &c.rule.MatchRules[i]
-			action, splits := m.action(c.rule, mr)
+			var action *conf_v1.Action
+			var splits []conf_v1.Split
+			if denied[mr.Source] {
+				action = returnAction(500, "Internal Server Error")
+			} else {
+				action, splits = m.action(c.rule, mr)
+			}
 			conds := matchConditions(mr.Match)
 			if c.scheme != "" {
 				conds = append([]conf_v1.Condition{{Variable: "$scheme", Value: c.scheme}}, conds...)
@@ -586,6 +693,16 @@ func matchValue(t dataplane.MatchType, v string) string {
 func (m *routeMapper) action(rule *dataplane.PathRule, mr *dataplane.MatchRule) (*conf_v1.Action, []conf_v1.Split) {
 	if mr.Filters.InvalidFilter != nil {
 		return returnAction(500, "Internal Server Error"), nil
+	}
+	if s := m.settingsOf(mr.Source); s != nil && len(s.settings.Restricted) > 0 {
+		// an annotation that restricts who gets an answer, which a route
+		// does not take: not served without it
+		if !s.warned {
+			s.warned = true
+			m.warnings = append(m.warnings, fmt.Sprintf("route %s: %s not supported on routes: its rules answer 503",
+				s.key, strings.Join(s.settings.Restricted, ", ")))
+		}
+		return returnAction(503, "Service Unavailable"), nil
 	}
 	m.serverSnippets(mr.Source)
 	if rd := mr.Filters.RequestRedirect; rd != nil {

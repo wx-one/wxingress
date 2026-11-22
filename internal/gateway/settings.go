@@ -73,6 +73,8 @@ func addPolicies(have []conf_v1.PolicyReference, refs []conf_v1.PolicyReference)
 type routeSettings struct {
 	key      string
 	settings configs.GatewaySettings
+	// warned tells that the restrictions it cannot apply were warned about
+	warned bool
 }
 
 // settingsOf reads the ingress-nginx annotations of the route of a match
