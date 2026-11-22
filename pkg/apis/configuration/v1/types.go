@@ -935,8 +935,8 @@ type JWTAuth struct {
 	SNIEnabled bool `json:"sniEnabled"`
 	// The SNI name to use when connecting to the remote server. If not set, the hostname from the ``jwksURI`` will be used.
 	SNIName string `json:"sniName"`
-	// Enables verification of the JWKS server SSL certificate. Default is false.
-	// +kubebuilder:default:=false
+	// Enables verification of the JWKS server SSL certificate. Default is true: a key set fetched without verification can be replaced by anybody on the path, who then signs every token.
+	// +kubebuilder:default:=true
 	SSLVerify bool `json:"sslVerify"`
 	// The name of the Kubernetes secret that stores the CA certificate for JWKS server verification. It must be in the same namespace as the Policy resource. A secret of the type Opaque is recommended. The secret is resolved with the CA role and must store the certificate under the ca.crt key.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
@@ -1022,8 +1022,8 @@ type OIDC struct {
 	AccessTokenEnable bool `json:"accessTokenEnable"`
 	// Switches Proof Key for Code Exchange on. The OpenID client needs to be in public mode. clientSecret is not used in this mode.
 	PKCEEnable bool `json:"pkceEnable"`
-	// Enables verification of the IDP server SSL certificate. Default is false.
-	// +kubebuilder:default:=false
+	// Enables verification of the IDP server SSL certificate. Default is true: discovery, the key set and the token endpoint fetched without verification can be answered by anybody on the path.
+	// +kubebuilder:default:=true
 	SSLVerify bool `json:"sslVerify"`
 	// The name of the Kubernetes secret that stores the CA certificate for IDP server verification. It must be in the same namespace as the Policy resource. A secret of the type Opaque is recommended. The secret is resolved with the CA role and must store the certificate under the ca.crt key.
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`

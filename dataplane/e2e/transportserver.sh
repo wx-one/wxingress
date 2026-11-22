@@ -86,11 +86,14 @@ converged() {
   done
   echo "timeout"
 }
-# the image has no curl; perl-base is Debian's and speaks to the socket
+# the image has no curl; perl-base is Debian's and speaks to the socket, with
+# the controller's token from the file the API's server includes
 api() {
   $K -n "$ns" exec "$pod" -- perl -MIO::Socket::UNIX -e '
+    my $t = "";
+    if (open(my $f, "<", "/etc/nginx/secrets/_wxingress-api-token.conf")) { local $/; ($t) = <$f> =~ /"([0-9a-f]+)"/; }
     my $s = IO::Socket::UNIX->new(Peer => "/var/lib/nginx/nginx-plus-api.sock") or die "$!\n";
-    print $s "GET $ARGV[0] HTTP/1.0\r\nHost: api\r\n\r\n";
+    print $s "GET $ARGV[0] HTTP/1.0\r\nHost: api\r\nX-Wxingress-Api-Token: $t\r\n\r\n";
     my $r = join("", <$s>); $r =~ s/^.*?\r\n\r\n//s; print $r' "$1"
 }
 servers() { api "/api/9/stream/upstreams/$upstream/servers" | tr '{' '\n' | sed -n 's/.*"server":"\([^"]*\)".*"max_fails":\([0-9]*\),"fail_timeout":"\([^"]*\)".*/\1 \2 \3/p' | sort; }

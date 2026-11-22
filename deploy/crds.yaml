@@ -807,9 +807,10 @@ spec:
                       used.
                     type: string
                   sslVerify:
-                    default: false
-                    description: Enables verification of the JWKS server SSL certificate.
-                      Default is false.
+                    default: true
+                    description: 'Enables verification of the JWKS server SSL certificate.
+                      Default is true: a key set fetched without verification can
+                      be replaced by anybody on the path, who then signs every token.'
                     type: boolean
                   sslVerifyDepth:
                     default: 1
@@ -899,9 +900,11 @@ spec:
                       The default is openid.
                     type: string
                   sslVerify:
-                    default: false
-                    description: Enables verification of the IDP server SSL certificate.
-                      Default is false.
+                    default: true
+                    description: 'Enables verification of the IDP server SSL certificate.
+                      Default is true: discovery, the key set and the token endpoint
+                      fetched without verification can be answered by anybody on the
+                      path.'
                     type: boolean
                   sslVerifyDepth:
                     default: 1

@@ -435,7 +435,7 @@ server {
     set $wxingress_jwt_jwks "";
     set $wxingress_jwt_cache "";
     set $wxingress_jwt_ca "";
-    set $wxingress_jwt_verify "";
+    set $wxingress_jwt_verify "0";
     set $wxingress_jwt_sni "";
     set $wxingress_jwt_token_from "";
     # server snippet
@@ -2299,6 +2299,76 @@ server {
         proxy_next_upstream ;
         proxy_next_upstream_timeout ;
         proxy_next_upstream_tries 0;
+    }
+}
+
+---
+
+[TestExecuteVirtualServerTemplate_ModulePolicyAndTLSVerify - 1]
+
+server {
+    listen 80 proxy_protocol;
+    listen [::]:80 proxy_protocol;
+
+
+    server_name example.com;
+
+    set $resource_type "virtualserver";
+    set $resource_name "";
+    set $resource_namespace "";
+    set $service "-";
+
+    server_tokens "";
+    set $wxingress_oidc_client "the-client";
+    set $wxingress_oidc_client_secret "";
+    set $wxingress_oidc_session_key_file "/etc/nginx/oidc-session/key";
+    set $wxingress_oidc_auth "";
+    set $wxingress_oidc_token "";
+    set $wxingress_oidc_jwks "";
+    set $wxingress_oidc_end_session "";
+    set $wxingress_oidc_scope "";
+    set $wxingress_oidc_redirect "/_codexch";
+    set $wxingress_oidc_post_logout "/_logout";
+    set $wxingress_oidc_extra "";
+    set $wxingress_oidc_pkce "";
+    set $wxingress_oidc_ca "";
+    set $wxingress_oidc_verify "0";
+    set $wxingress_oidc_issuer "https://idp.example.com";
+    set $wxingress_oidc_policy "tenant-a/oidc-policy";
+
+    location = "/_codexch" {
+        # the IdP's answer, which the module takes in the access phase
+        try_files /.wxingress-oidc =404;
+    }
+    location = /logout {
+        try_files /.wxingress-oidc =404;
+    }
+    location = /front_channel_logout {
+        try_files /.wxingress-oidc =404;
+    }
+    location = /_backchannel_logout {
+        try_files /.wxingress-oidc =404;
+    }
+    location = "/_logout" {
+        try_files /.wxingress-oidc =404;
+    }
+    set $wxingress_jwt_realm "My Api";
+    set $wxingress_jwt_keys "";
+    set $wxingress_jwt_jwks "https://idp.example.com/keys";
+    set $wxingress_jwt_cache "";
+    set $wxingress_jwt_ca "";
+    set $wxingress_jwt_verify "0";
+    set $wxingress_jwt_sni "";
+    set $wxingress_jwt_token_from "";
+
+    
+
+    
+    location "/" {
+        set $service "";
+
+        
+        set $default_connection_header close;
     }
 }
 
@@ -5480,8 +5550,9 @@ server {
     set $wxingress_oidc_extra "";
     set $wxingress_oidc_pkce "";
     set $wxingress_oidc_ca "";
-    set $wxingress_oidc_verify "";
+    set $wxingress_oidc_verify "0";
     set $wxingress_oidc_issuer "";
+    set $wxingress_oidc_policy "";
 
     location = "" {
         # the IdP's answer, which the module takes in the access phase
@@ -5504,7 +5575,7 @@ server {
     set $wxingress_jwt_jwks "";
     set $wxingress_jwt_cache "";
     set $wxingress_jwt_ca "";
-    set $wxingress_jwt_verify "";
+    set $wxingress_jwt_verify "0";
     set $wxingress_jwt_sni "";
     set $wxingress_jwt_token_from "";
     # server snippet
@@ -5895,8 +5966,9 @@ server {
     set $wxingress_oidc_extra "";
     set $wxingress_oidc_pkce "";
     set $wxingress_oidc_ca "";
-    set $wxingress_oidc_verify "";
+    set $wxingress_oidc_verify "0";
     set $wxingress_oidc_issuer "";
+    set $wxingress_oidc_policy "";
 
     location = "" {
         # the IdP's answer, which the module takes in the access phase
@@ -5919,7 +5991,7 @@ server {
     set $wxingress_jwt_jwks "";
     set $wxingress_jwt_cache "";
     set $wxingress_jwt_ca "";
-    set $wxingress_jwt_verify "";
+    set $wxingress_jwt_verify "0";
     set $wxingress_jwt_sni "";
     set $wxingress_jwt_token_from "";
     # server snippet
@@ -6160,8 +6232,9 @@ server {
     set $wxingress_oidc_extra "";
     set $wxingress_oidc_pkce "";
     set $wxingress_oidc_ca "";
-    set $wxingress_oidc_verify "";
+    set $wxingress_oidc_verify "0";
     set $wxingress_oidc_issuer "";
+    set $wxingress_oidc_policy "";
 
     location = "" {
         # the IdP's answer, which the module takes in the access phase
@@ -6186,7 +6259,7 @@ server {
     set $wxingress_jwt_jwks "";
     set $wxingress_jwt_cache "";
     set $wxingress_jwt_ca "";
-    set $wxingress_jwt_verify "";
+    set $wxingress_jwt_verify "0";
     set $wxingress_jwt_sni "";
     set $wxingress_jwt_token_from "";
     auth_request "/_external_auth/oauth2/auth";
@@ -8663,8 +8736,9 @@ server {
     set $wxingress_oidc_extra "";
     set $wxingress_oidc_pkce "";
     set $wxingress_oidc_ca "";
-    set $wxingress_oidc_verify "";
+    set $wxingress_oidc_verify "0";
     set $wxingress_oidc_issuer "";
+    set $wxingress_oidc_policy "";
 
     location = "" {
         # the IdP's answer, which the module takes in the access phase
@@ -8687,7 +8761,7 @@ server {
     set $wxingress_jwt_jwks "";
     set $wxingress_jwt_cache "";
     set $wxingress_jwt_ca "";
-    set $wxingress_jwt_verify "";
+    set $wxingress_jwt_verify "0";
     set $wxingress_jwt_sni "";
     set $wxingress_jwt_token_from "";
     # server snippet
@@ -9192,8 +9266,9 @@ server {
     set $wxingress_oidc_extra "";
     set $wxingress_oidc_pkce "";
     set $wxingress_oidc_ca "";
-    set $wxingress_oidc_verify "";
+    set $wxingress_oidc_verify "0";
     set $wxingress_oidc_issuer "";
+    set $wxingress_oidc_policy "";
 
     location = "" {
         # the IdP's answer, which the module takes in the access phase
@@ -9216,7 +9291,7 @@ server {
     set $wxingress_jwt_jwks "";
     set $wxingress_jwt_cache "";
     set $wxingress_jwt_ca "";
-    set $wxingress_jwt_verify "";
+    set $wxingress_jwt_verify "0";
     set $wxingress_jwt_sni "";
     set $wxingress_jwt_token_from "";
     # server snippet

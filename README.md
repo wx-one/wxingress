@@ -26,9 +26,10 @@
   </a>
 </p>
 
-wxingress is developed by [WizardTales](https://wizardtales.com) and runs the ingress of the
-[WX-ONE](https://wx1.eu) cloud platform. If your clusters depend on it, please consider
-[sponsoring its development](https://github.com/sponsors/wx-one).
+wxingress is officially maintained by [WizardTales](https://wizardtales.com) and runs the ingress of
+the [WX-ONE](https://wx1.eu) cloud platform. That is our commitment: it stays open source, and since we
+depend on it ourselves, its development is secured. Donations are still very welcome and go
+exclusively into its development: [sponsor wxingress](https://github.com/sponsors/wx-one).
 
 ## Commercial support
 
@@ -104,7 +105,7 @@ defaults, updates endpoints dynamically and serves Ingresses without a host. To 
 IngressClass `nginx` of an existing ingress-nginx installation, read the
 [migration guide](https://wx-one.github.io/wxingress/migration/ingress-nginx/) first.
 
-Images: `ghcr.io/wx-one/wxingress:<version>`, for example `5.7.1-wx6`. The image contains
+Images: `ghcr.io/wx-one/wxingress:<version>`, for example `5.7.1-wx7`. The image contains
 NGINX 1.31.9 from nginx.org.
 
 ## Moving from ingress-nginx
@@ -134,7 +135,7 @@ command-line flags and Helm values, and how to build and develop wxingress.
 
 | wxingress | based on NGINX Ingress Controller | NGINX | Gateway API (via NGINX Gateway Fabric) |
 |---|---|---|---|
-| 5.7.1-wx6 | 5.7.1 | 1.31.9 | v1.6.3 (NGF 2.8.1) |
+| 5.7.1-wx7 | 5.7.1 | 1.31.9 | v1.6.3 (NGF 2.8.1) |
 
 Every release comes with CycloneDX SBOMs of the binaries and of the image and names the image by its
 digest; see [Releases and SBOMs](https://wx-one.github.io/wxingress/getting-started/installation/#releases-and-sboms).

@@ -37,7 +37,7 @@ type OIDCApplyConfiguration struct {
 	AccessTokenEnable *bool `json:"accessTokenEnable,omitempty"`
 	// Switches Proof Key for Code Exchange on. The OpenID client needs to be in public mode. clientSecret is not used in this mode.
 	PKCEEnable *bool `json:"pkceEnable,omitempty"`
-	// Enables verification of the IDP server SSL certificate. Default is false.
+	// Enables verification of the IDP server SSL certificate. Default is true: discovery, the key set and the token endpoint fetched without verification can be answered by anybody on the path.
 	SSLVerify *bool `json:"sslVerify,omitempty"`
 	// The name of the Kubernetes secret that stores the CA certificate for IDP server verification. It must be in the same namespace as the Policy resource. A secret of the type Opaque is recommended. The secret is resolved with the CA role and must store the certificate under the ca.crt key.
 	TrustedCertSecret *string `json:"trustedCertSecret,omitempty"`

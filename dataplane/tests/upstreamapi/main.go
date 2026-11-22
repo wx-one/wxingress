@@ -94,8 +94,21 @@ func through(front string, count int) string {
 	return strings.Join(names, " ")
 }
 
+// withToken sends the controller's token with every request.
+type withToken struct {
+	token string
+	next  http.RoundTripper
+}
+
+func (t withToken) RoundTrip(r *http.Request) (*http.Response, error) {
+	r = r.Clone(r.Context())
+	r.Header.Set("X-Wxingress-Api-Token", t.token)
+	return t.next.RoundTrip(r)
+}
+
 func main() {
 	socket := flag.String("socket", "", "the upstream API's unix socket")
+	token := flag.String("token", "", "the controller's token, which the API's server asks for")
 	front := flag.String("front", "", "the proxy, as a URL")
 	upstream := flag.String("upstream", "", "the zoned upstream behind the proxy")
 	first := flag.String("first", "", "the first backend's address")
@@ -104,14 +117,15 @@ func main() {
 	streamUpstream := flag.String("stream-upstream", "", "the zoned stream upstream behind it")
 	flag.Parse()
 
-	// as cmd/nginx-ingress/main.go getSocketClient and createPlusClient build it
+	// as cmd/nginx-ingress/main.go getSocketClient and createPlusClient build
+	// it, with the token internal/nginx.WithAPIToken sends
 	httpClient := &http.Client{
 		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
+		Transport: withToken{token: *token, next: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 				return net.Dial("unix", *socket)
 			},
-		},
+		}},
 	}
 	api, err := client.NewNginxClient("http://nginx-plus-api/api", client.WithHTTPClient(httpClient))
 	if err != nil {

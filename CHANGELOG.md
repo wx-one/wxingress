@@ -4,6 +4,31 @@ wxingress versions are `<NGINX Ingress Controller version>-wx<n>`: `5.7.1-wx5` i
 release based on NGINX Ingress Controller 5.7.1. The changes of NGINX Ingress Controller itself are on its
 [releases page](https://github.com/nginx/kubernetes-ingress/releases).
 
+## 5.7.1-wx7
+
+A security release for the data plane module. It matters where JWT or OIDC Policies are used; upgrade
+from every earlier version.
+
+### Security
+
+- JWT and OIDC are checked on requests that NGINX redirects internally: a `rewrite` that changes the URI
+  (VirtualServer routes with `matches`, `splits` or `rewritePath`), `try_files`, `error_page` and named
+  locations. Before, those requests were served without a token. Built with metalang's fix for guards
+  on internal redirects.
+- OIDC sessions are bound to their Policy, issuer, client and host, and checked on every request; a
+  session of one Policy is not accepted by another. Existing sessions end, users log in once more.
+- JWKS, discovery and token endpoints are verified with TLS by default: `sslVerify` defaults to `true`
+  for JWT and OIDC Policies (Policies that set `false` keep it). Key sets and providers are cached per
+  TLS setting.
+- One fetch per key set at a time, failed fetches are cached for 10 seconds.
+- A refresh no longer redirects to another site (`//host`).
+- Cookies are kept per request; a session can no longer pass to a concurrent request.
+- Back-channel revocations are scoped to issuer and client; front-channel logout ends only the browser's
+  own session; a full revocation table is refused instead of dropping entries.
+- The module's API takes requests only with a token the controller makes at startup.
+- The upstream listing of the module's API can no longer overflow its buffer.
+- A writer that dies while holding a shared table no longer leaves readers spinning.
+
 ## 5.7.1-wx6
 
 A security release. Upgrade from every earlier version.

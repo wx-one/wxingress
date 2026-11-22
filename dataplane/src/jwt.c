@@ -77,6 +77,14 @@ typedef struct {
   /** the file or the URL */
   char source[1024];
   int fromURL;
+  /**
+   * How a URL's set is fetched - verified or not, the CA, the server name -
+   * as one text: a set fetched without verification is not the set of a
+   * Policy that asked for it, even at the same URL.
+   */
+  char tls[1200];
+  /** set while a task of this worker fetches it, which the others wait for */
+  int fetching;
   /** the file's modification time and size when it was read */
   struct timespec modified;
   off_t size;
@@ -348,8 +356,9 @@ static long jwtSeconds(const char *text) {
 /**
  * How a key set is fetched over TLS: the CA, the server name (SNI and the
  * certificate's) and whether the server is verified at all - NGINX Ingress
- * Controller's trustedCertSecret, sniName with sniEnabled and sslVerify,
- * whose default is no verification, as nginx's proxy_ssl_verify.
+ * Controller's trustedCertSecret, sniName with sniEnabled and sslVerify.
+ * The server is verified unless the configuration says `0`: a key set that
+ * anybody on the path can replace makes every token theirs to sign.
  */
 typedef struct {
   const char *ca;
@@ -368,10 +377,22 @@ static jwtTls_t jwtTlsOf(http_request_t *req, const char *prefix) {
   snprintf(name, sizeof name, "%s_sni", prefix);
   tls.sni = req.variable(name);
   snprintf(name, sizeof name, "%s_verify", prefix);
-  tls.verify = req.variable(name)[0] == '1';
+  tls.verify = req.variable(name)[0] != '0';
 
   return tls;
 }
+
+/** The TLS settings as the text a set is kept under. */
+static void jwtTlsKey(const jwtTls_t *tls, char *into, size_t room) {
+
+  if (tls == NULL)
+    snprintf(into, room, "-");
+  else
+    snprintf(into, room, "%d|%s|%s", tls->verify, tls->verify ? tls->ca : "", tls->sni);
+}
+
+/** How long a task waits for another's fetch of the same set: its timeouts and retries. */
+#define JWT_FETCH_WAIT_MS 20000
 
 static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
                           const jwtTls_t *tls, int unknownKid) {
@@ -379,9 +400,12 @@ static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
   jwtSet_t *set = NULL;
   jwtSet_t *free = NULL;
   time_t now = time(NULL);
+  char tlsKey[sizeof jwtSets[0].tls];
 
   if (source[0] == 0 || strlen(source) >= sizeof jwtSets[0].source)
     return NULL;
+
+  jwtTlsKey(fromURL ? tls : NULL, tlsKey, sizeof tlsKey);
 
   for (int at = 0; at < JWT_SETS; ++at) {
     if (jwtSets[at].source[0] == 0) {
@@ -389,7 +413,8 @@ static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
         free = &jwtSets[at];
       continue;
     }
-    if (jwtSets[at].fromURL == fromURL && strcmp(jwtSets[at].source, source) == 0) {
+    if (jwtSets[at].fromURL == fromURL && strcmp(jwtSets[at].source, source) == 0 &&
+        strcmp(jwtSets[at].tls, tlsKey) == 0) {
       set = &jwtSets[at];
       break;
     }
@@ -397,13 +422,18 @@ static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
 
   if (set == NULL) {
     if (free == NULL) {
-      /* full: the first one goes */
-      free = &jwtSets[0];
+      /* full: the first one that nobody is fetching goes */
+      for (int at = 0; at < JWT_SETS && free == NULL; ++at)
+        if (!jwtSets[at].fetching)
+          free = &jwtSets[at];
+      if (free == NULL)
+        return NULL;
       jwtSetEmpty(free);
     }
     set = free;
     memset(set, 0, sizeof *set);
     snprintf(set->source, sizeof set->source, "%s", source);
+    snprintf(set->tls, sizeof set->tls, "%s", tlsKey);
     set->fromURL = fromURL;
   }
 
@@ -444,17 +474,43 @@ static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
     return set->count > 0 ? set : NULL;
   }
 
+  /**
+   * One fetch of a set at a time: the others of this worker wait for it - a
+   * set that has keys is used as it is meanwhile - rather than each sending
+   * its own, which was a fetch per request for as long as the server took to
+   * answer, and for every request while it did not answer at all.
+   */
+  if (set->fetching) {
+
+    if (set->count > 0)
+      return set;
+
+    for (int waited = 0; set->fetching && waited < JWT_FETCH_WAIT_MS; waited += 50)
+      meta_sleepMs(50);
+
+    /* the slot may have gone to another source while this one waited */
+    if (strcmp(set->source, source) != 0 || set->fromURL != fromURL || strcmp(set->tls, tlsKey) != 0)
+      return NULL;
+
+    return set->count > 0 ? set : NULL;
+  }
+
   if (set->count > 0 && now < set->due &&
       !(unknownKid && now - set->fetched >= JWT_REFETCH_SECONDS))
     return set;
 
-  if (set->count > 0 && now - set->fetched < JWT_REFETCH_SECONDS)
-    return set;
+  /* fetched less than the refetch time ago: kept, or none - a set that could not be had is not asked for again at once */
+  if (set->fetched != 0 && now - set->fetched < JWT_REFETCH_SECONDS)
+    return set->count > 0 ? set : NULL;
 
   {
     fetch_call_t call = meta_fetch("GET", source).timeout(5).connectTimeout(3).retry(3);
     fetch_answer_t got;
     jwtSet_t fresh;
+
+    /* fetched as of now, before the wait: the requests meanwhile do not fetch it too */
+    set->fetched = now;
+    set->fetching = 1;
 
     if (tls != NULL) {
       call = call.verifyPeer(tls->verify);
@@ -466,13 +522,13 @@ static jwtSet_t *jwtSetOf(const char *source, int fromURL, const char *ttl,
 
     got = call.send();
 
+    set->fetching = 0;
+
     /* the slot may have gone to another source while this one waited */
-    if (strcmp(set->source, source) != 0 || set->fromURL != fromURL) {
+    if (strcmp(set->source, source) != 0 || set->fromURL != fromURL || strcmp(set->tls, tlsKey) != 0) {
       got.release();
       return NULL;
     }
-
-    set->fetched = now;
 
     if (got.ok && got.status == 200) {
 

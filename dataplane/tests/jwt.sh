@@ -36,6 +36,7 @@ prefix="$work/run"
 front=$port
 backend=$((port + 1))
 jwks=$((port + 2))
+tls=$((port + 3))
 
 stop() {
   if [ -f "$prefix/logs/nginx.pid" ]; then
@@ -73,6 +74,8 @@ http {
     map "" \$wxingress_jwt_ca { default ""; }
     map "" \$wxingress_jwt_token_from { default ""; }
     map "" \$wxingress_jwt_leeway { default ""; }
+    map "" \$wxingress_jwt_verify { default ""; }
+    map "" \$wxingress_jwt_sni { default ""; }
     map "" \$wxingress_oidc_client { default ""; }
     map "" \$wxingress_oidc_client_secret { default ""; }
     map "" \$wxingress_oidc_session_key_file { default ""; }
@@ -120,6 +123,47 @@ http {
             proxy_pass http://127.0.0.1:$backend;
         }
 
+        # a key set that is slow to come, and one that never does
+        location /slow-url {
+            set \$wxingress_jwt_realm "slow";
+            set \$wxingress_jwt_keys "";
+            set \$wxingress_jwt_jwks "http://127.0.0.1:$jwks/slow";
+            proxy_pass http://127.0.0.1:$backend;
+        }
+
+        location /broken-url {
+            set \$wxingress_jwt_realm "broken";
+            set \$wxingress_jwt_keys "";
+            set \$wxingress_jwt_jwks "http://127.0.0.1:$jwks/broken";
+            proxy_pass http://127.0.0.1:$backend;
+        }
+
+        # one key set over TLS with a certificate of its own: verified unless
+        # the Policy says 0, against the Policy's CA when it names one
+        location /tls-off {
+            set \$wxingress_jwt_realm "tls";
+            set \$wxingress_jwt_keys "";
+            set \$wxingress_jwt_jwks "https://127.0.0.1:$tls/jwks";
+            set \$wxingress_jwt_verify "0";
+            proxy_pass http://127.0.0.1:$backend;
+        }
+
+        location /tls-default {
+            set \$wxingress_jwt_realm "tls";
+            set \$wxingress_jwt_keys "";
+            set \$wxingress_jwt_jwks "https://127.0.0.1:$tls/jwks";
+            proxy_pass http://127.0.0.1:$backend;
+        }
+
+        location /tls-ca {
+            set \$wxingress_jwt_realm "tls";
+            set \$wxingress_jwt_keys "";
+            set \$wxingress_jwt_jwks "https://127.0.0.1:$tls/jwks";
+            set \$wxingress_jwt_verify "1";
+            set \$wxingress_jwt_ca "$prefix/keys/ca.pem";
+            proxy_pass http://127.0.0.1:$backend;
+        }
+
         location /cookie {
             set \$wxingress_jwt_token_from cookie_auth;
             proxy_pass http://127.0.0.1:$backend;
@@ -134,6 +178,48 @@ http {
             set \$wxingress_jwt_realm "";
             proxy_pass http://127.0.0.1:$backend;
         }
+
+        # requests nginx carries elsewhere inside itself, each of which sets
+        # r->internal: the realm of where they land is asked all the same
+        location /rewrite-break {
+            rewrite ^/rewrite-break(.*)\$ /file\$1 break;
+            proxy_pass http://127.0.0.1:$backend;
+        }
+
+        # the shape of a VirtualServer route with matches or splits: the
+        # route's own location opens no realm, the internal one it rewrites
+        # to does
+        location /split {
+            set \$wxingress_jwt_realm "";
+            rewrite ^ /internal_split last;
+        }
+
+        location /internal_split {
+            internal;
+            set \$wxingress_jwt_realm "split";
+            proxy_pass http://127.0.0.1:$backend;
+        }
+
+        location /tried {
+            set \$wxingress_jwt_realm "";
+            try_files /nowhere @protected;
+        }
+
+        location /tried-uri {
+            set \$wxingress_jwt_realm "";
+            try_files /nowhere /internal_split;
+        }
+
+        location /errored {
+            set \$wxingress_jwt_realm "";
+            error_page 418 = @protected;
+            return 418;
+        }
+
+        location @protected {
+            set \$wxingress_jwt_realm "named";
+            proxy_pass http://127.0.0.1:$backend;
+        }
     }
 }
 CONF
@@ -142,7 +228,7 @@ CONF
 sleep 1
 
 result=0
-( cd "$repository" && go run ./dataplane/tests/jwt -nginx "127.0.0.1:$front" -jwks "127.0.0.1:$jwks" -keys "$prefix/keys" ) || result=1
+( cd "$repository" && go run ./dataplane/tests/jwt -nginx "127.0.0.1:$front" -jwks "127.0.0.1:$jwks" -tls "127.0.0.1:$tls" -keys "$prefix/keys" ) || result=1
 
 alarms=$(grep -cE '\[(alert|emerg|crit)\]' "$prefix/logs/error.log")
 if [ "$alarms" != "0" ]; then

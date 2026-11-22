@@ -236,6 +236,7 @@ func main() {
 	public := flag.Bool("public", false, "a public client: no secret, PKCE alone")
 	discovery := flag.Bool("discovery", false, "the server names only the issuer: endpoints from discovery, iss checked, logouts and revocations")
 	api := flag.String("api", "", "the unix socket of the module's API")
+	otherNginx := flag.String("other", "", "a server of another Policy with the same client and key file")
 	flag.Parse()
 	if *public {
 		client, secret = "e2e-public", ""
@@ -275,6 +276,28 @@ func main() {
 	}
 	check("every worker opens the session", code, 200)
 
+	if *otherNginx != "" {
+		// the session of one Policy is no session of another's server, though
+		// the client ID and the controller's key file are the same
+		stolen := newBrowser()
+		for k, v := range b.cookies {
+			stolen.cookies[k] = v
+		}
+		code, h, _ = stolen.get("http://" + *otherNginx + "/app/page")
+		check("a session at another Policy's server with the same client: to the IdP", fmt.Sprint(code, " ", strings.Contains(h.Get("Location"), "/authorize?")), "302 true")
+
+		// and a session another tenant's server made is not taken here
+		o := newBrowser()
+		got, _ = o.login("http://" + *otherNginx + "/app/page")
+		check("a login at the other Policy's server", strings.HasPrefix(got, "200 alice"), true)
+		forged := newBrowser()
+		for k, v := range o.cookies {
+			forged.cookies[k] = v
+		}
+		code, h, _ = forged.get(app)
+		check("its session here: to the IdP", fmt.Sprint(code, " ", strings.Contains(h.Get("Location"), "/authorize?")), "302 true")
+	}
+
 	tampered := newBrowser()
 	for k, v := range b.cookies {
 		tampered.cookies[k] = v
@@ -299,6 +322,12 @@ func main() {
 	check("expired: refreshed, and sent to itself with 307", fmt.Sprint(code, " ", h.Get("Location")), "307 /app/page?x=1")
 	code, h, _ = b.get(app)
 	check("then served with the new session", fmt.Sprint(code, " ", h.Get("X-User"), " ", p.refreshes), "200 alice 1")
+
+	// a refresh at //app/x - which nginx serves as /app/x - sends the browser to
+	// /, not to the host "app" a browser reads in a Location of //app/x
+	time.Sleep(p.lifetime + time.Second)
+	code, h, _ = b.get("http://" + *nginx + "//app/x")
+	check("expired at //app/x: refreshed, and sent to / of this host", fmt.Sprint(code, " ", h.Get("Location")), "307 /")
 
 	// logout: the session goes, to the IdP's end session endpoint
 	code, h, _ = b.get("http://" + *nginx + "/logout")
@@ -363,15 +392,24 @@ func discovered(p *idp, nginx, api string) {
 	}
 	check("an ID token is no logout token: 400", code, 400)
 
-	// front channel: the IdP's iframe with iss and sid
+	// front channel: the IdP's iframe with iss and sid - which anybody can send
 	b = fresh()
-	c2, _, _ := newBrowser().get("http://" + nginx + "/front_channel_logout?iss=" + url.QueryEscape(p.issuer) + "&sid=" + url.QueryEscape(p.sid))
+	front := "http://" + nginx + "/front_channel_logout?iss=" + url.QueryEscape(p.issuer) + "&sid=" + url.QueryEscape(p.sid)
+	c2, _, _ := newBrowser().get(front)
 	check("front-channel logout answers the iframe", c2, 200)
-	check("and the session of its sid ends", served(b), 302)
+	check("without the browser's own session it ends nothing", served(b), 200)
+	copied := newBrowser()
+	for k, v := range b.cookies {
+		copied.cookies[k] = v
+	}
+	c2, _, _ = b.get(front)
+	check("from the browser of the session it is answered too", c2, 200)
+	check("and its cookies go", b.cookies["wxoidc_s0"] == "", true)
+	check("and the sessions of its sid end, a copy of the cookie too", served(copied), 302)
 
 	// RP-initiated logout ends a copy of the cookie too
 	b = fresh()
-	copied := newBrowser()
+	copied = newBrowser()
 	for k, v := range b.cookies {
 		copied.cookies[k] = v
 	}

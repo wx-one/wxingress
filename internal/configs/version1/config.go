@@ -577,6 +577,7 @@ type MainConfig struct {
 	StreamSnippets                     []string
 	StubStatusOverUnixSocketForOSS     bool
 	UpstreamAPI                        bool
+	UpstreamAPITokenFile               string
 	TLSPassthrough                     bool
 	TLSPassthroughPort                 int
 	VariablesHashBucketSize            uint64

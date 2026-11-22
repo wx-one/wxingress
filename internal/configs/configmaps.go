@@ -1412,6 +1412,7 @@ func GenerateNginxMainConfig(staticCfgParams *StaticConfigParams, config *Config
 		StreamSnippets:                     config.MainStreamSnippets,
 		StubStatusOverUnixSocketForOSS:     staticCfgParams.StubStatusOverUnixSocketForOSS,
 		UpstreamAPI:                        staticCfgParams.UpstreamAPI,
+		UpstreamAPITokenFile:               staticCfgParams.UpstreamAPITokenFile,
 		WorkerCPUAffinity:                  config.MainWorkerCPUAffinity,
 		WorkerProcesses:                    config.MainWorkerProcesses,
 		WorkerShutdownTimeout:              config.MainWorkerShutdownTimeout,

@@ -9579,6 +9579,27 @@ func TestExecuteMainTemplateForNGINXWithUpstreamAPI(t *testing.T) {
 		}
 	}
 
+	if strings.Contains(buf.String(), "include /etc/nginx/secrets/") {
+		t.Error("main template without a token file includes one")
+	}
+
+	// the controller's token: checked in the server of the socket, from a file of its own
+	buf.Reset()
+	cfg.UpstreamAPITokenFile = "/etc/nginx/secrets/_wxingress-api-token.conf"
+	if err := tmpl.Execute(buf, cfg); err != nil {
+		t.Fatal(err)
+	}
+	api := buf.String()
+	start := strings.Index(api, "listen unix:/var/lib/nginx/nginx-plus-api.sock;")
+	end := strings.Index(api, "meta_pass;")
+	if start < 0 || end < start ||
+		!strings.Contains(api[start:end], "include /etc/nginx/secrets/_wxingress-api-token.conf;") {
+		t.Error("the server of the upstream API does not include the token file")
+	}
+	if strings.Count(api, "_wxingress-api-token.conf") != 1 {
+		t.Error("the token file is included outside the server of the upstream API")
+	}
+
 	buf.Reset()
 	if err := tmpl.Execute(buf, mainCfg); err != nil {
 		t.Fatal(err)

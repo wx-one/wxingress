@@ -19,6 +19,8 @@
  *   set $wxingress_oidc_ca            "<CA file>" or "";
  *   set $wxingress_oidc_leeway        "<seconds>";
  *   set $wxingress_oidc_session_key_file "<file>";  the key sessions are sealed with
+ *   set $wxingress_oidc_policy        "<namespace>/<name>";   the Policy
+ *   set $wxingress_oidc_verify        "1", or "0" for no TLS verification
  *
  * and `set $wxingress_oidc_on "1";` where the Policy applies. The redirect
  * URI's location, `/logout` and the post-logout location exist in the
@@ -68,10 +70,12 @@
 
 static char oidcSealed[OIDC_CHUNKS * OIDC_CHUNK + 64];
 
-static int oidcRevoked(const char *sub, const char *sid, long long created);
+static int oidcRevoked(const char *iss, const char *aud, const char *sub, const char *sid, const char *ses,
+                       long long created);
 static http_response_t oidcBackChannel(http_request_t *req);
 static http_response_t oidcFrontChannel(http_request_t *req);
-static void oidcRevokeLocally(const char *kind, const char *value);
+static int oidcRevokeLocally(const char *kind, const char *scope, const char *value);
+static void oidcScopeOf(const char *iss, const char *aud, char *into, size_t room);
 static void urlDecoded(const char *text, char *into, size_t room);
 
 /** Why a login or a refresh did not work, for the error log (stderr, which nginx's is in the controller). */
@@ -82,10 +86,29 @@ static void oidcNote(const char *what, const char *detail) {
 /* ------------------------------------------------------------- sealing */
 
 /**
- * The session key of the client: HMAC-SHA256 of the client under the
- * session key file (`$wxingress_oidc_session_key_file`, the controller's
- * Secret every replica mounts), or under the client secret when there is no
- * such file - a public client with PKCE has no secret.
+ * What a session is sealed for, as the text its key is derived with: the
+ * Policy (namespace/name), the issuer, the client and the server. The key
+ * file is one Secret for every Policy of the controller, so a key of the
+ * client alone was the key of anybody's Policy with the same client ID -
+ * which is no secret: a tenant with a Policy of its own, its own IdP behind
+ * it and another tenant's client ID had its sessions opened by that tenant's
+ * servers, as whoever its IdP said. And a session of one server is not a
+ * session of another server of the same Policy.
+ */
+static int oidcKeyInfo(http_request_t *req, char *into, size_t room) {
+
+  int length = snprintf(into, room, "wxingress oidc session 2|%s|%s|%s|%s",
+                        req.variable("wxingress_oidc_policy"), req.variable("wxingress_oidc_issuer"),
+                        req.variable("wxingress_oidc_client"), req.variable("server_name"));
+
+  return length > 0 && (size_t)length < room;
+}
+
+/**
+ * The session key: HMAC-SHA256 of oidcKeyInfo under the session key file
+ * (`$wxingress_oidc_session_key_file`, the controller's Secret every replica
+ * mounts), or under the client secret when there is no such file - a public
+ * client with PKCE has no secret.
  */
 static int oidcKey(http_request_t *req, unsigned char key[32]) {
 
@@ -94,8 +117,7 @@ static int oidcKey(http_request_t *req, unsigned char key[32]) {
   static struct timespec fileModified;
   const char *file = req.variable("wxingress_oidc_session_key_file");
   const char *secret = req.variable("wxingress_oidc_client_secret");
-  const char *client = req.variable("wxingress_oidc_client");
-  static char info[512];
+  char info[2048];
   size_t length = 32;
   struct stat seen;
 
@@ -114,10 +136,8 @@ static int oidcKey(http_request_t *req, unsigned char key[32]) {
       secret = fileKey;
   }
 
-  if (secret[0] == 0)
+  if (secret[0] == 0 || !oidcKeyInfo(req, info, sizeof info))
     return 0;
-
-  snprintf(info, sizeof info, "wxingress oidc session 1|%s", client);
 
   return EVP_Q_mac(NULL, "HMAC", NULL, "SHA256", NULL, (const unsigned char *)secret, strlen(secret),
                    (const unsigned char *)info, strlen(info), key, 32, &length) != NULL && length == 32;
@@ -221,26 +241,43 @@ static const char *oidcCookieAttributes(http_request_t *req) {
 }
 
 /**
- * The Set-Cookie values of the answer being built. Shared by the requests of
- * a worker, so they are filled only after the last wait of a request - a
- * token request - and the answer goes out before the next one: the list is
- * emptied when a request starts and again when its wait is over.
+ * The Set-Cookie values of the answer being built: the request's own, on its
+ * task's stack. They were a list of the worker's once, shared by every
+ * request it had, and a request that waited - for the token endpoint, a key
+ * set, discovery - came back to the cookies of whichever ran meanwhile.
  */
-static char oidcCookies[OIDC_CHUNKS + 2][OIDC_CHUNK + 128];
-static int oidcCookieCount;
+typedef struct {
+  char cookies[OIDC_CHUNKS + 2][OIDC_CHUNK + 128];
+  int count;
+} oidcJar_t;
 
-static void oidcCookie(http_request_t *req, const char *name, const char *value, int remove) {
+/**
+ * Adds a cookie; 0 when it does not fit, which is refused rather than cut:
+ * what a cut takes off is the end, and the end is HttpOnly and Secure.
+ */
+static int oidcCookie(http_request_t *req, oidcJar_t *jar, const char *name, const char *value, int remove) {
 
-  if (oidcCookieCount >= OIDC_CHUNKS + 2)
-    return;
+  int length;
+
+  if (jar->count >= OIDC_CHUNKS + 2)
+    return 0;
 
   /* a cookie that goes: Max-Age and Expires both, as not every client reads Max-Age=0 */
-  snprintf(oidcCookies[oidcCookieCount++], sizeof oidcCookies[0], "%s=%s%s%s", name, value,
-           oidcCookieAttributes(req), remove ? "; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT" : "");
+  length = snprintf(jar->cookies[jar->count], sizeof jar->cookies[0], "%s=%s%s%s", name, value,
+                    oidcCookieAttributes(req), remove ? "; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT" : "");
+
+  if (length < 0 || (size_t)length >= sizeof jar->cookies[0]) {
+    jar->cookies[jar->count][0] = 0;
+    return 0;
+  }
+
+  ++jar->count;
+
+  return 1;
 }
 
 /** The session's cookies for `plain`, sealed and split; the unused ones removed. 0 when it is too big. */
-static int oidcSessionCookies(http_request_t *req, const char *plain) {
+static int oidcSessionCookies(http_request_t *req, oidcJar_t *jar, const char *plain) {
 
   size_t length = oidcSeal(req, "wxoidc_s", plain, oidcSealed, sizeof oidcSealed);
   size_t at = 0;
@@ -257,9 +294,10 @@ static int oidcSessionCookies(http_request_t *req, const char *plain) {
       memcpy(chunk, oidcSealed + at, n);
       chunk[n] = 0;
       at += n;
-      oidcCookie(req, name, chunk, 0);
-    } else {
-      oidcCookie(req, name, "", 1);
+      if (!oidcCookie(req, jar, name, chunk, 0))
+        return 0;
+    } else if (!oidcCookie(req, jar, name, "", 1)) {
+      return 0;
     }
   }
 
@@ -300,6 +338,7 @@ static char oidcOpenedId[OIDC_CHUNK * 2];
 static json_t oidcOpenedClaims;
 static int oidcOpenedHasClaims;
 static char oidcOpenedSub[256], oidcOpenedSid[256], oidcOpenedSes[64];
+static char oidcOpenedIss[512], oidcOpenedAud[256], oidcOpenedPolicy[512], oidcOpenedServer[256];
 static long long oidcOpenedCreated;
 
 /** The claims of the session before, which the next one replaces. */
@@ -323,6 +362,10 @@ static void oidcOpenedParse(const char *plain) {
   snprintf(oidcOpenedSub, sizeof oidcOpenedSub, "%s", doc.get("sub").text());
   snprintf(oidcOpenedSid, sizeof oidcOpenedSid, "%s", doc.get("sid").text());
   snprintf(oidcOpenedSes, sizeof oidcOpenedSes, "%s", doc.get("ses").text());
+  snprintf(oidcOpenedIss, sizeof oidcOpenedIss, "%s", doc.get("iss").text());
+  snprintf(oidcOpenedAud, sizeof oidcOpenedAud, "%s", doc.get("aud").text());
+  snprintf(oidcOpenedPolicy, sizeof oidcOpenedPolicy, "%s", doc.get("pol").text());
+  snprintf(oidcOpenedServer, sizeof oidcOpenedServer, "%s", doc.get("srv").text());
   snprintf(oidcOpenedAccess, sizeof oidcOpenedAccess, "%s", doc.get("access").text());
   snprintf(oidcOpenedId, sizeof oidcOpenedId, "%s", doc.get("id").text());
   doc.release();
@@ -374,17 +417,22 @@ static int oidcSessionOf(http_request_t *req, char *into, size_t room) {
     return 0;
 
   /**
-   * The last session this worker opened, by its sealed text and the client:
-   * the access step and each `$meta_oidc_*` of a request open the same
-   * cookie, and so do the next requests of the same browser. Equal text under
-   * the same key is the same session, so it is not decrypted again.
+   * The last session this worker opened, by its sealed text and what its key
+   * is derived from (oidcKeyInfo): the access step and each `$meta_oidc_*` of
+   * a request open the same cookie, and so do the next requests of the same
+   * browser. Equal text under the same key is the same session, so it is not
+   * decrypted again - and under another Policy, issuer, client or server it
+   * is not the same key, so not the same session either.
    */
   {
-    static char lastSealed[sizeof oidcSealed], lastClient[256], lastSecret[512], lastPlain[OIDC_CHUNKS * OIDC_CHUNK];
+    static char lastSealed[sizeof oidcSealed], lastClient[2048], lastSecret[512], lastPlain[OIDC_CHUNKS * OIDC_CHUNK];
     static long long lastStamp;
-    const char *client = req.variable("wxingress_oidc_client");
+    char client[2048];
     const char *secret = req.variable("wxingress_oidc_client_secret");
     long long stamp = oidcKeyStamp(req);
+
+    if (!oidcKeyInfo(req, client, sizeof client))
+      return 0;
 
     if (lastSealed[0] != 0 && strcmp(lastSealed, oidcSealed) == 0 && strcmp(lastClient, client) == 0 &&
         strcmp(lastSecret, secret) == 0 && lastStamp == stamp && (into == NULL || strlen(lastPlain) < room)) {
@@ -423,12 +471,13 @@ static int oidcSessionOf(http_request_t *req, char *into, size_t room) {
 
 /* --------------------------------------------------------------- answers */
 
-static http_response_t oidcAnswer(http_request_t *req, int code, const char *location, const char *text) {
+static http_response_t oidcAnswer(http_request_t *req, oidcJar_t *jar, int code, const char *location,
+                                  const char *text) {
 
   http_response_t answer = req.reply(code);
 
-  for (int at = 0; at < oidcCookieCount; ++at)
-    answer = answer.header("Set-Cookie", oidcCookies[at]);
+  for (int at = 0; jar != NULL && at < jar->count; ++at)
+    answer = answer.header("Set-Cookie", jar->cookies[at]);
 
   if (location != NULL)
     answer = answer.header("Location", location);
@@ -454,6 +503,18 @@ static void urlEncoded(const char *text, char *into, size_t room) {
   }
 
   into[used] = 0;
+}
+
+/**
+ * Where to send the browser back to on this host: a path of it, or `/`.
+ * `//host/` and `/\host/` are other hosts to a browser, and so is anything
+ * that is not a path.
+ */
+static void oidcLocalPath(const char *was, char *into, size_t room) {
+
+  int local = was[0] == '/' && was[1] != '/' && was[1] != '\\' && strpbrk(was, "\r\n") == NULL;
+
+  snprintf(into, room, "%s", local && strlen(was) < room ? was : "/");
 }
 
 /**
@@ -492,6 +553,9 @@ static void oidcScope(const char *scope, char *into, size_t room) {
 
 typedef struct {
   char issuer[512];
+  /** how it is fetched (jwtTlsKey): verified or not, the CA - another way is another provider */
+  char tls[1200];
+  int fetching;
   time_t due;
   char said[512];
   char auth[1024], token[1024], jwks[1024], endSession[1024];
@@ -505,22 +569,39 @@ static oidcProvider_t *oidcDiscovered(http_request_t *req) {
   oidcProvider_t *p = NULL;
   time_t now = time(NULL);
   char url[1200];
+  jwtTls_t tls = jwtTlsOf(req, "wxingress_oidc");
+  char tlsKey[sizeof oidcProviders[0].tls];
 
   if (issuer[0] == 0 || strlen(issuer) >= sizeof oidcProviders[0].issuer)
     return NULL;
 
+  jwtTlsKey(&tls, tlsKey, sizeof tlsKey);
+
   for (int at = 0; at < OIDC_PROVIDERS && p == NULL; ++at)
-    if (strcmp(oidcProviders[at].issuer, issuer) == 0)
+    if (strcmp(oidcProviders[at].issuer, issuer) == 0 && strcmp(oidcProviders[at].tls, tlsKey) == 0)
       p = &oidcProviders[at];
 
   if (p == NULL) {
     for (int at = 0; at < OIDC_PROVIDERS && p == NULL; ++at)
       if (oidcProviders[at].issuer[0] == 0)
         p = &oidcProviders[at];
+    for (int at = 0; at < OIDC_PROVIDERS && p == NULL; ++at)
+      if (!oidcProviders[at].fetching)
+        p = &oidcProviders[at];
     if (p == NULL)
-      p = &oidcProviders[0];
+      return NULL;
     memset(p, 0, sizeof *p);
     snprintf(p->issuer, sizeof p->issuer, "%s", issuer);
+    snprintf(p->tls, sizeof p->tls, "%s", tlsKey);
+  }
+
+  /* one fetch of the metadata at a time; the others wait for it, as for a key set */
+  if (p->fetching) {
+    for (int waited = 0; p->fetching && waited < JWT_FETCH_WAIT_MS; waited += 50)
+      meta_sleepMs(50);
+    if (strcmp(p->issuer, issuer) != 0 || strcmp(p->tls, tlsKey) != 0 || p->fetching)
+      return NULL;
+    return p;
   }
 
   if (now < p->due)
@@ -531,18 +612,18 @@ static oidcProvider_t *oidcDiscovered(http_request_t *req) {
            (int)(strlen(issuer) - (issuer[strlen(issuer) - 1] == '/')), issuer);
 
   {
-    const char *ca = req.variable("wxingress_oidc_ca");
-    fetch_call_t call = meta_fetch("GET", url).timeout(10).connectTimeout(5).retry(3)
-                            .verifyPeer(req.variable("wxingress_oidc_verify")[0] == '1');
+    fetch_call_t call = meta_fetch("GET", url).timeout(10).connectTimeout(5).retry(3).verifyPeer(tls.verify);
     fetch_answer_t got;
 
-    if (ca[0] != 0)
-      call = call.trust(ca);
+    if (tls.verify && tls.ca[0] != 0)
+      call = call.trust(tls.ca);
 
+    p->fetching = 1;
     got = call.send();
+    p->fetching = 0;
 
     /* the slot may have gone to another issuer while this one waited */
-    if (strcmp(p->issuer, issuer) != 0) {
+    if (strcmp(p->issuer, issuer) != 0 || strcmp(p->tls, tlsKey) != 0) {
       got.release();
       return NULL;
     }
@@ -647,7 +728,7 @@ static void oidcRandom(char *into, size_t room) {
 }
 
 /** To the IdP, with a fresh state, nonce and verifier in the state cookie. */
-static http_response_t oidcLogin(http_request_t *req) {
+static http_response_t oidcLogin(http_request_t *req, oidcJar_t *jar) {
 
   char state[64], nonce[64], verifier[64], challenge[64];
   char plain[8192], sealed[12000], location[32768];
@@ -658,10 +739,8 @@ static http_response_t oidcLogin(http_request_t *req) {
   const char *extra = req.variable("wxingress_oidc_extra");
   json_t doc = meta_toJSON("{}");
 
-  /* the authorization endpoint first: discovery may wait, and the cookies are this request's only after it */
+  /* the authorization endpoint first: discovery may wait */
   const char *auth = oidcEndpoint(req, "auth");
-
-  oidcCookieCount = 0;
 
   oidcRandom(state, sizeof state);
   oidcRandom(nonce, sizeof nonce);
@@ -676,10 +755,9 @@ static http_response_t oidcLogin(http_request_t *req) {
   doc.into(plain, sizeof plain);
   doc.release();
 
-  if (oidcSeal(req, "wxoidc_state", plain, sealed, sizeof sealed) == 0)
+  if (oidcSeal(req, "wxoidc_state", plain, sealed, sizeof sealed) == 0 ||
+      !oidcCookie(req, jar, "wxoidc_state", sealed, 0))
     return req.reply(500).text("the login state does not fit a cookie\n");
-
-  oidcCookie(req, "wxoidc_state", sealed, 0);
 
   oidcAbsolute(req, oidcRedirectURI(req), redirect, sizeof redirect);
   urlEncoded(redirect, encodedRedirect, sizeof encodedRedirect);
@@ -699,7 +777,7 @@ static http_response_t oidcLogin(http_request_t *req) {
            pkce[0] != 0 ? "&code_challenge_method=S256&code_challenge=" : "", pkce[0] != 0 ? challenge : "",
            extra[0] != 0 ? "&" : "", extra);
 
-  return oidcAnswer(req, 302, location, "");
+  return oidcAnswer(req, jar, 302, location, "");
 }
 
 /**
@@ -709,7 +787,9 @@ static http_response_t oidcLogin(http_request_t *req) {
 static json_t oidcTokenRequest(http_request_t *req, const char *form) {
 
   char credentials[2048], basic[3000], authorization[3100], encodedClient[1024], encodedSecret[1024];
-  const char *ca = req.variable("wxingress_oidc_ca");
+  /* where the form of a public client is written: used by the call below, so not in a block of its own */
+  char publicForm[40000];
+  jwtTls_t tls = jwtTlsOf(req, "wxingress_oidc");
   fetch_call_t call;
   fetch_answer_t got;
   json_t doc;
@@ -722,8 +802,9 @@ static json_t oidcTokenRequest(http_request_t *req, const char *form) {
 
   /* a public client (PKCE, no secret) names itself in the form */
   if (req.variable("wxingress_oidc_client_secret")[0] == 0) {
-    char publicForm[40000];
-    snprintf(publicForm, sizeof publicForm, "%s&client_id=%s", form, encodedClient);
+    int length = snprintf(publicForm, sizeof publicForm, "%s&client_id=%s", form, encodedClient);
+    if (length < 0 || (size_t)length >= sizeof publicForm)
+      return meta_toJSON("");
     form = publicForm;
   }
 
@@ -739,10 +820,10 @@ static json_t oidcTokenRequest(http_request_t *req, const char *form) {
   if (req.variable("wxingress_oidc_client_secret")[0] != 0)
     call = call.header("authorization", authorization);
 
-  call = call.verifyPeer(req.variable("wxingress_oidc_verify")[0] == '1');
+  call = call.verifyPeer(tls.verify);
 
-  if (ca[0] != 0)
-    call = call.trust(ca);
+  if (tls.verify && tls.ca[0] != 0)
+    call = call.trust(tls.ca);
 
   got = call.send();
 
@@ -849,8 +930,13 @@ static int oidcIdTokenGood(http_request_t *req, const char *token, const char *n
 /** The session of a token answer, as the text the cookies seal; 0 when its ID token is not good. */
 static void oidcRandom(char *into, size_t room);
 
+/**
+ * `keepSes` is the session id a refresh keeps, read from the session before
+ * the token request waited - never from the worker's last opened session,
+ * which by then is any browser's.
+ */
 static int oidcSessionText(http_request_t *req, json_t tokens, const char *nonce, const char *refreshBefore,
-                           char *into, size_t room) {
+                           const char *keepSes, char *into, size_t room) {
 
   long expires = 0;
   const char *idToken = tokens.get("id_token").text();
@@ -873,15 +959,20 @@ static int oidcSessionText(http_request_t *req, json_t tokens, const char *nonce
       json_t claims = jwtPart(parts.text + parts.headerLength + 1, parts.payloadLength);
       doc.sub = claims.get("sub").text();
       doc.sid = claims.get("sid").text();
+      doc.iss = claims.get("iss").text();
       claims.release();
     }
   }
+  /* what the session is for, which every request checks: the client, the Policy and the server */
+  doc.aud = req.variable("wxingress_oidc_client");
+  doc.pol = req.variable("wxingress_oidc_policy");
+  doc.srv = req.variable("server_name");
   doc.created = (long)time(NULL);
   /* the session's own id, which /logout revokes: kept by a refresh, new for a login */
   {
     char ses[64];
-    if (refreshBefore[0] != 0 && oidcOpenedSes[0] != 0)
-      snprintf(ses, sizeof ses, "%s", oidcOpenedSes);
+    if (refreshBefore[0] != 0 && keepSes != NULL && keepSes[0] != 0)
+      snprintf(ses, sizeof ses, "%s", keepSes);
     else
       oidcRandom(ses, sizeof ses);
     doc.ses = ses;
@@ -896,7 +987,7 @@ static int oidcSessionText(http_request_t *req, json_t tokens, const char *nonce
 }
 
 /** The redirect URI: the code for tokens, and the session. */
-static http_response_t oidcCallback(http_request_t *req) {
+static http_response_t oidcCallback(http_request_t *req, oidcJar_t *jar) {
 
   char state[8192], form[32768], redirect[2048], encodedRedirect[6144], encodedCode[4096];
   char back[8192], session[OIDC_CHUNKS * OIDC_CHUNK];
@@ -924,34 +1015,41 @@ static http_response_t oidcCallback(http_request_t *req) {
   snprintf(form, sizeof form, "grant_type=authorization_code&code=%s&redirect_uri=%s%s%s", encodedCode,
            encodedRedirect, saved.get("verifier").text()[0] != 0 ? "&code_verifier=" : "",
            saved.get("verifier").text());
-  /* back to a path of this host only: `//host/` and `/\host/` are other hosts to a browser */
-  {
-    const char *was = saved.get("back").text();
-    int local = was[0] == '/' && was[1] != '/' && was[1] != '\\';
-    snprintf(back, sizeof back, "%s", local ? was : "/");
-  }
+  /* back to a path of this host only */
+  oidcLocalPath(saved.get("back").text(), back, sizeof back);
 
   tokens = oidcTokenRequest(req, form);
-  /* other requests of this worker ran while it waited: the cookies are this one's from here */
-  oidcCookieCount = 0;
   good = tokens._refused == NULL &&
-         oidcSessionText(req, tokens, saved.get("nonce").text(), "", session, sizeof session);
+         oidcSessionText(req, tokens, saved.get("nonce").text(), "", NULL, session, sizeof session);
   tokens.release();
   saved.release();
 
   if (!good)
     return req.reply(401).text("the identity provider's answer is not good\n");
 
-  oidcCookie(req, "wxoidc_state", "", 1);
-
-  if (!oidcSessionCookies(req, session))
+  if (!oidcCookie(req, jar, "wxoidc_state", "", 1) || !oidcSessionCookies(req, jar, session))
     return req.reply(500).text("the session does not fit its cookies\n");
 
-  return oidcAnswer(req, 302, back, "");
+  return oidcAnswer(req, jar, 302, back, "");
+}
+
+/**
+ * Whether the session just opened is one of this place: sealed for this
+ * Policy, issuer, client and server - which its key already says, and which
+ * the session says again in what it holds.
+ */
+static int oidcSessionHere(http_request_t *req) {
+
+  const char *issuer = oidcIssuer(req);
+
+  return strcmp(oidcOpenedAud, req.variable("wxingress_oidc_client")) == 0 &&
+         strcmp(oidcOpenedPolicy, req.variable("wxingress_oidc_policy")) == 0 &&
+         strcmp(oidcOpenedServer, req.variable("server_name")) == 0 &&
+         (issuer[0] == 0 || strcmp(oidcOpenedIss, issuer) == 0);
 }
 
 /** /logout: the session goes, and the browser to the IdP's end of it. */
-static http_response_t oidcLogout(http_request_t *req) {
+static http_response_t oidcLogout(http_request_t *req, oidcJar_t *jar) {
 
   char session[OIDC_CHUNKS * OIDC_CHUNK], location[49152], after[2048], encodedAfter[6144],
       encodedHint[8192];
@@ -959,27 +1057,25 @@ static http_response_t oidcLogout(http_request_t *req) {
   const char *post = req.variable("wxingress_oidc_post_logout");
   char name[16];
 
-  /* the end session endpoint may have come from discovery, which waits: the cookies are this request's from here */
-  oidcCookieCount = 0;
-
   oidcAbsolute(req, post[0] != 0 ? post : "/_logout", after, sizeof after);
   encodedHint[0] = 0;
 
-  if (oidcSessionOf(req, session, sizeof session)) {
+  if (oidcSessionOf(req, session, sizeof session) && oidcSessionHere(req)) {
     json_t doc = meta_toJSON(session);
     urlEncoded(doc.get("id").text(), encodedHint, sizeof encodedHint);
     /* a copy of the cookie elsewhere ends too, on every replica */
-    oidcRevokeLocally("ses", doc.get("ses").text());
+    if (!oidcRevokeLocally("ses", "", doc.get("ses").text()))
+      oidcNote("the session could not be revoked", "the revocation table is full");
     doc.release();
   }
 
   for (int part = 0; part < OIDC_CHUNKS; ++part) {
     snprintf(name, sizeof name, "wxoidc_s%d", part);
-    oidcCookie(req, name, "", 1);
+    oidcCookie(req, jar, name, "", 1);
   }
 
   if (end[0] == 0)
-    return oidcAnswer(req, 302, after, "");
+    return oidcAnswer(req, jar, 302, after, "");
 
   urlEncoded(after, encodedAfter, sizeof encodedAfter);
 
@@ -987,31 +1083,33 @@ static http_response_t oidcLogout(http_request_t *req) {
            strchr(end, '?') ? "&" : "?", encodedAfter, req.variable("wxingress_oidc_client"),
            encodedHint[0] != 0 ? "&id_token_hint=" : "", encodedHint);
 
-  return oidcAnswer(req, 302, location, "");
+  return oidcAnswer(req, jar, 302, location, "");
 }
 
 /** The access step. */
 static http_response_t oidcGuard(http_request_t *req) {
 
   char session[OIDC_CHUNKS * OIDC_CHUNK], form[16384], encodedRefresh[6144], fresh[OIDC_CHUNKS * OIDC_CHUNK];
+  char ses[64], back[8192];
   const char *client = req.variable("wxingress_oidc_client");
   const char *path;
   const char *post;
   json_t doc;
   long leeway;
+  oidcJar_t jar;
 
   if (client[0] == 0)
     return req.reply(0);
 
-  oidcCookieCount = 0;
+  jar.count = 0;
   path = req.variable("uri");
   post = req.variable("wxingress_oidc_post_logout");
 
   if (strcmp(path, oidcRedirectURI(req)) == 0)
-    return oidcCallback(req);
+    return oidcCallback(req, &jar);
 
   if (strcmp(path, "/logout") == 0)
-    return oidcLogout(req);
+    return oidcLogout(req, &jar);
 
   if (strcmp(path, "/_backchannel_logout") == 0)
     return oidcBackChannel(req);
@@ -1025,12 +1123,17 @@ static http_response_t oidcGuard(http_request_t *req) {
   if (req.variable("wxingress_oidc_on")[0] == 0)
     return req.reply(0);
 
-  if (!oidcSessionOf(req, session, sizeof session))
-    return oidcLogin(req);
+  /**
+   * The session, and everything asked of it before anything waits: what was
+   * opened is the worker's, and after a wait it is whichever browser's came
+   * meanwhile.
+   */
+  if (!oidcSessionOf(req, session, sizeof session) || !oidcSessionHere(req))
+    return oidcLogin(req, &jar);
 
   /* a session the IdP or an administrator ended: a new login */
-  if (oidcRevoked(oidcOpenedSub, oidcOpenedSid, oidcOpenedCreated))
-    return oidcLogin(req);
+  if (oidcRevoked(oidcOpenedIss, oidcOpenedAud, oidcOpenedSub, oidcOpenedSid, oidcOpenedSes, oidcOpenedCreated))
+    return oidcLogin(req, &jar);
 
   leeway = strtol(req.variable("wxingress_oidc_leeway"), NULL, 10);
 
@@ -1038,6 +1141,7 @@ static http_response_t oidcGuard(http_request_t *req) {
   if ((double)time(NULL) <= oidcOpenedExpires + (double)leeway)
     return req.reply(0);
 
+  snprintf(ses, sizeof ses, "%s", oidcOpenedSes);
   doc = meta_toJSON(session);
 
   /* expired: refreshed, or a new login */
@@ -1049,24 +1153,27 @@ static http_response_t oidcGuard(http_request_t *req) {
     urlEncoded(doc.get("refresh").text(), encodedRefresh, sizeof encodedRefresh);
     snprintf(form, sizeof form, "grant_type=refresh_token&refresh_token=%s", encodedRefresh);
     tokens = oidcTokenRequest(req, form);
-    oidcCookieCount = 0;
-    good = tokens._refused == NULL && oidcSessionText(req, tokens, NULL, doc.get("refresh").text(), fresh, sizeof fresh);
+    good = tokens._refused == NULL &&
+           oidcSessionText(req, tokens, NULL, doc.get("refresh").text(), ses, fresh, sizeof fresh);
     tokens.release();
     doc.release();
 
-    if (good && oidcSessionCookies(req, fresh))
-      return oidcAnswer(req, 307, req.variable("request_uri"), "");
+    /* to itself again, with the new session - a path of this host, never `//other.example` */
+    if (good && oidcSessionCookies(req, &jar, fresh)) {
+      oidcLocalPath(req.variable("request_uri"), back, sizeof back);
+      return oidcAnswer(req, &jar, 307, back, "");
+    }
 
     if (good)
       oidcNote("the refreshed session does not fit its cookies", "");
 
-    oidcCookieCount = 0;
-    return oidcLogin(req);
+    jar.count = 0;
+    return oidcLogin(req, &jar);
   }
 
   doc.release();
 
-  return oidcLogin(req);
+  return oidcLogin(req, &jar);
 }
 
 /* --------------------------------------------------------- the variables */
@@ -1076,7 +1183,7 @@ static const char *oidcVariable(http_request_t *req, const char *argument) {
 
   static char value[OIDC_CHUNK * 2];
 
-  if (req.variable("wxingress_oidc_on")[0] == 0 || !oidcSessionOf(req, NULL, 0))
+  if (req.variable("wxingress_oidc_on")[0] == 0 || !oidcSessionOf(req, NULL, 0) || !oidcSessionHere(req))
     return "";
 
   if (strcmp(argument, "access_token") == 0)
@@ -1112,6 +1219,14 @@ static const char *oidcVariable(http_request_t *req, const char *argument) {
  *
  *   PUT /api/wxingress/1/oidc/revocations   {"all": <unix>, "entries": [{"key": "sub:alice", "before": <unix>}]}
  *   GET /api/wxingress/1/oidc/revocations   the same, with "local" on the ones a logout added
+ *
+ * What a logout of an IdP adds is scoped to that IdP and client:
+ * `sid:<scope>|<sid>` and `sub:<scope>|<sub>`, the scope being the first 16
+ * hex digits of SHA-256 over "<iss>|<client>" (oidcScopeOf). An IdP vouches
+ * for its own sessions only - the logout token of a tenant's own IdP, for
+ * another tenant's sub, ended that tenant's sessions everywhere. What an
+ * administrator writes without a scope - `sub:alice` - still ends that sub's
+ * sessions of every IdP.
  */
 #define REVOCATIONS 8192
 
@@ -1173,10 +1288,28 @@ static unsigned long long revocationHash(const char *key) {
   return hash != 0 ? hash : 1;
 }
 
-/** Adds or moves an entry; the caller holds the lock. 0 when the table is full. */
+/**
+ * How long a local entry is kept when the table is full and the controller
+ * has not taken it over yet: the controller keeps a line for a month, and a
+ * session is refreshed - made anew - long before.
+ */
+#define REVOCATION_KEPT_SECONDS (30LL * 86400)
+
+/**
+ * Adds or moves an entry; the caller holds the lock. 0 when the table is
+ * full - which the caller says, rather than the logout being dropped without
+ * a word.
+ *
+ * An entry older than REVOCATION_KEPT_SECONDS gives its slot to a new one
+ * on the new one's probe chain. A slot is never emptied - a reader without
+ * the lock walks the chain until an empty one - only taken over, so every
+ * other chain through it stays whole.
+ */
 static int revocationPut(const char *key, long long before, int local) {
 
   unsigned long long hash = revocationHash(key);
+  long long expired = (long long)time(NULL) - REVOCATION_KEPT_SECONDS;
+  revocation_t *stale = NULL;
 
   for (unsigned probe = 0; probe < REVOCATIONS; ++probe) {
     revocation_t *e = &revocations->entries[(hash + probe) % REVOCATIONS];
@@ -1187,18 +1320,30 @@ static int revocationPut(const char *key, long long before, int local) {
       return 1;
     }
     if (e->hash == 0) {
+      if (stale != NULL)
+        e = stale;
       snprintf(e->key, sizeof e->key, "%s", key);
       e->local = local;
       __atomic_store_n(&e->before, before, __ATOMIC_RELEASE);
       __atomic_store_n(&e->hash, hash, __ATOMIC_RELEASE);
       return 1;
     }
+    if (stale == NULL && e->before < expired)
+      stale = e;
   }
 
-  return 0;
+  if (stale == NULL)
+    return 0;
+
+  snprintf(stale->key, sizeof stale->key, "%s", key);
+  stale->local = local;
+  __atomic_store_n(&stale->before, before, __ATOMIC_RELEASE);
+  __atomic_store_n(&stale->hash, hash, __ATOMIC_RELEASE);
+
+  return 1;
 }
 
-/** When sessions of a key made before it end; 0 for none. No lock: entries are only added. */
+/** When sessions of a key made before it end; 0 for none. No lock: slots are only added or taken over. */
 static long long revocationOf(const char *key) {
 
   unsigned long long hash = revocationHash(key);
@@ -1218,9 +1363,54 @@ static long long revocationOf(const char *key) {
   return 0;
 }
 
-/** Whether a session of sub and sid, made at `created`, is revoked. */
-static int oidcRevoked(const char *sub, const char *sid, long long created) {
+/** The scope of the entries a logout of an IdP for a client adds: see above. */
+static void oidcScopeOf(const char *iss, const char *aud, char *into, size_t room) {
 
+  static const char hex[] = "0123456789abcdef";
+  unsigned char digest[32];
+  unsigned int length = 0;
+  char text[1024];
+
+  snprintf(text, sizeof text, "%s|%s", iss, aud);
+  into[0] = 0;
+
+  if (room < 17 || EVP_Digest(text, strlen(text), digest, &length, EVP_sha256(), NULL) != 1)
+    return;
+
+  for (int at = 0; at < 8; ++at) {
+    into[2 * at] = hex[digest[at] >> 4];
+    into[2 * at + 1] = hex[digest[at] & 15];
+  }
+
+  into[16] = 0;
+}
+
+/** Whether `created` is before the entry of kind:value - or kind:scope|value with a scope. */
+static int oidcRevokedBy(const char *kind, const char *scope, const char *value, long long created) {
+
+  char key[300];
+
+  if (value[0] == 0)
+    return 0;
+
+  if (scope[0] != 0)
+    snprintf(key, sizeof key, "%s:%s|%s", kind, scope, value);
+  else
+    snprintf(key, sizeof key, "%s:%s", kind, value);
+
+  return created < revocationOf(key);
+}
+
+/**
+ * Whether a session of an issuer and client, its sub and sid, made at
+ * `created`, is revoked: by everything before a time, by the
+ * administrator's entries of its sub or sid, by its IdP's logouts, or by its
+ * own id (/logout).
+ */
+static int oidcRevoked(const char *iss, const char *aud, const char *sub, const char *sid, const char *ses,
+                       long long created) {
+
+  char scope[32];
   char key[260];
 
   if (revocations == NULL)
@@ -1229,16 +1419,14 @@ static int oidcRevoked(const char *sub, const char *sid, long long created) {
   if (created < __atomic_load_n(&revocations->all, __ATOMIC_ACQUIRE))
     return 1;
 
-  snprintf(key, sizeof key, "sub:%s", sub);
-  if (sub[0] != 0 && created < revocationOf(key))
+  oidcScopeOf(iss, aud, scope, sizeof scope);
+
+  if (oidcRevokedBy("sub", "", sub, created) || oidcRevokedBy("sid", "", sid, created) ||
+      (scope[0] != 0 && (oidcRevokedBy("sub", scope, sub, created) || oidcRevokedBy("sid", scope, sid, created))))
     return 1;
 
-  snprintf(key, sizeof key, "sid:%s", sid);
-  if (sid[0] != 0 && created < revocationOf(key))
-    return 1;
-
-  snprintf(key, sizeof key, "ses:%s", oidcOpenedSes);
-  if (oidcOpenedSes[0] != 0 && revocationOf(key) != 0)
+  snprintf(key, sizeof key, "ses:%s", ses);
+  if (ses[0] != 0 && revocationOf(key) != 0)
     return 1;
 
   return 0;
@@ -1322,29 +1510,47 @@ static http_response_t listRevocations(http_request_t *req) {
   return req.reply(200).json(answer);
 }
 
-/** A logout of the IdP for a sid or a sub, on this replica until the controller passes it on. */
-static void oidcRevokeLocally(const char *kind, const char *value) {
+/**
+ * A logout for a sid, a sub or a session, on this replica until the
+ * controller passes it on: scoped when `scope` is given. 1 when it is in the
+ * table; 0 when it cannot be - too long, not text the controller can write
+ * on one line, or the table full.
+ */
+static int oidcRevokeLocally(const char *kind, const char *scope, const char *value) {
 
-  char key[260];
+  char key[300];
+  int put;
 
   if (revocations == NULL || value[0] == 0)
-    return;
+    return 0;
 
-  snprintf(key, sizeof key, "%s:%s", kind, value);
+  if (scope[0] != 0)
+    snprintf(key, sizeof key, "%s:%s|%s", kind, scope, value);
+  else
+    snprintf(key, sizeof key, "%s:%s", kind, value);
 
-  if (strlen(key) >= sizeof revocations->entries[0].key || !textual(key, sizeof revocations->entries[0].key, 0))
-    return;
+  /* a line of the ConfigMap is split at white space */
+  if (strlen(key) >= sizeof revocations->entries[0].key || !textual(key, sizeof revocations->entries[0].key, 0) ||
+      strpbrk(key, " \t") != NULL)
+    return 0;
 
   revocationsLock();
-  revocationPut(key, (long long)time(NULL) + 1, 1);
+  put = revocationPut(key, (long long)time(NULL) + 1, 1);
   pthread_mutex_unlock(&revocations->lock);
+
+  if (!put)
+    fprintf(stderr, "wxingress oidc: the revocation table is full, %s is not revoked\n", kind);
+
+  return put;
 }
 
 /**
  * Back-channel logout (OpenID Connect Back-Channel Logout 1.0): the IdP posts
  * `logout_token`, a JWT signed with the keys of the jwksURI, for the client,
  * from the issuer, with the back-channel logout event, a sub or a sid and no
- * nonce. Its sessions end on every replica.
+ * nonce. Its sessions end on every replica - those of its issuer and the
+ * client, scoped (see the revocations above). A logout that cannot be kept
+ * because the table is full is a 503, which the IdP may send again.
  */
 static http_response_t oidcBackChannel(http_request_t *req) {
 
@@ -1353,7 +1559,7 @@ static http_response_t oidcBackChannel(http_request_t *req) {
   const char *at;
   jwtParts_t parts;
   json_t claims, events;
-  int good;
+  int good, kept = 0;
   static const char *event = "http://schemas.openid.net/event/backchannel-logout";
 
   if (strcmp(req->method, "POST") != 0)
@@ -1382,9 +1588,14 @@ static http_response_t oidcBackChannel(http_request_t *req) {
          (claims.get("sub").text()[0] != 0 || claims.get("sid").text()[0] != 0);
 
   if (good) {
-    oidcRevokeLocally("sid", claims.get("sid").text());
-    if (claims.get("sid").text()[0] == 0)
-      oidcRevokeLocally("sub", claims.get("sub").text());
+    char scope[32];
+    oidcScopeOf(claims.get("iss").text(), req.variable("wxingress_oidc_client"), scope, sizeof scope);
+    if (scope[0] == 0)
+      kept = 0;
+    else if (claims.get("sid").text()[0] != 0)
+      kept = oidcRevokeLocally("sid", scope, claims.get("sid").text());
+    else
+      kept = oidcRevokeLocally("sub", scope, claims.get("sub").text());
   }
 
   claims.release();
@@ -1392,15 +1603,21 @@ static http_response_t oidcBackChannel(http_request_t *req) {
   if (!good)
     return req.reply(400).header("Cache-Control", "no-store").text("{\"error\":\"invalid_request\"}\n");
 
+  if (!kept)
+    return req.reply(503).header("Cache-Control", "no-store").text("{\"error\":\"temporarily_unavailable\"}\n");
+
   return req.reply(200).header("Cache-Control", "no-store").text("");
 }
 
 /**
  * Front-channel logout (OpenID Connect Front-Channel Logout 1.0): the IdP's
- * page loads this in an iframe with `iss` and `sid`. The sid's sessions end
- * on every replica, as with the back channel - the session cookie is SameSite
- * Lax and does not come along in a third party's iframe, so removing it is
- * not what ends the session.
+ * page loads this in an iframe with `iss` and `sid`. Nothing vouches for the
+ * request - anybody can send a sid - so it ends a session only of the browser
+ * that sends it: the session its cookies carry, when that session is of this
+ * place, of the issuer and of the sid. The sid of its IdP and client ends on every replica
+ * and its cookies go. Without the session cookie along - it is SameSite Lax,
+ * and an IdP of another site loads the iframe as a third party - it ends
+ * nothing; the back channel is what does it then.
  */
 /** A query value percent-decoded, `+` a space. */
 static void urlDecoded(const char *text, char *into, size_t room) {
@@ -1422,14 +1639,31 @@ static void urlDecoded(const char *text, char *into, size_t room) {
 
 static http_response_t oidcFrontChannel(http_request_t *req) {
 
-  char iss[1024], sid[512];
+  char iss[1024], sid[512], session[OIDC_CHUNKS * OIDC_CHUNK], name[16];
+  const char *issuer = oidcIssuer(req);
+  http_response_t answer;
+  oidcJar_t jar;
 
+  jar.count = 0;
   urlDecoded(req.query("iss"), iss, sizeof iss);
   urlDecoded(req.query("sid"), sid, sizeof sid);
-  const char *issuer = oidcIssuer(req);
 
-  if (sid[0] != 0 && (issuer[0] == 0 || strcmp(iss, issuer) == 0))
-    oidcRevokeLocally("sid", sid);
+  if (sid[0] != 0 && (issuer[0] == 0 || strcmp(iss, issuer) == 0) && oidcSessionOf(req, session, sizeof session) &&
+      oidcSessionHere(req) && strcmp(oidcOpenedSid, sid) == 0 && (iss[0] == 0 || strcmp(oidcOpenedIss, iss) == 0)) {
+    char scope[32];
+    oidcScopeOf(oidcOpenedIss, oidcOpenedAud, scope, sizeof scope);
+    if (scope[0] == 0 || !oidcRevokeLocally("sid", scope, sid))
+      oidcNote("the session could not be revoked", "the revocation table is full");
+    for (int part = 0; part < OIDC_CHUNKS; ++part) {
+      snprintf(name, sizeof name, "wxoidc_s%d", part);
+      oidcCookie(req, &jar, name, "", 1);
+    }
+  }
 
-  return req.reply(200).header("Cache-Control", "no-store").mime("text/html").text("<!doctype html><title>logged out</title>\n");
+  answer = req.reply(200).header("Cache-Control", "no-store").mime("text/html");
+
+  for (int at = 0; at < jar.count; ++at)
+    answer = answer.header("Set-Cookie", jar.cookies[at]);
+
+  return answer.text("<!doctype html><title>logged out</title>\n");
 }

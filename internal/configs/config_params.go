@@ -252,6 +252,9 @@ type StaticConfigParams struct {
 	// UpstreamAPI reports whether NGINX OSS runs with the upstream API of the
 	// wxingress module (-dynamic-upstreams).
 	UpstreamAPI bool
+	// UpstreamAPITokenFile is the file with the check of the controller's
+	// token that the server of the upstream API includes; "" for none.
+	UpstreamAPITokenFile string
 }
 
 // upstreamZoneSize is the size of an upstream's shared memory zone. The

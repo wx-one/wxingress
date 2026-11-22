@@ -242,7 +242,7 @@ func main() {
 	check("a certificate without a key is refused", status, 400)
 	status, _ = call(http.MethodPut, "b.test", "{nope")
 	check("a body that is not JSON is refused", status, 415)
-	for _, name := range []string{"a b.test", "foo.*.test", "*", "*.", "a..test", "a.test."} {
+	for _, name := range []string{"a b.test", "foo.*.test", "*", "*.", "a..test", "a.test.", ":443"} {
 		status, _ = call(http.MethodPut, name, map[string]string{"certificate": other.certificate, "key": other.key})
 		check(fmt.Sprintf("the name %q is refused", name), status, 400)
 	}

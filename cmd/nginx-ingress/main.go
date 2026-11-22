@@ -154,8 +154,11 @@ func main() {
 
 	constLabels := map[string]string{"class": *ingressClass}
 
+	// the token the controller names itself with on the socket of the wxingress module's API
+	apiToken := newAPIToken(ctx, *dynamicUpstreams && !*nginxPlus)
+
 	managerCollector, controllerCollector, registry := createManagerAndControllerCollectors(ctx, constLabels)
-	ingressNginxCollector := createIngressNginxCollector(ctx, registry, pod.Name, controllerNamespace)
+	ingressNginxCollector := createIngressNginxCollector(ctx, registry, pod.Name, controllerNamespace, apiToken)
 	if ingressNginxCollector != nil {
 		managerCollector = collectors.WithIngressNginxReloads(managerCollector, ingressNginxCollector)
 	}
@@ -241,6 +244,9 @@ func main() {
 
 	mustProcessGlobalConfiguration(ctx)
 
+	// the check of the token that the server of the module's API includes
+	apiTokenFile := writeAPIToken(apiToken, useFakeNginxManager, nginxManager)
+
 	cfgParams := configs.NewDefaultConfigParamsFor(ctx, *nginxPlus, *ingressNginxDefaults)
 	cfgParams = processConfigMaps(kubeClient, cfgParams, nginxManager, templateExecutor, eventRecorder)
 
@@ -275,6 +281,7 @@ func main() {
 		DefaultCABundle:                caBundlePath,
 		PLMEnabled:                     *plmStorageURL != "",
 		UpstreamAPI:                    *dynamicUpstreams,
+		UpstreamAPITokenFile:           apiTokenFile,
 		IngressNginxMetrics:            *enablePrometheusMetrics && *dynamicUpstreams,
 	}
 
@@ -300,7 +307,7 @@ func main() {
 
 	process := startChildProcesses(nginxManager, appProtectV5)
 
-	plusClient := createPlusClient(ctx, *nginxPlus || *dynamicUpstreams, useFakeNginxManager, nginxManager)
+	plusClient := createPlusClient(ctx, *nginxPlus || *dynamicUpstreams, useFakeNginxManager, nginxManager, apiToken)
 	if *nginxPlus {
 		licenseReporter.Config.PlusClient = plusClient
 	}
@@ -687,13 +694,13 @@ func createCustomClients(ctx context.Context, config *rest.Config) (dynamic.Inte
 }
 
 // createPlusClient creates the client of the upstream API - NGINX Plus's own, or the one of the wxingress module in NGINX OSS, which answers the same requests on the same socket.
-func createPlusClient(ctx context.Context, upstreamAPI bool, useFakeNginxManager bool, nginxManager nginx.Manager) *client.NginxClient {
+func createPlusClient(ctx context.Context, upstreamAPI bool, useFakeNginxManager bool, nginxManager nginx.Manager, apiToken string) *client.NginxClient {
 	l := nl.LoggerFromContext(ctx)
 	var plusClient *client.NginxClient
 	var err error
 
 	if upstreamAPI && !useFakeNginxManager {
-		httpClient := getSocketClient(filepath.Join(socketPath, "nginx-plus-api.sock"))
+		httpClient := nginx.WithAPIToken(getSocketClient(filepath.Join(socketPath, "nginx-plus-api.sock")), apiToken)
 		plusClient, err = client.NewNginxClient("http://nginx-plus-api/api", client.WithHTTPClient(httpClient))
 		if err != nil {
 			nl.Fatalf(l, "Failed to create NginxClient for Plus: %v", err)
@@ -1003,6 +1010,30 @@ func mustWriteInitialNginxConfig(staticCfgParams *configs.StaticConfigParams, cf
 	nginxManager.UpdateConfigVersionFile()
 }
 
+// newAPIToken makes the token of this run of the controller for the socket of
+// the wxingress module, which changes nginx's upstreams, certificates and
+// canaries without a reload: nginx refuses every request on it without the
+// token. "" without the module.
+func newAPIToken(ctx context.Context, module bool) string {
+	if !module {
+		return ""
+	}
+	token, err := nginx.NewAPIToken()
+	if err != nil {
+		nl.Fatalf(nl.LoggerFromContext(ctx), "%v", err)
+	}
+	return token
+}
+
+// writeAPIToken writes the check of the token that the server of the module's
+// API includes, and says where; "" without a token.
+func writeAPIToken(token string, useFakeNginxManager bool, nginxManager nginx.Manager) string {
+	if token == "" || useFakeNginxManager {
+		return ""
+	}
+	return nginxManager.CreateSecret(nginx.APITokenFile, nginx.APITokenConf(token), nginx.ReadWriteOnlyFileMode)
+}
+
 // getSocketClient gets a http.Client with a unix socket transport.
 func getSocketClient(sockPath string) *http.Client {
 	return &http.Client{
@@ -1150,7 +1181,7 @@ func createManagerAndControllerCollectors(ctx context.Context, constLabels map[s
 // reloads, the certificates and the nginx processes, with ingress-nginx's
 // constant labels - controller_class the IngressClass controller it serves
 // in ingress-nginx's place, k8s.io/ingress-nginx if it is one of them.
-func createIngressNginxCollector(ctx context.Context, registry *prometheus.Registry, pod, namespace string) *collectors.IngressNginxCollector {
+func createIngressNginxCollector(ctx context.Context, registry *prometheus.Registry, pod, namespace string, apiToken string) *collectors.IngressNginxCollector {
 	if !*enablePrometheusMetrics || registry == nil {
 		return nil
 	}
@@ -1174,7 +1205,7 @@ func createIngressNginxCollector(ctx context.Context, registry *prometheus.Regis
 		},
 	}
 	if *dynamicUpstreams {
-		module := getSocketClient(filepath.Join(socketPath, "nginx-plus-api.sock"))
+		module := nginx.WithAPIToken(getSocketClient(filepath.Join(socketPath, "nginx-plus-api.sock")), apiToken)
 		module.Timeout = 10 * time.Second
 		get := func(path string) func() ([]byte, error) {
 			return func() ([]byte, error) {

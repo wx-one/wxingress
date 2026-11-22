@@ -63,6 +63,8 @@ http {
     map "" $wxingress_oidc_on { default ""; }
     map "" $wxingress_oidc_issuer { default ""; }
     map "" $wxingress_oidc_verify { default ""; }
+    map "" $wxingress_oidc_policy { default ""; }
+    map "" $wxingress_oidc_sni { default ""; }
     map "" $wxingress_jwt_verify { default ""; }
     map "" $wxingress_jwt_sni { default ""; }
     {{- end }}
@@ -302,6 +304,11 @@ http {
     server {
         listen unix:/var/lib/nginx/nginx-plus-api.sock;
         access_log off;
+        {{- if .UpstreamAPITokenFile}}
+
+        # only the controller: a request without its token is refused here
+        include {{ .UpstreamAPITokenFile }};
+        {{- end}}
 
         location /configVersionCheck {
             if ($config_version_mismatch) {

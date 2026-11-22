@@ -251,6 +251,7 @@ func (p *policiesCfg) addJWTAuthConfig(
 	polKey string,
 	polNamespace string,
 	secretRefs map[secrets.SecretRefKey]*secrets.SecretReference,
+	defaultCABundle string,
 ) *validationResults {
 	res := newValidationResults()
 	if p.JWTAuth.Auth != nil {
@@ -280,8 +281,12 @@ func (p *policiesCfg) addJWTAuthConfig(
 	} else if jwtAuth.JwksURI != "" {
 		uri, _ := url.Parse(jwtAuth.JwksURI)
 
-		// Handle SSL verification for JWKS
+		// Handle SSL verification for JWKS: the system's CAs unless the Policy names its own,
+		// as for oidc - nginx verifies against nothing at all without a trusted certificate
 		var trustedCertPath string
+		if jwtAuth.SSLVerify {
+			trustedCertPath = defaultCABundle
+		}
 		if jwtAuth.SSLVerify && jwtAuth.TrustedCertSecret != "" {
 			trustedCertSecretKey := fmt.Sprintf("%s/%s", polNamespace, jwtAuth.TrustedCertSecret)
 			trustedCertSecretRef := secretRefs[secrets.RefKey(trustedCertSecretKey, secrets.RoleCA)]
@@ -1529,7 +1534,7 @@ func generatePolicies(
 					path,
 				)
 			case pol.Spec.JWTAuth != nil:
-				res = config.addJWTAuthConfig(pol.Spec.JWTAuth, key, polNamespace, policyOpts.secretRefs)
+				res = config.addJWTAuthConfig(pol.Spec.JWTAuth, key, polNamespace, policyOpts.secretRefs, policyOpts.defaultCABundle)
 			case pol.Spec.ExternalAuth != nil:
 				res = config.addExternalAuthConfig(pol.Spec.ExternalAuth, key, polNamespace, p.Name, policyOpts.secretRefs, policyOpts, ownerDetails)
 			case pol.Spec.BasicAuth != nil:

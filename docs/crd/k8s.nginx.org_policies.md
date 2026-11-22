@@ -102,7 +102,7 @@ The `.spec` object supports the following fields:
 | `jwt.secret` | `string` | The name of the Kubernetes secret containing the JSON Web Key. It must be in the same namespace as the Policy resource. A secret of the type Opaque is recommended. The secret is resolved with the JWK role and must store the JWK under the jwk key. |
 | `jwt.sniEnabled` | `boolean` | Enables SNI (Server Name Indication) for the JWT policy. This is useful when the remote server requires SNI to serve the correct certificate. |
 | `jwt.sniName` | `string` | The SNI name to use when connecting to the remote server. If not set, the hostname from the ``jwksURI`` will be used. |
-| `jwt.sslVerify` | `boolean` | Enables verification of the JWKS server SSL certificate. Default is false. |
+| `jwt.sslVerify` | `boolean` | Enables verification of the JWKS server SSL certificate. Default is true: a key set fetched without verification can be replaced by anybody on the path, who then signs every token. |
 | `jwt.sslVerifyDepth` | `integer` | Sets the verification depth in the JWKS server certificates chain. The default is 1. |
 | `jwt.token` | `string` | The token specifies a variable that contains the JSON Web Token. By default the JWT is passed in the Authorization header as a Bearer Token. JWT may be also passed as a cookie or a part of a query string, for example: $cookie_auth_token. Accepted variables are $http_, $arg_, $cookie_. |
 | `jwt.trustedCertSecret` | `string` | The name of the Kubernetes secret that stores the CA certificate for JWKS server verification. It must be in the same namespace as the Policy resource. A secret of the type Opaque is recommended. The secret is resolved with the CA role and must store the certificate under the ca.crt key. |
@@ -119,7 +119,7 @@ The `.spec` object supports the following fields:
 | `oidc.postLogoutRedirectURI` | `string` | URI to redirect to after the logout has been performed. Requires endSessionEndpoint. The default is /_logout. |
 | `oidc.redirectURI` | `string` | Allows overriding the default redirect URI. The default is /_codexch. |
 | `oidc.scope` | `string` | List of OpenID Connect scopes. The scope openid always needs to be present and others can be added concatenating them with a + sign, for example openid+profile+email, openid+email+userDefinedScope. The default is openid. |
-| `oidc.sslVerify` | `boolean` | Enables verification of the IDP server SSL certificate. Default is false. |
+| `oidc.sslVerify` | `boolean` | Enables verification of the IDP server SSL certificate. Default is true: discovery, the key set and the token endpoint fetched without verification can be answered by anybody on the path. |
 | `oidc.sslVerifyDepth` | `integer` | Sets the verification depth in the IDP server certificates chain. The default is 1. |
 | `oidc.tokenEndpoint` | `string` | URL for the token endpoint provided by your OpenID Connect provider. |
 | `oidc.trustedCertSecret` | `string` | The name of the Kubernetes secret that stores the CA certificate for IDP server verification. It must be in the same namespace as the Policy resource. A secret of the type Opaque is recommended. The secret is resolved with the CA role and must store the certificate under the ca.crt key. |

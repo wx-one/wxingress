@@ -254,8 +254,9 @@ server {
     set $wxingress_oidc_extra "{{ $oidc.AuthExtraArgs }}";
     set $wxingress_oidc_pkce "{{ if $oidc.PKCEEnable }}1{{ end }}";
     set $wxingress_oidc_ca "{{ if $oidc.TLSVerify }}{{ $oidc.CAFile }}{{ end }}";
-    set $wxingress_oidc_verify "{{ if $oidc.TLSVerify }}1{{ end }}";
+    set $wxingress_oidc_verify "{{ if $oidc.TLSVerify }}1{{ else }}0{{ end }}";
     set $wxingress_oidc_issuer "{{ $oidc.Issuer }}";
+    set $wxingress_oidc_policy "{{ $oidc.PolicyName }}";
 
     location = {{ printf "%q" $oidc.RedirectURI }} {
         # the IdP's answer, which the module takes in the access phase
@@ -307,7 +308,7 @@ server {
     set $wxingress_jwt_jwks "{{ .JwksURI.URL }}";
     set $wxingress_jwt_cache "{{ .KeyCache }}";
     set $wxingress_jwt_ca "{{ .JwksURI.TrustedCert }}";
-    set $wxingress_jwt_verify "{{ if .JwksURI.SSLVerify }}1{{ end }}";
+    set $wxingress_jwt_verify "{{ if .JwksURI.SSLVerify }}1{{ else }}0{{ end }}";
     set $wxingress_jwt_sni "{{ if .JwksURI.JwksSNIEnabled }}{{ .JwksURI.JwksSNIName }}{{ end }}";
     set $wxingress_jwt_token_from "{{ .TokenVariable }}";
     {{- end }}
@@ -490,10 +491,8 @@ server {
         set $wxingress_jwt_jwks "{{ .JwksURI.URL }}";
         set $wxingress_jwt_cache "{{ .KeyCache }}";
         set $wxingress_jwt_ca "{{ .JwksURI.TrustedCert }}";
-        set $wxingress_jwt_verify "{{ if .JwksURI.SSLVerify }}1{{ end }}";
+        set $wxingress_jwt_verify "{{ if .JwksURI.SSLVerify }}1{{ else }}0{{ end }}";
         set $wxingress_jwt_sni "{{ if .JwksURI.JwksSNIEnabled }}{{ .JwksURI.JwksSNIName }}{{ end }}";
-    set $wxingress_jwt_verify "{{ if .JwksURI.SSLVerify }}1{{ end }}";
-    set $wxingress_jwt_sni "{{ if .JwksURI.JwksSNIEnabled }}{{ .JwksURI.JwksSNIName }}{{ end }}";
         set $wxingress_jwt_token_from "{{ .TokenVariable }}";
         {{- end }}
 

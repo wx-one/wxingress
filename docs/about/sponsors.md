@@ -10,9 +10,12 @@ wxingress is developed by [WizardTales](https://wizardtales.com) and powers the 
 
 ## Sponsor wxingress
 
-Keeping an ingress controller secure and compatible is ongoing work: every NGINX security release, every
-upstream release of NGINX Ingress Controller and NGINX Gateway Fabric, every new Kubernetes version. If
-your clusters depend on wxingress, please consider sponsoring it:
+wxingress is officially maintained by WizardTales. That is our commitment: it stays open source, and
+since we run it in our own production, its development is secured without depending on donations.
+
+Keeping an ingress controller secure and compatible is ongoing work all the same: every NGINX security
+release, every upstream release of NGINX Ingress Controller and NGINX Gateway Fabric, every new
+Kubernetes version. Every donation goes exclusively into that development:
 
 [:octicons-heart-fill-24: Sponsor on GitHub](https://github.com/sponsors/wx-one){ .md-button .md-button--primary }
 

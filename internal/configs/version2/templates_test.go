@@ -1245,6 +1245,61 @@ func TestExecuteVirtualServerTemplate_WithOIDCTLSVerify(t *testing.T) {
 	t.Log(string(got))
 }
 
+// The wxingress module's oidc and jwt Policies without NGINX Plus: the
+// Policy a session is sealed for, and TLS verification as the Policy says it -
+// "1" or "0", never "", which the module takes as verification on.
+func TestExecuteVirtualServerTemplate_ModulePolicyAndTLSVerify(t *testing.T) {
+	t.Parallel()
+	executor := newTmplExecutorNGINX(t)
+
+	cfg := virtualServerCfgWithOIDCAndTLSVerify
+	server := cfg.Server
+	oidc := *server.OIDC
+	oidc.ClientID = "the-client"
+	oidc.Issuer = "https://idp.example.com"
+	oidc.PolicyName = "tenant-a/oidc-policy"
+	server.OIDC = &oidc
+	server.JWTAuth = &JWTAuth{
+		Key:   "tenant-a/jwt-policy",
+		Realm: "My Api",
+		JwksURI: JwksURI{
+			JwksScheme: "https",
+			JwksHost:   "idp.example.com",
+			JwksPath:   "/keys",
+			SSLVerify:  true,
+		},
+	}
+	cfg.Server = server
+
+	got, err := executor.ExecuteVirtualServerTemplate(&cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		`set $wxingress_oidc_policy "tenant-a/oidc-policy";`,
+		`set $wxingress_oidc_verify "1";`,
+		`set $wxingress_jwt_verify "1";`,
+	} {
+		if !bytes.Contains(got, []byte(want)) {
+			t.Errorf("want %q in the generated config", want)
+		}
+	}
+
+	oidc.TLSVerify = false
+	server.JWTAuth.JwksURI.SSLVerify = false
+	got, err = executor.ExecuteVirtualServerTemplate(&cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`set $wxingress_oidc_verify "0";`, `set $wxingress_jwt_verify "0";`} {
+		if !bytes.Contains(got, []byte(want)) {
+			t.Errorf("want %q in the generated config without verification", want)
+		}
+	}
+	snaps.MatchSnapshot(t, string(got))
+}
+
 func TestExecuteVirtualServerTemplate_OIDCClientSecretPreservesEscapes(t *testing.T) {
 	t.Parallel()
 	executor := newTmplExecutorNGINXPlus(t)

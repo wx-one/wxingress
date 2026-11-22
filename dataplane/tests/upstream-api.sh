@@ -67,6 +67,10 @@ mkdir -p "$prefix/conf" "$prefix/logs" "$prefix/modules" "$prefix/html"
 { echo "slow"; head -c 1500 /dev/zero | tr '\0' ' '; echo; } > "$prefix/html/slow"
 cp "$module" "$prefix/modules/ngx_http_wxingress_module.so"
 
+# the controller's token and its check, as internal/nginx/apitoken.go writes them
+token=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
+printf 'if ($http_x_wxingress_api_token != "%s") {\n    return 403;\n}\n' "$token" > "$prefix/conf/api-token.conf"
+
 # internal/nginx/verify.go writes this; version 1 is the first one
 cat > "$prefix/conf/config-version.conf" <<CONF
 server {
@@ -103,6 +107,9 @@ http {
         listen unix:$socket;
         access_log off;
 
+        # only the controller: a request without its token is refused here
+        include $prefix/conf/api-token.conf;
+
         location /configVersionCheck {
             if (\$config_version_mismatch) {
                 return 503;
@@ -137,6 +144,7 @@ http {
     upstream default-echo-canary-80 { zone default-echo-canary-80 64k; server 127.0.0.1:$second; }
     upstream default-empty-80       { zone default-empty-80 64k;       server 127.0.0.1:$first; }
     upstream default-gone-80        { zone default-gone-80 64k;        server 127.0.0.1:$second; }
+    upstream default-many-80        { zone default-many-80 4m;         server 127.0.0.1:$first; }
 
     # a Gateway route's upstreams have capitals, which nginx lowers in a variable's name
     upstream vs_ns_GW-1_be-2 { zone vs_ns_GW-1_be-2 64k; server 127.0.0.1:$first; }
@@ -235,7 +243,7 @@ while [ "$waited" -lt 100 ] && [ ! -S "$socket" ]; do
 done
 
 ( cd "$repository" && go run ./dataplane/tests/upstreamapi \
-    -socket "$socket" -front "http://127.0.0.1:$front/" -upstream "$upstream" \
+    -socket "$socket" -token "$token" -front "http://127.0.0.1:$front/" -upstream "$upstream" \
     -first "127.0.0.1:$first" -second "127.0.0.1:$second" \
     -stream-front "http://127.0.0.1:$tcp/" -stream-upstream ts_default_tcp-app_app )
 result=$?
@@ -255,8 +263,20 @@ check() {
   fi
 }
 
-api() { curl -s --max-time 5 --unix-socket "$socket" "$@"; }
-code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 --unix-socket "$socket" "$@"; }
+api() { curl -s --max-time 5 -H "X-Wxingress-Api-Token: $token" --unix-socket "$socket" "$@"; }
+code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 -H "X-Wxingress-Api-Token: $token" --unix-socket "$socket" "$@"; }
+bare() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 --unix-socket "$socket" "$@"; }
+
+# ------------------------------------------------------------ the API token
+
+check "without the controller's token the API refuses" \
+      "$(bare http://nginx-plus-api/api/wxingress/1/canaries)" "403"
+check "and with another token" \
+      "$(bare -H "X-Wxingress-Api-Token: ${token}0" http://nginx-plus-api/api/wxingress/1/canaries)" "403"
+check "and a change without it" \
+      "$(bare -X PUT --data '{"canary":"x","weight":1}' http://nginx-plus-api/api/wxingress/1/canaries/default-echo-80)" "403"
+check "with it the API answers" \
+      "$(code http://nginx-plus-api/api/wxingress/1/canaries)" "200"
 rule() { code -X PUT --data "$1" "http://nginx-plus-api/api/wxingress/1/canaries/default-echo-80"; }
 
 # who answers `count` requests, as "first:N second:M"
@@ -481,6 +501,25 @@ check "the rule is taken away" "$(code -X DELETE http://nginx-plus-api/api/wxing
 last_spread=$(btally /lb 30 -b "route=$on_primary")
 check "and the block's method balances again ($last_spread)" \
       "$(echo "$last_spread" | tr ' ' '\n' | wc -l | tr -d ' ')" "3"
+
+# ------------------------------------------------- the longest listing
+#
+# 1024 servers - MOST_SERVERS - at the longest address and numbers the API
+# writes, some 230 bytes each: the answer's buffer held 160 a server, and the
+# listing ran past its end into whatever lay behind it.
+
+added=0
+for i in $(seq 1 1023); do
+  h=$(printf '%04x' "$i")
+  c=$(code -X POST --data "{\"server\":\"[fd00:1234:5678:9abc:def0:1234:5678:$h]:65535\",\"weight\":1000000,\"max_conns\":2000000000,\"max_fails\":2000000000,\"fail_timeout\":\"3600s\"}" \
+      http://nginx-plus-api/api/9/http/upstreams/default-many-80/servers)
+  [ "$c" = 201 ] && added=$((added + 1))
+done
+check "1023 servers more, at the longest" "$added" "1023"
+listing=$(api http://nginx-plus-api/api/9/http/upstreams/default-many-80/servers)
+check "all 1024 are listed" "$(printf '%s' "$listing" | grep -o '"id":' | wc -l | tr -d ' ')" "1024"
+check "and the listing is whole" "$(printf '%s' "$listing" | tail -c 2)" "}]"
+check "the API still answers" "$(code http://nginx-plus-api/api/9/http/upstreams/default-many-80/servers)" "200"
 
 # a reload is the controller's, and the rules outlive it
 rule '{"canary":"default-echo-canary-80","weight":100}' >/dev/null

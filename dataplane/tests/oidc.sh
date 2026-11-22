@@ -35,6 +35,7 @@ public=$((port + 3))
 idp2=$((port + 4))
 discovered=$((port + 5))
 idp3=$((port + 6))
+other=$((port + 7))
 api="$work/api.sock"
 
 stop() {
@@ -92,6 +93,7 @@ http {
     map "" \$wxingress_oidc_issuer { default ""; }
     map "" \$wxingress_oidc_verify { default ""; }
     map "" \$wxingress_oidc_sni { default ""; }
+    map "" \$wxingress_oidc_policy { default ""; }
 
     server {
         listen 127.0.0.1:$backend;
@@ -164,6 +166,7 @@ http {
     server {
         listen 127.0.0.1:$public;
 
+        set \$wxingress_oidc_policy "tenant-a/oidc";
         set \$wxingress_oidc_client "e2e-public";
         set \$wxingress_oidc_client_secret "";
         set \$wxingress_oidc_session_key_file "$prefix/session.key";
@@ -187,6 +190,30 @@ http {
         location = /logout { try_files /.wxingress-oidc =404; }
         location = /_logout { try_files /.wxingress-oidc =404; }
     }
+
+    # another tenant's Policy with the same client ID - which is no secret -
+    # and the controller's one key file: its sessions are its own
+    server {
+        listen 127.0.0.1:$other;
+
+        set \$wxingress_oidc_policy "tenant-b/oidc";
+        set \$wxingress_oidc_client "e2e-public";
+        set \$wxingress_oidc_client_secret "";
+        set \$wxingress_oidc_session_key_file "$prefix/session.key";
+        set \$wxingress_oidc_auth "http://127.0.0.1:$idp2/authorize";
+        set \$wxingress_oidc_token "http://127.0.0.1:$idp2/token";
+        set \$wxingress_oidc_jwks "http://127.0.0.1:$idp2/jwks";
+        set \$wxingress_oidc_extra "prompt=login";
+        set \$wxingress_oidc_pkce "1";
+
+        location /app {
+            set \$wxingress_oidc_on "1";
+            add_header X-User \$meta_oidc_claim_sub;
+            proxy_pass http://127.0.0.1:$backend;
+        }
+
+        location = /_codexch { try_files /.wxingress-oidc =404; }
+    }
 }
 CONF
 
@@ -199,7 +226,7 @@ say "--- a confidential client"
 say "--- only an issuer: discovery, iss, logouts of the IdP, revocations"
 ( cd "$repository" && go run ./dataplane/tests/oidc -discovery -api "$api" -nginx "127.0.0.1:$discovered" -idp "127.0.0.1:$idp3" ) || result=1
 say "--- a public client with PKCE"
-( cd "$repository" && go run ./dataplane/tests/oidc -public -nginx "127.0.0.1:$public" -idp "127.0.0.1:$idp2" ) || result=1
+( cd "$repository" && go run ./dataplane/tests/oidc -public -nginx "127.0.0.1:$public" -idp "127.0.0.1:$idp2" -other "127.0.0.1:$other" ) || result=1
 
 alarms=$(grep -cE '\[(alert|emerg|crit)\]' "$prefix/logs/error.log")
 if [ "$alarms" != "0" ]; then

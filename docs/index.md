@@ -14,9 +14,11 @@ NGINX Ingress Controller's core, runs no Lua, and adds the Gateway API.
 [![WizardTales](assets/logos/wizardtales.svg){ .only-light }![WizardTales](assets/logos/wizardtales-dark.svg){ .only-dark }](https://wizardtales.com)
 </div>
 
-wxingress is developed by [WizardTales](https://wizardtales.com) and runs the ingress of the
-[WX-ONE](https://wx1.eu) cloud platform. It is open source under the [EUPL-1.2](about/license.md).
-If your clusters depend on it, please [sponsor its development](https://github.com/sponsors/wx-one).
+wxingress is officially maintained by [WizardTales](https://wizardtales.com) and runs the ingress of
+the [WX-ONE](https://wx1.eu) cloud platform. That is our commitment: it stays open source under the
+[EUPL-1.2](about/license.md), and since we depend on it ourselves, its development is secured.
+Donations are still very welcome and go exclusively into its development:
+[sponsor wxingress](https://github.com/sponsors/wx-one).
 
 !!! tip "Commercial support"
     WizardTales offers support packages for production use: the **fast release channel** (targeted fixes for critical vulnerabilities

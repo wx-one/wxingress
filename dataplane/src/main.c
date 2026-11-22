@@ -107,14 +107,25 @@
 #define MOST_SERVERS 1024
 
 /**
+ * The longest one server is written as: the field names and the literals
+ * are some 140 bytes, five numbers of at most 11 each, and the address at
+ * most the 127 of http_peer_t's `server` - 322, rounded up.
+ */
+#define SERVER_JSON 384
+
+/**
  * Where an answer is built.
  *
  * Static, for the reason meta's own examples give: the module copies the
  * answer into the request's pool once the handler has returned, and no
  * handler here waits between filling it and returning, so one per worker is
- * enough. 160 bytes a server is more than the longest one written.
+ * enough. Sized for the longest listing, every server at its longest, the
+ * brackets and commas included.
  */
-static char answer[MOST_SERVERS * 160 + 256];
+static char answer[MOST_SERVERS * (SERVER_JSON + 1) + 256];
+
+/** A listing that does not fit `answer`, refused as an error of nginx's. */
+#define LISTING_TOO_LONG (-1000)
 static http_peer_t listed[MOST_SERVERS];
 
 /** A server added to or removed from an upstream, for ewma (with the balancers). */
@@ -160,6 +171,8 @@ static http_response_t refused(http_request_t *req, int why) {
     return failed(req, 409, "server already exists", "UpstreamServerExists");
   case HTTP_PEER_NO_MEMORY:
     return failed(req, 500, "upstream zone is full", "UpstreamOutOfMemory");
+  case LISTING_TOO_LONG:
+    return failed(req, 500, "the servers do not fit the answer", "NginxError");
   default:
     return failed(req, 500, "the upstream could not be changed", "NginxError");
   }
@@ -194,7 +207,9 @@ static int peerRemove(int stream, const char *upstream, int id) {
 }
 
 /**
- * One server as JSON, at `into`; how many bytes it took.
+ * One server as JSON, at `into`; how many bytes it took, and 0 when it did
+ * not fit `room` with its terminating zero - never a count that runs past
+ * the end, which the listing adds to where it writes next.
  *
  * Every field the client compares, in its defaults where nginx has no
  * other: an open-source nginx has no slow start and no routes, so those are
@@ -216,13 +231,23 @@ static size_t written(char *into, size_t room, const http_peer_t *peer,
                         peer->backup ? "true" : "false",
                         peer->down ? "true" : "false");
 
-  if (length < 0)
+  if (length < 0 || (size_t)length >= room) {
+    if (room > 0)
+      into[0] = 0;
     return 0;
+  }
 
-  return (size_t)length < room ? (size_t)length : room;
+  return (size_t)length;
 }
 
-/** The servers of an upstream as a JSON array in `answer`; 0, or a refusal. */
+/**
+ * The servers of an upstream as a JSON array in `answer`; 0, or a refusal.
+ *
+ * Every write is bounded by what is left after it for the closing bracket
+ * and the zero, and a server that does not fit refuses the listing rather
+ * than cutting it: `used` never passes `sizeof answer - 2`, so the room left
+ * is never a size_t that wrapped.
+ */
 static int listing(int stream, const char *upstream) {
 
   int count = peersOf(stream, upstream, listed, MOST_SERVERS);
@@ -238,10 +263,21 @@ static int listing(int stream, const char *upstream) {
 
   for (int at = 0; at < count; ++at) {
 
+    size_t took;
+
+    /* a comma, a server of at least a byte, the bracket and the zero */
+    if (sizeof answer - used < 4)
+      return LISTING_TOO_LONG;
+
     if (at > 0)
       answer[used++] = ',';
 
-    used += written(answer + used, sizeof answer - used - 2, &listed[at], stream);
+    took = written(answer + used, sizeof answer - used - 2, &listed[at], stream);
+
+    if (took == 0)
+      return LISTING_TOO_LONG;
+
+    used += took;
   }
 
   answer[used++] = ']';
@@ -585,6 +621,90 @@ static http_response_t removeServer(http_request_t *req) {
   return req.reply(200).json(answer);
 }
 
+/* -------------------------------------------------------------- seqlocks */
+
+/**
+ * The tables in shared memory - canaries, balancers, ewma, certificates - are
+ * read without a lock: each entry starts with a `seq` that its writer, under
+ * the table's lock, makes odd, then writes, then makes even again, and a
+ * reader that saw it odd or saw it move reads again.
+ */
+
+/**
+ * How often a reader finds a `seq` odd before it asks the table's lock: a
+ * writer holds an entry odd for a copy of some hundred bytes, so this many
+ * looks are a writer that is not coming back - one that died between its two
+ * steps, which left the entry odd for every reader of every worker, each of
+ * which waited for it forever.
+ */
+#define SEQ_SPINS (1 << 16)
+
+/**
+ * A writer's step: odd before it writes, even after. The release fence
+ * after the step to odd keeps what it writes next from being seen before the
+ * entry is odd, which a store with release order alone does not - that
+ * orders what came before it.
+ */
+static void seqStep(unsigned *seq) {
+
+  if (__atomic_add_fetch(seq, 1, __ATOMIC_RELEASE) & 1)
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
+
+/**
+ * Every odd `seq` of a table made even, under its lock taken over from a
+ * worker that died holding it: the entry it was writing is what it left, the
+ * readers read it again and go on.
+ */
+static void seqRepair(void *table, size_t stride, size_t count) {
+
+  for (size_t at = 0; at < count; ++at) {
+
+    unsigned *seq = (unsigned *)((char *)table + at * stride);
+
+    if (__atomic_load_n(seq, __ATOMIC_RELAXED) & 1)
+      __atomic_add_fetch(seq, 1, __ATOMIC_RELEASE);
+  }
+}
+
+/** Takes a table's lock, and repairs the table when its last holder died with it. */
+static void seqLock(pthread_mutex_t *lock, void *table, size_t stride, size_t count) {
+
+  if (pthread_mutex_lock(lock) == EOWNERDEAD) {
+    seqRepair(table, stride, count);
+    pthread_mutex_consistent(lock);
+  }
+}
+
+/**
+ * A copy of `size` bytes whose first member is the `seq` of a seqlock.
+ * `unstuck` takes and gives back the table's lock: called when the entry has
+ * been odd for SEQ_SPINS looks, it waits for a writer that is slow and
+ * repairs the table of one that died.
+ */
+static void seqCopy(void *into, const void *from, size_t size, void (*unstuck)(void)) {
+
+  const unsigned *seq = from;
+  unsigned before;
+
+  do {
+    int spins = 0;
+
+    before = __atomic_load_n(seq, __ATOMIC_ACQUIRE);
+
+    while (before & 1) {
+      if (++spins == SEQ_SPINS) {
+        unstuck();
+        spins = 0;
+      }
+      before = __atomic_load_n(seq, __ATOMIC_ACQUIRE);
+    }
+
+    memcpy(into, from, size);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  } while (__atomic_load_n(seq, __ATOMIC_RELAXED) != before);
+}
+
 /* ---------------------------------------------------------------- canaries */
 
 /** How many primaries can have a canary at once. */
@@ -652,8 +772,12 @@ static int canariesOpen(void) {
 static void canariesLock(void) {
 
   /* a worker that died holding it left the table as it was: take it over */
-  if (pthread_mutex_lock(&canaries->lock) == EOWNERDEAD)
-    pthread_mutex_consistent(&canaries->lock);
+  seqLock(&canaries->lock, canaries->rules, sizeof canaries->rules[0], CANARIES);
+}
+
+static void canariesUnstuck(void) {
+  canariesLock();
+  pthread_mutex_unlock(&canaries->lock);
 }
 
 static unsigned slotOf(const char *primary) {
@@ -678,17 +802,8 @@ static int canaryRead(const char *primary, canaryRule_t *into) {
   for (unsigned probe = 0; probe < CANARIES; ++probe) {
 
     canaryRule_t *rule = &canaries->rules[(slot + probe) % CANARIES];
-    unsigned before;
 
-    do {
-      before = __atomic_load_n(&rule->seq, __ATOMIC_ACQUIRE);
-
-      while (before & 1)
-        before = __atomic_load_n(&rule->seq, __ATOMIC_ACQUIRE);
-
-      memcpy(into, rule, sizeof *into);
-      __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    } while (__atomic_load_n(&rule->seq, __ATOMIC_RELAXED) != before);
+    seqCopy(into, rule, sizeof *into, canariesUnstuck);
 
     if (!into->used && into->primary[0] == 0)
       return -1; /* an empty slot ends the probe */
@@ -738,18 +853,18 @@ static int canaryWrite(const canaryRule_t *given) {
     return given->used ? -1 : 0;
   }
 
-  __atomic_add_fetch(&found->seq, 1, __ATOMIC_RELEASE);
+  seqStep(&found->seq);
 
+  /* everything but `seq`: a copy of the given one's would make it even - and the entry readable - halfway */
   if (given->used) {
-    unsigned seq = found->seq;
-    memcpy(found, given, sizeof *found);
-    found->seq = seq;
+    memcpy((char *)found + sizeof found->seq, (const char *)given + sizeof given->seq,
+           sizeof *found - sizeof found->seq);
     found->generation = ++canaries->generation;
   } else {
     found->used = 0;
   }
 
-  __atomic_add_fetch(&found->seq, 1, __ATOMIC_RELEASE);
+  seqStep(&found->seq);
 
   pthread_mutex_unlock(&canaries->lock);
 
@@ -1397,27 +1512,22 @@ static int balancersOpen(void) {
   return 0;
 }
 
-static void robustLock(pthread_mutex_t *lock) {
-
-  if (pthread_mutex_lock(lock) == EOWNERDEAD)
-    pthread_mutex_consistent(lock);
+static void balancersLock(void) {
+  seqLock(&balancers->lock, balancers->rules, sizeof balancers->rules[0], BALANCERS);
 }
 
-/** A copy of `size` bytes whose first member is the `seq` of a seqlock. */
-static void seqCopy(void *into, const void *from, size_t size) {
+static void balancersUnstuck(void) {
+  balancersLock();
+  pthread_mutex_unlock(&balancers->lock);
+}
 
-  const unsigned *seq = from;
-  unsigned before;
+static void ewmasLock(void) {
+  seqLock(&ewmas->lock, ewmas->stats, sizeof ewmas->stats[0], EWMA_ADDRESSES);
+}
 
-  do {
-    before = __atomic_load_n(seq, __ATOMIC_ACQUIRE);
-
-    while (before & 1)
-      before = __atomic_load_n(seq, __ATOMIC_ACQUIRE);
-
-    memcpy(into, from, size);
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-  } while (__atomic_load_n(seq, __ATOMIC_RELAXED) != before);
+static void ewmasUnstuck(void) {
+  ewmasLock();
+  pthread_mutex_unlock(&ewmas->lock);
 }
 
 static unsigned fnv(const char *text) {
@@ -1449,7 +1559,7 @@ static int balancerRead(const char *upstream, balancerRule_t *into) {
     if (strncmp(rule->upstream, upstream, sizeof rule->upstream) != 0)
       continue;
 
-    seqCopy(into, rule, sizeof *into);
+    seqCopy(into, rule, sizeof *into, balancersUnstuck);
 
     if (into->used && strcmp(into->upstream, upstream) == 0)
       return 0;
@@ -1464,7 +1574,7 @@ static int balancerWrite(const balancerRule_t *given) {
   unsigned slot = fnv(given->upstream) % BALANCERS;
   balancerRule_t *found = NULL, *free = NULL;
 
-  robustLock(&balancers->lock);
+  balancersLock();
 
   for (unsigned probe = 0; probe < BALANCERS; ++probe) {
 
@@ -1491,18 +1601,18 @@ static int balancerWrite(const balancerRule_t *given) {
     return given->used ? -1 : 0;
   }
 
-  __atomic_add_fetch(&found->seq, 1, __ATOMIC_RELEASE);
+  seqStep(&found->seq);
 
+  /* everything but `seq`, as for canaries */
   if (given->used) {
-    unsigned seq = found->seq;
-    memcpy(found, given, sizeof *found);
-    found->seq = seq;
+    memcpy((char *)found + sizeof found->seq, (const char *)given + sizeof given->seq,
+           sizeof *found - sizeof found->seq);
     found->generation = ++balancers->generation;
   } else {
     found->used = 0;
   }
 
-  __atomic_add_fetch(&found->seq, 1, __ATOMIC_RELEASE);
+  seqStep(&found->seq);
 
   pthread_mutex_unlock(&balancers->lock);
 
@@ -1643,7 +1753,7 @@ static int ewmaRead(const char *address, ewmaStat_t *into) {
 
     unsigned at = (slot + probe) % EWMA_ADDRESSES;
 
-    seqCopy(into, &ewmas->stats[at], sizeof *into);
+    seqCopy(into, &ewmas->stats[at], sizeof *into, ewmasUnstuck);
 
     if (!into->used && into->address[0] == 0)
       return -1;
@@ -1684,7 +1794,7 @@ static void ewmaWrite(const char *address, int used, double ewma, double touched
   if (found == NULL || strlen(address) >= sizeof found->address)
     return;
 
-  __atomic_add_fetch(&found->seq, 1, __ATOMIC_RELEASE);
+  seqStep(&found->seq);
 
   if (used) {
     if (strcmp(found->address, address) != 0) {
@@ -1697,7 +1807,7 @@ static void ewmaWrite(const char *address, int used, double ewma, double touched
 
   found->used = used;
 
-  __atomic_add_fetch(&found->seq, 1, __ATOMIC_RELEASE);
+  seqStep(&found->seq);
 }
 
 #define EWMA_DECAY 10.0
@@ -1760,10 +1870,12 @@ static void ewmaUpdate(const char *address, double rtt) {
   double at = now(), ewma = 0, touched = 0;
   int locked = pthread_mutex_trylock(&ewmas->lock);
 
-  if (locked == EOWNERDEAD)
+  if (locked == EOWNERDEAD) {
+    seqRepair(ewmas->stats, sizeof ewmas->stats[0], EWMA_ADDRESSES);
     pthread_mutex_consistent(&ewmas->lock);
-  else if (locked != 0)
+  } else if (locked != 0) {
     return;
+  }
 
   if (ewmaRead(address, &stat) >= 0) {
     ewma = stat.ewma;
@@ -2445,7 +2557,7 @@ static void ewmaServers(const char *upstream, const char *address, int added) {
   if (balancers == NULL || balancerRead(upstream, &rule) != 0 || rule.algorithm != EWMA)
     return;
 
-  robustLock(&ewmas->lock);
+  ewmasLock();
 
   if (!added) {
     ewmaWrite(address, 0, 0, 0);
@@ -2703,7 +2815,7 @@ static http_response_t listEwma(http_request_t *req) {
 
     ewmaStat_t stat;
 
-    seqCopy(&stat, &ewmas->stats[at], sizeof stat);
+    seqCopy(&stat, &ewmas->stats[at], sizeof stat, ewmasUnstuck);
 
     if (!stat.used)
       continue;
@@ -2806,9 +2918,12 @@ static int certificatesOpen(void) {
 }
 
 static void certificatesLock(void) {
+  seqLock(&certificates->lock, certificates->names, sizeof certificates->names[0], CERTIFICATE_NAMES);
+}
 
-  if (pthread_mutex_lock(&certificates->lock) == EOWNERDEAD)
-    pthread_mutex_consistent(&certificates->lock);
+static void certificatesUnstuck(void) {
+  certificatesLock();
+  pthread_mutex_unlock(&certificates->lock);
 }
 
 static unsigned certificateSlotOf(const char *name) {
@@ -2824,18 +2939,7 @@ static unsigned certificateSlotOf(const char *name) {
 /** A copy of one slot, read without the lock. */
 static void certificateCopy(unsigned slot, certificate_t *into) {
 
-  certificate_t *entry = &certificates->names[slot];
-  unsigned before;
-
-  do {
-    before = __atomic_load_n(&entry->seq, __ATOMIC_ACQUIRE);
-
-    while (before & 1)
-      before = __atomic_load_n(&entry->seq, __ATOMIC_ACQUIRE);
-
-    memcpy(into, entry, sizeof *into);
-    __atomic_thread_fence(__ATOMIC_ACQUIRE);
-  } while (__atomic_load_n(&entry->seq, __ATOMIC_RELAXED) != before);
+  seqCopy(into, &certificates->names[slot], sizeof *into, certificatesUnstuck);
 }
 
 /** The slot of `name`, with a copy of it in `into`; -1 when it has none. */
@@ -2867,7 +2971,7 @@ static size_t certificateBlockSize(unsigned certificateLength, unsigned keyLengt
 }
 
 static void certificateWriting(certificate_t *entry) {
-  __atomic_add_fetch(&entry->seq, 1, __ATOMIC_RELEASE);
+  seqStep(&entry->seq);
 }
 
 /**
@@ -3192,6 +3296,10 @@ static int certificateName(const char *escaped, char *into, size_t room) {
 
     if (colon != NULL)
       length = (size_t)(colon - given);
+
+    /* `:443` is a port without a name */
+    if (length == 0)
+      return 0;
   }
 
   for (size_t at = 0; at < length; ++at) {

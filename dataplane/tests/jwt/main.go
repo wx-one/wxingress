@@ -20,11 +20,14 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"hash"
 	"math/big"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -185,6 +188,7 @@ func bearer(token string) func(*http.Request) {
 func main() {
 	nginx := flag.String("nginx", "", "")
 	jwksAddr := flag.String("jwks", "", "")
+	tlsAddr := flag.String("tls", "", "where to serve the JWK set over TLS, with a certificate of its own")
 	keysDir := flag.String("keys", "", "")
 	mint := flag.Bool("mint", false, "write keys.json and one token per algorithm (<alg>.token) into -keys, for benchmarks, and exit")
 	flag.Parse()
@@ -210,16 +214,45 @@ func main() {
 	// the URL's set: the same, also without the late key at first
 	var mu sync.Mutex
 	served := set(keys[:len(keys)-1]...)
-	var fetches atomic.Int32
+	var fetches, slowFetches, brokenFetches, tlsFetches atomic.Int32
+	serve := func(w http.ResponseWriter) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(served)
+	}
 	go func() {
-		_ = http.ListenAndServe(*jwksAddr, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			fetches.Add(1)
-			mu.Lock()
-			defer mu.Unlock()
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write(served)
+		_ = http.ListenAndServe(*jwksAddr, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/slow":
+				slowFetches.Add(1)
+				time.Sleep(500 * time.Millisecond)
+			case "/broken":
+				brokenFetches.Add(1)
+				http.Error(w, "no", http.StatusInternalServerError)
+				return
+			default:
+				fetches.Add(1)
+			}
+			serve(w)
 		}))
 	}()
+	if *tlsAddr != "" {
+		listener, err := net.Listen("tcp", *tlsAddr)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(2)
+		}
+		secure := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			tlsFetches.Add(1)
+			serve(w)
+		}))
+		secure.Listener = listener
+		secure.StartTLS()
+		defer secure.Close()
+		ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: secure.Certificate().Raw})
+		_ = os.WriteFile(filepath.Join(*keysDir, "ca.pem"), ca, 0o644)
+	}
 	time.Sleep(300 * time.Millisecond)
 
 	good := "200 alice|a,b|"
@@ -263,6 +296,59 @@ func main() {
 	check("not a JWS: 401", code, 401)
 	code, _, _ = ask(*nginx, "/open", nil)
 	check("a location without a realm needs no token", code, 200)
+
+	// a request nginx redirects inside itself is asked where it lands
+	signed := bearer(sign(keys[0], claims(nil), nil))
+	for _, c := range []struct{ path, realm string }{
+		{"/rewrite-break", "file"},
+		{"/split", "split"},
+		{"/tried", "named"},
+		{"/tried-uri", "split"},
+		{"/errored", "named"},
+	} {
+		code, _, challenge = ask(*nginx, c.path, nil)
+		check(c.path+" without a token: 401 with the realm it lands in", fmt.Sprint(code, " ", challenge), `401 Bearer realm="`+c.realm+`"`)
+		code, got, _ = ask(*nginx, c.path, signed)
+		check(c.path+" with one: 200 and the claims", fmt.Sprint(code, " ", got), good+"RS256")
+	}
+
+	// a key set is fetched once at a time: the requests that come while it is
+	// fetched wait for that fetch rather than each sending one
+	var wg sync.WaitGroup
+	var slowCodes sync.Map
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			code, _, _ := ask(*nginx, "/slow-url", signed)
+			slowCodes.Store(i, code)
+		}(i)
+	}
+	wg.Wait()
+	served200 := 0
+	slowCodes.Range(func(_, v any) bool {
+		if v.(int) == 200 {
+			served200++
+		}
+		return true
+	})
+	check("20 requests at once while the set is fetched: served, with one fetch", fmt.Sprint(served200, " ", slowFetches.Load()), "20 1")
+
+	// and a set that cannot be had is not asked for again by every request
+	for i := 0; i < 5; i++ {
+		code, _, _ = ask(*nginx, "/broken-url", signed)
+	}
+	check("a set whose server fails: 401, and one fetch for five requests", fmt.Sprint(code, " ", brokenFetches.Load()), "401 1")
+
+	if *tlsAddr != "" {
+		code, _, _ = ask(*nginx, "/tls-off", signed)
+		check("over TLS without verification, as the Policy says: 200", fmt.Sprint(code, " ", tlsFetches.Load()), "200 1")
+		code, _, _ = ask(*nginx, "/tls-default", signed)
+		check("the same URL verified by default: not the set fetched without, and the certificate is not trusted: 401",
+			fmt.Sprint(code, " ", tlsFetches.Load()), "401 1")
+		code, _, _ = ask(*nginx, "/tls-ca", signed)
+		check("verified against the Policy's CA: 200", fmt.Sprint(code, " ", tlsFetches.Load()), "200 2")
+	}
 
 	// where the token is
 	token := sign(keys[9], claims(nil), nil)
