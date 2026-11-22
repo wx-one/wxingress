@@ -68,8 +68,8 @@ of 97 Ingresses from production clusters and popular Helm charts, probed 2562 wa
     ---
 
     Gateways with HTTPRoute, GRPCRoute, TLSRoute, TCPRoute and UDPRoute on the same controller. The Gateway API
-    semantics (attachment, conflicts, status) come from NGINX Gateway Fabric.
-    [Gateway API](user-guide/gateway-api.md)
+    semantics (attachment, conflicts, status) come from NGINX Gateway Fabric. Tested against the conformance
+    suite; not yet in our production. [Gateway API](user-guide/gateway-api.md)
 
 -   **All of NGINX Ingress Controller**
 

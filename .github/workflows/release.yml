@@ -17,7 +17,7 @@
 # are needed.
 #
 # The image is linux/amd64 only: the controller binary is built for amd64 and
-# the meta compiler image, which builds the data plane module, is amd64 only.
+# the metalang compiler image, which builds the data plane module, is amd64 only.
 
 name: Release
 

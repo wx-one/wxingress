@@ -4,17 +4,18 @@
 #                    make test, with helm for the chart snapshot tests
 #   go-build         the controller binary nginx-ingress (CGO_ENABLED=0)
 #   dataplane-build  the data plane module and an nginx beside it, built with
-#                    dataplane/build.sh and the meta compiler
+#                    dataplane/build.sh and the metalang compiler
 #   dataplane-test   dataplane/tests/upstream-api.sh against that nginx
 #   helm             helm lint and helm package for charts/wxingress
 #
 # Nothing is pushed or deployed here. release.yml calls this workflow for a
 # tag and builds the image from the binary and module it uploads.
 #
-# meta is not open source. The metalanguage repository publishes it, binary
-# and headers, as the image wxone/meta, and this only uses it: copied out to
-# /opt/meta - see .github/actions/meta. Which one, by tag and digest, is in
-# ci/meta-image: the meta commit this is built and tested with, not latest.
+# metalang is not open source yet (planned for Q2-Q3 2027, see NOTICE). Its
+# repository publishes the compiler, binary and headers, as the image
+# wxone/meta, and this only uses it: copied out to /opt/meta - see
+# .github/actions/meta. Which one, by tag and digest, is in ci/meta-image: the
+# metalang commit this is built and tested with, not latest.
 
 name: CI
 
@@ -26,13 +27,13 @@ on:
   workflow_dispatch:
     inputs:
       meta_image:
-        description: meta compiler image to build the data plane with
+        description: metalang compiler image to build the data plane with
         required: false
         type: string
   workflow_call:
     inputs:
       meta_image:
-        description: meta compiler image to build the data plane with
+        description: metalang compiler image to build the data plane with
         required: false
         type: string
 
@@ -46,7 +47,7 @@ concurrency:
 env:
   # the version the chart snapshot tests were recorded with
   HELM_VERSION: v4.3.0
-  # The meta compiler is pinned by tag and digest in ci/meta-image: the data
+  # The metalang compiler is pinned by tag and digest in ci/meta-image: the data
   # plane is built and tested with a known compiler, not latest. The
   # repository variable META_IMAGE or the workflow_dispatch input try another.
   # must match NGINX_VERSION in dataplane/build.sh
@@ -111,13 +112,13 @@ jobs:
 
   dataplane-build:
     name: Data plane build
-    # meta lowers against the headers of the compiler its image was built
+    # metalang lowers against the headers of the compiler its image was built
     # with: ubuntu:24.04, so the runner is ubuntu-24.04 and uses its gcc
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
 
-      # meta by tag and digest, in one place: ci/meta-image
+      # metalang by tag and digest, in one place: ci/meta-image
       - id: pin
         run: echo "image=${{ inputs.meta_image || vars.META_IMAGE }}" >>"$GITHUB_OUTPUT"
       - id: pinfile
@@ -129,7 +130,7 @@ jobs:
           image: ${{ steps.pin.outputs.image || steps.pinfile.outputs.image }}
 
       # what nginx and the module's static libcurl need to build, and the
-      # headers meta lowers the module against (curl/curl.h for meta_fetch)
+      # headers metalang lowers the module against (curl/curl.h for meta_fetch)
       - name: Build dependencies
         run: |
           sudo apt-get update -qq
@@ -160,7 +161,7 @@ jobs:
     needs: dataplane-build
     runs-on: ubuntu-24.04
     # the same Debian release the image runs on, so the nginx built in the
-    # meta image finds its libraries
+    # metalang image finds its libraries
     container:
       image: golang:1.27.3-trixie
     steps:

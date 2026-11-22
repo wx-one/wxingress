@@ -18,11 +18,14 @@ Git history and CHANGELOG.md record the changes. Everything added or changed
 for wxingress is licensed under the EUPL-1.2, and wxingress as a whole is
 distributed under the EUPL-1.2.
 
-The data plane module (dataplane/) is written in meta and compiled with the
-meta compiler, which is not open source. Its binary and runtime are published
-as the container image docker.io/wxone/meta; the version wxingress is built
-with is pinned by digest in ci/meta-image. The meta runtime is linked into the
-data plane module and listed in the SBOM of every release.
+The data plane module (dataplane/) is written in metalang, the programming
+language WizardTales writes all of its software in, and compiled with the
+metalang compiler. metalang is not open source yet: it is developed rapidly,
+and we keep the freedom to change it until others depend on it. It is planned
+to be open-sourced in Q2-Q3 2027. Until then its compiler and runtime are
+published as the container image docker.io/wxone/meta; the version wxingress
+is built with is pinned by digest in ci/meta-image. The metalang runtime is
+linked into the data plane module and listed in the SBOM of every release.
 
 NGINX is a registered trademark of F5, Inc. wxingress is not affiliated with,
 endorsed by or sponsored by F5, Inc. or the Kubernetes ingress-nginx project.

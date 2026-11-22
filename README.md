@@ -79,7 +79,8 @@ each of the other 51 has a documented reason.
 
   How these numbers come about is described in [Testing and benchmarks](https://wx-one.github.io/wxingress/migration/testing/).
 - **Gateway API.** Gateways with HTTPRoute, GRPCRoute, TLSRoute, TCPRoute and UDPRoute, and
-  ReferenceGrants, on the same controller and the same data plane. The Gateway API semantics come from NGINX Gateway Fabric.
+  ReferenceGrants, on the same controller and the same data plane. The Gateway API semantics come from NGINX Gateway Fabric. It is tested (the Gateway API conformance suite and our own
+  end-to-end tests) but does not run in production yet, unlike the Ingress side.
 - **Everything NGINX Ingress Controller has.** VirtualServer, VirtualServerRoute, TransportServer, Policy
   and GlobalConfiguration resources, and the `nginx.org/*` annotations.
 - **Built for a careful switch.** Both controllers can serve the same Ingresses at the same time, node by

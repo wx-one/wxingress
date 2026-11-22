@@ -6,6 +6,11 @@ Controller's resources, from the same controller and the same NGINX. The Gateway
 those of [NGINX Gateway Fabric](https://github.com/nginx/nginx-gateway-fabric) 2.8.1, whose graph
 wxingress contains as a copy. The NGINX configuration is wxingress's own.
 
+!!! info "Status"
+    The Gateway API support is tested: the conformance suite of the Gateway API and wxingress's own
+    end-to-end tests run against it. Unlike the Ingress side, it does not run in our production clusters
+    yet. Feedback from real use is very welcome.
+
 | | |
 |---|---|
 | Gateway API version | v1.6.3, standard channel |

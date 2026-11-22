@@ -39,7 +39,8 @@ controller you consider supports, and test the defaults, not just the annotation
   ingress-nginx 1.15 on the same node, half the CPU per HTTPS request, half the memory under load.
 - **The Gateway API is included.** When you are ready to move routes to the Gateway API, the same
   controller serves Gateways and HTTPRoutes next to your Ingresses, and the ingress-nginx annotations even
-  work on routes. You can migrate to the Gateway API later, one route at a time, instead of all at once.
+  work on routes. You can migrate to the Gateway API later, one route at a time, instead of all at once. (The Gateway
+  API side is tested against the conformance suite but, unlike the Ingress side, not yet in our production.)
 
 ## When wxingress is not the best choice
 

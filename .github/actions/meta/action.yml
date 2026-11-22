@@ -1,10 +1,10 @@
-# meta, as the metalanguage repository publishes it: the image wxone/meta,
+# The metalang compiler, as its repository publishes it: the image wxone/meta,
 # with the binary and its headers at /opt/meta, where it was built and where
 # its baked-in paths point. Copied out to the same place, with META_ROOT and
-# META set for dataplane/build.sh - and META_IMAGE and META_DIGEST, which meta
+# META set for dataplane/build.sh - and META_IMAGE and META_DIGEST, which compiler
 # it was (the SBOM names it).
 name: meta
-description: meta from wxone/meta, at /opt/meta
+description: the metalang compiler from wxone/meta, at /opt/meta
 inputs:
   image:
     description: the image, by tag and digest (ci/meta-image)

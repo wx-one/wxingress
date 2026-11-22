@@ -5,7 +5,7 @@ wxingress has three parts:
 | Part | Language | Built with |
 |---|---|---|
 | The controller (`cmd/nginx-ingress`, `internal/`, `pkg/`) | Go | `go build`, `make` |
-| The data plane module (`dataplane/`) | meta | the meta compiler, in the image `docker.io/wxone/meta` |
+| The data plane module (`dataplane/`) | metalang | the metalang compiler, in the image `docker.io/wxone/meta` |
 | The image | Dockerfile | `build/Dockerfile.wxingress`, from the two above and NGINX packages from nginx.org |
 
 ## The controller
@@ -36,9 +36,15 @@ make test-update-snaps
 ## The data plane module
 
 The module `ngx_http_wxingress_module.so` provides the dynamic upstreams, the balancers, the
-ingress-nginx metrics and what NGINX Ingress Controller does in njs. It is written in meta and compiled to C
-by the meta compiler, then built as a dynamic NGINX module against the exact NGINX version of the image
-(`NGINX_VERSION` in `dataplane/build.sh`).
+ingress-nginx metrics and what NGINX Ingress Controller does in njs. It is written in metalang and compiled
+to C by the metalang compiler, then built as a dynamic NGINX module against the exact NGINX version of the
+image (`NGINX_VERSION` in `dataplane/build.sh`).
+
+!!! note "About metalang"
+    metalang is the programming language WizardTales writes all of its software in. It is not open source
+    yet: it is still developed rapidly, and we keep the freedom to change it until others depend on it. It
+    is planned to be open-sourced in Q2-Q3 2027. Until then the compiler and its runtime are published as
+    the container image `docker.io/wxone/meta`, which is all you need to build the module.
 
 ```sh
 docker run --rm -v "$PWD:/src" -w /src -e META=/opt/meta/meta \
@@ -82,7 +88,7 @@ The scripts in `dataplane/e2e/` run against a kind cluster and need Docker, kind
 ## CI
 
 `.github/workflows/ci.yml` runs the Go tests, builds the controller, builds and tests the data plane
-module in the meta image, and lints the chart, on every push and pull request.
+module with the metalang compiler, and lints the chart, on every push and pull request.
 `.github/workflows/release.yml` runs on tags `v*`, builds the image and pushes it to
 `ghcr.io/wx-one/wxingress`, pushes the chart to `oci://ghcr.io/wx-one/charts`, and creates a GitHub
 release.

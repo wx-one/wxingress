@@ -2,11 +2,11 @@
 # CycloneDX 1.6 SBOMs for wxingress, written from what the build knows rather
 # than scanned for: the controller is a static Go binary (its modules are in
 # its build info), the data plane module links libcurl statically and the
-# meta runtime, and the image installs packages whose list dpkg keeps.
+# metalang runtime, and the image installs packages whose list dpkg keeps.
 #
 #   ci/sbom.sh release <version> <nginx-ingress> <module.so> > release.cdx.json
 #       the controller binary and its Go modules, the data plane module with
-#       the libcurl and meta runtime inside it, and the nginx it is built for
+#       the libcurl and metalang runtime inside it, and the nginx it is built for
 #       (scope "excluded": the image provides it)
 #
 #   ci/sbom.sh image <release.cdx.json> <image-ref> <image-id> > image.cdx.json
@@ -16,7 +16,7 @@
 #
 # Needs jq, go (for `go version -m`) and, for image, docker. Reads from
 # dataplane/build.sh: NGINX_VERSION, CURL_VERSION, CURL_SHA256, CURL_URL; and
-# META-IMAGE beside the module (which meta built it).
+# META-IMAGE beside the module (which metalang compiler built it).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -69,7 +69,7 @@ release)
      version: ($ref | split("@")[0] | split(":")[1] // "unknown"),
      properties: [{name: "meta:image", value: $ref}], licenses: [{license: {name: "proprietary (wx-one)"}}],
      scope: "required",
-     description: "runtime of the meta compiler the data plane module is written in, linked statically",
+     description: "runtime of metalang, the language the data plane module is written in, linked statically",
      externalReferences: [{type: "distribution", url: "https://hub.docker.com/r/wxone/meta"}]}')")
 
   nginx_v=$(build_var NGINX_VERSION)

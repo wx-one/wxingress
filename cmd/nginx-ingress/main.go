@@ -1474,6 +1474,8 @@ func logEventAndExit(ctx context.Context, eventLog record.EventRecorder, obj pkg
 }
 
 func initLogger(logFormat string, level slog.Level, out io.Writer) context.Context {
+	// validateLogFormat takes the format in any case, so the logger does too
+	logFormat = strings.ToLower(logFormat)
 	programLevel := new(slog.LevelVar) // Info by default
 	var h slog.Handler
 
