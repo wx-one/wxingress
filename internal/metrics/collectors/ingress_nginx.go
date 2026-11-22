@@ -95,8 +95,10 @@ type IngressNginxCollector struct {
 	procWrite                                                     *prometheus.Desc
 	checkSuccess, checkErrors                                     *prometheus.Desc
 
-	// checks counts the admission webhook's checks per namespace and Ingress: [0] passed, [1] failed
-	checks map[[2]string]*[2]uint64
+	// checks counts the admission webhook's checks per namespace and Ingress
+	checks map[[2]string]*ingressChecks
+	// ingressExists tells if an Ingress exists, so that the counts of those that do not are dropped (pruneChecks)
+	ingressExists func(namespace, name string) bool
 
 	mu          sync.Mutex
 	reloads     uint64
@@ -138,7 +140,7 @@ func NewIngressNginxCollector(pod, namespace, class string, sources IngressNginx
 		procWrite:            desc("nginx_process_write_bytes_total", "number of bytes written"),
 		checkSuccess:         desc("check_success", "Cumulative number of Ingress controller syntax check operations", "namespace", "ingress"),
 		checkErrors:          desc("check_errors", "Cumulative number of Ingress controller errors during syntax check operations", "namespace", "ingress"),
-		checks:               make(map[[2]string]*[2]uint64),
+		checks:               make(map[[2]string]*ingressChecks),
 	}
 	for _, h := range ingressNginxHistograms {
 		c.histograms = append(c.histograms, desc(h.name, h.help, ingressNginxRequestLabels...))
@@ -166,20 +168,59 @@ func (c *IngressNginxCollector) Reloaded(ok bool) {
 	}
 }
 
+// ingressChecks are the counts of the checks of an Ingress, and when it was last checked.
+type ingressChecks struct {
+	passed, failed uint64
+	last           time.Time
+}
+
+// checksRetention is how long the counts of the checks of an Ingress that does not exist are kept after its last
+// check: those of an Ingress refused, never created, or deleted.
+const checksRetention = 10 * time.Minute
+
+// maxIngressChecks is the most Ingresses with counts of checks kept: beyond, the counts of those that do not exist
+// go at once, whenever they were checked, so that names checked by the million do not fill the memory.
+const maxIngressChecks = 10000
+
+// SetIngressExists sets how the collector learns if an Ingress exists: the counts of the checks of one that does
+// not are dropped checksRetention after its last check. Without it, every count is kept.
+func (c *IngressNginxCollector) SetIngressExists(exists func(namespace, name string) bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ingressExists = exists
+}
+
 // CheckDone counts a check of the admission webhook, as ingress-nginx's check_success and check_errors.
 func (c *IngressNginxCollector) CheckDone(namespace, name string, ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := time.Now()
 	key := [2]string{namespace, name}
 	n := c.checks[key]
 	if n == nil {
-		n = &[2]uint64{}
+		c.pruneChecks(now)
+		n = &ingressChecks{}
 		c.checks[key] = n
 	}
+	n.last = now
 	if ok {
-		n[0]++
+		n.passed++
 	} else {
-		n[1]++
+		n.failed++
+	}
+}
+
+// pruneChecks drops the counts of the Ingresses that do not exist and were last checked checksRetention ago, or,
+// with maxIngressChecks Ingresses counted, whenever they were last checked. c.mu is held.
+func (c *IngressNginxCollector) pruneChecks(now time.Time) {
+	if c.ingressExists == nil {
+		return
+	}
+	full := len(c.checks) >= maxIngressChecks
+	for key, n := range c.checks {
+		if (full || now.Sub(n.last) > checksRetention) && !c.ingressExists(key[0], key[1]) {
+			delete(c.checks, key)
+		}
 	}
 }
 
@@ -251,13 +292,14 @@ func (c *IngressNginxCollector) collectReloads(ch chan<- prometheus.Metric) {
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.pruneChecks(time.Now())
 	for key, n := range c.checks {
 		// as ingress-nginx's counter vectors: a series once there is a count of it
-		if n[0] > 0 {
-			ch <- prometheus.MustNewConstMetric(c.checkSuccess, prometheus.CounterValue, float64(n[0]), key[0], key[1])
+		if n.passed > 0 {
+			ch <- prometheus.MustNewConstMetric(c.checkSuccess, prometheus.CounterValue, float64(n.passed), key[0], key[1])
 		}
-		if n[1] > 0 {
-			ch <- prometheus.MustNewConstMetric(c.checkErrors, prometheus.CounterValue, float64(n[1]), key[0], key[1])
+		if n.failed > 0 {
+			ch <- prometheus.MustNewConstMetric(c.checkErrors, prometheus.CounterValue, float64(n.failed), key[0], key[1])
 		}
 	}
 }

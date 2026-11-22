@@ -184,6 +184,34 @@ func restrictTLSListeners(gw *graph.Gateway) {
 	}
 }
 
+// restrictFrontendValidation rejects the listeners that ask for client
+// certificates (spec.tls.frontend of the Gateway): the VirtualServers and
+// TransportServers the listeners map onto would serve them without the
+// verification, to any client. Such a listener is not accepted and not
+// served - an ingressMTLS Policy (wxingress.wizardtales.com/policies) on
+// the Gateway or its routes verifies client certificates instead.
+func restrictFrontendValidation(gw *graph.Gateway) {
+	for _, l := range gw.Listeners {
+		if !l.Valid || (len(l.CACertificateRefs) == 0 && l.ValidationMode == "") {
+			continue
+		}
+		msg := "client certificate validation (spec.tls.frontend) is not supported: the listener is not served; " +
+			"use an ingressMTLS Policy with the annotation " + AnnotationPolicies
+		l.Valid = false
+		l.SupportedKinds = nil
+		l.L4Routes = nil
+		l.Conditions = append(l.Conditions,
+			conditions.Condition{
+				Type:    string(gatewayv1.ListenerConditionAccepted),
+				Status:  metav1.ConditionFalse,
+				Reason:  string(gatewayv1.ListenerReasonUnsupportedValue),
+				Message: msg,
+			},
+			conditions.NewListenerNotProgrammedInvalid(msg),
+		)
+	}
+}
+
 // ServiceName is the name of the Service of a Gateway in its namespace: its
 // name and the class, as NGF names it, if that is a valid Service name;
 // otherwise a shortened one with a hash.
@@ -261,6 +289,12 @@ type addressing struct {
 	used map[int32]bool
 	// existing are the Services of Gateways, by namespace and name
 	existing map[types.NamespacedName]*v1.Service
+	// ports are the nginx ports of the Services that passed the checks of
+	// validPorts, by Service: only those are served and kept
+	ports map[types.NamespacedName]map[listenerPort]int32
+	// gateways are the UIDs of the Gateways of the graph, which a Service has
+	// to be owned by
+	gateways map[types.NamespacedName]types.UID
 	// wanted are the Services the Gateways of this Build have
 	wanted map[types.NamespacedName]bool
 	leader bool
@@ -268,11 +302,13 @@ type addressing struct {
 	endpoints []discoveryv1.EndpointSlice
 }
 
-func (c *Controller) newAddressing() (*addressing, error) {
+func (c *Controller) newAddressing(gateways map[types.NamespacedName]types.UID) (*addressing, error) {
 	a := &addressing{
 		c:        c,
 		used:     make(map[int32]bool),
 		existing: make(map[types.NamespacedName]*v1.Service),
+		ports:    make(map[types.NamespacedName]map[listenerPort]int32),
+		gateways: gateways,
 		wanted:   make(map[types.NamespacedName]bool),
 	}
 	if c.cfg.IsLeader != nil {
@@ -287,14 +323,136 @@ func (c *Controller) newAddressing() (*addressing, error) {
 	}
 	for _, svc := range svcs {
 		a.existing[types.NamespacedName{Namespace: svc.Namespace, Name: svc.Name}] = svc
-		for _, port := range nginxPortsOf(svc) {
-			a.used[port] = true
-		}
 	}
+	a.validPorts()
 	if a.leader {
 		a.endpoints = c.controllerEndpoints()
 	}
 	return a, nil
+}
+
+// The Service of a Gateway is in the Gateway's namespace, where its owners
+// can change it: the nginx ports read back from it are checked before they
+// are served. A port counts only if
+//
+//   - the Service is the controller's: its controlling owner is the
+//     Gateway of the graph it is named after, with that Gateway's UID - a
+//     Service made by someone else with the labels is never taken over;
+//   - it is a number in -gateway-listener-ports and none of the ports
+//     nginx or the controller listen on otherwise;
+//   - no other port has it, of this Service or another: of those that do,
+//     the one of the Service that was written to first keeps it (the
+//     lowest resourceVersion, as one changed by hand is written to last),
+//     the others lose theirs.
+//
+// A port that fails a check is not served, and the leader gives the listener
+// a free one in its place.
+
+// gatewayOwner is the Gateway a Service names as its controlling owner.
+func gatewayOwner(svc *v1.Service) (types.NamespacedName, types.UID, bool) {
+	for _, o := range svc.OwnerReferences {
+		if o.Controller == nil || !*o.Controller || o.Kind != "Gateway" ||
+			!strings.HasPrefix(o.APIVersion, gatewayv1.GroupName+"/") {
+			continue
+		}
+		return types.NamespacedName{Namespace: svc.Namespace, Name: o.Name}, o.UID, true
+	}
+	return types.NamespacedName{}, "", false
+}
+
+// ownedService tells whether svc is the Service the controller made for the
+// Gateway gw of the graph.
+func (a *addressing) ownedService(svc *v1.Service, gw types.NamespacedName) bool {
+	owner, uid, ok := gatewayOwner(svc)
+	if !ok || owner != gw || svc.Name != ServiceName(gw, a.c.cfg.GatewayClass) {
+		return false
+	}
+	want, ok := a.gateways[gw]
+	return ok && want == uid
+}
+
+// inRange tells whether n may be the nginx port of a listener.
+func (a *addressing) inRange(n int32) bool {
+	lo, hi := a.c.cfg.ListenerPortMin, a.c.cfg.ListenerPortMax
+	if lo <= 0 || hi < lo || n < lo || n > hi {
+		return false
+	}
+	return !slices.Contains(a.c.cfg.ReservedPorts, n)
+}
+
+// validPorts checks the nginx ports of the existing Services and keeps those
+// that pass in ports and used.
+func (a *addressing) validPorts() {
+	type claim struct {
+		svc     types.NamespacedName
+		lp      listenerPort
+		rv      uint64
+		rvOK    bool
+		created metav1.Time
+	}
+	claims := make(map[int32][]claim)
+	for _, name := range slices.SortedFunc(maps.Keys(a.existing), compareNames) {
+		svc := a.existing[name]
+		gw, _, isGateways := gatewayOwner(svc)
+		owned := isGateways && a.ownedService(svc, gw)
+		rv, err := strconv.ParseUint(svc.ResourceVersion, 10, 64)
+		for lp, n := range nginxPortsOf(svc) {
+			if !a.inRange(n) || (lp.protocol != v1.ProtocolTCP && lp.protocol != v1.ProtocolUDP) {
+				continue
+			}
+			if !owned {
+				// the Service of a Gateway not in the graph (yet), or of
+				// none: its ports are served by no one, but are not given to
+				// another Gateway while it is there - the leader deletes it
+				if isGateways {
+					a.used[n] = true
+				}
+				continue
+			}
+			claims[n] = append(claims[n], claim{svc: name, lp: lp, rv: rv, rvOK: err == nil, created: svc.CreationTimestamp})
+		}
+	}
+	for n, cs := range claims {
+		winner := slices.MinFunc(cs, func(x, y claim) int {
+			switch {
+			case x.rvOK && y.rvOK && x.rv != y.rv:
+				return cmpUint(x.rv, y.rv)
+			case !x.created.Equal(&y.created):
+				if x.created.Before(&y.created) {
+					return -1
+				}
+				return 1
+			case x.svc != y.svc:
+				return compareNames(x.svc, y.svc)
+			case x.lp.port != y.lp.port:
+				return int(x.lp.port - y.lp.port)
+			}
+			return strings.Compare(string(x.lp.protocol), string(y.lp.protocol))
+		})
+		if len(cs) > 1 {
+			a.c.logger.Info("nginx port claimed by more than one Gateway listener, kept by the Service written to first",
+				"port", n, "service", winner.svc.String(), "listener", winner.lp.portName())
+		}
+		if a.ports[winner.svc] == nil {
+			a.ports[winner.svc] = make(map[listenerPort]int32)
+		}
+		a.ports[winner.svc][winner.lp] = n
+		a.used[n] = true
+	}
+}
+
+func compareNames(x, y types.NamespacedName) int {
+	return strings.Compare(x.String(), y.String())
+}
+
+func cmpUint(x, y uint64) int {
+	switch {
+	case x < y:
+		return -1
+	case x > y:
+		return 1
+	}
+	return 0
 }
 
 // ownServices are the Services of the Gateways of the class, in every
@@ -328,6 +486,7 @@ func (c *Controller) controllerEndpoints() []discoveryv1.EndpointSlice {
 func (a *addressing) address(ctx context.Context, gw *graph.Gateway) gatewayAddress {
 	name := types.NamespacedName{Namespace: gw.Source.Namespace, Name: gw.Source.Name}
 	restrictTLSListeners(gw)
+	restrictFrontendValidation(gw)
 	if name == a.c.cfg.DefaultGateway {
 		restrictDefaultGateway(gw)
 		return gatewayAddress{shared: true}
@@ -343,6 +502,13 @@ func (a *addressing) address(ctx context.Context, gw *graph.Gateway) gatewayAddr
 	a.wanted[svcName] = true
 
 	current := a.existing[svcName]
+	if current != nil && !a.ownedService(current, name) {
+		// a Service of that name the controller did not make for this
+		// Gateway - made by hand, or for a Gateway of the name before: it is
+		// neither taken over nor served
+		a.c.logger.Info("the Service of a Gateway is not owned by it and is not used", "gateway", name.String(), "service", svcName.String())
+		return gatewayAddress{pending: fmt.Sprintf("its Service %s exists but was not made for it by the controller", svcName)}
+	}
 	if a.leader {
 		svc, err := a.ensureService(ctx, gw, svcName, current, wanted)
 		if err != nil {
@@ -358,7 +524,7 @@ func (a *addressing) address(ctx context.Context, gw *graph.Gateway) gatewayAddr
 		return gatewayAddress{pending: fmt.Sprintf("its Service %s does not exist yet", svcName)}
 	}
 
-	have := nginxPortsOf(current)
+	have := a.ports[svcName]
 	out := gatewayAddress{nginxPorts: make(map[listenerPort]int32), addresses: serviceAddresses(current)}
 	var missing []string
 	for _, p := range wanted {
@@ -389,7 +555,7 @@ func (a *addressing) ensureService(
 	wanted []listenerPort,
 ) (*v1.Service, error) {
 	cfg := a.c.cfg
-	have := nginxPortsOf(current)
+	have := a.ports[name]
 	var ports []v1.ServicePort
 	for _, p := range wanted {
 		n, ok := have[p]
@@ -455,6 +621,9 @@ func (a *addressing) ensureService(
 		if apierrors.IsAlreadyExists(err) {
 			return nil, fmt.Errorf("the Service %s exists but is not in the cache yet", name)
 		}
+		if err == nil {
+			a.ports[name] = portsOfSpec(ports)
+		}
 		return created, err
 	}
 
@@ -495,9 +664,23 @@ func (a *addressing) ensureService(
 		equality.Semantic.DeepEqual(current.Annotations, svc.Annotations) &&
 		equality.Semantic.DeepEqual(current.OwnerReferences, svc.OwnerReferences) &&
 		equality.Semantic.DeepEqual(current.Spec, svc.Spec) {
+		a.ports[name] = portsOfSpec(ports)
 		return current, nil
 	}
-	return cfg.KubeClient.CoreV1().Services(name.Namespace).Update(ctx, svc, metav1.UpdateOptions{})
+	updated, err := cfg.KubeClient.CoreV1().Services(name.Namespace).Update(ctx, svc, metav1.UpdateOptions{})
+	if err == nil {
+		a.ports[name] = portsOfSpec(ports)
+	}
+	return updated, err
+}
+
+// portsOfSpec are the nginx ports of the ports the leader wrote.
+func portsOfSpec(ports []v1.ServicePort) map[listenerPort]int32 {
+	out := make(map[listenerPort]int32, len(ports))
+	for _, p := range ports {
+		out[listenerPort{port: p.Port, protocol: p.Protocol}] = p.TargetPort.IntVal
+	}
+	return out
 }
 
 var controllerOwner = true
@@ -650,6 +833,10 @@ func (a *addressing) collect(ctx context.Context) {
 	}
 	for name, svc := range a.existing {
 		if a.wanted[name] || !a.c.syncedFor(svc.Namespace) {
+			continue
+		}
+		if _, _, ok := gatewayOwner(svc); !ok {
+			// one with the labels that no Gateway owns is not the controller's
 			continue
 		}
 		err := a.c.cfg.KubeClient.CoreV1().Services(svc.Namespace).Delete(ctx, svc.Name, metav1.DeleteOptions{

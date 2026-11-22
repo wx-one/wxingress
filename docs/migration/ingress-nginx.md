@@ -1,4 +1,4 @@
-# Migrating from ingress-nginx
+# Migrating from ingress-nginx to wxingress
 
 wxingress is a drop-in replacement for ingress-nginx. Your Ingresses, their `nginx.ingress.kubernetes.io/*`
 annotations, the IngressClass `nginx` and the keys of your ingress-nginx ConfigMap stay as they are. The

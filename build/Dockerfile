@@ -184,7 +184,7 @@ RUN --mount=type=secret,id=nginx-repo.crt,dst=/etc/ssl/nginx/nginx-repo.crt,mode
 
 ############################################# NGINX OSS - Debian with the wxingress module #############################################
 # Base:    debian (above)
-# Adds:    the wxingress data plane, a module written in meta that answers the upstream API (-dynamic-upstreams)
+# Adds:    the wxingress data plane, a module written in metalang that answers the upstream API (-dynamic-upstreams)
 # Used as: BUILD_OS=debian-wxingress
 # The module is built beforehand by dataplane/build.sh, against the same nginx release and with --with-compat,
 # so the nginx.org package loads it; it needs libc, and takes OpenSSL and zlib from nginx. libcurl, with which

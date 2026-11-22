@@ -18,6 +18,16 @@ rules:
   - get
   - list
   - watch
+# the headless Services the controller makes in its own namespace (zone sync,
+# the pods' headless Service)
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - update
+  - delete
 {{- if and .Values.controller.enableOIDC (or .Values.controller.dynamicUpstreams .Values.controller.ingressNginxCompat) }}
 # the revocations of oidc sessions: each replica writes the logouts its module took
 - apiGroups:

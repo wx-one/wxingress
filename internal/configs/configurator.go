@@ -2738,12 +2738,16 @@ func (cnf *Configurator) syncCanaries() error {
 	return errors.Join(errs...)
 }
 
+// keyToFileName returns the name of the config file (without .conf) of the Ingress of the key (<namespace>/<name>).
 func keyToFileName(key string) string {
-	return strings.Replace(key, "/", "-", -1)
+	return strings.Replace(key, "/", "_", 1)
 }
 
+// objectMetaToFileName returns the name of the config file (without .conf) of the Ingress: <namespace>_<name>, as
+// neither a namespace nor a name has an underscore - with a hyphen, namespace a-b and name c had the file of
+// namespace a and name b-c, and each would overwrite the other's config.
 func objectMetaToFileName(meta *meta_v1.ObjectMeta) string {
-	return meta.Namespace + "-" + meta.Name
+	return meta.Namespace + "_" + meta.Name
 }
 
 func generateNamespaceNameKey(objectMeta *meta_v1.ObjectMeta) string {

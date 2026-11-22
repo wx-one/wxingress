@@ -30,6 +30,7 @@ func TestHelmNICTemplate(t *testing.T) {
 		releaseName   string
 		namespace     string
 		templateFiles []string
+		kubeVersion   string
 	}{
 		"default values file": {
 			valuesFile:  "",
@@ -40,6 +41,20 @@ func TestHelmNICTemplate(t *testing.T) {
 			valuesFile:  "testdata/admission-webhooks.yaml",
 			releaseName: "admission-webhooks",
 			namespace:   "default",
+		},
+		"admission-webhooks-network-policy": {
+			valuesFile:    "testdata/admission-webhooks-network-policy.yaml",
+			releaseName:   "admission-webhooks-network-policy",
+			namespace:     "default",
+			templateFiles: []string{"templates/admission-webhooks/networkpolicy.yaml"},
+		},
+		// before 1.30 there is no sleep action: the preStop hook runs the controller's sleep subcommand
+		"ingress-nginx-compat-kube-1.29": {
+			valuesFile:    "testdata/admission-webhooks.yaml",
+			releaseName:   "compat-kube-129",
+			namespace:     "default",
+			templateFiles: []string{"templates/controller-daemonset.yaml"},
+			kubeVersion:   "1.29.0",
 		},
 		"admission-webhooks-cert-manager": {
 			valuesFile:  "testdata/admission-webhooks-cert-manager.yaml",
@@ -307,6 +322,9 @@ func TestHelmNICTemplate(t *testing.T) {
 			var extraArgs []string
 			for _, f := range tc.templateFiles {
 				extraArgs = append(extraArgs, "--show-only", f)
+			}
+			if tc.kubeVersion != "" {
+				extraArgs = append(extraArgs, "--kube-version", tc.kubeVersion)
 			}
 
 			output := renderTemplate(t, helmChartPath, tc.releaseName, options, extraArgs...)

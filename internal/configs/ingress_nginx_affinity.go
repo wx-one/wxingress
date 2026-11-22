@@ -42,7 +42,9 @@ const (
 
 var (
 	ingressNginxAffinityAgeRegexp = regexp.MustCompile(`^(0|[1-9]\d*)$`)
-	ingressNginxHashByRegexp      = regexp.MustCompile(`^[A-Za-z0-9\-_${}]*$`)
+	// letters, digits, - and _ and variables, $name or ${name}: no bare
+	// brace, as the key is unquoted in hash ... consistent
+	ingressNginxHashByRegexp = regexp.MustCompile(`^[A-Za-z0-9\-_${}]*$`)
 )
 
 // ingressNginxAffinity is the cookie affinity an Ingress asks for with the annotations of ingress-nginx.
@@ -291,7 +293,7 @@ func parseIngressNginxLoadBalancing(a *ingressNginxAnnotations, cfgParams *Confi
 	if hashBy, exists := a.value(IngressNginxUpstreamHashByAnnotation, nginxOrgLBMethod); exists {
 		if hashBy = strings.ReplaceAll(hashBy, " ", ""); !ingressNginxHashByRegexp.MatchString(hashBy) {
 			a.invalid(IngressNginxUpstreamHashByAnnotation, hashBy, "it must be letters, digits, - and _ and variables")
-		} else {
+		} else if a.variables(IngressNginxUpstreamHashByAnnotation, hashBy, false) {
 			cfgParams.LBMethod = fmt.Sprintf("hash %s consistent", hashBy)
 			balancing.algorithm, balancing.hashBy = "chash", hashBy
 			if subset, ok := a.boolean(IngressNginxUpstreamHashBySubsetAnnotation); ok && subset {

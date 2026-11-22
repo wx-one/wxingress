@@ -105,6 +105,8 @@ type listenerInfo struct {
 	dynamic bool
 	// snippets tells that snippets are allowed (-enable-snippets)
 	snippets bool
+	// access decides which Policies of other namespaces a route may name
+	access *policyAccess
 }
 
 // isMirrorPath tells whether a path rule is one NGF made for the target of

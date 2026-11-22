@@ -1111,3 +1111,63 @@ func TestFakeSecretStore_NoNegativeLookupCaching(t *testing.T) {
 		t.Fatalf("HasRef(%q) = true after DeleteSecret on FakeSecretStore, want false", key)
 	}
 }
+
+// A Secret a check of the admission webhook resolved is on disk for the check only: released, its file goes and
+// the store forgets it, unless a resource resolved it meanwhile.
+func TestGetSecretForCheckIsReleased(t *testing.T) {
+	t.Parallel()
+	manager := newFakeSecretFileManager()
+	store := NewLocalSecretStore(manager)
+	store.AddOrUpdateSecret(validSecret)
+	key := "default/tls-secret"
+
+	ref, held := store.GetSecretForCheck(key, RoleTLS)
+	if !held || ref.Error != nil || manager.AddedOrUpdated[RefKey(key, RoleTLS)] == nil {
+		t.Fatalf("held %v, ref %+v, materialized %v", held, ref, manager.AddedOrUpdated)
+	}
+	// a second check holds it too
+	if _, held := store.GetSecretForCheck(key, RoleTLS); !held {
+		t.Fatal("a second check does not hold the entry")
+	}
+	store.ReleaseCheckSecret(key, RoleTLS)
+	if manager.Deleted[RefKey(key, RoleTLS)] || !store.HasRef(key) {
+		t.Fatal("released while another check holds it")
+	}
+	store.ReleaseCheckSecret(key, RoleTLS)
+	if !manager.Deleted[RefKey(key, RoleTLS)] || store.HasRef(key) {
+		t.Errorf("after the checks: deleted %v, has ref %v", manager.Deleted, store.HasRef(key))
+	}
+
+	// adopted by a resource, it stays
+	manager.Reset()
+	if _, held := store.GetSecretForCheck(key, RoleTLS); !held {
+		t.Fatal("not held")
+	}
+	if ref := store.GetSecret(key, RoleTLS); ref.Error != nil {
+		t.Fatal(ref.Error)
+	}
+	store.ReleaseCheckSecret(key, RoleTLS)
+	if manager.Deleted[RefKey(key, RoleTLS)] || !store.HasRef(key) {
+		t.Errorf("an adopted Secret was released")
+	}
+
+	// one a resource had before is not held at all
+	if _, held := store.GetSecretForCheck(key, RoleTLS); held {
+		t.Errorf("a check holds the entry of a resource")
+	}
+}
+
+// A Secret a check fetched through the resolver is forgotten with its entry.
+func TestGetSecretForCheckForgetsResolvedSecret(t *testing.T) {
+	t.Parallel()
+	manager := newFakeSecretFileManager()
+	store := NewLocalSecretStore(manager, WithSecretResolver(func(string) (*api_v1.Secret, error) { return validSecret, nil }))
+	key := "default/tls-secret"
+	if _, held := store.GetSecretForCheck(key, RoleTLS); !held {
+		t.Fatal("not held")
+	}
+	store.ReleaseCheckSecret(key, RoleTLS)
+	if store.HoldsSecret(key) {
+		t.Errorf("the store keeps the Secret the check fetched")
+	}
+}

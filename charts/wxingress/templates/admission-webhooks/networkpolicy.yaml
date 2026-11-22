@@ -1,0 +1,50 @@
+{{- /*
+The admission webhook's port on the controller pods, reachable only from
+controller.admissionWebhooks.networkPolicy.from (the API server's addresses).
+A NetworkPolicy that selects the pods isolates them for every port, so the
+same policy keeps every other port (nginx's listeners, metrics, readiness)
+open to everybody, as it is without one.
+*/ -}}
+{{- $wh := default (dict) .Values.controller.admissionWebhooks -}}
+{{- $np := default (dict) $wh.networkPolicy -}}
+{{- if and $wh.enabled $np.enabled }}
+{{- if not $np.from }}
+{{- fail "controller.admissionWebhooks.networkPolicy.from must name the API server's addresses (ipBlock entries) when the NetworkPolicy is enabled" }}
+{{- end }}
+{{- $port := int $wh.port }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "nginx-ingress.admissionWebhooks.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nginx-ingress.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "nginx-ingress.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # the webhook, from the API server only
+    - from:
+        {{- toYaml $np.from | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: {{ $port }}
+    # every other port, from everybody
+    - ports:
+        {{- if gt $port 1 }}
+        - protocol: TCP
+          port: 1
+          endPort: {{ sub $port 1 }}
+        {{- end }}
+        {{- if lt $port 65535 }}
+        - protocol: TCP
+          port: {{ add $port 1 }}
+          endPort: 65535
+        {{- end }}
+        - protocol: UDP
+          port: 1
+          endPort: 65535
+{{- end }}

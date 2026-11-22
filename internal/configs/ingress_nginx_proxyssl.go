@@ -116,10 +116,10 @@ func parseIngressNginxProxySSL(a *ingressNginxAnnotations, ingEx *IngressEx, cfg
 		}
 	}
 	if v, ok := a.value(IngressNginxProxySSLNameAnnotation); ok {
-		if ingressNginxProxySSLNameRegexp.MatchString(v) {
-			tls.SSLName = v
-		} else {
+		if !ingressNginxProxySSLNameRegexp.MatchString(v) {
 			a.invalid(IngressNginxProxySSLNameAnnotation, v, "it must be a host name")
+		} else if a.variables(IngressNginxProxySSLNameAnnotation, v, false) {
+			tls.SSLName = v
 		}
 	}
 	if v, ok := a.onOff(IngressNginxProxySSLServerNameAnnotation); ok {

@@ -1,0 +1,6 @@
+# Changes to how wxingress is built, released and deployed need the review of
+# its maintainer: the workflows, the release scripts, the image and the chart.
+/.github/ @wzrdtales
+/ci/ @wzrdtales
+/build/ @wzrdtales
+/charts/ @wzrdtales

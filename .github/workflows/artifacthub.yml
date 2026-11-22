@@ -1,0 +1,35 @@
+# Pushes .github/artifacthub-repo.yml as the OCI artifact Artifact Hub reads
+# for the chart repository (ghcr.io/wx-one/charts/wxingress:artifacthub.io),
+# whenever the file changes or by hand.
+name: Artifact Hub
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/artifacthub-repo.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: Repository metadata
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1.2.4
+      - name: Push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          oras login ghcr.io -u "${{ github.actor }}" --password-stdin <<< "$GITHUB_TOKEN"
+          cd .github
+          oras push ghcr.io/wx-one/charts/wxingress:artifacthub.io \
+            --config /dev/null:application/vnd.cncf.artifacthub.config.v1+yaml \
+            artifacthub-repo.yml:application/vnd.cncf.artifacthub.repository-metadata.layer.v1.yaml

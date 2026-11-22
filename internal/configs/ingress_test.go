@@ -242,7 +242,7 @@ func TestGetNameForUpstreamUsesTokenForEmptyHost(t *testing.T) {
 	}
 
 	got := getNameForUpstream(ing, emptyHostName, backend)
-	want := "default-cafe-ingress-_-tea-svc-80"
+	want := "default_cafe-ingress___tea-svc_80"
 
 	if got != want {
 		t.Fatalf("getNameForUpstream() = %q, want %q", got, want)
@@ -269,11 +269,11 @@ func TestGenerateNginxCfgForJWT(t *testing.T) {
 		Key:                  "/etc/nginx/secrets/default-cafe-jwk",
 		Realm:                "Cafe App",
 		Token:                "$cookie_auth_token",
-		RedirectLocationName: "@login_url_default-cafe-ingress",
+		RedirectLocationName: "@login_url_default_cafe-ingress",
 	}
 	expected.Servers[0].JWTRedirectLocations = []version1.JWTRedirectLocation{
 		{
-			Name:     "@login_url_default-cafe-ingress",
+			Name:     "@login_url_default_cafe-ingress",
 			LoginURL: "https://login.example.com",
 		},
 	}
@@ -1835,7 +1835,7 @@ func createExpectedConfigForCafeIngressEx(isPlus bool) version1.IngressNginxConf
 	}
 
 	coffeeUpstream := version1.Upstream{
-		Name:             "default-cafe-ingress-cafe.example.com-coffee-svc-80",
+		Name:             "default_cafe-ingress_cafe.example.com_coffee-svc_80",
 		LBMethod:         "random two least_conn",
 		UpstreamZoneSize: upstreamZoneSize,
 		UpstreamServers: []version1.UpstreamServer{
@@ -1857,7 +1857,7 @@ func createExpectedConfigForCafeIngressEx(isPlus bool) version1.IngressNginxConf
 	}
 
 	teaUpstream := version1.Upstream{
-		Name:             "default-cafe-ingress-cafe.example.com-tea-svc-80",
+		Name:             "default_cafe-ingress_cafe.example.com_tea-svc_80",
 		LBMethod:         "random two least_conn",
 		UpstreamZoneSize: upstreamZoneSize,
 		UpstreamServers: []version1.UpstreamServer{
@@ -1898,7 +1898,7 @@ func createExpectedConfigForCafeIngressEx(isPlus bool) version1.IngressNginxConf
 						ClientMaxBodySize:   "1m",
 						ProxyBuffering:      true,
 						ProxySSLName:        "coffee-svc.default.svc",
-						ProxyPass:           "http://default-cafe-ingress-cafe.example.com-coffee-svc-80",
+						ProxyPass:           "http://default_cafe-ingress_cafe.example.com_coffee-svc_80",
 					},
 					{
 						Path:                "/tea",
@@ -1910,7 +1910,7 @@ func createExpectedConfigForCafeIngressEx(isPlus bool) version1.IngressNginxConf
 						ClientMaxBodySize:   "1m",
 						ProxyBuffering:      true,
 						ProxySSLName:        "tea-svc.default.svc",
-						ProxyPass:           "http://default-cafe-ingress-cafe.example.com-tea-svc-80",
+						ProxyPass:           "http://default_cafe-ingress_cafe.example.com_tea-svc_80",
 					},
 				},
 				SSL:               true,
@@ -2786,21 +2786,21 @@ func TestGenerateNginxCfgForMergeableIngressesForJWT(t *testing.T) {
 		Key:                  "/etc/nginx/secrets/default-cafe-jwk",
 		Realm:                "Cafe",
 		Token:                "$cookie_auth_token",
-		RedirectLocationName: "@login_url_default-cafe-ingress-master",
+		RedirectLocationName: "@login_url_default_cafe-ingress-master",
 	}
 	expected.Servers[0].Locations[0].JWTAuth = &version1.JWTAuth{
 		Key:                  "/etc/nginx/secrets/default-coffee-jwk",
 		Realm:                "Coffee",
 		Token:                "$cookie_auth_token_coffee",
-		RedirectLocationName: "@login_url_default-cafe-ingress-coffee-minion",
+		RedirectLocationName: "@login_url_default_cafe-ingress-coffee-minion",
 	}
 	expected.Servers[0].JWTRedirectLocations = []version1.JWTRedirectLocation{
 		{
-			Name:     "@login_url_default-cafe-ingress-master",
+			Name:     "@login_url_default_cafe-ingress-master",
 			LoginURL: "https://login.example.com",
 		},
 		{
-			Name:     "@login_url_default-cafe-ingress-coffee-minion",
+			Name:     "@login_url_default_cafe-ingress-coffee-minion",
 			LoginURL: "https://login.coffee.example.com",
 		},
 	}
@@ -3409,7 +3409,7 @@ func TestGenerateNginxCfgForMergeableIngressesWithUseClusterIP(t *testing.T) {
 func createExpectedConfigForMergeableCafeIngressWithUseClusterIP() version1.IngressNginxConfig {
 	upstreamZoneSize := "256k"
 	coffeeUpstream := version1.Upstream{
-		Name:             "default-cafe-ingress-coffee-minion-cafe.example.com-coffee-svc-80",
+		Name:             "default_cafe-ingress-coffee-minion_cafe.example.com_coffee-svc_80",
 		LBMethod:         "random two least_conn",
 		UpstreamZoneSize: upstreamZoneSize,
 		UpstreamServers: []version1.UpstreamServer{
@@ -3422,7 +3422,7 @@ func createExpectedConfigForMergeableCafeIngressWithUseClusterIP() version1.Ingr
 		},
 	}
 	teaUpstream := version1.Upstream{
-		Name:             "default-cafe-ingress-tea-minion-cafe.example.com-tea-svc-80",
+		Name:             "default_cafe-ingress-tea-minion_cafe.example.com_tea-svc_80",
 		LBMethod:         "random two least_conn",
 		UpstreamZoneSize: upstreamZoneSize,
 		UpstreamServers: []version1.UpstreamServer{
@@ -3463,7 +3463,7 @@ func createExpectedConfigForMergeableCafeIngressWithUseClusterIP() version1.Ingr
 							},
 						},
 						ProxySSLName: "coffee-svc.default.svc",
-						ProxyPass:    "http://default-cafe-ingress-coffee-minion-cafe.example.com-coffee-svc-80",
+						ProxyPass:    "http://default_cafe-ingress-coffee-minion_cafe.example.com_coffee-svc_80",
 					},
 					{
 						Path:                "/tea",
@@ -3483,7 +3483,7 @@ func createExpectedConfigForMergeableCafeIngressWithUseClusterIP() version1.Ingr
 							},
 						},
 						ProxySSLName: "tea-svc.default.svc",
-						ProxyPass:    "http://default-cafe-ingress-tea-minion-cafe.example.com-tea-svc-80",
+						ProxyPass:    "http://default_cafe-ingress-tea-minion_cafe.example.com_tea-svc_80",
 					},
 				},
 				SSL:               true,
@@ -3516,7 +3516,7 @@ func createExpectedConfigForCafeIngressWithUseClusterIPNamedPorts() version1.Ing
 	upstreamZoneSize := "256k"
 
 	coffeeUpstream := version1.Upstream{
-		Name:             "default-cafe-ingress-cafe.example.com-coffee-svc-custom-port-name",
+		Name:             "default_cafe-ingress_cafe.example.com_coffee-svc_custom-port-name",
 		LBMethod:         "random two least_conn",
 		UpstreamZoneSize: upstreamZoneSize,
 		UpstreamServers: []version1.UpstreamServer{
@@ -3530,7 +3530,7 @@ func createExpectedConfigForCafeIngressWithUseClusterIPNamedPorts() version1.Ing
 	}
 
 	teaUpstream := version1.Upstream{
-		Name:             "default-cafe-ingress-cafe.example.com-tea-svc-80",
+		Name:             "default_cafe-ingress_cafe.example.com_tea-svc_80",
 		LBMethod:         "random two least_conn",
 		UpstreamZoneSize: upstreamZoneSize,
 		UpstreamServers: []version1.UpstreamServer{
@@ -3564,7 +3564,7 @@ func createExpectedConfigForCafeIngressWithUseClusterIPNamedPorts() version1.Ing
 
 						ProxyBuffering: true,
 						ProxySSLName:   "coffee-svc.default.svc",
-						ProxyPass:      "http://default-cafe-ingress-cafe.example.com-coffee-svc-custom-port-name",
+						ProxyPass:      "http://default_cafe-ingress_cafe.example.com_coffee-svc_custom-port-name",
 					},
 					{
 						Path:                "/tea",
@@ -3576,7 +3576,7 @@ func createExpectedConfigForCafeIngressWithUseClusterIPNamedPorts() version1.Ing
 						ClientMaxBodySize:   "1m",
 						ProxyBuffering:      true,
 						ProxySSLName:        "tea-svc.default.svc",
-						ProxyPass:           "http://default-cafe-ingress-cafe.example.com-tea-svc-80",
+						ProxyPass:           "http://default_cafe-ingress_cafe.example.com_tea-svc_80",
 					},
 				},
 				SSL:               true,
@@ -3608,7 +3608,7 @@ func createExpectedConfigForCafeIngressWithUseClusterIP() version1.IngressNginxC
 	upstreamZoneSize := "256k"
 
 	coffeeUpstream := version1.Upstream{
-		Name:             "default-cafe-ingress-cafe.example.com-coffee-svc-80",
+		Name:             "default_cafe-ingress_cafe.example.com_coffee-svc_80",
 		LBMethod:         "random two least_conn",
 		UpstreamZoneSize: upstreamZoneSize,
 		UpstreamServers: []version1.UpstreamServer{
@@ -3622,7 +3622,7 @@ func createExpectedConfigForCafeIngressWithUseClusterIP() version1.IngressNginxC
 	}
 
 	teaUpstream := version1.Upstream{
-		Name:             "default-cafe-ingress-cafe.example.com-tea-svc-80",
+		Name:             "default_cafe-ingress_cafe.example.com_tea-svc_80",
 		LBMethod:         "random two least_conn",
 		UpstreamZoneSize: upstreamZoneSize,
 		UpstreamServers: []version1.UpstreamServer{
@@ -3655,7 +3655,7 @@ func createExpectedConfigForCafeIngressWithUseClusterIP() version1.IngressNginxC
 						ClientMaxBodySize:   "1m",
 						ProxyBuffering:      true,
 						ProxySSLName:        "coffee-svc.default.svc",
-						ProxyPass:           "http://default-cafe-ingress-cafe.example.com-coffee-svc-80",
+						ProxyPass:           "http://default_cafe-ingress_cafe.example.com_coffee-svc_80",
 					},
 					{
 						Path:                "/tea",
@@ -3667,7 +3667,7 @@ func createExpectedConfigForCafeIngressWithUseClusterIP() version1.IngressNginxC
 						ClientMaxBodySize:   "1m",
 						ProxyBuffering:      true,
 						ProxySSLName:        "tea-svc.default.svc",
-						ProxyPass:           "http://default-cafe-ingress-cafe.example.com-tea-svc-80",
+						ProxyPass:           "http://default_cafe-ingress_cafe.example.com_tea-svc_80",
 					},
 				},
 				SSL:               true,
@@ -4316,7 +4316,7 @@ func createExpectedConfigForMergeableCafeIngress(isPlus bool) version1.IngressNg
 	}
 
 	coffeeUpstream := version1.Upstream{
-		Name:             "default-cafe-ingress-coffee-minion-cafe.example.com-coffee-svc-80",
+		Name:             "default_cafe-ingress-coffee-minion_cafe.example.com_coffee-svc_80",
 		LBMethod:         "random two least_conn",
 		UpstreamZoneSize: upstreamZoneSize,
 		UpstreamServers: []version1.UpstreamServer{
@@ -4338,7 +4338,7 @@ func createExpectedConfigForMergeableCafeIngress(isPlus bool) version1.IngressNg
 	}
 
 	teaUpstream := version1.Upstream{
-		Name:             "default-cafe-ingress-tea-minion-cafe.example.com-tea-svc-80",
+		Name:             "default_cafe-ingress-tea-minion_cafe.example.com_tea-svc_80",
 		LBMethod:         "random two least_conn",
 		UpstreamZoneSize: upstreamZoneSize,
 		UpstreamServers: []version1.UpstreamServer{
@@ -4387,7 +4387,7 @@ func createExpectedConfigForMergeableCafeIngress(isPlus bool) version1.IngressNg
 							},
 						},
 						ProxySSLName: "coffee-svc.default.svc",
-						ProxyPass:    "http://default-cafe-ingress-coffee-minion-cafe.example.com-coffee-svc-80",
+						ProxyPass:    "http://default_cafe-ingress-coffee-minion_cafe.example.com_coffee-svc_80",
 					},
 					{
 						Path:                "/tea",
@@ -4407,7 +4407,7 @@ func createExpectedConfigForMergeableCafeIngress(isPlus bool) version1.IngressNg
 							},
 						},
 						ProxySSLName: "tea-svc.default.svc",
-						ProxyPass:    "http://default-cafe-ingress-tea-minion-cafe.example.com-tea-svc-80",
+						ProxyPass:    "http://default_cafe-ingress-tea-minion_cafe.example.com_tea-svc_80",
 					},
 				},
 				SSL:               true,
@@ -4438,7 +4438,7 @@ func createExpectedConfigForMergeableCafeIngress(isPlus bool) version1.IngressNg
 
 func createExpectedConfigForCrossNamespaceMergeableCafeIngress() version1.IngressNginxConfig {
 	coffeeUpstream := version1.Upstream{
-		Name:             "coffee-cafe-ingress-coffee-minion-cafe.example.com-coffee-svc-80",
+		Name:             "coffee_cafe-ingress-coffee-minion_cafe.example.com_coffee-svc_80",
 		LBMethod:         "random two least_conn",
 		UpstreamZoneSize: "256k",
 		UpstreamServers: []version1.UpstreamServer{
@@ -4451,7 +4451,7 @@ func createExpectedConfigForCrossNamespaceMergeableCafeIngress() version1.Ingres
 		},
 	}
 	teaUpstream := version1.Upstream{
-		Name:             "tea-cafe-ingress-tea-minion-cafe.example.com-tea-svc-80",
+		Name:             "tea_cafe-ingress-tea-minion_cafe.example.com_tea-svc_80",
 		LBMethod:         "random two least_conn",
 		UpstreamZoneSize: "256k",
 		UpstreamServers: []version1.UpstreamServer{
@@ -4491,7 +4491,7 @@ func createExpectedConfigForCrossNamespaceMergeableCafeIngress() version1.Ingres
 							},
 						},
 						ProxySSLName: "coffee-svc.coffee.svc",
-						ProxyPass:    "http://coffee-cafe-ingress-coffee-minion-cafe.example.com-coffee-svc-80",
+						ProxyPass:    "http://coffee_cafe-ingress-coffee-minion_cafe.example.com_coffee-svc_80",
 					},
 					{
 						Path:                "/tea",
@@ -4511,7 +4511,7 @@ func createExpectedConfigForCrossNamespaceMergeableCafeIngress() version1.Ingres
 							},
 						},
 						ProxySSLName: "tea-svc.tea.svc",
-						ProxyPass:    "http://tea-cafe-ingress-tea-minion-cafe.example.com-tea-svc-80",
+						ProxyPass:    "http://tea_cafe-ingress-tea-minion_cafe.example.com_tea-svc_80",
 					},
 				},
 				SSL:               true,
@@ -7164,8 +7164,8 @@ func TestGenerateNginxCfgKeepalivePerUpstream(t *testing.T) {
 	t.Parallel()
 
 	const (
-		coffeeUpstreamName = "default-cafe-ingress-coffee-minion-cafe.example.com-coffee-svc-80"
-		teaUpstreamName    = "default-cafe-ingress-tea-minion-cafe.example.com-tea-svc-80"
+		coffeeUpstreamName = "default_cafe-ingress-coffee-minion_cafe.example.com_coffee-svc_80"
+		teaUpstreamName    = "default_cafe-ingress-tea-minion_cafe.example.com_tea-svc_80"
 	)
 
 	tests := []struct {

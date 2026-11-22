@@ -166,8 +166,9 @@ func parseIngressNginxFastCGI(a *ingressNginxAnnotations, ingEx *IngressEx, cfgP
 		if !ok {
 			return
 		}
-		for k, v := range data {
-			if !ingressNginxFastCGIKeyRegexp.MatchString(k) || !ingressNginxFastCGIValueRegexp.MatchString(v) {
+		for _, k := range sortedKeys(data) {
+			v := data[k]
+			if !ingressNginxFastCGIKeyRegexp.MatchString(k) || !ingressNginxFastCGIValueRegexp.MatchString(v) || checkIngressNginxVariables(v, false) != nil {
 				a.warnings.AddWarningf(a.ing, "the locations of the Ingress answer %d: %s: the parameter %s is invalid", ingressNginxDeniedCode, IngressNginxFastCGIParamsAnnotation, k)
 				cfgParams.IngressNginxDenied = true
 				return
@@ -270,6 +271,24 @@ func parseIngressNginxAuthProxySetHeaders(a *ingressNginxAnnotations, ingEx *Ing
 	data, ok := ingressNginxConfigMap(a, ingEx, cfgParams, IngressNginxAuthProxySetHeadersAnnotation, false)
 	if !ok {
 		return !cfgParams.IngressNginxDenied
+	}
+	// the values are those ingress-nginx takes of a header (no CR, LF or
+	// other control character, which %q would make an escape nginx turns
+	// back into a line break), empty to send none, with variables nginx knows
+	for _, header := range sortedKeys(data) {
+		v := data[header]
+		if v != "" && !ingressNginxHeaderValueRegexp.MatchString(v) {
+			a.warnings.AddWarningf(a.ing, "the locations of the Ingress answer %d: %s: the header %s has an invalid value",
+				ingressNginxDeniedCode, IngressNginxAuthProxySetHeadersAnnotation, header)
+			cfgParams.IngressNginxDenied = true
+			return false
+		}
+		if err := checkIngressNginxVariables(v, true); err != nil {
+			a.warnings.AddWarningf(a.ing, "the locations of the Ingress answer %d: %s: the header %s has an invalid value: %v",
+				ingressNginxDeniedCode, IngressNginxAuthProxySetHeadersAnnotation, header, err)
+			cfgParams.IngressNginxDenied = true
+			return false
+		}
 	}
 	// as ingress-nginx's proxy_set_header "name" "value": the value may have variables
 	auth.ProxySetHeaders = sortedHeaders(data, false)

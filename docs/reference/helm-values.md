@@ -57,7 +57,7 @@ upgrade. The Gateway API CRDs are optional, see [Gateway API](#gateway-api).
 
 | Value | Default | Description |
 |---|---|---|
-| `controller.image.repository` | `docker.io/wxone/wxingress` | The image repository. |
+| `controller.image.repository` | `ghcr.io/wx-one/wxingress` | The image repository. |
 | `controller.image.tag` | the chart's `appVersion` | The image tag. |
 | `controller.image.digest` | (unset) | An image digest; wins over the tag. |
 | `controller.image.pullPolicy` | `IfNotPresent` | The pull policy. |
@@ -123,7 +123,7 @@ A typical migration values file:
 ```yaml
 controller:
   image:
-    repository: docker.io/wxone/wxingress
+    repository: ghcr.io/wx-one/wxingress
   ingressNginxCompat: true
   ingressClass:
     create: false          # ingress-nginx still owns the IngressClass "nginx"
@@ -221,7 +221,7 @@ configuration fails `nginx -t`.
 | Value | Default | Description |
 |---|---|---|
 | `controller.logLevel` | `info` | `trace`, `debug`, `info`, `warning`, `error`, `fatal`. |
-| `controller.logFormat` | `glog` | `glog`, `json` or `text`. |
+| `controller.logFormat` | `glog` | `glog`, `json` or `text`, or `json-unix`, `json-unix-ms`, `text-unix`, `text-unix-ms` (the time as Unix seconds or milliseconds). |
 | `controller.watchNamespace`, `controller.watchNamespaceLabel`, `controller.watchSecretNamespace` | `""` | Restrict the watched namespaces. |
 | `controller.enableCustomResources` | `true` | Serve VirtualServer, TransportServer, Policy and the other custom resources. |
 | `controller.globalConfiguration.create`, `.spec`, `.customName` | `false` | A GlobalConfiguration with extra listeners for TransportServers. |

@@ -108,6 +108,10 @@ func (c *Configuration) ingressOverlap(key string, ing *networking.Ingress) erro
 					if host == "" {
 						host = "_"
 					}
+					if other.Namespace != ing.Namespace {
+						// nothing of another namespace's Ingress - its namespace, its name - to whoever creates this one
+						return fmt.Errorf("host %q and path %q is already defined in another Ingress", host, rootIfEmpty(path.Path))
+					}
 					return fmt.Errorf("host %q and path %q is already defined in ingress %s/%s", host, rootIfEmpty(path.Path), other.Namespace, other.Name)
 				}
 			}
@@ -129,4 +133,12 @@ func ingressHasHostPath(ing *networking.Ingress, host string, path string) bool 
 		}
 	}
 	return false
+}
+
+// HasIngress tells whether the Configuration has the Ingress (of a class the controller serves).
+func (c *Configuration) HasIngress(namespace, name string) bool {
+	c.lock.RLock()
+	defer c.lock.RUnlock()
+	_, exists := c.ingresses[namespace+"/"+name]
+	return exists
 }

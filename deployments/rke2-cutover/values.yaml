@@ -22,7 +22,7 @@ controller:
   kind: daemonset
 
   image:
-    repository: docker.io/wxone/wxingress
+    repository: ghcr.io/wx-one/wxingress
     # tag: set on the command line
 
   # as ingress-nginx: one pod per node, ports of the node, no Service of type LoadBalancer

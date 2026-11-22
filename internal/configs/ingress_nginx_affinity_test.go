@@ -32,14 +32,14 @@ func TestGenerateNginxCfgWithIngressNginxAffinity(t *testing.T) {
 	}
 
 	// the cafe Ingress has TLS and redirects to HTTPS by default, so the cookie is Secure as ingress-nginx makes it there
-	tea := upstreamOf(cfg, "default-cafe-ingress-cafe.example.com-tea-svc-80")
+	tea := upstreamOf(cfg, "default_cafe-ingress_cafe.example.com_tea-svc_80")
 	if want := "INGRESSCOOKIE expires=172800s httponly secure samesite=lax path=/tea"; tea == nil || tea.StickyCookie != want {
 		t.Errorf("tea is sticky with %q, want %q", tea.StickyCookie, want)
 	}
 	if tea.LBMethod != "random" {
 		t.Errorf("new sessions go by %q, want random", tea.LBMethod)
 	}
-	coffee := upstreamOf(cfg, "default-cafe-ingress-cafe.example.com-coffee-svc-80")
+	coffee := upstreamOf(cfg, "default_cafe-ingress_cafe.example.com_coffee-svc_80")
 	if coffee == nil || coffee.StickyCookie != "INGRESSCOOKIE expires=172800s httponly secure samesite=lax path=/coffee" {
 		t.Errorf("coffee is sticky with %q", coffee.StickyCookie)
 	}
@@ -171,8 +171,8 @@ func TestParseIngressNginxLoadBalancing(t *testing.T) {
 
 func TestGenerateNginxCfgWithIngressNginxAffinityAndCanary(t *testing.T) {
 	t.Parallel()
-	const primary = "default-cafe-ingress-cafe.example.com-tea-svc-80"
-	const canary = "default-cafe-canary-cafe.example.com-tea-canary-svc-80"
+	const primary = "default_cafe-ingress_cafe.example.com_tea-svc_80"
+	const canary = "default_cafe-canary_cafe.example.com_tea-canary-svc_80"
 
 	for _, behavior := range []string{"sticky", "legacy"} {
 		t.Run(behavior, func(t *testing.T) {
@@ -230,8 +230,8 @@ func TestCommonPathPrefix(t *testing.T) {
 
 func TestIngressNginxBalancers(t *testing.T) {
 	t.Parallel()
-	const tea = "default-cafe-ingress-cafe.example.com-tea-svc-80"
-	const coffee = "default-cafe-ingress-cafe.example.com-coffee-svc-80"
+	const tea = "default_cafe-ingress_cafe.example.com_tea-svc_80"
+	const coffee = "default_cafe-ingress_cafe.example.com_coffee-svc_80"
 
 	tests := []struct {
 		name        string
@@ -339,7 +339,7 @@ func TestIngressNginxBalancersWithoutTheModule(t *testing.T) {
 
 	cfg, _ := generateCanaryCfg(t, &ingEx, false)
 
-	tea := upstreamOf(cfg, "default-cafe-ingress-cafe.example.com-tea-svc-80")
+	tea := upstreamOf(cfg, "default_cafe-ingress_cafe.example.com_tea-svc_80")
 	if len(cfg.Balancers) != 0 || tea == nil || tea.MetaBalancer || tea.LBMethod != "least_time last_byte" {
 		t.Errorf("without -dynamic-upstreams nginx balances: %+v, %+v", cfg.Balancers, tea)
 	}

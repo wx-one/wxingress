@@ -1354,8 +1354,11 @@ func validateURL(name string, fieldPath *field.Path) field.ErrorList {
 	if err != nil {
 		return field.ErrorList{field.Invalid(fieldPath, name, err.Error())}
 	}
-	if u.Scheme == "" {
+	if u.Scheme != "http" && u.Scheme != "https" {
 		return field.ErrorList{field.Invalid(fieldPath, name, "scheme required, please use the prefix http(s)://")}
+	}
+	if strings.HasPrefix(strings.ToLower(u.Host), "unix:") {
+		return field.ErrorList{field.Invalid(fieldPath, name, "a unix socket is not a host")}
 	}
 	if u.Host == "" {
 		return field.ErrorList{field.Invalid(fieldPath, name, "hostname required")}

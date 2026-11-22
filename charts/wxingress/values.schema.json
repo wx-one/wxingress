@@ -816,7 +816,11 @@
           "enum": [
             "glog",
             "json",
-            "text"
+            "json-unix",
+            "json-unix-ms",
+            "text",
+            "text-unix",
+            "text-unix-ms"
           ],
           "examples": [
             "json"
@@ -864,10 +868,10 @@
           "properties": {
             "repository": {
               "type": "string",
-              "default": "docker.io/wxone/wxingress",
+              "default": "ghcr.io/wx-one/wxingress",
               "title": "The repository of the Ingress Controller",
               "examples": [
-                "docker.io/wxone/wxingress"
+                "ghcr.io/wx-one/wxingress"
               ]
             },
             "tag": {
@@ -910,7 +914,7 @@
           },
           "examples": [
             {
-              "repository": "docker.io/wxone/wxingress",
+              "repository": "ghcr.io/wx-one/wxingress",
               "tag": "5.7.1",
               "pullPolicy": "IfNotPresent"
             }
@@ -2373,10 +2377,10 @@
         },
         "readOnlyRootFilesystem": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "title": "The readOnlyRootFilesystem",
           "examples": [
-            false
+            true
           ]
         },
         "enableSSLDynamicReload": {
@@ -2451,6 +2455,11 @@
           "type": "boolean",
           "default": false,
           "title": "The profile for running in the place of ingress-nginx"
+        },
+        "ingressNginxCrossNamespace": {
+          "type": "boolean",
+          "default": false,
+          "title": "Lets Ingresses of different namespaces share a host and canaries attach across namespaces"
         },
         "tcpServices": {
           "type": "object",
@@ -2548,6 +2557,25 @@
             "labels": {
               "type": "object",
               "default": {}
+            },
+            "networkPolicy": {
+              "type": "object",
+              "title": "A NetworkPolicy that lets only the API server reach the webhook's port",
+              "default": {},
+              "properties": {
+                "enabled": {
+                  "type": "boolean",
+                  "default": false
+                },
+                "from": {
+                  "type": "array",
+                  "default": [],
+                  "title": "NetworkPolicy peers of the API server (ipBlock)",
+                  "items": {
+                    "type": "object"
+                  }
+                }
+              }
             },
             "service": {
               "type": "object",
@@ -2666,7 +2694,7 @@
           "logFormat": "glog",
           "customPorts": [],
           "image": {
-            "repository": "docker.io/wxone/wxingress",
+            "repository": "ghcr.io/wx-one/wxingress",
             "tag": "5.7.1",
             "digest": "",
             "pullPolicy": "IfNotPresent"
@@ -2815,7 +2843,7 @@
           "disableIPV6": false,
           "defaultHTTPListenerPort": 80,
           "defaultHTTPSListenerPort": 443,
-          "readOnlyRootFilesystem": false,
+          "readOnlyRootFilesystem": true,
           "enableSSLDynamicReload": true,
           "telemetryReporting": {
             "enable": false
@@ -3299,7 +3327,7 @@
         "logFormat": "glog",
         "customPorts": [],
         "image": {
-          "repository": "docker.io/wxone/wxingress",
+          "repository": "ghcr.io/wx-one/wxingress",
           "tag": "5.7.1",
           "digest": "",
           "pullPolicy": "IfNotPresent"
@@ -3448,7 +3476,7 @@
         "disableIPV6": false,
         "defaultHTTPListenerPort": 80,
         "defaultHTTPSListenerPort": 443,
-        "readOnlyRootFilesystem": false,
+        "readOnlyRootFilesystem": true,
         "enableSSLDynamicReload": true,
         "telemetryReporting": {
           "enable": false

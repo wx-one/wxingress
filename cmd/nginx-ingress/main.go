@@ -100,6 +100,7 @@ const maxProcs = 4
 const gcPercent = 50
 
 func main() {
+	runSubcommand(os.Args)
 	if os.Getenv("GOMAXPROCS") == "" && runtime.GOMAXPROCS(0) > maxProcs {
 		runtime.GOMAXPROCS(maxProcs)
 	}
@@ -286,6 +287,10 @@ func main() {
 		}
 	}
 
+	// the Ingress configs of a version that named them <namespace>-<name>, before nginx starts with them
+	if m, ok := nginxManager.(interface{ RemoveLegacyIngressConfigs() }); ok {
+		m.RemoveLegacyIngressConfigs()
+	}
 	mustWriteInitialNginxConfig(staticCfgParams, cfgParams, mgmtCfgParams, templateExecutor, nginxManager)
 
 	if *enableTLSPassthrough {
@@ -358,6 +363,7 @@ func main() {
 		IsNginxPlus:                  *nginxPlus,
 		IsDynamicUpstreams:           *dynamicUpstreams,
 		IngressNginxDefaults:         *ingressNginxDefaults,
+		IngressNginxCrossNamespace:   *ingressNginxCrossNamespace,
 		IngressClass:                 *ingressClass,
 		IngressClassControllers:      ingressClassControllerList(),
 		WatchIngressWithoutClass:     *watchIngressWithoutClass,
@@ -410,7 +416,16 @@ func main() {
 			port := fmt.Sprintf(":%v", *readyStatusPort)
 			s := http.NewServeMux()
 			s.HandleFunc("/nginx-ready", ready(lbc))
-			nl.Fatal(l, http.ListenAndServe(port, s)) // nolint:gosec
+			server := &http.Server{
+				Addr:              port,
+				Handler:           s,
+				ReadHeaderTimeout: 5 * time.Second,
+				ReadTimeout:       10 * time.Second,
+				WriteTimeout:      10 * time.Second,
+				IdleTimeout:       60 * time.Second,
+				MaxHeaderBytes:    16 << 10,
+			}
+			nl.Fatal(l, server.ListenAndServe())
 		}()
 	}
 
@@ -1474,6 +1489,8 @@ func logEventAndExit(ctx context.Context, eventLog record.EventRecorder, obj pkg
 }
 
 func initLogger(logFormat string, level slog.Level, out io.Writer) context.Context {
+	// validateLogFormat takes the format in any case, so the logger does too
+	logFormat = strings.ToLower(logFormat)
 	programLevel := new(slog.LevelVar) // Info by default
 	var h slog.Handler
 

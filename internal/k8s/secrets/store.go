@@ -53,6 +53,12 @@ type storeKey struct {
 type secretEntry struct {
 	ref          *SecretReference
 	materialized bool
+	// checks is the number of checks of the admission webhook holding the entry, which one of them made
+	// (GetSecretForCheck): its file goes when the last of them lets it go, unless a resource took it (adopted).
+	checks  int
+	adopted bool
+	// resolved tells that a check fetched the Secret through the resolver, so the store forgets it with the entry.
+	resolved bool
 }
 
 // SecretRefKey identifies a SecretReference within a resource's SecretRefs map.
@@ -188,36 +194,101 @@ func (s *LocalSecretStore) GetSecret(key string, role SecretRole) *SecretReferen
 
 	refKey := storeKey{secret: key, role: role}
 	if entry, ok := s.refs[refKey]; ok {
+		if entry.checks > 0 {
+			// what a check made is a resource's now: it stays when the check is done
+			entry.adopted = true
+		}
 		return entry.ref
 	}
 
+	entry, _ := s.resolve(key, role, false)
+	return entry.ref
+}
+
+// resolve makes the entry of the Secret in the role, keeping it unless the Secret does not exist: validated,
+// and materialized if valid. It tells if it kept the entry.
+func (s *LocalSecretStore) resolve(key string, role SecretRole, forCheck bool) (*secretEntry, bool) {
+	refKey := storeKey{secret: key, role: role}
 	paths := s.manager.SecretPaths(key, role)
 	ref := &SecretReference{Path: paths.Path, CRLPath: paths.CRLPath}
 
 	secret, exists := s.secrets[key]
+	resolved := false
 	if !exists && s.resolver != nil {
-		if resolved, err := s.resolver(key); err == nil && resolved != nil {
-			secret = resolved
+		if r, err := s.resolver(key); err == nil && r != nil {
+			secret = r
 			s.secrets[key] = secret
-			exists = true
+			exists, resolved = true, true
 		}
 	}
 	if !exists {
 		ref.Error = fmt.Errorf("secret %s doesn't exist", key)
-		return ref
+		return &secretEntry{ref: ref}, false
 	}
 
 	ref.Secret = secret
 	ref.Error = ValidateSecretForRole(secret, role)
 
 	entry := &secretEntry{ref: ref}
+	if forCheck {
+		entry.checks, entry.resolved = 1, resolved
+	}
 	if ref.Error == nil {
 		paths = s.manager.AddOrUpdateSecret(secret, role)
 		ref.setPaths(paths)
 		entry.materialized = true
 	}
 	s.refs[refKey] = entry
-	return ref
+	return entry, true
+}
+
+// GetSecretForCheck is GetSecret for a check of the admission webhook, which renders a config only to test it:
+// a Secret that no resource has resolved in the role is materialized for nginx -t as GetSecret does, but held by
+// the check, and ReleaseCheckSecret removes its file and forgets it again once the check is done - unless a
+// resource resolved it meanwhile. It tells if the check holds the entry and must release it.
+func (s *LocalSecretStore) GetSecretForCheck(key string, role SecretRole) (*SecretReference, bool) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if entry, ok := s.refs[storeKey{secret: key, role: role}]; ok {
+		if entry.checks > 0 && !entry.adopted {
+			entry.checks++
+			return entry.ref, true
+		}
+		return entry.ref, false
+	}
+	entry, kept := s.resolve(key, role, true)
+	return entry.ref, kept
+}
+
+// ReleaseCheckSecret lets go of an entry GetSecretForCheck held: when no check holds it any more and no resource
+// resolved it, its file is removed and the store forgets it.
+func (s *LocalSecretStore) ReleaseCheckSecret(key string, role SecretRole) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	refKey := storeKey{secret: key, role: role}
+	entry, ok := s.refs[refKey]
+	if !ok || entry.checks == 0 {
+		return
+	}
+	entry.checks--
+	if entry.checks > 0 || entry.adopted {
+		return
+	}
+	if entry.materialized {
+		s.manager.DeleteSecret(key, role)
+	}
+	delete(s.refs, refKey)
+	if !entry.resolved {
+		return
+	}
+	for other := range s.refs {
+		if other.secret == key {
+			return
+		}
+	}
+	delete(s.secrets, key)
 }
 
 // SecretCount returns the number of distinct Secrets that resolved successfully in

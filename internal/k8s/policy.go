@@ -951,7 +951,7 @@ func (lbc *LoadBalancerController) resolveWAFBundleSecret(bs *conf_v1.BundleSour
 	}
 
 	secretKey := namespace + "/" + bs.Secret
-	ref := lbc.secretStore.GetSecret(secretKey, role)
+	ref := lbc.secretRef(secretKey, role)
 	if ref.Error != nil {
 		return fmt.Errorf("secret %s not found or invalid: %w", secretKey, ref.Error)
 	}
@@ -985,7 +985,7 @@ func (lbc *LoadBalancerController) resolveWAFBundleSecret(bs *conf_v1.BundleSour
 // resolveWAFTrustedCert resolves the trusted CA certificate secret.
 func (lbc *LoadBalancerController) resolveWAFTrustedCert(secretName, namespace string, auth *wafbundle.BundleAuth) error {
 	caSecretKey := namespace + "/" + secretName
-	caRef := lbc.secretStore.GetSecret(caSecretKey, secrets.RoleCA)
+	caRef := lbc.secretRef(caSecretKey, secrets.RoleCA)
 	if caRef == nil || caRef.Error != nil || caRef.Secret == nil {
 		var msg string
 		if caRef != nil && caRef.Error != nil {

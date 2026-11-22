@@ -681,7 +681,7 @@ func TestAddOrUpdateIngressReturnsErrorWhenDefaultServerSyncFails(t *testing.T) 
 	if err == nil {
 		t.Fatal("expected AddOrUpdateIngress to fail when default server sync fails")
 	}
-	if err.Error() != "error adding or updating ingress default/cafe-ingress: error syncing default server config for ingress default-cafe-ingress: error writing default server config: default server create failed" {
+	if err.Error() != "error adding or updating ingress default/cafe-ingress: error syncing default server config for ingress default_cafe-ingress: error writing default server config: default server create failed" {
 		t.Fatalf("unexpected AddOrUpdateIngress error: %v", err)
 	}
 }
@@ -699,7 +699,7 @@ func TestAddOrUpdateMergeableIngressReturnsErrorWhenDefaultServerSyncFails(t *te
 	if err == nil {
 		t.Fatal("expected AddOrUpdateMergeableIngress to fail when default server sync fails")
 	}
-	if err.Error() != "error when adding or updating ingress default/cafe-ingress-master: error syncing default server config for mergeable ingress default-cafe-ingress-master: error writing default server config: default server create failed" {
+	if err.Error() != "error when adding or updating ingress default/cafe-ingress-master: error syncing default server config for mergeable ingress default_cafe-ingress-master: error writing default server config: default server create failed" {
 		t.Fatalf("unexpected AddOrUpdateMergeableIngress error: %v", err)
 	}
 }
@@ -4218,11 +4218,11 @@ func TestBuildFilenameToErrorKey_EmptyHostMapsToDefaultServer(t *testing.T) {
 	if got := m[DefaultServerConfigName]; len(got) != 1 || got[0] != wantEmptyKey {
 		t.Errorf("m[%q] = %v, want [%q] — empty-host Ingress must map to DefaultServerConfigName", DefaultServerConfigName, got, wantEmptyKey)
 	}
-	if got, ok := m["default-empty"]; ok {
-		t.Errorf("m[default-empty] = %v, want no entry — empty-host Ingress never writes its per-Ingress file, so it must not appear in the attribution map", got)
+	if got, ok := m["default_empty"]; ok {
+		t.Errorf("m[default_empty] = %v, want no entry — empty-host Ingress never writes its per-Ingress file, so it must not appear in the attribution map", got)
 	}
-	if got := m["default-named"]; len(got) != 1 || got[0] != wantNamedKey {
-		t.Errorf("m[default-named] = %v, want [%q] — named Ingress must map to its file-name key", got, wantNamedKey)
+	if got := m["default_named"]; len(got) != 1 || got[0] != wantNamedKey {
+		t.Errorf("m[default_named] = %v, want [%q] — named Ingress must map to its file-name key", got, wantNamedKey)
 	}
 	for _, key := range m[DefaultServerConfigName] {
 		if key == wantNamedKey {

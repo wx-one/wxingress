@@ -411,3 +411,8 @@ internal/k8s/secrets/embeds-empty-ca.key
 
 
 # END CERTGEN SECTION. YOU MAY EDIT BELOW
+
+# credentials that must never be committed
+*.pem
+.env
+kubeconfig*

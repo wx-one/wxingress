@@ -25,6 +25,8 @@ rules:
   - create
   - patch
   - list
+# reading only: the controller writes Services in its own namespace (the Role)
+# and, with the Gateway API, those of the Gateways (below)
 - apiGroups:
   - ""
   resources:
@@ -33,10 +35,6 @@ rules:
   - get
   - list
   - watch
-  - create
-  - update
-  - patch
-  - delete
 - apiGroups:
   - coordination.k8s.io
   resources:
