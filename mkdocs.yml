@@ -1,5 +1,5 @@
 site_name: wxingress
-site_description: The drop-in successor of ingress-nginx, built on NGINX Ingress Controller, with the Gateway API.
+site_description: wxingress is the drop-in replacement for the retired ingress-nginx - your Ingresses, annotations and ConfigMap as they are, on NGINX Ingress Controller, without Lua, with the Gateway API. Migration guide, Lua to njs, benchmarks.
 site_url: https://wx-one.github.io/wxingress/
 repo_url: https://github.com/wx-one/wxingress
 repo_name: wx-one/wxingress
@@ -88,6 +88,7 @@ nav:
       - Installation: getting-started/installation.md
       - First Ingress: getting-started/first-ingress.md
   - Migration:
+      - Choosing a replacement: migration/alternatives.md
       - From ingress-nginx: migration/ingress-nginx.md
       - Lua to njs: migration/lua-to-njs.md
       - RKE2 node by node: migration/rke2.md

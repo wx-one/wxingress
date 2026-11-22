@@ -75,6 +75,8 @@ each of the other 51 has a documented reason.
   | Memory under load | 246 MiB | **135 MiB** |
   | Controller CPU during endpoint churn | 28.8 s | **0.16 s** |
 
+  ![wxingress compared with ingress-nginx: about 4 times the HTTP requests per second, half the CPU per HTTPS request, half the memory under load](docs/assets/benchmark.svg)
+
   How these numbers come about is described in [Testing and benchmarks](https://wx-one.github.io/wxingress/migration/testing/).
 - **Gateway API.** Gateways with HTTPRoute, GRPCRoute, TLSRoute, TCPRoute and UDPRoute, and
   ReferenceGrants, on the same controller and the same data plane. The Gateway API semantics come from NGINX Gateway Fabric.

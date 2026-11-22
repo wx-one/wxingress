@@ -14,6 +14,25 @@ maintainers:
     url: https://wizardtales.com
 annotations:
   artifacthub.io/license: EUPL-1.2
+  artifacthub.io/category: networking
+  artifacthub.io/operator: "false"
+  artifacthub.io/prerelease: "false"
+  artifacthub.io/images: |
+    - name: wxingress
+      image: ghcr.io/wx-one/wxingress:5.7.1-wx5
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://wx-one.github.io/wxingress/
+    - name: Migrating from ingress-nginx
+      url: https://wx-one.github.io/wxingress/migration/ingress-nginx/
+    - name: Source
+      url: https://github.com/wx-one/wxingress
+    - name: Support
+      url: https://wx-one.github.io/wxingress/about/support/
 keywords:
   - ingress
   - ingress-nginx
+  - ingress-controller
+  - nginx
+  - gateway-api
+  - kubernetes

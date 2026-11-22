@@ -89,6 +89,8 @@ wxingress. A browser sends such a request again.
 
 ## What it costs: the benchmark
 
+![wxingress compared with ingress-nginx](../assets/benchmark.svg)
+
 `dataplane/e2e/ingress-nginx-bench.sh` runs on the same kind node, the same
 backends and the same 97 Ingresses of the parity corpus, one controller at
 a time as the hostPort DaemonSet, each installed fresh: ingress-nginx 4.15.1

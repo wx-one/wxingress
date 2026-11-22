@@ -85,6 +85,8 @@ of 97 Ingresses from production clusters and popular Helm charts, probed 2562 wa
 Same node, same backends, same 97 Ingresses, each controller installed fresh as a hostPort DaemonSet with
 four NGINX workers:
 
+![wxingress compared with ingress-nginx](assets/benchmark.svg)
+
 | | ingress-nginx 1.15.1 | rke2-ingress-nginx 1.12.6 | wxingress |
 |---|---|---|---|
 | HTTP requests/s | 39 156 | 62 145 | **161 832** |

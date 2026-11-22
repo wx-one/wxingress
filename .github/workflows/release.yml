@@ -139,6 +139,8 @@ jobs:
       # the image tag the chart deploys by default, becomes the release's.
       - name: Package
         run: |
+          # the image Artifact Hub lists is the release's
+          sed -i "s|image: ghcr.io/wx-one/wxingress:.*|image: ghcr.io/wx-one/wxingress:${GITHUB_REF_NAME#v}|" charts/wxingress/Chart.yaml
           helm lint charts/wxingress
           helm package charts/wxingress -d chart --app-version "${GITHUB_REF_NAME#v}"
           ls -l chart
