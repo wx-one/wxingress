@@ -135,17 +135,12 @@ command-line flags and Helm values, and how to build and develop wxingress.
 
 ## Versions
 
-Every release, newest first. A component in **bold** changed with that release.
+A row for every release in which a component changed, newest first; each holds until the next row.
 
-| wxingress | Chart | based on NGINX Ingress Controller | NGINX | Gateway API (via NGINX Gateway Fabric) |
-|---|---|---|---|---|
-| 5.7.1-wx11 | 2.8.7 | 5.7.1 | 1.31.9 | **v1.7.0 (NGF 2.9.0)** |
-| 5.7.1-wx10 | 2.8.6 | 5.7.1 | 1.31.9 | v1.6.3 (NGF 2.8.1) |
-| 5.7.1-wx9 | 2.8.5 | 5.7.1 | 1.31.9 | v1.6.3 (NGF 2.8.1) |
-| 5.7.1-wx8 | 2.8.4 | 5.7.1 | 1.31.9 | v1.6.3 (NGF 2.8.1) |
-| 5.7.1-wx7 | 2.8.3 | 5.7.1 | 1.31.9 | v1.6.3 (NGF 2.8.1) |
-| 5.7.1-wx6 | 2.8.2 | 5.7.1 | 1.31.9 | v1.6.3 (NGF 2.8.1) |
-| 5.7.1-wx5 | 2.8.1 | 5.7.1 | 1.31.9 | v1.6.3 (NGF 2.8.1) |
+| wxingress | based on NGINX Ingress Controller | NGINX | Gateway API (via NGINX Gateway Fabric) |
+|---|---|---|---|
+| 5.7.1-wx11 and later | 5.7.1 | 1.31.9 | v1.7.0 (NGF 2.9.0) |
+| 5.7.1-wx5 to 5.7.1-wx10 | 5.7.1 | 1.31.9 | v1.6.3 (NGF 2.8.1) |
 
 `controller.gatewayAPI.installCRDs` installs the CRDs of the release's Gateway API version: from
 5.7.1-wx11 those of v1.7.0, before that those of v1.6.3.
