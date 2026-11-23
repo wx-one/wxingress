@@ -142,20 +142,6 @@ type L4RouteSpec struct {
 	BackendRefs []BackendRef
 	// Hostnames defines a set of hostnames used to select a Route used to process the request.
 	Hostnames []v1.Hostname
-	// FIXME (sarthyparty): change to slice of BackendRef, as for now we are only supporting one BackendRef.
-	// We will eventually support multiple BackendRef https://github.com/nginx/nginx-gateway-fabric/issues/2184
-	BackendRef BackendRef
-}
-
-// GetBackendRefs returns all backend references for this L4Route.
-// For TCPRoute/UDPRoute with multiple backends, it returns BackendRefs.
-// For TLSRoute or single-backend routes, it returns a slice containing BackendRef.
-func (spec *L4RouteSpec) GetBackendRefs() []BackendRef {
-	if len(spec.BackendRefs) > 0 {
-		return spec.BackendRefs
-	}
-	// For single-backend routes, always return the BackendRef.
-	return []BackendRef{spec.BackendRef}
 }
 
 // L7Route is the generic type for the layer 7 routes, HTTPRoute and GRPCRoute.
@@ -328,6 +314,7 @@ func buildL4RoutesForGateways(
 		return nil
 	}
 
+	// Process TLS routes
 	routes := make(map[L4RouteKey]*L4Route)
 	for _, route := range tlsRoutes {
 		r := buildTLSRoute(
@@ -526,7 +513,10 @@ func buildSectionNameRefs(
 				var listeners []*Listener
 				switch parentRef.Kind {
 				case kinds.Gateway:
-					listeners = gw.Listeners
+					// gw.Listeners also holds the listeners merged in from attached ListenerSets.
+					// A Gateway parentRef only attaches to the Gateway's own listeners, and
+					// ListenerSet listeners may reuse a Gateway listener name.
+					listeners = getGatewayListeners(gw.Listeners)
 				case kinds.ListenerSet:
 					listeners = ls.Listeners
 				}
@@ -696,24 +686,22 @@ func getListenerHostPortMap(listeners []*Listener) map[string]hostPort {
 
 // isolateL7RouteListeners ensures listener isolation for all L7Routes.
 func isolateL7RouteListeners(routes []*L7Route, listenerHostPortMap map[string]hostPort) {
-	isL4Route := false
 	for _, route := range routes {
-		isolateHostnamesForParentRefs(route.ParentRefs, listenerHostPortMap, isL4Route)
+		isolateHostnamesForParentRefs(route.ParentRefs, listenerHostPortMap)
 	}
 }
 
 // isolateL4RouteListeners ensures listener isolation for all L4Routes.
 func isolateL4RouteListeners(routes []*L4Route, listenerHostPortMap map[string]hostPort) {
-	isL4Route := true
 	for _, route := range routes {
-		isolateHostnamesForParentRefs(route.ParentRefs, listenerHostPortMap, isL4Route)
+		isolateHostnamesForParentRefs(route.ParentRefs, listenerHostPortMap)
 	}
 }
 
 // isolateHostnamesForParentRefs iterates through the parentRefs of a route to identify the list of accepted hostnames
 // for each listener. If any accepted hostname belongs to another listener with the same port, then
 // it removes those hostnames to ensure listener isolation.
-func isolateHostnamesForParentRefs(parentRef []ParentRef, listenerHostnameMap map[string]hostPort, isL4Route bool) {
+func isolateHostnamesForParentRefs(parentRef []ParentRef, listenerHostnameMap map[string]hostPort) {
 	for _, ref := range parentRef {
 		// when sectionName is nil we allow all listeners to attach to the route
 		if ref.SectionName == nil {
@@ -746,15 +734,9 @@ func isolateHostnamesForParentRefs(parentRef []ParentRef, listenerHostnameMap ma
 						continue
 					}
 
-					// for L7Routes, we compare the hostname, port and listenerName combination
-					// to identify if hostname needs to be isolated.
-					if h == lHostPort.hostname && key != lName {
-						// for L4Routes, we only compare the hostname and listener name combination
-						// because we do not allow l4Routes to attach to the same listener
-						// if they share the same port and hostname.
-						if isL4Route || lHostPort.port == listenerAttachment.Port {
-							hostnamesToRemoves[h] = struct{}{}
-						}
+					// A listener on another port is a separate listener, so a shared hostname needs no isolation.
+					if h == lHostPort.hostname && key != lName && lHostPort.port == listenerAttachment.Port {
+						hostnamesToRemoves[h] = struct{}{}
 					}
 				}
 			}
@@ -792,8 +774,7 @@ func validateParentRef(
 	if listenerSet != nil {
 		listeners = listenerSet.Listeners
 	} else {
-		gatewayListeners, _ := separateGatewayAndListenerSetListeners(gw.Listeners)
-		listeners = gatewayListeners
+		listeners = getGatewayListeners(gw.Listeners)
 	}
 	attachableListeners, listenerExists := findAttachableListeners(
 		ref,
@@ -864,7 +845,7 @@ func bindL4RouteToListeners(
 			continue
 		}
 
-		backendRefs := route.Spec.GetBackendRefs()
+		backendRefs := route.Spec.BackendRefs
 		for _, br := range backendRefs {
 			if cond, ok := br.InvalidForGateways[gwNsName]; ok {
 				attachment.FailedConditions = append(attachment.FailedConditions, cond)
@@ -1390,20 +1371,15 @@ func getSectionName(s *v1.SectionName) string {
 	return string(*s)
 }
 
-// separateGatewayAndListenerSetListeners takes a slice of listeners and separates them into
-// Gateway listeners (ListenerSetName.Name == "") and ListenerSet listeners (ListenerSetName.Name != "").
-func separateGatewayAndListenerSetListeners(listeners []*Listener) (
-	gatewayListeners []*Listener,
-	listenerSetListeners []*Listener,
-) {
+// getGatewayListeners returns the Gateway's own listeners.
+func getGatewayListeners(listeners []*Listener) []*Listener {
+	var gatewayListeners []*Listener
 	for _, l := range listeners {
 		if l.ListenerSetName.Name == "" {
 			gatewayListeners = append(gatewayListeners, l)
-		} else {
-			listenerSetListeners = append(listenerSetListeners, l)
 		}
 	}
-	return gatewayListeners, listenerSetListeners
+	return gatewayListeners
 }
 
 func validateHostnames(hostnames []v1.Hostname, path *field.Path) error {
@@ -1480,9 +1456,8 @@ func getSessionPersistenceKey(ruleIdx int, routeNsName types.NamespacedName) str
 }
 
 // processSessionPersistenceConfig processes the session persistence configuration.
-func processSessionPersistenceConfig[T any](
+func processSessionPersistenceConfig(
 	sp *v1.SessionPersistence,
-	routeMatches []T,
 	rulePath *field.Path,
 	validator validation.HTTPFieldsValidator,
 ) (*SessionPersistenceConfig, routeRuleErrors) {
@@ -1500,27 +1475,24 @@ func processSessionPersistenceConfig[T any](
 	}
 
 	var sessionName string
-	if sp.SessionName != nil {
-		sessionName = *sp.SessionName
+	if sp.Cookie != nil && sp.Cookie.Name != nil {
+		sessionName = string(*sp.Cookie.Name)
 	}
 
 	var cookieLifetimeType v1.CookieLifetimeType
-	if sp.CookieConfig != nil {
-		cookieLifetimeType = *sp.CookieConfig.LifetimeType
+	if sp.Cookie != nil && sp.Cookie.LifetimeType != nil {
+		cookieLifetimeType = *sp.Cookie.LifetimeType
 	}
 
 	if sp.AbsoluteTimeout != nil && cookieLifetimeType == v1.SessionCookieLifetimeType {
 		expiry = ""
 	}
 
-	var path string
-	switch rm := any(routeMatches).(type) {
-	case []v1.HTTPRouteMatch:
-		path = deriveCookiePathForHTTPMatches(rm)
-	case []v1.GRPCRouteMatch:
-		path = ""
-	default:
-		panic("unsupported route match type")
+	// Per the Gateway API spec, implementations MUST default the cookie path to "/" when not
+	// explicitly specified.
+	path := "/"
+	if sp.Cookie != nil && sp.Cookie.Path != nil {
+		path = *sp.Cookie.Path
 	}
 
 	spConfig = SessionPersistenceConfig{
@@ -1570,60 +1542,6 @@ func validateSessionPersistenceConfig(
 	}
 
 	return timeout, errors
-}
-
-func deriveCookiePathForHTTPMatches(matches []v1.HTTPRouteMatch) string {
-	paths := make([]string, 0, len(matches))
-	for _, match := range matches {
-		paths = append(paths, getCookiePath(match))
-	}
-
-	return longestCommonPathPrefix(paths)
-}
-
-// longestCommonPathPrefix returns the longest common path prefix of the given
-// paths.
-// Examples:
-//
-//	["/foo/bar", "/foo/baz"]    -> "/foo"
-//	["/foo/bar", "/foo/bar/b"]  -> "/foo/bar"
-//	["/foo", "/bar"]            -> ""
-//	[]                          -> ""
-func longestCommonPathPrefix(paths []string) string {
-	if len(paths) == 0 {
-		return ""
-	}
-	if len(paths) == 1 {
-		return paths[0]
-	}
-
-	commonSegs := strings.Split(paths[0], "/")
-	for _, p := range paths[1:] {
-		segs := strings.Split(p, "/")
-		i := 0
-		limit := min(len(segs), len(commonSegs))
-		for i < limit && commonSegs[i] == segs[i] {
-			i++
-		}
-		// truncate commonSegs to the common prefix
-		commonSegs = commonSegs[:i]
-		if len(commonSegs) == 0 {
-			return ""
-		}
-	}
-
-	return strings.Join(commonSegs, "/")
-}
-
-func getCookiePath(match v1.HTTPRouteMatch) string {
-	pathType := *match.Path.Type
-
-	switch pathType {
-	case v1.PathMatchExact, v1.PathMatchPathPrefix:
-		return *match.Path.Value
-	default:
-		return ""
-	}
 }
 
 // l4RouteConfig holds the configuration needed to build an L4Route generically.

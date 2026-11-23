@@ -26,6 +26,7 @@ func TestBuildSectionNameRefs(t *testing.T) {
 	gwNsName1 := types.NamespacedName{Namespace: routeNamespace, Name: "gateway-1"}
 	gwNsName2 := types.NamespacedName{Namespace: routeNamespace, Name: "gateway-2"}
 	gwNsName3 := types.NamespacedName{Namespace: routeNamespace, Name: "gateway-3"}
+	gwNsName4 := types.NamespacedName{Namespace: routeNamespace, Name: "gateway-4"}
 
 	parentRefs := []gatewayv1.ParentReference{
 		{
@@ -92,6 +93,37 @@ func TestBuildSectionNameRefs(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      gwNsName3.Name,
 					Namespace: gwNsName3.Namespace,
+				},
+			},
+		},
+		gwNsName4: {
+			Listeners: []*Listener{
+				{
+					GatewayName: gwNsName4,
+					Source: gatewayv1.Listener{
+						Name: "http",
+					},
+				},
+				{
+					// ListenerSet listeners merged into the Gateway may reuse a Gateway listener name.
+					GatewayName:     gwNsName4,
+					ListenerSetName: types.NamespacedName{Namespace: routeNamespace, Name: "listenerset-4"},
+					Source: gatewayv1.Listener{
+						Name: "http",
+					},
+				},
+				{
+					GatewayName:     gwNsName4,
+					ListenerSetName: types.NamespacedName{Namespace: routeNamespace, Name: "listenerset-4"},
+					Source: gatewayv1.Listener{
+						Name: "ls-only",
+					},
+				},
+			},
+			Source: &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      gwNsName4.Name,
+					Namespace: gwNsName4.Namespace,
 				},
 			},
 		},
@@ -227,6 +259,24 @@ func TestBuildSectionNameRefs(t *testing.T) {
 			},
 			name:          "duplicate sectionNames when one parentRef has no sectionName",
 			expectedError: errors.New("duplicate section name \"http\" for ParentRef test/gateway-3"),
+		},
+		{
+			name: "Gateway parentRef without sectionName ignores ListenerSet listeners",
+			parentRefs: []gatewayv1.ParentReference{
+				{
+					Name: gatewayv1.ObjectName(gwNsName4.Name),
+				},
+			},
+			expectedRefs: []ParentRef{
+				{
+					Idx:            0,
+					Kind:           kinds.Gateway,
+					NamespacedName: gwNsName4,
+					GatewayNsName:  gwNsName4,
+					SectionName:    helpers.GetPointer[gatewayv1.SectionName]("http"),
+				},
+			},
+			expectedError: nil,
 		},
 		{
 			name: "ListenerSet references",
@@ -635,20 +685,6 @@ func TestBindRouteToListeners(t *testing.T) {
 			},
 		},
 	}
-	invalidAttachableRoute2 := &L7Route{
-		RouteType:  RouteTypeHTTP,
-		Source:     hr,
-		Valid:      false,
-		Attachable: true,
-		ParentRefs: []ParentRef{
-			{
-				NamespacedName: client.ObjectKeyFromObject(gw),
-				Idx:            0,
-				SectionName:    hr.Spec.ParentRefs[0].SectionName,
-			},
-		},
-	}
-
 	routeWithMissingSectionName := &L7Route{
 		RouteType:  RouteTypeHTTP,
 		Source:     hrWithNilSectionName,
@@ -1159,7 +1195,7 @@ func TestBindRouteToListeners(t *testing.T) {
 			name: "invalid attachable route",
 		},
 		{
-			route: invalidAttachableRoute2,
+			route: invalidAttachableRoute1,
 			gateway: &Gateway{
 				Source: gw,
 				Valid:  true,
@@ -1191,7 +1227,7 @@ func TestBindRouteToListeners(t *testing.T) {
 				createModifiedListener("listener-80-1", func(l *Listener) {
 					l.Valid = false
 					l.Routes = map[RouteKey]*L7Route{
-						CreateRouteKey(hr): invalidAttachableRoute2,
+						CreateRouteKey(hr): invalidAttachableRoute1,
 					}
 				}),
 			},
@@ -1959,9 +1995,10 @@ func TestValidateHostnames(t *testing.T) {
 	const validHostname = "example.com"
 
 	tests := []struct {
-		name      string
-		hostnames []gatewayv1.Hostname
-		expectErr bool
+		name        string
+		errContains string
+		hostnames   []gatewayv1.Hostname
+		expectErr   bool
 	}{
 		{
 			hostnames: []gatewayv1.Hostname{
@@ -1977,8 +2014,9 @@ func TestValidateHostnames(t *testing.T) {
 				validHostname,
 				"",
 			},
-			expectErr: true,
-			name:      "valid and invalid",
+			expectErr:   true,
+			errContains: "cannot be empty string",
+			name:        "valid and invalid",
 		},
 	}
 
@@ -1993,6 +2031,7 @@ func TestValidateHostnames(t *testing.T) {
 
 			if test.expectErr {
 				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(ContainSubstring(test.errContains))
 			} else {
 				g.Expect(err).ToNot(HaveOccurred())
 			}
@@ -2289,9 +2328,11 @@ func TestBindL4RouteToListeners(t *testing.T) {
 	}
 
 	routeWithInvalidBackendRefs := createNormalRoute(gw)
-	routeWithInvalidBackendRefs.Spec.BackendRef = BackendRef{
-		InvalidForGateways: map[types.NamespacedName]conditions.Condition{
-			client.ObjectKeyFromObject(gw): {Message: "invalid backend"},
+	routeWithInvalidBackendRefs.Spec.BackendRefs = []BackendRef{
+		{
+			InvalidForGateways: map[types.NamespacedName]conditions.Condition{
+				client.ObjectKeyFromObject(gw): {Message: "invalid backend"},
+			},
 		},
 	}
 
@@ -4370,6 +4411,18 @@ func TestIsolateL4Listeners(t *testing.T) {
 		routeHostname...,
 	)
 
+	tlsCollectorRoute := createTLSRouteWithSectionNameAndPort(
+		"tls_collector",
+		[]parentRef{
+			{
+				parentRefNsName: client.ObjectKeyFromObject(gw),
+				sectionName:     helpers.GetPointer[gatewayv1.SectionName]("tls-4317"),
+			},
+		},
+		"test",
+		"collector.example.com",
+	)
+
 	tests := []struct {
 		expectedResult map[string][]ParentRef
 		listenerMap    map[string]hostPort
@@ -4381,6 +4434,59 @@ func TestIsolateL4Listeners(t *testing.T) {
 			routes:         routesHostnameIntersection,
 			listenerMap:    listenerMapHostnameIntersection,
 			expectedResult: expectedResultHostnameIntersection,
+		},
+		{
+			name: "no isolation for listeners with same hostname, different ports",
+			routes: []*L4Route{
+				createL4RoutewithAcceptedHostnames(
+					tlsCollectorRoute,
+					[]ListenerAttachmentStatus{
+						{
+							Key:               CreateParentRefListenerKey(client.ObjectKeyFromObject(gw), "tls-4317"),
+							Port:              4317,
+							AcceptedHostnames: []string{"collector.example.com"},
+						},
+					},
+					[]gatewayv1.Hostname{"collector.example.com"},
+					helpers.GetPointer[gatewayv1.SectionName]("tls-4317"),
+				),
+			},
+			listenerMap: map[string]hostPort{
+				CreateParentRefListenerKey(client.ObjectKeyFromObject(gw), "tls-4317"): {
+					hostname:        "collector.example.com",
+					port:            4317,
+					parentRefNsName: client.ObjectKeyFromObject(gw),
+				},
+				CreateParentRefListenerKey(client.ObjectKeyFromObject(gw), "tls-4318"): {
+					hostname:        "collector.example.com",
+					port:            4318,
+					parentRefNsName: client.ObjectKeyFromObject(gw),
+				},
+				CreateParentRefListenerKey(client.ObjectKeyFromObject(gw), "tls-4320"): {
+					hostname:        "collector.example.com",
+					port:            4320,
+					parentRefNsName: client.ObjectKeyFromObject(gw),
+				},
+			},
+			expectedResult: map[string][]ParentRef{
+				"tls_collector": {
+					{
+						NamespacedName: client.ObjectKeyFromObject(gw),
+						Idx:            0,
+						SectionName:    tlsCollectorRoute.Spec.ParentRefs[0].SectionName,
+						Attachment: &ParentRefAttachmentStatus{
+							Listeners: []ListenerAttachmentStatus{
+								{
+									Key:               CreateParentRefListenerKey(client.ObjectKeyFromObject(gw), "tls-4317"),
+									Port:              4317,
+									AcceptedHostnames: []string{"collector.example.com"},
+								},
+							},
+							Attached: true,
+						},
+					},
+				},
+			},
 		},
 		{
 			name: "no listener isolation for routes with no section name, attaches to all listeners",
@@ -6176,8 +6282,6 @@ func TestProcessSessionPersistenceConfiguration(t *testing.T) {
 		sessionPersistence *gatewayv1.SessionPersistence
 		expectedResult     SessionPersistenceConfig
 		expectedErrors     routeRuleErrors
-		httpRouteMatches   []gatewayv1.HTTPRouteMatch
-		grpcRouteMatches   []gatewayv1.GRPCRouteMatch
 	}{
 		{
 			name: "session persistence has errors in configuration",
@@ -6201,22 +6305,14 @@ func TestProcessSessionPersistenceConfiguration(t *testing.T) {
 			expectedResult: SessionPersistenceConfig{
 				Valid: false,
 			},
-			httpRouteMatches: []gatewayv1.HTTPRouteMatch{
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchExact),
-						Value: helpers.GetPointer("/coffee"),
-					},
-				},
-			},
 		},
 		{
 			name: "when lifetime type of a cookie is Session, timeout is set to 0",
 			sessionPersistence: &gatewayv1.SessionPersistence{
-				SessionName:     helpers.GetPointer("session-persistence"),
 				Type:            helpers.GetPointer(gatewayv1.CookieBasedSessionPersistence),
 				AbsoluteTimeout: helpers.GetPointer(gatewayv1.Duration("20m")),
-				CookieConfig: &gatewayv1.CookieConfig{
+				Cookie: &gatewayv1.CookieConfig{
+					Name:         helpers.GetPointer[gatewayv1.CookieName]("session-persistence"),
 					LifetimeType: helpers.GetPointer(gatewayv1.SessionCookieLifetimeType),
 				},
 			},
@@ -6224,24 +6320,16 @@ func TestProcessSessionPersistenceConfiguration(t *testing.T) {
 				Valid:       true,
 				SessionType: gatewayv1.CookieBasedSessionPersistence,
 				Name:        "session-persistence",
-				Path:        "/tea",
-			},
-			httpRouteMatches: []gatewayv1.HTTPRouteMatch{
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchExact),
-						Value: helpers.GetPointer("/tea"),
-					},
-				},
+				Path:        "/",
 			},
 		},
 		{
 			name: "valid session persistence configuration for HTTPRoute",
 			sessionPersistence: &gatewayv1.SessionPersistence{
-				SessionName:     helpers.GetPointer("session-persistence-http"),
 				Type:            helpers.GetPointer(gatewayv1.CookieBasedSessionPersistence),
 				AbsoluteTimeout: helpers.GetPointer(gatewayv1.Duration("1h")),
-				CookieConfig: &gatewayv1.CookieConfig{
+				Cookie: &gatewayv1.CookieConfig{
+					Name:         helpers.GetPointer[gatewayv1.CookieName]("session-persistence-http"),
 					LifetimeType: helpers.GetPointer(gatewayv1.PermanentCookieLifetimeType),
 				},
 			},
@@ -6250,42 +6338,16 @@ func TestProcessSessionPersistenceConfiguration(t *testing.T) {
 				SessionType: gatewayv1.CookieBasedSessionPersistence,
 				Name:        "session-persistence-http",
 				Expiry:      "1h",
-				Path:        "/app/v1",
-			},
-			httpRouteMatches: []gatewayv1.HTTPRouteMatch{
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchExact),
-						Value: helpers.GetPointer("/app/v1/users/"),
-					},
-				},
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchPathPrefix),
-						Value: helpers.GetPointer("/app/v1/latte/"),
-					},
-				},
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchExact),
-						Value: helpers.GetPointer("/app/v1/tea"),
-					},
-				},
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchPathPrefix),
-						Value: helpers.GetPointer("/app/v1/coffee"),
-					},
-				},
+				Path:        "/",
 			},
 		},
 		{
 			name: "valid session persistence configuration for GRPCRoute",
 			sessionPersistence: &gatewayv1.SessionPersistence{
-				SessionName:     helpers.GetPointer("session-persistence-grpc"),
 				Type:            helpers.GetPointer(gatewayv1.CookieBasedSessionPersistence),
 				AbsoluteTimeout: helpers.GetPointer(gatewayv1.Duration("30m")),
-				CookieConfig: &gatewayv1.CookieConfig{
+				Cookie: &gatewayv1.CookieConfig{
+					Name:         helpers.GetPointer[gatewayv1.CookieName]("session-persistence-grpc"),
 					LifetimeType: helpers.GetPointer(gatewayv1.PermanentCookieLifetimeType),
 				},
 			},
@@ -6294,20 +6356,26 @@ func TestProcessSessionPersistenceConfiguration(t *testing.T) {
 				SessionType: gatewayv1.CookieBasedSessionPersistence,
 				Name:        "session-persistence-grpc",
 				Expiry:      "30m",
+				Path:        "/",
 			},
-			grpcRouteMatches: []gatewayv1.GRPCRouteMatch{
-				{
-					Method: &gatewayv1.GRPCMethodMatch{
-						Type:    helpers.GetPointer(gatewayv1.GRPCMethodMatchExact),
-						Service: helpers.GetPointer("mymethod.user"),
-					},
+		},
+		{
+			name: "explicit cookie path overrides the default",
+			sessionPersistence: &gatewayv1.SessionPersistence{
+				Type:            helpers.GetPointer(gatewayv1.CookieBasedSessionPersistence),
+				AbsoluteTimeout: helpers.GetPointer(gatewayv1.Duration("1h")),
+				Cookie: &gatewayv1.CookieConfig{
+					Name:         helpers.GetPointer[gatewayv1.CookieName]("session-persistence-custom-path"),
+					LifetimeType: helpers.GetPointer(gatewayv1.PermanentCookieLifetimeType),
+					Path:         helpers.GetPointer("/custom"),
 				},
-				{
-					Method: &gatewayv1.GRPCMethodMatch{
-						Type:    helpers.GetPointer(gatewayv1.GRPCMethodMatchExact),
-						Service: helpers.GetPointer("mymethod.coffee"),
-					},
-				},
+			},
+			expectedResult: SessionPersistenceConfig{
+				Valid:       true,
+				SessionType: gatewayv1.CookieBasedSessionPersistence,
+				Name:        "session-persistence-custom-path",
+				Expiry:      "1h",
+				Path:        "/custom",
 			},
 		},
 	}
@@ -6317,25 +6385,11 @@ func TestProcessSessionPersistenceConfiguration(t *testing.T) {
 			t.Parallel()
 			g := NewWithT(t)
 
-			var result *SessionPersistenceConfig
-			var errors routeRuleErrors
-			if test.httpRouteMatches != nil {
-				result, errors = processSessionPersistenceConfig(
-					test.sessionPersistence,
-					test.httpRouteMatches,
-					sessionPersistencePath,
-					createDurationValidator(test.sessionPersistence.AbsoluteTimeout),
-				)
-			}
-
-			if test.grpcRouteMatches != nil {
-				result, errors = processSessionPersistenceConfig(
-					test.sessionPersistence,
-					test.grpcRouteMatches,
-					sessionPersistencePath,
-					createDurationValidator(test.sessionPersistence.AbsoluteTimeout),
-				)
-			}
+			result, errors := processSessionPersistenceConfig(
+				test.sessionPersistence,
+				sessionPersistencePath,
+				createDurationValidator(test.sessionPersistence.AbsoluteTimeout),
+			)
 
 			g.Expect(result).To(HaveValue(Equal(test.expectedResult)))
 			g.Expect(errors).To(Equal(test.expectedErrors))
@@ -6405,10 +6459,10 @@ func TestValidateSessionPersistence(t *testing.T) {
 		{
 			name: "valid session persistence returns no errors",
 			sessionPersistence: &gatewayv1.SessionPersistence{
-				SessionName:     helpers.GetPointer("session-persistence"),
 				Type:            helpers.GetPointer(gatewayv1.CookieBasedSessionPersistence),
 				AbsoluteTimeout: helpers.GetPointer(gatewayv1.Duration("30m")),
-				CookieConfig: &gatewayv1.CookieConfig{
+				Cookie: &gatewayv1.CookieConfig{
+					Name:         helpers.GetPointer[gatewayv1.CookieName]("session-persistence"),
 					LifetimeType: helpers.GetPointer(gatewayv1.PermanentCookieLifetimeType),
 				},
 			},
@@ -6431,155 +6485,7 @@ func TestValidateSessionPersistence(t *testing.T) {
 	}
 }
 
-func TestGetCookiePath(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name         string
-		expectedPath string
-		matches      []gatewayv1.HTTPRouteMatch
-	}{
-		{
-			name:         "no matches returns empty path",
-			matches:      []gatewayv1.HTTPRouteMatch{},
-			expectedPath: "",
-		},
-		{
-			name: "single match with type Exact returns that path",
-			matches: []gatewayv1.HTTPRouteMatch{
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchExact),
-						Value: helpers.GetPointer("/app/users"),
-					},
-				},
-			},
-			expectedPath: "/app/users",
-		},
-		{
-			name: "single match with type Prefix returns that path",
-			matches: []gatewayv1.HTTPRouteMatch{
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchPathPrefix),
-						Value: helpers.GetPointer("/app/orders"),
-					},
-				},
-			},
-			expectedPath: "/app/orders",
-		},
-		{
-			name: "single match with type Regular Expression returns empty path",
-			matches: []gatewayv1.HTTPRouteMatch{
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchRegularExpression),
-						Value: helpers.GetPointer("/app/[a-z]+/orders"),
-					},
-				},
-			},
-			expectedPath: "",
-		},
-		{
-			name: "multiple matches with all three types of matches returns empty path",
-			matches: []gatewayv1.HTTPRouteMatch{
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchRegularExpression),
-						Value: helpers.GetPointer("/app/[a-z]+/orders"),
-					},
-				},
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchPathPrefix),
-						Value: helpers.GetPointer("/app/users/login"),
-					},
-				},
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchExact),
-						Value: helpers.GetPointer("/app/users/"),
-					},
-				},
-			},
-			expectedPath: "",
-		},
-		{
-			name: "multiple matches with all predefined path types Exact and PathPrefix " +
-				"returns longest common prefix",
-			matches: []gatewayv1.HTTPRouteMatch{
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchPathPrefix),
-						Value: helpers.GetPointer("/app/users/profile/"),
-					},
-				},
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchPathPrefix),
-						Value: helpers.GetPointer("/app/users/login"),
-					},
-				},
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchExact),
-						Value: helpers.GetPointer("/app/users/orders/"),
-					},
-				},
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchPathPrefix),
-						Value: helpers.GetPointer("/app/users/history"),
-					},
-				},
-			},
-			expectedPath: "/app/users",
-		},
-		{
-			name: "multiple matches with all predefined path types Exact and PathPrefix " +
-				"returns empty path when there is no common prefix",
-			matches: []gatewayv1.HTTPRouteMatch{
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchExact),
-						Value: helpers.GetPointer("/app/v1"),
-					},
-				},
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchPathPrefix),
-						Value: helpers.GetPointer("/coffee/latte/"),
-					},
-				},
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchExact),
-						Value: helpers.GetPointer("/coffee/espresso"),
-					},
-				},
-				{
-					Path: &gatewayv1.HTTPPathMatch{
-						Type:  helpers.GetPointer(gatewayv1.PathMatchPathPrefix),
-						Value: helpers.GetPointer("/tea/green"),
-					},
-				},
-			},
-			expectedPath: "",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			g := NewWithT(t)
-
-			result := deriveCookiePathForHTTPMatches(test.matches)
-			g.Expect(result).To(Equal(test.expectedPath))
-		})
-	}
-}
-
-func TestL4RouteSpec_GetBackendRefs(t *testing.T) {
+func TestL4RouteSpec_BackendRefs(t *testing.T) {
 	t.Parallel()
 
 	svc1 := types.NamespacedName{Namespace: "test", Name: "svc1"}
@@ -6604,12 +6510,14 @@ func TestL4RouteSpec_GetBackendRefs(t *testing.T) {
 			},
 		},
 		{
-			name: "single backend route with BackendRef set",
+			name: "single backend route with valid BackendRef",
 			spec: L4RouteSpec{
-				BackendRef: BackendRef{
-					SvcNsName: svc1,
-					Valid:     true,
-					Weight:    1,
+				BackendRefs: []BackendRef{
+					{
+						SvcNsName: svc1,
+						Valid:     true,
+						Weight:    1,
+					},
 				},
 			},
 			expected: []BackendRef{
@@ -6619,10 +6527,12 @@ func TestL4RouteSpec_GetBackendRefs(t *testing.T) {
 		{
 			name: "single backend route with invalid BackendRef",
 			spec: L4RouteSpec{
-				BackendRef: BackendRef{
-					SvcNsName:          svc1,
-					Valid:              false,
-					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+				BackendRefs: []BackendRef{
+					{
+						SvcNsName:          svc1,
+						Valid:              false,
+						InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
+					},
 				},
 			},
 			expected: []BackendRef{
@@ -6634,27 +6544,9 @@ func TestL4RouteSpec_GetBackendRefs(t *testing.T) {
 			},
 		},
 		{
-			name: "empty route with no backends returns zero-value BackendRef",
-			spec: L4RouteSpec{},
-			expected: []BackendRef{
-				{}, // Expect a single zero-value BackendRef
-			},
-		},
-		{
-			name: "BackendRefs takes precedence over BackendRef",
-			spec: L4RouteSpec{
-				BackendRefs: []BackendRef{
-					{SvcNsName: svc1, Valid: true, Weight: 100},
-				},
-				BackendRef: BackendRef{
-					SvcNsName: svc2,
-					Valid:     true,
-					Weight:    1,
-				},
-			},
-			expected: []BackendRef{
-				{SvcNsName: svc1, Valid: true, Weight: 100},
-			},
+			name:     "empty route with no backends has nil BackendRefs",
+			spec:     L4RouteSpec{},
+			expected: nil,
 		},
 	}
 
@@ -6663,7 +6555,7 @@ func TestL4RouteSpec_GetBackendRefs(t *testing.T) {
 			t.Parallel()
 			g := NewWithT(t)
 
-			result := test.spec.GetBackendRefs()
+			result := test.spec.BackendRefs
 			g.Expect(result).To(Equal(test.expected))
 		})
 	}

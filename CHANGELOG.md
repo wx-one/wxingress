@@ -4,6 +4,36 @@ wxingress versions are `<NGINX Ingress Controller version>-wx<n>`: `5.7.1-wx5` i
 release based on NGINX Ingress Controller 5.7.1. The changes of NGINX Ingress Controller itself are on its
 [releases page](https://github.com/nginx/kubernetes-ingress/releases).
 
+## 5.7.1-wx11
+
+ListenerSets of the Gateway API, Gateway API v1.7.0. Upgrade where `load-balance` or `upstream-hash-by`
+changes on routes with the wxingress module.
+
+### Features
+
+- ListenerSets of the Gateway API. A namespace adds listeners to a Gateway of another namespace, with
+  certificates of its own, where the Gateway allows it in `spec.allowedListeners`. On the default
+  Gateway this gives teams their own hostnames and certificates on the shared address, as with
+  Ingresses, without access to the Gateway; cert-manager 1.20 or later issues the certificates from an
+  annotation on the ListenerSet. Listeners of the Gateway keep their hostnames over those of a
+  ListenerSet, and on the default Gateway a ListenerSet can only add HTTP on 80 and HTTPS on 443. The
+  controller looks for the ListenerSet CRD when it starts and serves none without it. The chart's
+  ClusterRole reads ListenerSets and writes their status.
+
+### Changes
+
+- The Gateway API is v1.7.0, and its semantics those of NGINX Gateway Fabric 2.9.0 (from 2.8.1).
+  `controller.gatewayAPI.installCRDs` installs the CRDs of v1.7.0. Among NGF's fixes since 2.8.1: a
+  listener of a ListenerSet with the name of a listener of its Gateway no longer takes the routes
+  attached to the Gateway without a `sectionName` off it.
+
+### Fixes
+
+- With `-dynamic-upstreams`, changing `load-balance` or `upstream-hash-by` on a route reloaded NGINX
+  since 5.7.1-wx10, which gave the route's upstream `least_time` for `ewma`. The wxingress module
+  balances routes by its rule, as Ingresses: the upstream keeps NGINX's method, and the change
+  reloads nothing.
+
 ## 5.7.1-wx10
 
 A security release. Upgrade where an ingress-nginx ConfigMap has global allow or deny lists and

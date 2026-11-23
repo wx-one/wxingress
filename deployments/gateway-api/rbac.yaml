@@ -15,6 +15,7 @@ rules:
   - tcproutes
   - udproutes
   - referencegrants
+  - listenersets
   verbs:
   - list
   - watch
@@ -29,6 +30,7 @@ rules:
   - tlsroutes/status
   - tcproutes/status
   - udproutes/status
+  - listenersets/status
   verbs:
   - update
 # the Services of the Gateways with addresses of their own, in the Gateways'

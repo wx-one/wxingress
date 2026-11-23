@@ -31,7 +31,7 @@ it is edited by hand: a test (`TestNGFCopyIsUnmodified`) recomputes the checksum
 code in `internal/gateway/` that uses the copy, then sync again.
 
 ```sh
-hack/sync-ngf.sh v2.8.1
+hack/sync-ngf.sh v2.9.0
 ```
 
 The script clones NGF at the tag, copies the package closure of the graph, rewrites the import paths,

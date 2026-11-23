@@ -30,6 +30,10 @@ var SupportedFeatures = []features.FeatureName{
 	features.SupportGatewayAddressEmpty,
 	features.SupportGatewayInfrastructure,
 
+	// ListenerSet (internal/gateway/listenerset_test.go; on the default
+	// Gateway: dataplane/e2e/gateway-listenerset.sh)
+	features.SupportListenerSet,
+
 	// HTTPRoute, extended: matches
 	features.SupportHTTPRouteMethodMatching,
 	features.SupportHTTPRouteQueryParamMatching,

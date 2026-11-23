@@ -80,7 +80,7 @@ type upstreamIndex map[string]servicePort
 func newUpstreamIndex(g *graph.Graph) upstreamIndex {
 	idx := make(upstreamIndex)
 	for _, r := range g.L4Routes {
-		for _, br := range r.Spec.GetBackendRefs() {
+		for _, br := range r.Spec.BackendRefs {
 			if ref := br.ServicePortReference(); ref != "" {
 				idx[ref] = servicePort{svc: br.SvcNsName, port: br.ServicePort.Port}
 			}
@@ -884,6 +884,12 @@ func (m *routeMapper) upstream(upstreamName string, grpc bool, rule *dataplane.P
 		u := conf_v1.Upstream{Name: name, Service: svc, Port: uint16(sp.port)} //nolint:gosec // a Service port fits
 		if settings != nil {
 			u = withSettings(u, settings.settings)
+			if m.listener.dynamic && settings.settings.Balancing {
+				// the wxingress module balances by a rule, as for an
+				// Ingress: the upstream keeps nginx's method, and a change
+				// of load-balance or upstream-hash-by reloads nothing
+				u.LBMethod = ""
+			}
 		}
 		if grpc {
 			u.Type = "grpc"

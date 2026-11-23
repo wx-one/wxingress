@@ -10,6 +10,8 @@
 #
 #   helm install wxgw charts/wxingress -n wxgw --create-namespace \
 #     --set controller.dynamicUpstreams=true \
+#     --set controller.enableOIDC=true \
+#     --set controller.enableSnippets=true \
 #     --set controller.ingressClass.name=wxgw \
 #     --set controller.service.type=ClusterIP \
 #     --set controller.gatewayAPI.enable=true \
@@ -74,8 +76,12 @@ podip=$($K -n "$ns" get "$pod" -o jsonpath='{.status.podIP}')
 
 X() { $D exec "$node" "$@"; }
 reloads() { X curl -s "http://$podip:9113/metrics" | grep '^nginx_ingress_controller_nginx_reloads_total' | awk '{s+=$2} END {print s+0}'; }
+# the nginx processes of the pod, read on the kind node: the image has no
+# shell to read them in the pod. The pod's processes are those in its cgroup.
 nginxes() {
-  list=$($K -n "$ns" exec "$pod" -- sh -c 'for p in /proc/[0-9]*; do c=$(tr "\0" " " < $p/cmdline 2>/dev/null); case "$c" in nginx:*) echo "${p#/proc/}:${c#nginx: }";; esac; done' | sort)
+  uid=$($K -n "$ns" get "$pod" -o jsonpath='{.metadata.uid}')
+  uid_=$(echo "$uid" | tr - _)
+  list=$(X sh -c "for p in /proc/[0-9]*; do grep -q -e $uid -e $uid_ \$p/cgroup 2>/dev/null || continue; c=\$(tr '\\0' ' ' < \$p/cmdline 2>/dev/null); case \"\$c\" in nginx:*) echo \"\${p#/proc/}:\${c#nginx: }\";; esac; done" | sort)
   echo "$(echo "$list" | grep -c master) master, $(echo "$list" | grep -c worker) workers, $(echo "$list" | cksum | cut -d' ' -f1)"
 }
 cond() { $K -n $N get "$1" -o jsonpath="{$2}"; }
@@ -220,6 +226,7 @@ within "weights 80/20: requests of 200 to v2" "$v2" 20 60
 
 r0=$(reloads)
 p0=$(nginxes)
+check "the pod's nginx master is found, to compare its processes" "${p0%% master*}" "1"
 echo "         reloads so far: $r0; nginx: $p0"
 
 echo "--- endpoints without reloads"
@@ -461,7 +468,7 @@ else
   check "without -enable-snippets the route has no snippets" "$(X curl -s -o /dev/null -D - --max-time 3 -H 'Host: snip.example.com' "http://$(addr)/hostname" | grep -ci '^x-snippet:')" "0"
 fi
 clusterip=$($K -n $N get svc v1 -o jsonpath='{.spec.clusterIP}')
-check "service-upstream on the route: its upstream is the ClusterIP" "$($K -n "$ns" exec "$pod" -- sh -c 'grep -l clusterip.example.com /etc/nginx/conf.d/*.conf | xargs cat' | grep -q "server $clusterip:80" && echo yes)" "yes"
+check "service-upstream on the route: its upstream is the ClusterIP" "$($K -n "$ns" exec "$pod" -c wxingress -- nginx -T 2>/dev/null | grep -q "server $clusterip:80" && echo yes)" "yes"
 check "and it answers" "$(get clusterip.example.com | grep -c '^v1-')" "1"
 check "external auth of a Policy: the auth service says 2xx, the request goes on" "$(get extauth.example.com | grep -c '^v1-')" "1"
 check "and when it has no endpoints, it does not" "$(get extauth-broken.example.com)" "500"

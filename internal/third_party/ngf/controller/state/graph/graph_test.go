@@ -204,9 +204,9 @@ func TestBuildGraph(t *testing.T) {
 			Namespace: testNs,
 		},
 		Spec: ngfAPIv1alpha1.SnippetsFilterSpec{
-			Snippets: []ngfAPIv1alpha1.Snippet{
+			Snippets: []ngfAPIv1alpha1.FilterSnippet{
 				{
-					Context: ngfAPIv1alpha1.NginxContextMain,
+					Context: ngfAPIv1alpha1.SnippetsFilterContextMain,
 					Value:   "main snippet",
 				},
 			},
@@ -219,9 +219,9 @@ func TestBuildGraph(t *testing.T) {
 			Namespace: testNs,
 		},
 		Spec: ngfAPIv1alpha1.SnippetsFilterSpec{
-			Snippets: []ngfAPIv1alpha1.Snippet{
+			Snippets: []ngfAPIv1alpha1.FilterSnippet{
 				{
-					Context: ngfAPIv1alpha1.NginxContextHTTPServer,
+					Context: ngfAPIv1alpha1.SnippetsFilterContextHTTPServer,
 					Value:   "server snippet",
 				},
 			},
@@ -561,10 +561,10 @@ func TestBuildGraph(t *testing.T) {
 	}
 
 	spConfig := &gatewayv1.SessionPersistence{
-		SessionName:     helpers.GetPointer("session-persistence-httproute"),
 		Type:            helpers.GetPointer(gatewayv1.CookieBasedSessionPersistence),
 		AbsoluteTimeout: helpers.GetPointer(gatewayv1.Duration("30m")),
-		CookieConfig: &gatewayv1.CookieConfig{
+		Cookie: &gatewayv1.CookieConfig{
+			Name:         helpers.GetPointer[gatewayv1.CookieName]("session-persistence-httproute"),
 			LifetimeType: helpers.GetPointer(gatewayv1.PermanentCookieLifetimeType),
 		},
 	}
@@ -701,10 +701,10 @@ func TestBuildGraph(t *testing.T) {
 						},
 					},
 					SessionPersistence: &gatewayv1.SessionPersistence{
-						SessionName:     helpers.GetPointer("session-persistence-grpcroute"),
 						Type:            helpers.GetPointer(gatewayv1.CookieBasedSessionPersistence),
 						AbsoluteTimeout: helpers.GetPointer(gatewayv1.Duration("30m")),
-						CookieConfig: &gatewayv1.CookieConfig{
+						Cookie: &gatewayv1.CookieConfig{
+							Name:         helpers.GetPointer[gatewayv1.CookieName]("session-persistence-grpcroute"),
 							LifetimeType: helpers.GetPointer(gatewayv1.PermanentCookieLifetimeType),
 						},
 					},
@@ -1050,6 +1050,7 @@ func TestBuildGraph(t *testing.T) {
 			Namespace: testNs, Name: controller.CreateInferencePoolServiceName(inferencePool.Name),
 		},
 		Spec: v1.ServiceSpec{
+			ClusterIP: "10.96.0.100",
 			Ports: []v1.ServicePort{
 				{
 					Port: 80,
@@ -1514,45 +1515,22 @@ func TestBuildGraph(t *testing.T) {
 				},
 				SectionName: &gw1.Source.Spec.Listeners[3].Name,
 			},
-			{
-				Kind:                kinds.Gateway,
-				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
-				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
-				Idx:                 0,
-				EffectiveNginxProxy: np1Effective,
-				Attachment: &ParentRefAttachmentStatus{
-					Listeners:        []ListenerAttachmentStatus{},
-					Attached:         false,
-					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
-				},
-				SectionName: helpers.GetPointer[gatewayv1.SectionName]("http-8080"),
-			},
-			{
-				Kind:                kinds.Gateway,
-				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
-				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
-				Idx:                 0,
-				EffectiveNginxProxy: np1Effective,
-				Attachment: &ParentRefAttachmentStatus{
-					Listeners:        []ListenerAttachmentStatus{},
-					Attached:         false,
-					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
-				},
-				SectionName: helpers.GetPointer[gatewayv1.SectionName]("https-9443"),
-			},
 		},
 		Spec: L4RouteSpec{
 			Hostnames: tr.Spec.Hostnames,
-			BackendRef: BackendRef{
-				SvcNsName: types.NamespacedName{
-					Namespace: "test",
-					Name:      "foo2",
+			BackendRefs: []BackendRef{
+				{
+					SvcNsName: types.NamespacedName{
+						Namespace: "test",
+						Name:      "foo2",
+					},
+					ServicePort: v1.ServicePort{
+						Port: 80,
+					},
+					Weight:             1,
+					Valid:              true,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
 				},
-				ServicePort: v1.ServicePort{
-					Port: 80,
-				},
-				Valid:              true,
-				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
 			},
 		},
 	}
@@ -1615,45 +1593,22 @@ func TestBuildGraph(t *testing.T) {
 				},
 				SectionName: &gw1.Source.Spec.Listeners[3].Name,
 			},
-			{
-				Kind:                kinds.Gateway,
-				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
-				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
-				Idx:                 0,
-				EffectiveNginxProxy: np1Effective,
-				Attachment: &ParentRefAttachmentStatus{
-					Listeners:        []ListenerAttachmentStatus{},
-					Attached:         false,
-					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
-				},
-				SectionName: helpers.GetPointer[gatewayv1.SectionName]("http-8080"),
-			},
-			{
-				Kind:                kinds.Gateway,
-				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
-				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
-				Idx:                 0,
-				EffectiveNginxProxy: np1Effective,
-				Attachment: &ParentRefAttachmentStatus{
-					Listeners:        []ListenerAttachmentStatus{},
-					Attached:         false,
-					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
-				},
-				SectionName: helpers.GetPointer[gatewayv1.SectionName]("https-9443"),
-			},
 		},
 		Spec: L4RouteSpec{
 			Hostnames: tr.Spec.Hostnames,
-			BackendRef: BackendRef{
-				SvcNsName: types.NamespacedName{
-					Namespace: "test",
-					Name:      "foo2",
+			BackendRefs: []BackendRef{
+				{
+					SvcNsName: types.NamespacedName{
+						Namespace: "test",
+						Name:      "foo2",
+					},
+					ServicePort: v1.ServicePort{
+						Port: 80,
+					},
+					Weight:             1,
+					Valid:              true,
+					InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
 				},
-				ServicePort: v1.ServicePort{
-					Port: 80,
-				},
-				Valid:              true,
-				InvalidForGateways: map[types.NamespacedName]conditions.Condition{},
 			},
 		},
 	}
@@ -1715,32 +1670,6 @@ func TestBuildGraph(t *testing.T) {
 					FailedConditions: []conditions.Condition{conditions.NewRouteNotAllowedByListeners()},
 				},
 				SectionName: &gw1.Source.Spec.Listeners[3].Name,
-			},
-			{
-				Kind:                kinds.Gateway,
-				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
-				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
-				Idx:                 0,
-				EffectiveNginxProxy: np1Effective,
-				Attachment: &ParentRefAttachmentStatus{
-					Listeners:        []ListenerAttachmentStatus{},
-					Attached:         false,
-					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
-				},
-				SectionName: helpers.GetPointer[gatewayv1.SectionName]("http-8080"),
-			},
-			{
-				Kind:                kinds.Gateway,
-				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
-				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
-				Idx:                 0,
-				EffectiveNginxProxy: np1Effective,
-				Attachment: &ParentRefAttachmentStatus{
-					Listeners:        []ListenerAttachmentStatus{},
-					Attached:         false,
-					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
-				},
-				SectionName: helpers.GetPointer[gatewayv1.SectionName]("https-9443"),
 			},
 		},
 		Spec: L4RouteSpec{
@@ -1819,32 +1748,6 @@ func TestBuildGraph(t *testing.T) {
 				},
 				SectionName: &gw1.Source.Spec.Listeners[3].Name,
 			},
-			{
-				Kind:                kinds.Gateway,
-				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
-				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
-				Idx:                 0,
-				EffectiveNginxProxy: np1Effective,
-				Attachment: &ParentRefAttachmentStatus{
-					Listeners:        []ListenerAttachmentStatus{},
-					Attached:         false,
-					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
-				},
-				SectionName: helpers.GetPointer[gatewayv1.SectionName]("http-8080"),
-			},
-			{
-				Kind:                kinds.Gateway,
-				NamespacedName:      client.ObjectKeyFromObject(gw1.Source),
-				GatewayNsName:       client.ObjectKeyFromObject(gw1.Source),
-				Idx:                 0,
-				EffectiveNginxProxy: np1Effective,
-				Attachment: &ParentRefAttachmentStatus{
-					Listeners:        []ListenerAttachmentStatus{},
-					Attached:         false,
-					FailedConditions: []conditions.Condition{conditions.NewRouteNoMatchingParent()},
-				},
-				SectionName: helpers.GetPointer[gatewayv1.SectionName]("https-9443"),
-			},
 		},
 		Spec: L4RouteSpec{
 			BackendRefs: []BackendRef{
@@ -1869,6 +1772,7 @@ func TestBuildGraph(t *testing.T) {
 		SessionType: gatewayv1.CookieBasedSessionPersistence,
 		Expiry:      "30m",
 		Valid:       true,
+		Path:        "/",
 		Idx:         "gr_test_0",
 	}
 	routeGR := &L7Route{
@@ -2337,6 +2241,7 @@ func TestBuildGraph(t *testing.T) {
 					GatewayNsNames: map[types.NamespacedName]struct{}{{Namespace: testNs, Name: "gateway-1"}: {}},
 				},
 				client.ObjectKeyFromObject(inferenceSvc): {
+					ClusterIP:      "10.96.0.100",
 					GatewayNsNames: map[types.NamespacedName]struct{}{{Namespace: testNs, Name: "gateway-1"}: {}},
 				},
 				client.ObjectKeyFromObject(lsBackendSvc): {
@@ -2646,6 +2551,7 @@ func TestBuildGraph(t *testing.T) {
 					Plus:         test.plus,
 				},
 				test.endpointSliceOwnership,
+				nil, // secretReferenceable
 			)
 
 			// Handle ListenerFactory separately due to complex internal structure

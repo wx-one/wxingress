@@ -3,7 +3,7 @@
 wxingress serves the [Gateway API](https://gateway-api.sigs.k8s.io/) next to Ingresses and NGINX Ingress
 Controller's resources, from the same controller and the same NGINX. The Gateway API semantics
 (attachment of routes to listeners, hostnames, ReferenceGrants, conflicts and every status condition) are
-those of [NGINX Gateway Fabric](https://github.com/nginx/nginx-gateway-fabric) 2.8.1, whose graph
+those of [NGINX Gateway Fabric](https://github.com/nginx/nginx-gateway-fabric) 2.9.0, whose graph
 wxingress contains as a copy. The NGINX configuration is wxingress's own.
 
 !!! info "Status"
@@ -13,8 +13,9 @@ wxingress contains as a copy. The NGINX configuration is wxingress's own.
 
 | | |
 |---|---|
-| Gateway API version | v1.6.3, standard channel |
+| Gateway API version | v1.7.0, standard channel |
 | Routes | HTTPRoute, GRPCRoute, TLSRoute, TCPRoute, UDPRoute |
+| ListenerSet | listeners and certificates of other namespaces, on the default Gateway too ([below](#listeners-of-other-namespaces-listenersets)) |
 | HTTPRoute extended features | method, query and port matching, response header modification, path and host rewrite, path and port redirect, and more |
 | GatewayClass `controllerName` | `wxingress.wizardtales.com/gateway-controller` |
 
@@ -68,6 +69,155 @@ between Ingresses, the oldest one gets it. A route's host counts as created when
 brought that hostname was created, but never before the Gateway itself. Hosts that existing Ingresses
 and VirtualServers already serve therefore stay with them, even when the default Gateway takes routes
 from all namespaces.
+
+## Listeners of other namespaces: ListenerSets
+
+On a Gateway, certificates belong to listeners, not to routes: an HTTPRoute cannot name one. With an
+Ingress, every team brings its certificate along in `spec.tls`; with a Gateway, someone who may edit the
+Gateway would have to add a listener and its certificate for every new hostname.
+
+A [ListenerSet](https://gateway-api.sigs.k8s.io/guides/listener-set/) lets a namespace add listeners to a
+Gateway of another namespace, with certificates of its own namespace, without access to the Gateway.
+The Gateway decides which namespaces may do that in `spec.allowedListeners`. This also works on the
+default Gateway, so teams can serve their own hostnames with their own certificates from the shared
+address, as they do with Ingresses:
+
+```yaml
+# once, on the default Gateway
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: default
+  namespace: wxingress
+spec:
+  gatewayClassName: wxingress
+  allowedListeners:
+    namespaces:
+      from: Selector
+      selector:
+        matchLabels:
+          wxingress.wizardtales.com/default-gateway: allowed
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 80
+      allowedRoutes:
+        namespaces:
+          from: Selector
+          selector:
+            matchLabels:
+              wxingress.wizardtales.com/default-gateway: allowed
+---
+# in the team's namespace, which has the label
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: app
+  namespace: team-a
+spec:
+  parentRef:
+    name: default
+    namespace: wxingress
+  listeners:
+    - name: https
+      hostname: app.example.com
+      protocol: HTTPS
+      port: 443
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: app-tls          # a Secret of team-a
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: app
+  namespace: team-a
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: ListenerSet
+      name: app
+      sectionName: https
+  hostnames: ["app.example.com"]
+  rules:
+    - backendRefs:
+        - name: app
+          port: 80
+```
+
+What a ListenerSet may do is bounded:
+
+- On the default Gateway its listeners can only be HTTP on 80 and HTTPS on 443, as the Gateway's own.
+  A listener on another port is not accepted (`PortUnavailable`).
+- A listener on a port and hostname a listener of the Gateway already has is a conflict
+  (`Conflicted`): the Gateway's listener and its certificate keep the hostname. Between two
+  ListenerSets, the older one keeps it.
+- A host that an Ingress or VirtualServer already serves stays with it, as for any route on the default
+  Gateway.
+- A listener name may repeat a name of the Gateway's listeners. Routes attached to the Gateway stay on
+  the Gateway's own listeners.
+
+The controller looks for the ListenerSet CRD when it starts. It is part of the standard channel since
+Gateway API 1.5, and `controller.gatewayAPI.installCRDs` installs it. Without the CRD, ListenerSets are not
+served and the controller logs a warning; after installing the CRD, restart the controller.
+
+### Certificates from cert-manager
+
+cert-manager 1.20 or later creates the certificates of a ListenerSet's listeners from an annotation, as it
+does for Ingresses, with its Gateway API support and the ListenerSet feature turned on:
+
+```yaml
+# values of the cert-manager chart
+config:
+  apiVersion: controller.config.cert-manager.io/v1alpha1
+  kind: ControllerConfiguration
+  gatewayAPI:
+    enabled: true
+    enableListenerSet: true
+  featureGates:
+    ListenerSets: true
+```
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: app
+  namespace: team-a
+  annotations:
+    cert-manager.io/issuer: letsencrypt   # or cert-manager.io/cluster-issuer
+```
+
+cert-manager then creates a Certificate for every listener with a hostname, in the ListenerSet's
+namespace, with the Secret the listener names.
+
+For HTTP-01, let the issuer answer the challenge with an HTTPRoute on the HTTP listener of the default
+Gateway, not with an Ingress: on the default Gateway the older of a route and an Ingress keeps a host, and
+an Ingress for the challenge would come after the routes of that host.
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt
+  namespace: team-a
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@example.com
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - http01:
+          gatewayHTTPRoute:
+            parentRefs:
+              - group: gateway.networking.k8s.io
+                kind: Gateway
+                name: default
+                namespace: wxingress
+                sectionName: http
+```
 
 ## Client certificates
 

@@ -90,6 +90,11 @@ type Config struct {
 	WatchNamespaces []string
 	// Resync is the resync period of the informers.
 	Resync time.Duration
+	// ListenerSets tells that the cluster has the ListenerSet CRD: its
+	// ListenerSets are watched, and add listeners to the Gateways that allow
+	// them (spec.allowedListeners). Without the CRD an informer would never
+	// sync.
+	ListenerSets bool
 }
 
 // Controller turns Gateway API resources into VirtualServers through NGF's
@@ -256,7 +261,8 @@ func (c *Controller) build(ctx context.Context, state graph.ClusterState) Result
 		c.validators,
 		c.logger,
 		graph.FeatureFlags{},
-		nil,
+		nil, // EndpointSlice ownership: the controller resolves endpoints itself
+		nil, // every Secret may be referenced, as before NGF v2.9.0
 	)
 
 	res := Result{Graph: g, Addresses: make(map[types.NamespacedName][]gatewayv1.GatewayStatusAddress)}
@@ -391,6 +397,7 @@ func (c *Controller) clusterState() (graph.ClusterState, error) {
 		Namespaces:      make(map[types.NamespacedName]*v1.Namespace),
 		ReferenceGrants: make(map[types.NamespacedName]*gatewayv1.ReferenceGrant),
 		Secrets:         make(map[types.NamespacedName]*v1.Secret),
+		ListenerSets:    make(map[types.NamespacedName]*gatewayv1.ListenerSet),
 	}
 
 	gcs, err := c.gatewayClasses.List(everything)
@@ -426,6 +433,11 @@ func (c *Controller) clusterState() (graph.ClusterState, error) {
 		}
 		if err := listInto(w.udpRoutes.List, state.UDPRoutes); err != nil {
 			return state, err
+		}
+		if w.listenerSets != nil {
+			if err := listInto(w.listenerSets.List, state.ListenerSets); err != nil {
+				return state, err
+			}
 		}
 		grants, err := w.referenceGrants.List(everything)
 		if err != nil {

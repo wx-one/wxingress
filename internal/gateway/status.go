@@ -37,8 +37,12 @@ func (c *Controller) WriteStatus(
 	c.handled = current
 
 	reqs := status.PrepareGatewayClassRequests(g.GatewayClass, g.IgnoredGatewayClasses, now)
-	reqs = append(reqs, status.PrepareActiveRouteRequests(g.L4Routes, g.Routes, now, c.cfg.ControllerName)...)
+	reqs = append(reqs, status.PrepareActiveRouteRequests(g.L4Routes, g.Routes, now, c.cfg.ControllerName,
+		// no NoReadyEndpoints condition: the endpoints of the upstreams are
+		// the controller's, which the graph does not resolve
+		nil)...)
 	reqs = append(reqs, status.PrepareDroppedRequests(dropped, c.cfg.ControllerName)...)
+	reqs = append(reqs, status.PrepareListenerSetRequests(g.ListenerSets, now)...)
 	for _, gw := range sortedGateways(g) {
 		name := types.NamespacedName{Namespace: gw.Source.Namespace, Name: gw.Source.Name}
 		addresses := sharedAddresses
@@ -110,6 +114,11 @@ func (c *Controller) write(ctx context.Context, r status.UpdateRequest) error {
 				func() (*gatewayv1.UDPRoute, error) { return cachedIn(c, ns, name, (*nsWatch).udpRoute) },
 				gw.UDPRoutes(ns).Get, gw.UDPRoutes(ns).UpdateStatus,
 				func(o *gatewayv1.UDPRoute) any { return o.Status })
+		case *gatewayv1.ListenerSet:
+			err = writeObject(ctx, fresh, name, r.Setter,
+				func() (*gatewayv1.ListenerSet, error) { return cachedIn(c, ns, name, (*nsWatch).listenerSet) },
+				gw.ListenerSets(ns).Get, gw.ListenerSets(ns).UpdateStatus,
+				func(o *gatewayv1.ListenerSet) any { return o.Status })
 		default:
 			// kinds wxingress does not serve have no status to write
 			return nil
@@ -201,4 +210,11 @@ func (w *nsWatch) tcpRoute(ns, name string) (*gatewayv1.TCPRoute, error) {
 
 func (w *nsWatch) udpRoute(ns, name string) (*gatewayv1.UDPRoute, error) {
 	return w.udpRoutes.UDPRoutes(ns).Get(name)
+}
+
+func (w *nsWatch) listenerSet(ns, name string) (*gatewayv1.ListenerSet, error) {
+	if w.listenerSets == nil {
+		return nil, apierrors.NewNotFound(gatewayv1.Resource("listenersets"), name)
+	}
+	return w.listenerSets.ListenerSets(ns).Get(name)
 }

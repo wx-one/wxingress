@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gwclient "sigs.k8s.io/gateway-api/pkg/client/clientset/versioned"
 
 	"github.com/wx-one/wxingress/internal/gateway"
@@ -67,5 +68,26 @@ func newGatewayAPI(ctx context.Context, config *rest.Config, kubeClient kubernet
 		ListenerPortMax:  last,
 		ReservedPorts:    gatewayReservedPorts(),
 		Resync:           30 * time.Second,
+		ListenerSets:     hasListenerSets(ctx, kubeClient),
 	})
+}
+
+// hasListenerSets tells whether the cluster has the ListenerSet CRD, which
+// the standard channel of the Gateway API has since 1.5: without it, an
+// informer of ListenerSets would never sync. The CRD is looked for once, at
+// the start - one installed later takes a restart.
+func hasListenerSets(ctx context.Context, kubeClient kubernetes.Interface) bool {
+	l := nl.LoggerFromContext(ctx)
+	res, err := kubeClient.Discovery().ServerResourcesForGroupVersion(gatewayv1.GroupVersion.String())
+	if err != nil {
+		nl.Warnf(l, "Could not tell whether the cluster has the ListenerSet CRD, ListenerSets are not served: %v", err)
+		return false
+	}
+	for _, r := range res.APIResources {
+		if r.Name == "listenersets" {
+			return true
+		}
+	}
+	nl.Warnf(l, "The cluster has no ListenerSet CRD (%s), ListenerSets are not served: install the CRDs of Gateway API 1.5 or later and restart", gatewayv1.GroupVersion)
+	return false
 }

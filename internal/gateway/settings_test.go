@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -163,5 +165,35 @@ func TestPoliciesOfAnotherNamespaceNeedAReferenceGrant(t *testing.T) {
 	vs = onlyVS(t, build(t, testController(), b))
 	if len(vs.Spec.Policies) != 1 || len(vs.Spec.Routes) < 2 {
 		t.Errorf("the Gateway's granted Policy: policies %+v routes %+v", vs.Spec.Policies, vs.Spec.Routes)
+	}
+}
+
+// TestModuleBalancedRoutesKeepNginxMethod: with the wxingress module a
+// route's load-balance is a rule of the module, and the upstream keeps
+// nginx's method - switching between ewma and round_robin changes no
+// VirtualServer, which would reload nginx. Without the module ewma is
+// least_time, as for an Ingress.
+func TestModuleBalancedRoutesKeepNginxMethod(t *testing.T) {
+	t.Parallel()
+	upstreamWith := func(dynamic bool, method string) conf_v1.Upstream {
+		b := newState().gateway("gw", httpListener("http", "")).service("a", 80).
+			route("tuned", []string{"x.example.com"}, filterRoute("/tuned"))
+		b.s.HTTPRoutes[routeKey("tuned")].Annotations = map[string]string{"nginx.ingress.kubernetes.io/load-balance": method}
+		c := testController()
+		c.cfg.DynamicUpstreams = dynamic
+		vs := onlyVS(t, build(t, c, b))
+		if len(vs.Spec.Upstreams) != 1 {
+			t.Fatalf("upstreams %+v", vs.Spec.Upstreams)
+		}
+		return vs.Spec.Upstreams[0]
+	}
+	if u := upstreamWith(true, "ewma"); u.LBMethod != "" {
+		t.Errorf("with the module ewma is %q on the upstream, want nginx's method", u.LBMethod)
+	}
+	if a, b := upstreamWith(true, "ewma"), upstreamWith(true, "round_robin"); !cmp.Equal(a, b) {
+		t.Errorf("ewma and round_robin differ in the upstream: %s", cmp.Diff(a, b))
+	}
+	if u := upstreamWith(false, "ewma"); u.LBMethod != "least_time last_byte" {
+		t.Errorf("without the module ewma is %q, want least_time last_byte", u.LBMethod)
 	}
 }

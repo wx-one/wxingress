@@ -57,6 +57,8 @@ type nsWatch struct {
 	tcpRoutes       gwlisters.TCPRouteLister
 	udpRoutes       gwlisters.UDPRouteLister
 	referenceGrants gwlisters.ReferenceGrantLister
+	// listenerSets is nil where the cluster has no ListenerSet CRD
+	listenerSets gwlisters.ListenerSetLister
 
 	informers []cache.SharedIndexInformer
 }
@@ -83,6 +85,10 @@ func (c *Controller) newNSWatch(ns string) *nsWatch {
 		gw.TCPRoutes().Informer(),
 		gw.UDPRoutes().Informer(),
 		gw.ReferenceGrants().Informer(),
+	}
+	if c.cfg.ListenerSets {
+		w.listenerSets = gw.ListenerSets().Lister()
+		w.informers = append(w.informers, gw.ListenerSets().Informer())
 	}
 	return w
 }

@@ -89,6 +89,12 @@ type Configuration struct {
 	// GuardrailsEnabled indicates whether the ai-guardrails NGINX module must be loaded because at least
 	// one location has a Guardrails (PayloadProcessor ExtProcess) configuration.
 	GuardrailsEnabled bool
+	// InferenceEnabled indicates whether the inference_epp Rust module must be loaded because at least
+	// one location has an inference endpoint picker configuration.
+	InferenceEnabled bool
+	// ZoneSizeMaxSize is the maximum zone size, in bytes, that an automatically-sized
+	// ("auto") upstream zone can grow to.
+	ZoneSizeMaxSize int64
 }
 
 // Snapshot returns a copy of the configuration for telemetry consumers.
@@ -263,6 +269,9 @@ type SSL struct {
 	SessionTimeout string
 	// EcdhCurve specifies the value for the ssl_ecdh_curve directive. Empty means omit.
 	EcdhCurve string
+	// CertificateCache specifies the value for the ssl_certificate_cache directive. Empty means omit.
+	// When set, it overrides the global ssl_certificate_cache from NginxProxy at the server level.
+	CertificateCache string
 	// ClientCertBundleID is the ID of the client certificate bundle for client verification.
 	ClientCertBundleID CertBundleID
 	// VerifyClient specifies the client certificate verification mode.
@@ -374,7 +383,7 @@ type HTTPExternalAuthFilter struct {
 	// MaxBodySize sets the maximum size of the request body that the client is allowed to send.
 	// It is only applicable when ForwardBody is true. Requests with body larger than the specified size
 	// will be rejected with 413 Payload Too Large error.
-	MaxBodySize uint16
+	MaxBodySize int32
 }
 
 // AuthenticationFilter holds the top level spec for each kind of authentication (e.g. Basic, JWT, etc...).
@@ -387,6 +396,27 @@ type AuthenticationFilter struct {
 
 	// JWT contains fields related to JWT authentication.
 	JWT *AuthJWT
+
+	// APIKey contains fields related to API key authentication.
+	APIKey *AuthAPIKey
+}
+
+// AuthAPIKeySource defines where clients can provide an API key.
+type AuthAPIKeySource struct {
+	// Type is the source type: "Header" or "Query".
+	Type string
+	// Name is the header name or query parameter name.
+	Name string
+}
+
+// AuthAPIKey contains fields related to API key authentication.
+type AuthAPIKey struct {
+	// SecretName is the name of the secret containing the API keys.
+	SecretName string
+	// SecretNamespace is the namespace of the secret containing the API keys.
+	SecretNamespace string
+	// Sources defines the locations where clients can provide the API key.
+	Sources []AuthAPIKeySource
 }
 
 // AuthBasic contains fields related to basic authentication.
@@ -662,6 +692,10 @@ type GuardrailsConfig struct {
 	APITokenAuthFileID AuthFileID
 	// Enabled reports whether the guardrails filter is active for the match.
 	Enabled bool
+	// FailOpen reports whether the processor should fail open (allow the request through) when the
+	// Guardrails backend cannot be reached to produce a verdict. When false (the default), the
+	// processor fails closed and rejects such requests.
+	FailOpen bool
 }
 
 // Match represents a match for a routing rule which consist of matches against various HTTP request attributes.
@@ -737,6 +771,8 @@ type EndpointPickerConfig struct {
 	VerifyTLS *VerifyTLS
 	// NsName is the namespace of the EndpointPicker.
 	NsName string
+	// ClusterIP is the EPP Service's ClusterIP.
+	ClusterIP string
 }
 
 // VerifyTLS holds the backend TLS verification configuration.
@@ -808,6 +844,8 @@ type BaseHTTPConfig struct {
 type BaseStreamConfig struct {
 	// DNSResolver specifies the DNS resolver configuration for ExternalName services.
 	DNSResolver *DNSResolverConfig
+	// Policies contains Gateway-attached policies that apply at the stream context.
+	Policies []policies.Policy
 }
 
 // RewriteClientIPSettings defines configuration for rewriting the client IP to the original client's IP.
