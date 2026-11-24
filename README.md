@@ -31,10 +31,12 @@ the [WX-ONE](https://wx1.eu) cloud platform. That is our commitment: it stays op
 depend on it ourselves, its development is secured. Donations are still very welcome and go
 exclusively into its development: [sponsor wxingress](https://github.com/sponsors/wx-one).
 
-> **ingress-nginx gets no fix for [nginx2root](https://blog.cloudflare.com/nginx2root/)** (CVE-2026-123007 and four
-> more, the worst remote code execution over HTTP/2). The project was retired in March 2026. wxingress takes over its
-> Ingresses unchanged and ships NGINX 1.31.9, which has the fixes. Four times the HTTP requests per second
-> of ingress-nginx, with half the memory ([benchmarks](#why-wxingress), [compared with the alternatives](#your-options-compared)).
+## Why switch now: nginx2root
+
+**ingress-nginx gets no fix for [nginx2root](https://blog.cloudflare.com/nginx2root/)** (CVE-2026-123007 and four
+more, the worst remote code execution over HTTP/2). The project was retired in March 2026. wxingress takes over its
+Ingresses unchanged and ships NGINX 1.31.9, which has the fixes. Four times the HTTP requests per second
+of ingress-nginx, with half the memory ([benchmarks](#why-wxingress), [compared with the alternatives](#your-options-compared)).
 
 ## Are you affected?
 
