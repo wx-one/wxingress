@@ -4,6 +4,23 @@ wxingress versions are `<NGINX Ingress Controller version>-wx<n>`: `5.7.1-wx5` i
 release based on NGINX Ingress Controller 5.7.1. The changes of NGINX Ingress Controller itself are on its
 [releases page](https://github.com/nginx/kubernetes-ingress/releases).
 
+## 5.7.1-wx12
+
+Upgrade where wxingress runs on the nodes' ports behind a ClusterIP Service, as rke2-ingress-nginx does,
+and something waits on the address in an Ingress's status, such as Argo CD.
+
+### Fixes
+
+- Ingresses get the addresses of the nodes wxingress's pods run on in their status, as with ingress-nginx
+  without `--publish-service`, where no LoadBalancer Service, IngressLink or `external-status-address`
+  gives one. Before, a DaemonSet on the nodes' ports behind a ClusterIP Service wrote no address, and
+  Argo CD kept every application with an Ingress Progressing. The list follows the pods as nodes come and
+  go; a pod that restarts keeps its node in it. With `controller.ingressNginxCompat` the chart passes its
+  Service to the controller (`-external-service`) for a ClusterIP Service too, from which the nodes are
+  found.
+- `external-status-address` removed from the ConfigMap gives the status back to the Service or the nodes;
+  before, the old address stayed until the pod restarted.
+
 ## 5.7.1-wx11
 
 ListenerSets of the Gateway API, Gateway API v1.7.0. Upgrade where `load-balance` or `upstream-hash-by`

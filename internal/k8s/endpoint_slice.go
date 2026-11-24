@@ -96,6 +96,7 @@ func (lbc *LoadBalancerController) syncEndpointSlices(task task) bool {
 
 	// check if this is the endpointslice for the controller's own service
 	if lbc.statusUpdater.namespace == endpointSlice.Namespace && lbc.statusUpdater.externalServiceName == svcName {
+		lbc.syncStatusFromNodes(endpointSlice.Namespace, svcName)
 		return lbc.updateNumberOfIngressControllerReplicas(*endpointSlice)
 	}
 

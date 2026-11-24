@@ -56,6 +56,14 @@ func TestHelmNICTemplate(t *testing.T) {
 			templateFiles: []string{"templates/controller-daemonset.yaml"},
 			kubeVersion:   "1.29.0",
 		},
+		// a DaemonSet on the nodes' ports behind a ClusterIP Service gets -external-service, whose
+		// EndpointSlices name the nodes reported as the Ingresses' status
+		"ingress-nginx-compat-hostport": {
+			valuesFile:    "testdata/ingress-nginx-compat-hostport.yaml",
+			releaseName:   "compat-hostport",
+			namespace:     "default",
+			templateFiles: []string{"templates/controller-daemonset.yaml"},
+		},
 		"admission-webhooks-cert-manager": {
 			valuesFile:  "testdata/admission-webhooks-cert-manager.yaml",
 			releaseName: "admission-webhooks-cert-manager",

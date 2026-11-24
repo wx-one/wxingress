@@ -59,7 +59,7 @@ defaults, updates endpoints dynamically and serves Ingresses without a host. It 
 so you can move traffic over step by step. To have wxingress serve the IngressClass `nginx` of an existing
 ingress-nginx installation, read the [migration guide](https://wx-one.github.io/wxingress/migration/ingress-nginx/) first.
 
-Images: `ghcr.io/wx-one/wxingress:<version>`, for example `5.7.1-wx11`. The image contains
+Images: `ghcr.io/wx-one/wxingress:<version>`, for example `5.7.1-wx12`. The image contains
 NGINX 1.31.9 from nginx.org.
 
 ## What it is

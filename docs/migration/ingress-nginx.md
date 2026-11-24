@@ -223,6 +223,11 @@ helm upgrade wxingress oci://ghcr.io/wx-one/charts/wxingress -n wxingress --reus
   --set controller.reportIngressStatus.enable=true
 ```
 
+The Ingresses then get wxingress's address in their status, as with ingress-nginx: the address of its
+LoadBalancer Service, or, behind a ClusterIP Service on the nodes' ports, the addresses of the nodes its
+pods run on. `external-status-address` in the ConfigMap sets one of your own. Argo CD waits on an Ingress
+without an address as Progressing, and external-dns publishes the address it finds there.
+
 Then uninstall ingress-nginx. On RKE2, disable the bundled chart (`disable: [rke2-ingress-nginx]` in
 `/etc/rancher/rke2/config.yaml`, or in the cluster's configuration in Rancher) so that an upgrade of RKE2
 does not reinstall it. On RKE1, set the ingress provider to `none`.

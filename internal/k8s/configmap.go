@@ -105,7 +105,8 @@ func (lbc *LoadBalancerController) syncConfigMap(task task) {
 		if configExists {
 			lbc.configMap = obj.(*v1.ConfigMap)
 			externalStatusAddress, exists := lbc.configMap.Data["external-status-address"]
-			if exists {
+			// a key removed gives the status back to the Service, the IngressLink or the nodes
+			if exists || lbc.statusUpdater.externalStatusAddress != "" {
 				lbc.statusUpdater.SaveStatusFromExternalStatus(externalStatusAddress)
 			}
 		} else {

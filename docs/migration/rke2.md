@@ -320,13 +320,20 @@ ServiceMonitor go with the release; wxingress's stay.
     kubectl -n kube-system get pod -l app.kubernetes.io/name=rke2-ingress-nginx   # none
 
 Ingress status: rke2-ingress-nginx wrote the addresses of the nodes it ran
-on; wxingress writes a fixed list from its ConfigMap:
+on, and so does wxingress from 5.7.1-wx12 (with `ingressNginxCompat`): the
+ExternalIP or else the InternalIP of every node one of its pods runs on,
+following the pods as nodes come and go. Argo CD waits on an Ingress without
+an address as Progressing, so turn it on:
 
-    ips=$(kubectl get nodes -l wx1.eu/ingress=wxingress \
-      -o jsonpath='{range .items[*]}{.status.addresses[?(@.type=="InternalIP")].address}{","}{end}' | sed 's/,$//')
     helm upgrade wxingress charts/wxingress -n wxingress --reuse-values \
-      --set controller.reportIngressStatus.enable=true \
-      --set-json "controller.config.entries.external-status-address=\"$ips\""   # --set-string would split at the commas
+      --set controller.reportIngressStatus.enable=true
+
+An address of your own, such as the load balancer's in front of the nodes,
+wins over the nodes' (and external-dns publishes what the status says):
+
+    --set-string controller.config.entries.external-status-address=203.0.113.10
+
+Before 5.7.1-wx12 wxingress wrote no address without that key.
 
 `-report-ingress-status` is an argument of the pod, and the DaemonSet is
 OnDelete: the upgrade restarts no pod, and none writes a status until it is

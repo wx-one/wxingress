@@ -418,7 +418,7 @@ Build the args for the service binary.
 - -ingresslink={{ .Values.controller.reportIngressStatus.ingressLink }}
 {{- else if .Values.controller.reportIngressStatus.externalService }}
 - -external-service={{ .Values.controller.reportIngressStatus.externalService }}
-{{- else if and (.Values.controller.service.create) (or (eq .Values.controller.service.type "LoadBalancer") .Values.controller.gatewayAPI.enable) }}
+{{- else if and (.Values.controller.service.create) (or (eq .Values.controller.service.type "LoadBalancer") .Values.controller.gatewayAPI.enable .Values.controller.ingressNginxCompat .Values.controller.ingressNginxDefaults) }}
 - -external-service={{ include "nginx-ingress.controller.service.name" . }}
 {{- end }}
 {{- end }}

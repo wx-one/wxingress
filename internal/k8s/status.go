@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -33,17 +34,21 @@ type statusUpdater struct {
 	externalServiceName      string
 	externalStatusAddress    string
 	externalServiceAddresses []string
-	externalServicePorts     string
-	bigIPAddress             string
-	bigIPPorts               string
-	externalEndpoints        []conf_v1.ExternalEndpoint
-	status                   []networking.IngressLoadBalancerIngress
-	statusInitialized        bool
-	keyFunc                  func(obj interface{}) (string, error)
-	namespacedInformers      *nsregistry.Registry[namespacedInformer]
-	confClient               k8s_nginx.Interface
-	hasCorrectIngressClass   func(interface{}) bool
-	logger                   *slog.Logger
+	// nodeAddresses are the addresses of the nodes the controller's pods run
+	// on, the status where nothing else gives one, as ingress-nginx reports
+	// without --publish-service (-ingress-nginx-defaults)
+	nodeAddresses          []string
+	externalServicePorts   string
+	bigIPAddress           string
+	bigIPPorts             string
+	externalEndpoints      []conf_v1.ExternalEndpoint
+	status                 []networking.IngressLoadBalancerIngress
+	statusInitialized      bool
+	keyFunc                func(obj interface{}) (string, error)
+	namespacedInformers    *nsregistry.Registry[namespacedInformer]
+	confClient             k8s_nginx.Interface
+	hasCorrectIngressClass func(interface{}) bool
+	logger                 *slog.Logger
 }
 
 func (su *statusUpdater) UpdateExternalEndpointsForResources(resource []Resource) error {
@@ -297,6 +302,11 @@ func (su *statusUpdater) SaveStatusFromExternalStatus(externalStatusAddress stri
 			su.externalEndpoints = su.generateExternalEndpointsFromStatus(su.status)
 			return
 		}
+
+		// and on the controller's nodes
+		su.saveStatus(su.nodeAddresses)
+		su.externalEndpoints = su.generateExternalEndpointsFromStatus(su.status)
+		return
 	}
 	// a list separated by commas, as ingress-nginx's --publish-status-address: the nodes of a hostPort DaemonSet
 	ips := []string{}
@@ -325,6 +335,9 @@ func (su *statusUpdater) SaveStatusFromExternalService(svc *api_v1.Service) {
 		nl.Info(su.logger, "skipping external service address/ports - external-status-address is set and takes precedence")
 		return
 	}
+	if len(ips) == 0 && su.bigIPAddress == "" {
+		ips = su.nodeAddresses
+	}
 	su.saveStatus(ips)
 	su.externalEndpoints = su.generateExternalEndpointsFromStatus(su.status)
 }
@@ -352,9 +365,29 @@ func (su *statusUpdater) ClearStatusFromIngressLink() {
 		return
 	}
 
-	ips := []string{}
+	ips := su.externalServiceAddresses
+	if len(ips) == 0 {
+		ips = su.nodeAddresses
+	}
 	su.saveStatus(ips)
 	su.externalEndpoints = su.generateExternalEndpointsFromStatus(su.status)
+}
+
+// SaveStatusFromNodes saves the addresses of the nodes the controller's pods
+// run on. They are the status only where neither external-status-address, the
+// external Service nor an IngressLink gives an address. It reports whether the
+// status changed.
+func (su *statusUpdater) SaveStatusFromNodes(addresses []string) bool {
+	if slices.Equal(su.nodeAddresses, addresses) {
+		return false
+	}
+	su.nodeAddresses = addresses
+	if su.externalStatusAddress != "" || len(su.externalServiceAddresses) > 0 || su.bigIPAddress != "" {
+		return false
+	}
+	su.saveStatus(addresses)
+	su.externalEndpoints = su.generateExternalEndpointsFromStatus(su.status)
+	return true
 }
 
 func (su *statusUpdater) retryUpdateTransportServerStatus(tsCopy *conf_v1.TransportServer) error {

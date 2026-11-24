@@ -155,7 +155,7 @@ Snippets in the ConfigMap do not need `-enable-snippets`; only whoever can edit 
 | Key | Default | Description |
 |---|---|---|
 | `default-server-return` | `404` | What the default server answers for unknown hosts: a status code, or a code and text or URL, as in `return`. With `-default-backend-service`, that Service answers instead unless this key is set. |
-| `external-status-address` | | The address written into the status of Ingresses (with `-report-ingress-status`); wins over `-external-service`. |
+| `external-status-address` | | The address written into the status of Ingresses (with `-report-ingress-status`), or several separated by commas; wins over `-external-service`. Without it and without an address of the Service, wxingress writes the addresses of the nodes its pods run on with `-ingress-nginx-defaults`, as ingress-nginx does without `--publish-service`. |
 
 ### OpenTelemetry
 

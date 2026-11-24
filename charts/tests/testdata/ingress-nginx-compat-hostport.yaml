@@ -1,0 +1,12 @@
+# ingress-nginx's usual setup on RKE2: a DaemonSet on the nodes' ports behind a
+# ClusterIP Service; the status comes from the controller's nodes, which the
+# controller finds through its Service (-external-service)
+controller:
+  kind: daemonset
+  ingressNginxCompat: true
+  hostPort:
+    enable: true
+  service:
+    type: ClusterIP
+  reportIngressStatus:
+    enable: true
