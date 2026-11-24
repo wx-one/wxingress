@@ -31,20 +31,34 @@ the [WX-ONE](https://wx1.eu) cloud platform. That is our commitment: it stays op
 depend on it ourselves, its development is secured. Donations are still very welcome and go
 exclusively into its development: [sponsor wxingress](https://github.com/sponsors/wx-one).
 
-## Commercial support
+> **ingress-nginx gets no fix for [nginx2root](https://blog.cloudflare.com/nginx2root/)** (CVE-2026-123007 and four
+> more, the worst remote code execution over HTTP/2). The project was retired in March 2026. wxingress takes over its
+> Ingresses unchanged and ships NGINX 1.31.9, which has the fixes. Four times the HTTP requests per second
+> of ingress-nginx, with half the memory ([benchmarks](#why-wxingress), [compared with the alternatives](#your-options-compared)).
 
-WizardTales offers support packages for organisations that run wxingress in production:
+## Are you affected?
 
-| Package | Price | Includes |
-|---|---|---|
-| **Fast release channel** | €1,000 per month per legal entity | targeted fixes for critical vulnerabilities from the WX-ONE emergency response team, ahead of the official release |
-| **Emergency support desk** | €3,000 per month per legal entity | the fast release channel, plus an 8×5 emergency support desk with prioritised support; 24×7 on request |
+```sh
+kubectl get pods --all-namespaces --selector app.kubernetes.io/name=ingress-nginx
+```
 
-Public releases are not held back: wxingress is usually released for everyone within about 24 to 48 hours
-on working days. The fast release channel's emergency releases are not official releases, but targeted
-fixes that close a critical gap until then. Order by email to
-[support-ingress@wx1.de](mailto:support-ingress@wx1.de). A support package does not entitle you to demand
-features. Details are on the [support page](https://wx-one.github.io/wxingress/about/support/).
+Any pod listed runs the retired controller.
+
+## Quick start
+
+```sh
+helm install wxingress oci://ghcr.io/wx-one/charts/wxingress \
+  --namespace wxingress --create-namespace \
+  --set controller.ingressNginxCompat=true
+```
+
+`controller.ingressNginxCompat=true` is the ingress-nginx profile. With it, wxingress uses ingress-nginx's
+defaults, updates endpoints dynamically and serves Ingresses without a host. It runs next to ingress-nginx,
+so you can move traffic over step by step. To have wxingress serve the IngressClass `nginx` of an existing
+ingress-nginx installation, read the [migration guide](https://wx-one.github.io/wxingress/migration/ingress-nginx/) first.
+
+Images: `ghcr.io/wx-one/wxingress:<version>`, for example `5.7.1-wx11`. The image contains
+NGINX 1.31.9 from nginx.org.
 
 ## What it is
 
@@ -94,21 +108,18 @@ each of the other 51 has a documented reason.
 - **Open source, European licence.** [EUPL-1.2](LICENSE). The Apache-2.0 code it is built on stays
   Apache-2.0, see [NOTICE](NOTICE).
 
-## Quick start
+## Your options, compared
 
-```sh
-helm install wxingress oci://ghcr.io/wx-one/charts/wxingress \
-  --namespace wxingress --create-namespace \
-  --set controller.ingressNginxCompat=true
-```
+As of November 2026:
 
-`controller.ingressNginxCompat=true` is the ingress-nginx profile. With it, wxingress uses ingress-nginx's
-defaults, updates endpoints dynamically and serves Ingresses without a host. To have wxingress serve the
-IngressClass `nginx` of an existing ingress-nginx installation, read the
-[migration guide](https://wx-one.github.io/wxingress/migration/ingress-nginx/) first.
-
-Images: `ghcr.io/wx-one/wxingress:<version>`, for example `5.7.1-wx11`. The image contains
-NGINX 1.31.9 from nginx.org.
+| | ingress-nginx | **wxingress** | F5 NGINX Ingress Controller | Traefik | Gateway API controllers (NGINX Gateway Fabric, Envoy Gateway, …) |
+|---|---|---|---|---|---|
+| Security fixes | none since March 2026 | **yes** | yes | yes | yes |
+| Your `nginx.ingress.kubernetes.io/*` annotations | yes | **yes, as they are** | no, `nginx.org/*` instead | many, through a compatibility provider | no, Ingresses are rewritten as routes |
+| Your ingress-nginx ConfigMap and Helm values | yes | **yes** ([values translator](https://wx-one.github.io/wxingress/migration/ingress-nginx/#translate-your-values)) | no | no | no |
+| ingress-nginx's Prometheus metrics | yes | **yes** | no | no | no |
+| Gateway API | no | **yes** | no | yes | yes |
+| Cost | free, but unmaintained | **free, open source (EUPL-1.2)** | free, open source | free, open source | free, open source |
 
 ## Moving from ingress-nginx
 
@@ -149,6 +160,21 @@ Every release comes with CycloneDX SBOMs of the binaries and of the image and na
 digest; see [Releases and SBOMs](https://wx-one.github.io/wxingress/getting-started/installation/#releases-and-sboms).
 
 The chart requires Kubernetes 1.25 or newer. wxingress is tested on Kubernetes 1.31 and 1.32, on RKE2 and kind.
+
+## Commercial support
+
+WizardTales offers support packages for organisations that run wxingress in production:
+
+| Package | Price | Includes |
+|---|---|---|
+| **Fast release channel** | €1,000 per month per legal entity | targeted fixes for critical vulnerabilities from the WX-ONE emergency response team, ahead of the official release |
+| **Emergency support desk** | €3,000 per month per legal entity | the fast release channel, plus an 8×5 emergency support desk with prioritised support; 24×7 on request |
+
+Public releases are not held back: wxingress is usually released for everyone within about 24 to 48 hours
+on working days. The fast release channel's emergency releases are not official releases, but targeted
+fixes that close a critical gap until then. Order by email to
+[support-ingress@wx1.de](mailto:support-ingress@wx1.de). A support package does not entitle you to demand
+features. Details are on the [support page](https://wx-one.github.io/wxingress/about/support/).
 
 ## Contributing
 
