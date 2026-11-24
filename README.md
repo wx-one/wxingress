@@ -121,6 +121,11 @@ As of November 2026:
 | Gateway API | no | **yes** | no | yes | yes |
 | Cost | free, but unmaintained | **free, open source (EUPL-1.2)** | free, open source | free, open source | free, open source |
 
+F5 makes you choose between Ingress and the Gateway API: NGINX Ingress Controller serves Ingresses but not
+the Gateway API, NGINX Gateway Fabric serves the Gateway API but not Ingresses. Two controllers, two
+deployments, and moving from one to the other is a cut-over. wxingress serves both at once, on the same
+address, so applications move to the Gateway API one at a time, when it suits them.
+
 ## Moving from ingress-nginx
 
 For almost every cluster the switch is: install wxingress, point it at the IngressClass, move the traffic.
