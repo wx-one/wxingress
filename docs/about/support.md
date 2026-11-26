@@ -22,6 +22,11 @@ development and gives you a direct line to the people who build it.
 All prices are per month and per legal entity. Each company of a group that uses wxingress needs its own
 package.
 
+The legal entity is always the **end customer**: the company whose clusters run wxingress. A system
+integrator, reseller or service provider that buys support for a customer buys it in the name of that
+customer. The package is the customer's, and its rules apply to the customer: one package per end
+customer, with the clusters counted per end customer. Several customers cannot share one package.
+
 ## Fast release channel
 
 The fast release channel is run by the emergency response team of WX-ONE. When a critical vulnerability
@@ -74,8 +79,9 @@ can be offered separately. 24×7 coverage is available on request, with an on-ca
 ## Ordering
 
 Order by email to **[support-ingress@wx1.de](mailto:support-ingress@wx1.de)**. Please include the name and
-address of the legal entity, the package you want, the number of clusters, and a technical contact. For
-24×7 coverage, tell us what you need and we will send you an offer.
+address of the legal entity (the end customer, also when you order on a customer's behalf), the package
+you want, the number of clusters, and a technical contact. For 24×7 coverage, tell us what you need and we
+will send you an offer.
 
 !!! note "Support is not a feature contract"
     A paid support package entitles you to the support described above. It does not entitle you to
