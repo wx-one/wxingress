@@ -31,6 +31,21 @@ the [WX-ONE](https://wx1.eu) cloud platform. That is our commitment: it stays op
 depend on it ourselves, its development is secured. Donations are still very welcome and go
 exclusively into its development: [sponsor wxingress](https://github.com/sponsors/wx-one).
 
+## Commercial support
+
+WizardTales offers support packages for organisations that run wxingress in production:
+
+| Package | Price | Includes |
+|---|---|---|
+| **Fast release channel** | €1,000 per month per legal entity | targeted fixes for critical vulnerabilities from the WX-ONE emergency response team, ahead of the official release |
+| **Emergency support desk** | €3,000 per month per legal entity | the fast release channel, plus an 8×5 emergency support desk with prioritised support; 24×7 on request |
+
+Public releases are not held back: wxingress is usually released for everyone within about 24 to 48 hours
+on working days. The fast release channel's emergency releases are not official releases, but targeted
+fixes that close a critical gap until then. Order by email to
+[support-ingress@wx1.de](mailto:support-ingress@wx1.de). A support package does not entitle you to demand
+features. Details are on the [support page](https://wx-one.github.io/wxingress/about/support/).
+
 ## Why switch now: nginx2root
 
 **ingress-nginx gets no fix for [nginx2root](https://blog.cloudflare.com/nginx2root/)** (CVE-2026-123007 and four
@@ -167,21 +182,6 @@ Every release comes with CycloneDX SBOMs of the binaries and of the image and na
 digest; see [Releases and SBOMs](https://wx-one.github.io/wxingress/getting-started/installation/#releases-and-sboms).
 
 The chart requires Kubernetes 1.25 or newer. wxingress is tested on Kubernetes 1.31 and 1.32, on RKE2 and kind.
-
-## Commercial support
-
-WizardTales offers support packages for organisations that run wxingress in production:
-
-| Package | Price | Includes |
-|---|---|---|
-| **Fast release channel** | €1,000 per month per legal entity | targeted fixes for critical vulnerabilities from the WX-ONE emergency response team, ahead of the official release |
-| **Emergency support desk** | €3,000 per month per legal entity | the fast release channel, plus an 8×5 emergency support desk with prioritised support; 24×7 on request |
-
-Public releases are not held back: wxingress is usually released for everyone within about 24 to 48 hours
-on working days. The fast release channel's emergency releases are not official releases, but targeted
-fixes that close a critical gap until then. Order by email to
-[support-ingress@wx1.de](mailto:support-ingress@wx1.de). A support package does not entitle you to demand
-features. Details are on the [support page](https://wx-one.github.io/wxingress/about/support/).
 
 ## Contributing
 
