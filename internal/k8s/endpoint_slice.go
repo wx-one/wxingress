@@ -68,6 +68,13 @@ func (nsi *namespacedInformer) addEndpointSliceHandler(handlers cache.ResourceEv
 	return nil
 }
 
+// Every Configurator call reachable from here (directly, or via the
+// updateNumberOfIngressControllerReplicas early return below) must mark the
+// batch dirty on its own error path when it can have already written config
+// before failing — see the invariant documented on Configurator.deferReload.
+// sync() no longer forces a reload at the end of an endpointslice-only batch
+// (https://github.com/nginx/kubernetes-ingress/issues/7778): a reload that is
+// needed is kept by Configurator.Reload (reloadAsked, reloadDeferred).
 func (lbc *LoadBalancerController) syncEndpointSlices(task task) bool {
 	key := task.Key
 	var obj interface{}
@@ -97,7 +104,8 @@ func (lbc *LoadBalancerController) syncEndpointSlices(task task) bool {
 	// check if this is the endpointslice for the controller's own service
 	if lbc.statusUpdater.namespace == endpointSlice.Namespace && lbc.statusUpdater.externalServiceName == svcName {
 		lbc.syncStatusFromNodes(endpointSlice.Namespace, svcName)
-		return lbc.updateNumberOfIngressControllerReplicas(*endpointSlice)
+		lbc.updateNumberOfIngressControllerReplicas(*endpointSlice)
+		return false
 	}
 
 	return lbc.syncServiceEndpoints(ns, n, svcName, svcResource)

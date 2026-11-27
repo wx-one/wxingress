@@ -12,11 +12,11 @@ DOS_REPO					  ?= "pkgs.nginx.com" ## The package repo to install nginx app prot
 
 # renovate: datasource=docker depName=nginx/nginx
 NGINX_OSS_VERSION             ?= 1.31.10
-NGINX_PLUS_VERSION            ?= R37.2
+NGINX_PLUS_VERSION            ?= R37.3
 
-NAP_WAF_VERSION               ?= 37.2+5.777
+NAP_WAF_VERSION               ?= 37.3+5.777
 NAP_WAF_COMMON_VERSION        ?= 11.869
-NAP_WAF_PLUGIN_VERSION        ?= 6.32
+NAP_WAF_PLUGIN_VERSION        ?= 6.34
 NAP_WAF_IPI_VERSION           ?= 1.71
 
 AGENT_V2_VERSION              ?= 2
@@ -36,7 +36,7 @@ endif
 PLUS_ARGS ?=  $(DOCKER_AUTH) --build-arg NGINX_PLUS_VERSION=$(NGINX_PLUS_VERSION) --build-arg PLUS_PACKAGE_REPO=$(PLUS_REPO)
 
 # Variables that can be overridden
-UBI10_PACKAGES_IMAGE ?= ghcr.io/nginx/dependencies/nginx-ubi:ubi10@sha256:8fb7d622f38e0d0f4dba7bfc6228fee7241adf7e1c981f16c532cfbd47eccfc9
+UBI10_PACKAGES_IMAGE ?= ghcr.io/nginx/dependencies/nginx-ubi:ubi10@sha256:94dafbf3beec35c54010009aade5ef2c290bc396ce2ca4a494974f26f2fe1898
 
 # renovate: datasource=github-releases depName=dominikh/go-tools
 STATICCHECK_VERSION ?= 452d5bb86b45416c35891262f6a11dbd6a970117
@@ -46,7 +46,7 @@ GOVULNCHECK_VERSION ?= v1.9.0
 
 GO_DOCKER_IMAGE_NAME    ?= golang
 # renovate: datasource=docker depName=golang versioning=docker
-GO_DOCKER_IMAGE_VERSION ?= 1.27.3-trixie
+GO_DOCKER_IMAGE_VERSION ?= 1.27.4-trixie
 GO_DOCKER_IMAGE         ?= $(GO_DOCKER_IMAGE_NAME):$(GO_DOCKER_IMAGE_VERSION)
 
 REGISTRY                      ?= ## The registry where the image is located.
@@ -60,7 +60,7 @@ GOOS                          ?= linux ## The OS of the binary. For example linu
 # renovate: datasource=github-releases depName=golangci/golangci-lint
 GOLANGCI_LINT_VERSION         ?= v2.15.0 ## The version of golangci-lint to use
 # renovate: datasource=go depName=golang.org/x/tools
-GOIMPORTS_VERSION             ?= v0.52.0 ## The version of goimports to use
+GOIMPORTS_VERSION             ?= v0.53.0 ## The version of goimports to use
 # renovate: datasource=go depName=mvdan.cc/gofumpt
 GOFUMPT_VERSION               ?= v0.12.0 ## The version of gofumpt to use
 
@@ -149,12 +149,17 @@ update-codegen: ## Generate code
 
 .PHONY: update-crds
 update-crds: ## Update CRDs
-	go run sigs.k8s.io/controller-tools/cmd/controller-gen crd paths=./pkg/apis/... output:crd:artifacts:config=config/crd/bases
+	go run sigs.k8s.io/controller-tools/cmd/controller-gen crd paths=./pkg/apis/configuration/... paths=./pkg/apis/dos/... paths=./pkg/apis/externaldns/... output:crd:artifacts:config=config/crd/bases
+	go run sigs.k8s.io/controller-tools/cmd/controller-gen crd paths=./pkg/apis/externaldnsk8s/... output:crd:artifacts:config=config/crd/upstream
 	@kustomize version || (code=$$?; printf "\033[0;31mError\033[0m: there was a problem with kustomize, use 'brew install kustomize' to install it\n"; exit $$code)
 	kustomize build config/crd >deploy/crds.yaml
 	kustomize build config/crd/app-protect-dos --load-restrictor='LoadRestrictionsNone' >deploy/crds-nap-dos.yaml
 	kustomize build config/crd/app-protect-waf --load-restrictor='LoadRestrictionsNone' >deploy/crds-nap-waf.yaml
 	$(MAKE) update-crd-docs
+
+.PHONY: update-helm-schema
+update-helm-schema: ## Regenerate the bundled Kubernetes definitions in the Helm chart values schema
+	./hack/generate-helm-schema.sh
 
 .PHONY: build-local
 build-local: $(BINARY_NAME)-$(ARCH) ## Build Ingress Controller binary (local, incremental)

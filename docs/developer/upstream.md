@@ -9,7 +9,7 @@ wxingress follows two upstream projects. Both are licensed under the Apache Lice
 
 ## NGINX Ingress Controller
 
-wxingress is a fork of NGINX Ingress Controller 5.7.1 and merges new upstream releases. What wxingress
+wxingress is a fork of NGINX Ingress Controller, based on 5.8.1 since 5.8.1-wx1 (5.7.1 before), and merges new upstream releases. What wxingress
 removes or replaces:
 
 - **Telemetry** is removed (`internal/telemetry` must not exist; a test checks it).
@@ -22,6 +22,19 @@ removes or replaces:
 When you merge an upstream release, keep conflicts in templates and `internal/configs` small: the
 ingress-nginx compatibility lives mostly in files of its own (`internal/configs/ingress_nginx*.go`,
 `internal/k8s/ingress_shape.go` and others).
+
+The history of wxingress does not contain upstream's, so an upstream release is not merged with `git merge`.
+Instead, two commits put upstream in wxingress's shape - the release wxingress is based on and the new one
+on top of it: without the paths wxingress does not have (`.github`, `docs`, `internal/telemetry` and F5's
+tooling), with the chart in `charts/wxingress` and the module path `github.com/wx-one/wxingress` in Go
+imports (not in URLs). Cherry-picking the second onto wxingress is then a three-way merge with the old
+release as its base, and conflicts arise only where wxingress changed what upstream changed too.
+
+Where upstream changes the batching of syncs and reloads, wxingress keeps its own model (coalesced
+endpoint and certificate tasks, `reloadAsked`, the module taking servers without a reload) and takes from
+upstream what it lacks: since 5.8.1, `deferReload` on error paths after a write, `reloadDeferred` beside
+`reloadAsked`, and `-batch-reload-window`. NGINX Plus's API writes follow upstream; the module's follow
+`pushWhileReloadsWait`.
 
 ## NGINX Gateway Fabric
 

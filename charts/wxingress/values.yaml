@@ -65,13 +65,16 @@ controller:
     ## Secret containing trusted CA certificate
     # sslTrustedCertificateSecretName: ssl-trusted-cert
 
-    # configMapName allows changing the name of the MGMT config map
+    # configMapName allows changing the name of the MGMT config map
     # the name should not include a namespace
     # configMapName: ""
 
 
   ## Timeout in milliseconds which the Ingress Controller will wait for a successful NGINX reload after a change or at the initial start.
   nginxReloadTimeout: 60000
+
+  ## Maximum time in milliseconds that the Ingress Controller will defer a reload under sustained EndpointSlice churn (e.g. a rolling deployment) before flushing it, bounding how stale the running NGINX config can get. 0 disables the bound.
+  batchReloadWindow: 2000
 
   ## Support for App Protect WAF
   appprotect:
@@ -105,7 +108,7 @@ controller:
         repository: private-registry.nginx.com/nap/waf-enforcer
 
         ## The tag of the App Protect WAF v5 Enforcer image.
-        tag: "5.16.1"
+        tag: "5.16.3"
         ## The digest of the App Protect WAF v5 Enforcer image.
         ## If digest is specified it has precedence over tag and will be used instead
         # digest: "sha256:CHANGEME"
@@ -129,7 +132,7 @@ controller:
         repository: private-registry.nginx.com/nap/waf-config-mgr
 
         ## The tag of the App Protect WAF v5 Configuration Manager image.
-        tag: "5.16.1"
+        tag: "5.16.3"
         ## The digest of the App Protect WAF v5 Configuration Manager image.
         ## If digest is specified it has precedence over tag and will be used instead
         # digest: "sha256:CHANGEME"
@@ -138,7 +141,7 @@ controller:
         pullPolicy: IfNotPresent
       securityContext:
         allowPrivilegeEscalation: false
-        runAsUser: 101 #nginx
+        runAsUser: 101 # nginx
         runAsNonRoot: true
         capabilities:
           drop:
@@ -175,7 +178,7 @@ controller:
         repository: private-registry.nginx.com/nap/waf-ip-intelligence
 
         ## The tag of the App Protect WAF v5 IP Intelligence image.
-        tag: "5.16.1"
+        tag: "5.16.3"
         ## The digest of the App Protect WAF v5 IP Intelligence image.
         ## If digest is specified it has precedence over tag and will be used instead
         # digest: "sha256:CHANGEME"
@@ -184,7 +187,7 @@ controller:
         pullPolicy: IfNotPresent
       securityContext:
         allowPrivilegeEscalation: false
-        runAsUser: 101 #nginx
+        runAsUser: 101 # nginx
         runAsNonRoot: true
         capabilities:
           drop:
@@ -262,7 +265,7 @@ controller:
     repository: ghcr.io/wx-one/wxingress
 
     ## The tag of the Ingress Controller image. If not specified the appVersion from Chart.yaml is used as a tag.
-    # tag: "5.7.1-wx13"
+    # tag: "5.8.1-wx1"
     ## The digest of the Ingress Controller image.
     ## If digest is specified it has precedence over tag and will be used instead
     # digest: "sha256:CHANGEME"
@@ -366,7 +369,7 @@ controller:
     {} # Remove curly brackets before adding values
     # allowPrivilegeEscalation: false
     # readOnlyRootFilesystem: true
-    # runAsUser: 101 #nginx
+    # runAsUser: 101 # nginx
     # runAsNonRoot: true
     # seccompProfile:
     #   type: RuntimeDefault
@@ -462,7 +465,7 @@ controller:
       storageClass: ""
       ## Access modes for the nginx-cache volume
       accessModes:
-      - "ReadWriteOnce"
+        - "ReadWriteOnce"
 
   ## Extra containers for the Ingress Controller pods.
   extraContainers: []
@@ -726,6 +729,14 @@ controller:
     ## CRDs belong to the cluster - another controller or the cluster provider may have installed them already.
     ## They are kept when the release is uninstalled.
     installCRDs: false
+  ## Selects the DNSEndpoint API group and version NGINX Ingress Controller writes to when
+  ## enableExternalDNS is true.
+  ## Use "externaldns.nginx.org/v1" (default) with external-dns <= v0.20.x started with
+  ## --crd-source-apiversion=externaldns.nginx.org/v1. Use "externaldns.k8s.io/v1alpha1" with
+  ## external-dns v0.21.0+, which only recognizes the upstream group. The upstream CRD is NOT
+  ## shipped by this chart; install it separately (e.g. via the external-dns Helm chart) when
+  ## selecting the upstream value.
+  externalDNSGroupVersion: "externaldns.nginx.org/v1"
 
   globalConfiguration:
     ## Creates the GlobalConfiguration custom resource. Requires controller.enableCustomResources.
@@ -1090,6 +1101,8 @@ nginxAgent:
   endpointHost: "agent.connect.nginx.com"
   endpointPort: 443
   tlsSkipVerify: false
+  ## Custom labels to associate with the NGINX instance in NGINX One Console (for example, display-name: my-instance).
+  labels: {}
 
   # Agent V2 configuration
   ## If nginxAgent.instanceGroup is not set the value of nginx-ingress.controller.fullname will be used

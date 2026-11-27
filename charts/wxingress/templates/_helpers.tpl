@@ -340,6 +340,7 @@ Build the args for the service binary.
 - -validating-webhook-nginx-test={{ .Values.controller.admissionWebhooks.nginxTest }}
 {{- end }}
 - -nginx-reload-timeout={{ .Values.controller.nginxReloadTimeout }}
+- -batch-reload-window={{ .Values.controller.batchReloadWindow }}
 - -enable-app-protect={{ .Values.controller.appprotect.enable }}
 - -enable-app-protect-ip-intelligence={{ and .Values.controller.appprotect.enable .Values.controller.appprotect.ipIntelligence.enable }}
 {{- if and .Values.controller.appprotect.enable .Values.controller.appprotect.logLevel }}
@@ -465,6 +466,9 @@ Build the args for the service binary.
 {{- end }}
 - -gateway-service-type={{ .Values.controller.gatewayAPI.service.type }}
 - -gateway-listener-ports={{ .Values.controller.gatewayAPI.listenerPorts }}
+{{- end }}
+{{- if .Values.controller.enableExternalDNS }}
+- -external-dns-group-version={{ .Values.controller.externalDNSGroupVersion }}
 {{- end }}
 {{- if and .Values.controller.globalConfiguration.create (not .Values.controller.globalConfiguration.customName) }}
 - -global-configuration=$(POD_NAMESPACE)/{{ include "nginx-ingress.controller.fullname" . }}
@@ -757,6 +761,11 @@ command:
 collector:
   log:
     path: "stdout"
+{{- if .Values.nginxAgent.labels }}
+
+labels:
+{{ toYaml .Values.nginxAgent.labels | indent 2 }}
+{{- end }}
 
 {{- else }}
 log:

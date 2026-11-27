@@ -4,6 +4,31 @@ wxingress versions are `<NGINX Ingress Controller version>-wx<n>`: `5.7.1-wx5` i
 release based on NGINX Ingress Controller 5.7.1. The changes of NGINX Ingress Controller itself are on its
 [releases page](https://github.com/nginx/kubernetes-ingress/releases).
 
+## 5.8.1-wx1
+
+Based on NGINX Ingress Controller 5.8.1 (from 5.7.1). Upgrade with the chart 2.9.0; nothing in the values,
+the annotations or the ConfigMap needs to change, and the configuration NGINX gets for existing resources
+is the same.
+
+### New, from NGINX Ingress Controller 5.8
+
+- The `connectionLimit` Policy: `limit_conn` for VirtualServers, VirtualServerRoutes and Ingresses.
+- JWTAuth Policies validate the claims of a token.
+- ExternalAuth Policies pass the headers of the auth response to the backend (`authResponseHeaders`).
+- `nginx.org/proxy-set-headers` takes NGINX variables, from the same list VirtualServer headers allow.
+- `-external-dns-group-version` (chart `controller.externalDNSGroupVersion`) for external-dns v0.21 and
+  later.
+- `-batch-reload-window` (chart `controller.batchReloadWindow`, 2 seconds): during a long run of endpoint
+  changes, such as a rolling update, a configuration change waiting in a batch is applied after at most
+  that long.
+- Helm validates the values without network access.
+
+### Changes
+
+- An EndpointSlice no longer forces a reload at the end of a batch. A reload that is needed is kept and
+  done; with `controller.dynamicUpstreams` the wxingress module takes the servers without one.
+- A failed write after part of a batch was already written is still applied at the end of the batch.
+
 ## 5.7.1-wx13
 
 Upgrade everywhere: NGINX 1.31.10 with the fixes of 23 November 2026.

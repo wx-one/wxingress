@@ -6,9 +6,11 @@ import (
 	configurationv1 "github.com/wx-one/wxingress/pkg/apis/configuration/v1"
 	v1beta1 "github.com/wx-one/wxingress/pkg/apis/dos/v1beta1"
 	v1 "github.com/wx-one/wxingress/pkg/apis/externaldns/v1"
+	v1alpha1 "github.com/wx-one/wxingress/pkg/apis/externaldnsk8s/v1alpha1"
 	applyconfigurationconfigurationv1 "github.com/wx-one/wxingress/pkg/client/applyconfiguration/configuration/v1"
 	dosv1beta1 "github.com/wx-one/wxingress/pkg/client/applyconfiguration/dos/v1beta1"
 	externaldnsv1 "github.com/wx-one/wxingress/pkg/client/applyconfiguration/externaldns/v1"
+	externaldnsk8sv1alpha1 "github.com/wx-one/wxingress/pkg/client/applyconfiguration/externaldnsk8s/v1alpha1"
 	internal "github.com/wx-one/wxingress/pkg/client/applyconfiguration/internal"
 	runtime "k8s.io/apimachinery/pkg/runtime"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
@@ -30,6 +32,18 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &dosv1beta1.DosProtectedResourceSpecApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("DosSecurityLog"):
 		return &dosv1beta1.DosSecurityLogApplyConfiguration{}
+
+		// Group=externaldns.k8s.io, Version=v1alpha1
+	case v1alpha1.SchemeGroupVersion.WithKind("DNSEndpoint"):
+		return &externaldnsk8sv1alpha1.DNSEndpointApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("DNSEndpointSpec"):
+		return &externaldnsk8sv1alpha1.DNSEndpointSpecApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("DNSEndpointStatus"):
+		return &externaldnsk8sv1alpha1.DNSEndpointStatusApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("Endpoint"):
+		return &externaldnsk8sv1alpha1.EndpointApplyConfiguration{}
+	case v1alpha1.SchemeGroupVersion.WithKind("ProviderSpecificProperty"):
+		return &externaldnsk8sv1alpha1.ProviderSpecificPropertyApplyConfiguration{}
 
 		// Group=externaldns.nginx.org, Version=v1
 	case v1.SchemeGroupVersion.WithKind("DNSEndpoint"):
@@ -74,6 +88,8 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &applyconfigurationconfigurationv1.CertManagerApplyConfiguration{}
 	case configurationv1.SchemeGroupVersion.WithKind("Condition"):
 		return &applyconfigurationconfigurationv1.ConditionApplyConfiguration{}
+	case configurationv1.SchemeGroupVersion.WithKind("ConnectionLimit"):
+		return &applyconfigurationconfigurationv1.ConnectionLimitApplyConfiguration{}
 	case configurationv1.SchemeGroupVersion.WithKind("CORS"):
 		return &applyconfigurationconfigurationv1.CORSApplyConfiguration{}
 	case configurationv1.SchemeGroupVersion.WithKind("EgressMTLS"):
@@ -104,6 +120,12 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &applyconfigurationconfigurationv1.IngressMTLSApplyConfiguration{}
 	case configurationv1.SchemeGroupVersion.WithKind("JWTAuth"):
 		return &applyconfigurationconfigurationv1.JWTAuthApplyConfiguration{}
+	case configurationv1.SchemeGroupVersion.WithKind("JWTAuthorization"):
+		return &applyconfigurationconfigurationv1.JWTAuthorizationApplyConfiguration{}
+	case configurationv1.SchemeGroupVersion.WithKind("JWTAuthorizationRule"):
+		return &applyconfigurationconfigurationv1.JWTAuthorizationRuleApplyConfiguration{}
+	case configurationv1.SchemeGroupVersion.WithKind("JWTClaim"):
+		return &applyconfigurationconfigurationv1.JWTClaimApplyConfiguration{}
 	case configurationv1.SchemeGroupVersion.WithKind("JWTCondition"):
 		return &applyconfigurationconfigurationv1.JWTConditionApplyConfiguration{}
 	case configurationv1.SchemeGroupVersion.WithKind("Listener"):

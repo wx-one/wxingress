@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/wx-one/wxingress/internal/gateway"
 	"github.com/wx-one/wxingress/internal/helpers"
@@ -22,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 
+	"github.com/wx-one/wxingress/internal/externaldns"
 	nl "github.com/wx-one/wxingress/internal/logger"
 )
 
@@ -207,6 +209,9 @@ NIC prints a startup warning when set. Requires -plm-storage-url.`)
 	nginxReloadTimeout = flag.Int("nginx-reload-timeout", 60000,
 		`The timeout in milliseconds which the Ingress Controller will wait for a successful NGINX reload after a change or at the initial start. (default 60000)`)
 
+	batchReloadWindow = flag.Int("batch-reload-window", 2000,
+		`The maximum time in milliseconds that the Ingress Controller will defer a reload under sustained EndpointSlice churn (e.g. a rolling deployment) before flushing it, bounding how stale the running NGINX config can get. A value of 0 disables the bound, restoring unbounded deferral under churn. (default 2000)`)
+
 	wildcardTLSSecret = flag.String("wildcard-tls-secret", "",
 		`A Secret with a TLS certificate and key for TLS termination of every Ingress/VirtualServer host for which TLS termination is enabled but the Secret is not specified.
 		Format: <namespace>/<name>. If the argument is not set, for such Ingress/VirtualServer hosts NGINX will break any attempt to establish a TLS connection.
@@ -306,6 +311,12 @@ NIC prints a startup warning when set. Requires -plm-storage-url.`)
 	enableExternalDNS = flag.Bool("enable-external-dns", false,
 		"Enable external-dns controller for VirtualServer resources. Requires -enable-custom-resources")
 
+	externalDNSGroupVersion = flag.String("external-dns-group-version", externaldns.GroupVersionNginx,
+		fmt.Sprintf("The DNSEndpoint API group and version NGINX Ingress Controller writes to when -enable-external-dns is set. "+
+			"Use %q for the NGINX Ingress Controller CRD (external-dns <= v0.20.x, started with --crd-source-apiversion=externaldns.nginx.org/v1), "+
+			"or %q for the upstream CRD that external-dns v0.21.0+ recognizes.",
+			externaldns.GroupVersionNginx, externaldns.GroupVersionUpstream))
+
 	disableIPV6 = flag.Bool("disable-ipv6", false,
 		`Disable IPV6 listeners explicitly for nodes that do not support the IPV6 stack`)
 
@@ -332,8 +343,6 @@ NIC prints a startup warning when set. Requires -plm-storage-url.`)
 	Ingress resources without a host across namespaces without conflict, use mergeable Ingress. To configure
 	TLS, use -default-server-tls-secret. To configure listener ports, use -default-http-listener-port or
 	-default-https-listener-port. Default is false.`)
-
-	startupCheckFn func() error
 )
 
 // plmSecretRefs holds the parsed PLM secret refs after mustValidateFlags
@@ -421,14 +430,6 @@ func initValidate(ctx context.Context) {
 func mustValidateInitialChecks(ctx context.Context) {
 	l := nl.LoggerFromContext(ctx)
 
-	if startupCheckFn != nil {
-		err := startupCheckFn()
-		if err != nil {
-			nl.Fatalf(l, "Failed startup check: %v", err)
-		}
-		l.Info("AWS startup check passed")
-	}
-
 	l.Info(fmt.Sprintf("Starting with flags: %+q", os.Args[1:]))
 
 	unparsed := flag.Args()
@@ -512,6 +513,12 @@ func mustValidateFlags(ctx context.Context) {
 	healthProbePortValidationError := internalValidation.ValidateUnprivilegedPort(*serviceInsightListenPort)
 	if healthProbePortValidationError != nil {
 		nl.Fatalf(l, "Invalid value for service-insight-listen-port: %v", metricsPortValidationError)
+	}
+
+	// The upper bound keeps time.Duration(ms) * time.Millisecond from overflowing int64.
+	const maxBatchReloadWindow = math.MaxInt64 / int64(time.Millisecond)
+	if *batchReloadWindow < 0 || int64(*batchReloadWindow) > maxBatchReloadWindow {
+		nl.Fatalf(l, "Invalid value for batch-reload-window: %v, must be between 0 and %d milliseconds", *batchReloadWindow, maxBatchReloadWindow)
 	}
 
 	var err error
@@ -616,6 +623,11 @@ func mustValidateFlags(ctx context.Context) {
 
 	if *enableExternalDNS && !*enableCustomResources {
 		nl.Fatal(l, "enable-external-dns flag requires -enable-custom-resources")
+	}
+
+	if !externaldns.IsSupportedGroupVersion(*externalDNSGroupVersion) {
+		nl.Fatalf(l, "invalid -external-dns-group-version %q; supported values: %v",
+			*externalDNSGroupVersion, externaldns.SupportedGroupVersions())
 	}
 
 	if *ingressLink != "" && *externalService != "" {

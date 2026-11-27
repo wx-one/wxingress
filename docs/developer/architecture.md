@@ -4,7 +4,7 @@ This page describes how wxingress is built, for developers working on the code. 
 parts:
 
 - **the controller** (Go), a fork of [NGINX Ingress Controller](https://github.com/nginx/kubernetes-ingress)
-  5.7.1. It watches the Kubernetes API, renders the NGINX configuration and reloads NGINX. On top of the
+  5.8.1. It watches the Kubernetes API, renders the NGINX configuration and reloads NGINX. On top of the
   upstream controller it reads Ingresses with the semantics of ingress-nginx;
 - **the Gateway API layer** (Go, `internal/gateway/`), built on the Gateway API graph of
   [NGINX Gateway Fabric](https://github.com/nginx/nginx-gateway-fabric). It maps Gateways and their

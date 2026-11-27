@@ -123,6 +123,7 @@ type NginxCfgParams struct {
 	dosResource               *appProtectDosResource
 	BaseCfgParams             *ConfigParams
 	isMinion                  bool
+	isMaster                  bool
 	isPlus                    bool
 	isResolverConfigured      bool
 	isWildcardEnabled         bool
@@ -408,6 +409,7 @@ func generateNginxCfg(ncp NginxCfgParams) (version1.IngressNginxConfig, Warnings
 		if ncp.isMinion {
 			ownerDetails.parentName = ncp.mergeableIngs.Master.Ingress.Name
 			ownerDetails.parentNamespace = ncp.mergeableIngs.Master.Ingress.Namespace
+			ownerDetails.ownerType = "ing"
 			pathContext = minionContext
 		}
 		oidcNativeLocations := ncp.oidcNativeLocations
@@ -433,6 +435,7 @@ func generateNginxCfg(ncp NginxCfgParams) (version1.IngressNginxConfig, Warnings
 				oidcNativeLocations: oidcNativeLocations,
 			},
 			bundleValidator,
+			nil, // no JWT claim variables on Ingress, see generatePolicies
 		)
 		allWarnings.Add(warnings)
 	}
@@ -498,6 +501,8 @@ func generateNginxCfg(ncp NginxCfgParams) (version1.IngressNginxConfig, Warnings
 		return aliases
 	}
 
+	// replacedHeaders adds each warning once, however many hosts repeat it.
+	replacedHeaders := newHeaderWarnings(allWarnings)
 	for _, rule := range ncp.ingEx.Ingress.Spec.Rules {
 		// skipping invalid hosts
 		if !ncp.ingEx.ValidHosts[rule.Host] {
@@ -565,6 +570,8 @@ func generateNginxCfg(ncp NginxCfgParams) (version1.IngressNginxConfig, Warnings
 			WAF:                    policyCfg.WAF,
 			EgressMTLS:             policyCfg.EgressMTLS,
 			PoliciesErrorReturn:    policyCfg.ErrorReturn,
+			LimitConnOptions:       policyCfg.ConnectionLimit.Options,
+			LimitConns:             policyCfg.ConnectionLimit.Conns,
 		}
 
 		if isDefaultServer {
@@ -861,6 +868,12 @@ func generateNginxCfg(ncp NginxCfgParams) (version1.IngressNginxConfig, Warnings
 					loc.PoliciesErrorReturn = policyCfg.ErrorReturn
 				}
 
+				// An ACME challenge location keeps the server's limit, which the templates switch to dry run.
+				if !loc.ACMEChallenge {
+					loc.LimitConnOptions = policyCfg.ConnectionLimit.Options
+					loc.LimitConns = policyCfg.ConnectionLimit.Conns
+				}
+
 				if policyCfg.ExternalAuth != nil {
 					exAuth := policyCfg.ExternalAuth
 					authUps, authLocs, portWarning := resolveExternalAuth(exAuth, ncp.ingEx.Ingress, ncp.ingEx.Endpoints, &cfgParams)
@@ -1095,6 +1108,11 @@ func generateNginxCfg(ncp NginxCfgParams) (version1.IngressNginxConfig, Warnings
 				}
 			}
 		}
+		// generateNginxCfgForMergeableIngresses resolves the merged server of masters and minions.
+		if !ncp.isMinion && !ncp.isMaster {
+			server.AuthResponseHeaderNames = resolveIngressAuthResponseHeaders(locations, server.ExternalAuth,
+				func(*version1.Location) runtime.Object { return ncp.ingEx.Ingress }, replacedHeaders)
+		}
 		server.Locations = locations
 		server.IngressNginxHTTPSRedirect = server.IngressNginxRedirect && ((server.SSL && server.SSLRedirect) || server.ForceSSLRedirect)
 		enforceIngressNginxRegex(&server, ncp.ingEx.Ingress.Annotations)
@@ -1181,6 +1199,7 @@ func generateNginxCfg(ncp NginxCfgParams) (version1.IngressNginxConfig, Warnings
 		IngressNginxAuthUpstreams: uniqueAuthUpstreams(append(ingressNginxAuthUpstreamsOf(ingressNginxExtAuth, ingressNginxAuthResolver(ncp)),
 			mergedAuthUpstreams...)),
 		IngressNginxStreamSnippets: uniqueStreamSnippets(mergedStreamSnippets...),
+		LimitConnZones:             policyCfg.ConnectionLimit.Zones,
 		Maps:                       removeDuplicateMaps(maps),
 		AppProtectLoadModule:       ncp.staticParams.MainAppProtectLoadModule,
 		HTTP2:                      ncp.BaseCfgParams.HTTP2,
@@ -1910,6 +1929,7 @@ func generateNginxCfgForMergeableIngresses(ncp NginxCfgParams) (version1.Ingress
 	var ingressNginxAuthCaches []version1.IngressNginxAuthCache
 	var ingressNginxAuthUpstreams []version1.IngressNginxAuthUpstream
 	var ingressNginxStreamSnippets [][]string
+	var limitConnZones []version2.LimitConnZone
 	var maps []version2.Map
 	var oidcProviders []version2.OIDCProvider
 	var canaries map[string]nginx.Canary
@@ -1933,6 +1953,7 @@ func generateNginxCfgForMergeableIngresses(ncp NginxCfgParams) (version1.Ingress
 		apResources:               ncp.apResources,
 		dosResource:               ncp.dosResource,
 		isMinion:                  isMinion,
+		isMaster:                  true,
 		isPlus:                    ncp.isPlus,
 		BaseCfgParams:             ncp.BaseCfgParams,
 		isResolverConfigured:      ncp.isResolverConfigured,
@@ -1960,6 +1981,7 @@ func generateNginxCfgForMergeableIngresses(ncp NginxCfgParams) (version1.Ingress
 	upstreams = append(upstreams, masterNginxCfg.Upstreams...)
 	balancers := masterNginxCfg.Balancers
 	maps = append(maps, masterNginxCfg.Maps...)
+	limitConnZones = append(limitConnZones, masterNginxCfg.LimitConnZones...)
 
 	if masterNginxCfg.OIDCProviders != nil {
 		oidcProviders = append(oidcProviders, masterNginxCfg.OIDCProviders...)
@@ -1973,9 +1995,11 @@ func generateNginxCfgForMergeableIngresses(ncp NginxCfgParams) (version1.Ingress
 	minions := ncp.mergeableIngs.Minions
 	grpcOnly := true
 	hasGRPCLocations := false
+	minionOwners := make(map[string]runtime.Object, len(minions))
 	for _, minion := range minions {
 		// replace minion with a deepcopy because we will modify it
 		originalMinion := minion.Ingress
+		minionOwners[originalMinion.Namespace+"/"+originalMinion.Name] = originalMinion
 		minion.Ingress = minion.Ingress.DeepCopy()
 
 		// Remove the default backend so that "/" will not be generated
@@ -2105,6 +2129,7 @@ func generateNginxCfgForMergeableIngresses(ncp NginxCfgParams) (version1.Ingress
 		for _, snippet := range minionNginxCfg.IngressNginxStreamSnippets {
 			ingressNginxStreamSnippets = append(ingressNginxStreamSnippets, []string{snippet})
 		}
+		limitConnZones = append(limitConnZones, minionNginxCfg.LimitConnZones...)
 		maps = append(maps, minionNginxCfg.Maps...)
 	}
 
@@ -2129,6 +2154,10 @@ func generateNginxCfgForMergeableIngresses(ncp NginxCfgParams) (version1.Ingress
 	masterServer.Locations = append(masterInternalLocations, locations...)
 	// a use-regex or rewrite-target of one minion makes the paths of all of them regular expressions
 	enforceIngressNginxRegex(&masterServer, ncp.mergeableIngs.Master.Ingress.Annotations)
+	// Resolve after the merge above, which set each minion location's ProxySetHeaders and cleared an
+	// ExternalAuth that duplicates the master's. Warnings go to the original objects, as above.
+	masterServer.AuthResponseHeaderNames = resolveIngressAuthResponseHeaders(masterServer.Locations, masterServer.ExternalAuth,
+		mergeableLocationOwner(minionOwners, originalMaster), newHeaderWarnings(warnings))
 	masterServer.ACMEChallengeActive = hasACMEChallengeLocation(masterServer.Locations)
 	masterServer.HasGRPCLocations = hasGRPCLocations
 	masterServer.GRPCOnly = hasGRPCLocations && grpcOnly
@@ -2161,6 +2190,7 @@ func generateNginxCfgForMergeableIngresses(ncp NginxCfgParams) (version1.Ingress
 		IngressNginxAuthCaches:     ingressNginxAuthCaches,
 		IngressNginxAuthUpstreams:  uniqueAuthUpstreams(ingressNginxAuthUpstreams),
 		IngressNginxStreamSnippets: uniqueStreamSnippets(ingressNginxStreamSnippets...),
+		LimitConnZones:             removeDuplicateLimitConnZones(limitConnZones),
 		Maps:                       removeDuplicateMaps(maps),
 		AppProtectLoadModule:       ncp.staticParams.MainAppProtectLoadModule,
 		HTTP2:                      ncp.BaseCfgParams.HTTP2,

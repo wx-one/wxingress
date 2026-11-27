@@ -169,6 +169,16 @@ func TestHelmNICTemplate(t *testing.T) {
 			releaseName: "custom-resources",
 			namespace:   "custom-resources",
 		},
+		"externalDNSNginx": {
+			valuesFile:  "testdata/external-dns-nginx.yaml",
+			releaseName: "external-dns-nginx",
+			namespace:   "default",
+		},
+		"externalDNSUpstream": {
+			valuesFile:  "testdata/external-dns-upstream.yaml",
+			releaseName: "external-dns-upstream",
+			namespace:   "default",
+		},
 		"appProtectWAF": {
 			valuesFile:  "testdata/app-protect-waf.yaml",
 			releaseName: "appprotect-waf",
@@ -311,6 +321,11 @@ func TestHelmNICTemplate(t *testing.T) {
 			releaseName: "common-labels",
 			namespace:   "default",
 		},
+		"batchReloadWindow": {
+			valuesFile:  "testdata/batch-reload-window.yaml",
+			releaseName: "batch-reload-window",
+			namespace:   "default",
+		},
 	}
 
 	// Path to the helm chart we will test
@@ -451,6 +466,18 @@ func TestHelmNICTemplateNegative(t *testing.T) {
 			releaseName:       "common-labels-reserved",
 			namespace:         "default",
 			expectedErrorMsgs: []string{`label "app.kubernetes.io/name" is managed by the chart and cannot be overridden`},
+		},
+		"agentLabelsInvalid": {
+			valuesFile:  "testdata/agent-labels-invalid.yaml",
+			releaseName: "agent-labels-invalid",
+			namespace:   "default",
+			expectedErrorMsgs: []string{
+				"invalid propertyName 'bad,key'",
+				"'/nginxAgent/labels/comma': 'a,b' does not match pattern",
+				"'/nginxAgent/labels/equals': 'a=b' does not match pattern",
+				"'/nginxAgent/labels/empty': '' does not match pattern",
+				"'/nginxAgent/labels/number': got number, want string",
+			},
 		},
 		"appProtectWAFPLMWithoutPlus": {
 			valuesFile:        "testdata/app-protect-waf-plm-without-plus.yaml",

@@ -26,6 +26,7 @@ import (
 	"github.com/wx-one/wxingress/internal/configs/version1"
 	"github.com/wx-one/wxingress/internal/configs/version2"
 	"github.com/wx-one/wxingress/internal/configs/wafbundle"
+	"github.com/wx-one/wxingress/internal/externaldns"
 	"github.com/wx-one/wxingress/internal/healthcheck"
 	"github.com/wx-one/wxingress/internal/k8s"
 	"github.com/wx-one/wxingress/internal/k8s/appprotect"
@@ -147,6 +148,7 @@ func main() {
 		api_v1.EventSource{Component: k8s.EventReporterName})
 	defer eventBroadcaster.Shutdown()
 	mustValidateIngressClass(ctx, kubeClient)
+	mustValidateExternalDNSCRD(ctx, kubeClient)
 
 	checkNamespaces(ctx, kubeClient)
 
@@ -401,6 +403,7 @@ func main() {
 		SnippetsEnabled:              *enableSnippets,
 		CertManagerEnabled:           *enableCertManager,
 		ExternalDNSEnabled:           *enableExternalDNS,
+		ExternalDNSGroupVersion:      *externalDNSGroupVersion,
 		IsIPV6Disabled:               *disableIPV6,
 		IsDirectiveAutoadjustEnabled: *enableDirectiveAutoadjust,
 		AllowEmptyIngressHost:        *allowEmptyIngressHost,
@@ -410,6 +413,7 @@ func main() {
 		DynamicWeightChangesReload:   *enableDynamicWeightChangesReload,
 		InstallationFlags:            parsedFlags,
 		ShuttingDown:                 false,
+		BatchReloadWindow:            time.Duration(*batchReloadWindow) * time.Millisecond,
 		Zone:                         controllerZone,
 		NodeName:                     controllerNodeName,
 		TopologyAwareRouting:         *enableTopologyAwareRouting,
@@ -633,6 +637,25 @@ func mustValidateIngressClass(ctx context.Context, kubeClient kubernetes.Interfa
 	}
 	nl.Warnf(l, "IngressClass %v has the controller %v, which is not in -ingress-class-controllers %q; Ingresses naming it are served all the same",
 		ingressClassRes.Name, ingressClassRes.Spec.Controller, *ingressClassControllers)
+}
+
+// mustValidateExternalDNSCRD calls internally os.Exit and terminates the
+// program if -enable-external-dns is set and the DNSEndpoint CRD for the
+// configured -external-dns-group-version is not installed.
+//
+// Without this check a missing CRD fails silently: the DNSEndpoint informer
+// never syncs and the ExternalDNS control loop stalls without creating or
+// updating any DNSEndpoint, while external-dns keeps reading whatever it read
+// last. See docs/crd/externaldns.nginx.org_dnsendpoints.md for where each
+// group's CRD comes from.
+func mustValidateExternalDNSCRD(ctx context.Context, kubeClient kubernetes.Interface) {
+	if !*enableExternalDNS {
+		return
+	}
+	l := nl.LoggerFromContext(ctx)
+	if err := externaldns.CheckDNSEndpointCRD(kubeClient.Discovery(), *externalDNSGroupVersion); err != nil {
+		nl.Fatalf(l, "Cannot enable external-dns: %v", err)
+	}
 }
 
 func checkNamespaces(ctx context.Context, kubeClient kubernetes.Interface) {
