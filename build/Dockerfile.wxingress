@@ -31,7 +31,7 @@
 ARG SEED=registry.opencode.de/oci-community/images/auswaertiges-amt/debian:13.7@sha256:e6a784c10fcb9e6748815e6838b8c71a2f099846131232ddf17581fa518aacc9
 
 # the Debian snapshot the seed's builder uses
-FROM debian:trixie-20260918@sha256:9cc080028c43b27d2074d63a5f9caf7166d731494965616c1a6d2827a004585c AS assemble
+FROM debian:trixie-20261123@sha256:3cda3ca472ce45507a5109c6a3907093e24d9ae67d55954c9a07a45665dafba2 AS assemble
 
 ARG OSS_PACKAGE_REPO=packages.nginx.org
 # must match NGINX_VERSION in dataplane/build.sh: nginx takes the module only
