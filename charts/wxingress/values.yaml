@@ -262,7 +262,7 @@ controller:
     repository: ghcr.io/wx-one/wxingress
 
     ## The tag of the Ingress Controller image. If not specified the appVersion from Chart.yaml is used as a tag.
-    # tag: "5.7.1-wx12"
+    # tag: "5.7.1-wx13"
     ## The digest of the Ingress Controller image.
     ## If digest is specified it has precedence over tag and will be used instead
     # digest: "sha256:CHANGEME"

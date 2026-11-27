@@ -50,7 +50,7 @@ features. Details are on the [support page](https://wx-one.github.io/wxingress/a
 
 **ingress-nginx gets no fix for [nginx2root](https://blog.cloudflare.com/nginx2root/)** (CVE-2026-123007 and four
 more, the worst remote code execution over HTTP/2). The project was retired in March 2026. wxingress takes over its
-Ingresses unchanged and ships NGINX 1.31.9, which has the fixes. Four times the HTTP requests per second
+Ingresses unchanged and ships NGINX 1.31.10, which has the fixes. Four times the HTTP requests per second
 of ingress-nginx, with half the memory ([benchmarks](#why-wxingress), [compared with the alternatives](#your-options-compared)).
 
 ## Are you affected?
@@ -74,8 +74,8 @@ defaults, updates endpoints dynamically and serves Ingresses without a host. It 
 so you can move traffic over step by step. To have wxingress serve the IngressClass `nginx` of an existing
 ingress-nginx installation, read the [migration guide](https://wx-one.github.io/wxingress/migration/ingress-nginx/) first.
 
-Images: `ghcr.io/wx-one/wxingress:<version>`, for example `5.7.1-wx12`. The image contains
-NGINX 1.31.9 from nginx.org.
+Images: `ghcr.io/wx-one/wxingress:<version>`, for example `5.7.1-wx13`. The image contains
+NGINX 1.31.10 from nginx.org.
 
 ## What it is
 
@@ -172,7 +172,8 @@ A row for every release in which a component changed, newest first; each holds u
 
 | wxingress | based on NGINX Ingress Controller | NGINX | Gateway API (via NGINX Gateway Fabric) |
 |---|---|---|---|
-| 5.7.1-wx11 and later | 5.7.1 | 1.31.9 | v1.7.0 (NGF 2.9.0) |
+| 5.7.1-wx13 and later | 5.7.1 | 1.31.10 | v1.7.0 (NGF 2.9.1) |
+| 5.7.1-wx11 and 5.7.1-wx12 | 5.7.1 | 1.31.9 | v1.7.0 (NGF 2.9.0) |
 | 5.7.1-wx5 to 5.7.1-wx10 | 5.7.1 | 1.31.9 | v1.6.3 (NGF 2.8.1) |
 
 `controller.gatewayAPI.installCRDs` installs the CRDs of the release's Gateway API version: from

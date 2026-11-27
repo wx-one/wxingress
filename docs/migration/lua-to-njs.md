@@ -226,7 +226,7 @@ Test the script before it reaches the cluster, with the `njs` command line or in
 official image, which has the njs module (the wxingress image has no shell to run this in):
 
 ```sh
-docker run --rm -v "$PWD:/njs" nginx:1.31.9 sh -c '
+docker run --rm -v "$PWD:/njs" nginx:1.31.10 sh -c '
   cat > /tmp/nginx.conf <<EOF
 load_module /usr/lib/nginx/modules/ngx_http_js_module.so;
 events {}

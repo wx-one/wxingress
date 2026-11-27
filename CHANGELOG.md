@@ -4,6 +4,19 @@ wxingress versions are `<NGINX Ingress Controller version>-wx<n>`: `5.7.1-wx5` i
 release based on NGINX Ingress Controller 5.7.1. The changes of NGINX Ingress Controller itself are on its
 [releases page](https://github.com/nginx/kubernetes-ingress/releases).
 
+## 5.7.1-wx13
+
+Upgrade everywhere: NGINX 1.31.10 with the fixes of 23 November 2026.
+
+### Fixes
+
+- NGINX 1.31.10 (from 1.31.9) in the image and for the data plane module. It fixes CVE-2026-132779, where a
+  client could make NGINX use excessive CPU when `ssl_early_data` is on; wxingress does not set it, only a
+  snippet can. It also fixes NGINX hogging a CPU with TLS connections to backends, which wxingress opens for
+  `backend-protocol: HTTPS` and for Policies with TLS to the upstream.
+- The Gateway API graph follows NGINX Gateway Fabric 2.9.1 (from 2.9.0), which changes nothing in it that
+  wxingress uses. The Gateway API stays v1.7.0.
+
 ## 5.7.1-wx12
 
 Upgrade where wxingress runs on the nodes' ports behind a ClusterIP Service, as rke2-ingress-nginx does,

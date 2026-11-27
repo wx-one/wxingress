@@ -1,9 +1,9 @@
 # Copied by hack/sync-ngf.sh - do not edit anything below this directory.
 repository: https://github.com/nginx/nginx-gateway-fabric.git
-tag: v2.9.0
-commit: 63846d07b738dd024bc9b6c39aceaf730775a879
+tag: v2.9.1
+commit: 701a744b96f9d0aaaef5901206b96c033939aed6
 gateway-api: v1.7.0
-tree-sha256: 230a6be431dcc15689fc058073565792b0888370d51474048e21024eaf41a732
+tree-sha256: 8dc3cddaafcd47fe09fccc153ec590c9939084b709b77a1c846542c15f804e19
 patches:
   - 0001-s3-client-behind-build-tag.patch
 packages:

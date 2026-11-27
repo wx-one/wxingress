@@ -37,8 +37,8 @@ root=${META_ROOT:-$here/../../metalanguage}
 meta=${META:-$root/meta}
 
 # the version NGINX_OSS_VERSION in build/Dockerfile names
-NGINX_VERSION=1.31.9
-NGINX_SHA256=a11c5eeee2e257f4478f0e649f84b0040787d277d2d3e5233952aa6b6dcb80ad
+NGINX_VERSION=1.31.10
+NGINX_SHA256=a9b690957fca84abdae8a9b52d66b1bb459282d7f01fe4b94b498ed8e977bdb3
 NGINX_URL=https://nginx.org/download/nginx-$NGINX_VERSION.tar.gz
 
 # libcurl, which meta's fetch drives (JWK sets, OIDC discovery), linked into

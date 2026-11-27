@@ -48,7 +48,7 @@ env:
   # repository variable META_IMAGE or the workflow_dispatch input try another,
   # by digest, in runs of this workflow only - never when release.yml calls it.
   # must match NGINX_VERSION in dataplane/build.sh
-  NGINX_OSS_VERSION: 1.31.9
+  NGINX_OSS_VERSION: 1.31.10
 
 jobs:
   go-test:
